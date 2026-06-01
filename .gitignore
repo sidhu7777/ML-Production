@@ -86,5 +86,8 @@ commands.*.local.txt
 *.geojson
 *.zip
 
+# Curated fixture data exceptions
+!tests/fixtures/project_196_rsrp_tilt/*.csv
+
 # Platform / deployment-local
 .render/
