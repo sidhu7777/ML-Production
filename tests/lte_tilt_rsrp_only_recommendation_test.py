@@ -26,6 +26,12 @@ from tests import lte_tilt_recommendation_test as base
 
 
 OUTPUT_ROOT = Path("tests/output")
+PROJECT_196_RSRP_TILT_FIXTURE_ROOT = Path("tests/fixtures/project_196_rsrp_tilt")
+PROJECT_196_RSRP_TILT_BASELINE_POINTS = PROJECT_196_RSRP_TILT_FIXTURE_ROOT / "rf_prediction_grid.parquet"
+PROJECT_196_RSRP_TILT_ANTENNA_INPUT = PROJECT_196_RSRP_TILT_FIXTURE_ROOT / "antenna_input.csv"
+PROJECT_196_RSRP_TILT_GEO_FEATURES = PROJECT_196_RSRP_TILT_FIXTURE_ROOT / "geo_features_input.csv.gz"
+PROJECT_196_RSRP_TILT_GRID_ANALYTICS = PROJECT_196_RSRP_TILT_FIXTURE_ROOT / "local_grid_analytics_geo.csv"
+PROJECT_196_RSRP_TILT_THRESHOLD_FILE = PROJECT_196_RSRP_TILT_FIXTURE_ROOT / "lte_tilt_recommendation_transformed.csv"
 
 
 def _quiet_build_cell_site_map(antenna_df: pd.DataFrame) -> pd.DataFrame:
@@ -2368,6 +2374,7 @@ def run_tilt_rsrp_only_recommendation_test(config: TiltRsrpOnlyRecommendationTes
 
 def _parse_args() -> TiltRsrpOnlyRecommendationTestConfig:
     parser = argparse.ArgumentParser()
+    fixture_available = PROJECT_196_RSRP_TILT_BASELINE_POINTS.exists()
     parser.add_argument("--project-id", type=int, default=DEFAULT_PROJECT_ID)
     parser.add_argument("--region", type=str, default=DEFAULT_REGION)
     parser.add_argument("--operator", type=str, default=None)
@@ -2384,11 +2391,41 @@ def _parse_args() -> TiltRsrpOnlyRecommendationTestConfig:
     parser.add_argument("--min-recovered-bad-samples", type=int, default=0)
     parser.add_argument("--bad-grid-coverage-pct", type=float, default=80.0)
     parser.add_argument("--max-group-cells", type=int, default=0)
-    parser.add_argument("--threshold-file", "--threshold-file-path", dest="threshold_file_path", type=str, default=None)
-    parser.add_argument("--baseline-points", "--baseline-points-path", dest="baseline_points_path", type=str, default=None)
-    parser.add_argument("--antenna-input", "--antenna-input-path", dest="antenna_input_path", type=str, default=None)
-    parser.add_argument("--geo-features", "--geo-features-path", dest="geo_features_path", type=str, default=None)
-    parser.add_argument("--grid-analytics", "--grid-analytics-path", dest="grid_analytics_path", type=str, default=None)
+    parser.add_argument(
+        "--threshold-file",
+        "--threshold-file-path",
+        dest="threshold_file_path",
+        type=str,
+        default=str(PROJECT_196_RSRP_TILT_THRESHOLD_FILE) if fixture_available else None,
+    )
+    parser.add_argument(
+        "--baseline-points",
+        "--baseline-points-path",
+        dest="baseline_points_path",
+        type=str,
+        default=str(PROJECT_196_RSRP_TILT_BASELINE_POINTS) if fixture_available else None,
+    )
+    parser.add_argument(
+        "--antenna-input",
+        "--antenna-input-path",
+        dest="antenna_input_path",
+        type=str,
+        default=str(PROJECT_196_RSRP_TILT_ANTENNA_INPUT) if fixture_available else None,
+    )
+    parser.add_argument(
+        "--geo-features",
+        "--geo-features-path",
+        dest="geo_features_path",
+        type=str,
+        default=str(PROJECT_196_RSRP_TILT_GEO_FEATURES) if fixture_available else None,
+    )
+    parser.add_argument(
+        "--grid-analytics",
+        "--grid-analytics-path",
+        dest="grid_analytics_path",
+        type=str,
+        default=str(PROJECT_196_RSRP_TILT_GRID_ANALYTICS) if fixture_available else None,
+    )
     parser.add_argument("--local-baseline-kpi-stage", choices=["geo", "demo", "raw"], default="geo")
     parser.add_argument("--session-ids", type=str, default=",".join(str(value) for value in DEFAULT_SESSION_IDS))
     parser.add_argument("--validation-fraction", type=float, default=DEFAULT_VALIDATION_FRACTION)

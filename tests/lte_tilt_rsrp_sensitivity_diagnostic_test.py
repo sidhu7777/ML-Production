@@ -598,6 +598,7 @@ def _parse_deltas(raw: str) -> Sequence[float]:
 
 def _parse_args() -> TiltRsrpSensitivityDiagnosticConfig:
     parser = argparse.ArgumentParser()
+    fixture_available = rsrp_only.PROJECT_196_RSRP_TILT_BASELINE_POINTS.exists()
     parser.add_argument("--project-id", type=int, default=DEFAULT_PROJECT_ID)
     parser.add_argument("--region", type=str, default=DEFAULT_REGION)
     parser.add_argument("--operator", type=str, default=None)
@@ -614,16 +615,46 @@ def _parse_args() -> TiltRsrpSensitivityDiagnosticConfig:
     parser.add_argument("--session-ids", type=str, default=",".join(str(value) for value in DEFAULT_SESSION_IDS))
     parser.add_argument("--validation-fraction", type=float, default=DEFAULT_VALIDATION_FRACTION)
     parser.add_argument("--no-residual-calibration", action="store_true")
-    parser.add_argument("--baseline-points", "--baseline-points-path", dest="baseline_points_path", type=str, default=None)
-    parser.add_argument("--antenna-input", "--antenna-input-path", dest="antenna_input_path", type=str, default=None)
-    parser.add_argument("--geo-features", "--geo-features-path", dest="geo_features_path", type=str, default=None)
-    parser.add_argument("--grid-analytics", "--grid-analytics-path", dest="grid_analytics_path", type=str, default=None)
+    parser.add_argument(
+        "--baseline-points",
+        "--baseline-points-path",
+        dest="baseline_points_path",
+        type=str,
+        default=str(rsrp_only.PROJECT_196_RSRP_TILT_BASELINE_POINTS) if fixture_available else None,
+    )
+    parser.add_argument(
+        "--antenna-input",
+        "--antenna-input-path",
+        dest="antenna_input_path",
+        type=str,
+        default=str(rsrp_only.PROJECT_196_RSRP_TILT_ANTENNA_INPUT) if fixture_available else None,
+    )
+    parser.add_argument(
+        "--geo-features",
+        "--geo-features-path",
+        dest="geo_features_path",
+        type=str,
+        default=str(rsrp_only.PROJECT_196_RSRP_TILT_GEO_FEATURES) if fixture_available else None,
+    )
+    parser.add_argument(
+        "--grid-analytics",
+        "--grid-analytics-path",
+        dest="grid_analytics_path",
+        type=str,
+        default=str(rsrp_only.PROJECT_196_RSRP_TILT_GRID_ANALYTICS) if fixture_available else None,
+    )
     parser.add_argument("--local-baseline-kpi-stage", choices=["geo", "demo", "raw"], default="geo")
     parser.add_argument("--recompute-k1k2-from-baseline", action="store_true")
     parser.add_argument("--fixed-dt-calibration-k1", type=float, default=170.0)
     parser.add_argument("--fixed-dt-calibration-k2", type=float, default=35.2)
     parser.add_argument("--no-fixed-dt-calibration-fallback", action="store_true")
-    parser.add_argument("--threshold-file", "--threshold-file-path", dest="threshold_file_path", type=str, default=None)
+    parser.add_argument(
+        "--threshold-file",
+        "--threshold-file-path",
+        dest="threshold_file_path",
+        type=str,
+        default=str(rsrp_only.PROJECT_196_RSRP_TILT_THRESHOLD_FILE) if fixture_available else None,
+    )
     parser.add_argument("--output-root", type=Path, default=OUTPUT_ROOT)
     args = parser.parse_args()
     return TiltRsrpSensitivityDiagnosticConfig(
