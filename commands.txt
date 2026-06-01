@@ -101,3 +101,34 @@ do {
   $s
   Start-Sleep -Seconds 5
 } while ($s.status -ne "done" -and $s.status -ne "failed")
+
+
+
+
+
+# just to run OPENCELLID test case 
+
+
+
+
+# test-only: run optimization using the latest saved tilt recommendation scenario
+
+cd c:\ml\python-ml-backend_23042026
+venv\Scripts\python.exe tests\lte_tilt_recommendation_optimization_test.py `
+  --project-id 196 `
+  --region india `
+  --operator Airtel `
+  --radius-m 500 `
+  --grid-resolution-m 10 `
+  --workers 8 `
+  --impact-radius-m 500 `
+  --neighbor-site-count 2 `
+  --max-interference-sites 10
+
+
+
+
+# command to run the test case coverage 
+
+cd c:\ml\python-ml-backend_23042026
+venv\Scripts\python.exe tests\coverage_prediction\lte_coverage_test.py --region india --chunk-size 5000 --grid-size-m 50 --baseline-radius-m 500 --baseline-workers 3 --geo-cache-mode build --geo-base-run-dir "tests\output\project_196\coverage_20260520_133328" --polygon-wkt "POLYGON((77.3493010211505 28.6451999446618,77.3760801959551 28.6563475183659,77.3798996615923 28.6493804236681,77.3790413547076 28.6309248012639,77.3383146930255 28.6320924980605,77.3493010211505 28.6451999446618))"

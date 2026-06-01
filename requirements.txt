@@ -136,6 +136,7 @@ notebook==7.3.3
 notebook_shim==0.2.4
 numpy==2.2.1
 openpyxl==3.1.5
+optuna>=3.6,<5
 orjson==3.11.3
 osmnx==2.0.6
 overrides==7.7.0
@@ -255,5 +256,4 @@ yellowbrick==1.5
 zipp==3.21.0
 zope.event==5.0
 zope.interface==7.2
-
-
+optuna ==4.0.0

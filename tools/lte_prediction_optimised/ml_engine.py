@@ -666,6 +666,17 @@ def run_prediction_only_optimized(opt_sites, k1k2_map, params):
     impact_radius_m = float(params.get("impact_radius_m", params.get("radius", 500)))
     neighbor_site_count = int(params.get("neighbor_site_count", 2))
     max_interference_sites = int(params.get("max_interference_sites", 10))
+    prediction_points_df = params.get("prediction_points_df")
+    if isinstance(prediction_points_df, pd.DataFrame) and not prediction_points_df.empty:
+        prediction_points_df = prediction_points_df.copy()
+        if "Node_Cell_ID" in prediction_points_df.columns:
+            prediction_points_df["Node_Cell_ID"] = prediction_points_df["Node_Cell_ID"].astype(str)
+        print(
+            f"[LTE_OPT][POINTS_OVERRIDE] enabled=True rows={len(prediction_points_df)} "
+            f"distinct_node_cell_id={_safe_nunique(prediction_points_df, 'Node_Cell_ID')}"
+        )
+    else:
+        prediction_points_df = pd.DataFrame()
 
     affected_cells, affected_sites, changed_rows = _compute_affected_cells(
         work_df,
@@ -680,8 +691,18 @@ def run_prediction_only_optimized(opt_sites, k1k2_map, params):
 
     final_list = []
     print(f"[LTE_OPT][RUN] total_cells_to_process={len(affected_cells)}")
-    geo_features_df = pd.DataFrame()
-    if params.get("project_id"):
+    geo_features_df = params.get("geo_features_df")
+    if isinstance(geo_features_df, pd.DataFrame) and not geo_features_df.empty:
+        geo_features_df = geo_features_df.copy()
+        if "nodeb_id_cell_id" in geo_features_df.columns and "Node_Cell_ID" not in geo_features_df.columns:
+            geo_features_df["Node_Cell_ID"] = geo_features_df["nodeb_id_cell_id"].astype(str)
+        print(
+            f"[LTE_OPT][GEO_FETCH] source=local_geo_features rows={len(geo_features_df)} "
+            f"distinct_node_cell_id={_safe_nunique(geo_features_df, 'Node_Cell_ID')}"
+        )
+    else:
+        geo_features_df = pd.DataFrame()
+    if geo_features_df.empty and params.get("project_id"):
         try:
             geo_features_df = fetch_geo_features(
                 params["project_id"],
@@ -718,14 +739,29 @@ def run_prediction_only_optimized(opt_sites, k1k2_map, params):
             "k2": k2,
             "all_sites_rows": local_interference_records
         })
-        pts = generate_grid(
-            site_rows,
-            cell_params["radius"],
-            cell_params["grid_resolution"]
-        )
         point_source = "generated_grid"
+        if not prediction_points_df.empty and {"Node_Cell_ID", "lat", "lon"}.issubset(prediction_points_df.columns):
+            pts = (
+                prediction_points_df.loc[
+                    prediction_points_df["Node_Cell_ID"].astype(str) == str(cid),
+                    ["lat", "lon"],
+                ]
+                .dropna(subset=["lat", "lon"])
+                .drop_duplicates()
+                .copy()
+            )
+            point_source = "baseline_prediction_points"
+        else:
+            pts = pd.DataFrame()
+        if pts.empty:
+            pts = generate_grid(
+                site_rows,
+                cell_params["radius"],
+                cell_params["grid_resolution"]
+            )
+            point_source = "generated_grid"
         cell_geo = geo_features_df[geo_features_df["Node_Cell_ID"].astype(str) == str(cid)].copy() if not geo_features_df.empty else pd.DataFrame()
-        if not cell_geo.empty and not pts.empty:
+        if point_source == "generated_grid" and not cell_geo.empty and not pts.empty:
             geo_mask = (
                 cell_geo.loc[:, ["lat", "lon"]]
                 .dropna(subset=["lat", "lon"])

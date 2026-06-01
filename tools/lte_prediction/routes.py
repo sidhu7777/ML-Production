@@ -22,7 +22,7 @@ def run_prediction():
             "grid_resolution": float(data.get("grid_resolution", 25)),
             "building": bool(data.get("building", True)),
             "n_workers": int(data.get("n_workers", max(1, cpu_count - 1))),
-            "max_interference_sites": int(data.get("max_interference_sites", 50)),
+            "max_interference_sites": int(data.get("max_interference_sites", 10)),
             "dem_raster_path": data.get("dem_raster_path"),
             "output_folder": current_app.config['OUTPUT_FOLDER']
         }

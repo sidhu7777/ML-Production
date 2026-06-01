@@ -68,6 +68,12 @@ tests/output/**/antenna_input.csv
 tests/output/**/baseline_log_input.csv
 tests/output/**/dominant_bearing_summary.csv
 tests/output/**/summary.json
+tests/output_nocache*/
+
+# Curated offline test fixtures
+!tests/fixtures/
+!tests/fixtures/project_196_rsrp_tilt/
+!tests/fixtures/project_196_rsrp_tilt/**
 
 # Local API / run scratch files
 commands.local.txt

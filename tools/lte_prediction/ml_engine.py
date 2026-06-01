@@ -97,6 +97,16 @@ def _load_project_polygons(project_id, current_engine):
     return polygons
 
 
+def _resolve_prediction_polygons(params, current_engine):
+    polygon_wkt = str(params.get("polygon_wkt") or "").strip() if params else ""
+    if polygon_wkt:
+        try:
+            return [load_wkt(polygon_wkt)]
+        except Exception as exc:
+            print(f"[LTE][POLYGON_OVERRIDE] invalid_wkt={exc}")
+    return _load_project_polygons(params["project_id"], current_engine)
+
+
 def _swap_polygon_coords(polygons):
     def _swap_xy(x, y, z=None):
         return (y, x) if z is None else (y, x, z)
@@ -446,7 +456,7 @@ def run_rf_prediction_fast(site_df, drive_df, building_df, params):
     building_path = f"{temp_dir}/building.csv"
 
     current_engine = engine.get(params.get("region", "india").lower(), engine["india"])
-    polygons = _load_project_polygons(params["project_id"], current_engine)
+    polygons = _resolve_prediction_polygons(params, current_engine)
     site_export_df = prepare_site_df_for_source_rf_export(site_df)
     building_export_df = building_df.copy()
     if polygons:
@@ -493,9 +503,26 @@ def run_rf_prediction_fast(site_df, drive_df, building_df, params):
     })
 
     pred_df = pd.read_csv(f"{temp_dir}/prediction_ALL_SITES.csv")
-    pred_df, polygon_stats = _apply_prediction_polygon_filter(
-        pred_df, params["project_id"], current_engine
-    )
+    override_polygon_wkt = str(params.get("polygon_wkt") or "").strip()
+    if override_polygon_wkt:
+        polygons = _resolve_prediction_polygons(params, current_engine)
+        pred_df = _filter_df_by_polygons(pred_df, polygons)
+        polygon_stats = {
+            "polygons_found": len(polygons),
+            "rows_before": len(pd.read_csv(f"{temp_dir}/prediction_ALL_SITES.csv")),
+            "rows_after": len(pred_df),
+            "swapped": False,
+            "skipped": False,
+        }
+        print(
+            f"[LTE][RF_OUTPUT_POLYGON] polygons_found={polygon_stats['polygons_found']} "
+            f"rows_before={polygon_stats['rows_before']} rows_after={polygon_stats['rows_after']} "
+            f"swapped={polygon_stats['swapped']} override=True"
+        )
+    else:
+        pred_df, polygon_stats = _apply_prediction_polygon_filter(
+            pred_df, params["project_id"], current_engine
+        )
     print(
         f"[LTE][RF_OUTPUT_COUNTS] rows_before_polygon={polygon_stats['rows_before']} "
         f"rows_after_polygon={len(pred_df)} "
@@ -522,7 +549,6 @@ def run_rf_prediction_fast(site_df, drive_df, building_df, params):
     )
     return pred_df
 
-
 def run_ml_fast(pred_df, drive_df, site_df=None, building_df=None, params=None):
     print(
         f"[LTE][POST_INPUT] pred_rows={len(pred_df)} drive_rows={len(drive_df)} "
@@ -532,7 +558,7 @@ def run_ml_fast(pred_df, drive_df, site_df=None, building_df=None, params=None):
         raise ValueError("Geo/display correction requires site_df, building_df, and params")
 
     current_engine = engine.get(params.get("region", "india").lower(), engine["india"])
-    polygons = _load_project_polygons(params["project_id"], current_engine)
+    polygons = _resolve_prediction_polygons(params, current_engine)
     final_df, summary = apply_full_display_correction(
         pred_df,
         drive_df,
