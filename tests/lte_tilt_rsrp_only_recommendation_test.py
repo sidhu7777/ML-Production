@@ -1695,7 +1695,13 @@ def _build_tilt_only_recommendations(
         return pd.DataFrame(), pd.DataFrame()
 
     tech_col = "Technology" if "Technology" in ant_use.columns else ""
-    baseline_job_id = base._fetch_latest_baseline_job_id(config.project_id, config.region)
+    using_local_inputs = bool(
+        getattr(config, "baseline_points_path", None)
+        or getattr(config, "antenna_input_path", None)
+        or getattr(config, "geo_features_path", None)
+        or getattr(config, "grid_analytics_path", None)
+    )
+    baseline_job_id = "local_artifact_baseline" if using_local_inputs else base._fetch_latest_baseline_job_id(config.project_id, config.region)
     evaluation_rows: List[Dict[str, object]] = []
     recommendation_rows: List[Dict[str, object]] = []
     site_id = "GLOBAL_BAD_GRID_CELL_OPT"
