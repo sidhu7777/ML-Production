@@ -1866,6 +1866,7 @@ def _build_tilt_only_recommendations(
             f"baseline_bad_grids={float(result.get('baseline_bad_grid_count', 0.0)):.0f} "
             f"candidate_bad_grids={float(result.get('candidate_bad_grid_count', 0.0)):.0f} "
             f"net={float(result.get('net_bad_reduction', 0.0)):.0f} score={float(result.get('score', 0.0)):.4f}"
+            + (f" error={error}" if error else "")
         )
         return result
 
