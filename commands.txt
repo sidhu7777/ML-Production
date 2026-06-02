@@ -142,3 +142,8 @@ venv\Scripts\python.exe -B tests\lte_tilt_rsrp_sensitivity_diagnostic_test.py --
 # RSRP-only tilt recommendation using curated fixture inputs (offline/local)
 cd c:\ml\python-ml-backend_23042026
 venv\Scripts\python.exe -B tests\lte_tilt_rsrp_only_recommendation_test.py --project-id 196 --region india --operator Airtel --rsrp -93
+
+
+# command to run 
+
+venv\Scripts\python.exe -B tests\lte_tilt_rsrp_only_recommendation_test.py --project-id 196 --region india --operator Airtel --rsrp -90 --bad-grid-coverage-pct 60 --max-group-cells 15 --no-residual-calibration --workers 1

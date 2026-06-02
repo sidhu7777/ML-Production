@@ -558,7 +558,32 @@ def _aggregate_bad_geo_context(bad_geo_df: pd.DataFrame) -> pd.DataFrame:
         return pd.DataFrame()
 
     work = bad_geo_df.copy()
-    work["nlos_flag_num"] = pd.to_numeric(work.get("nlos_flag"), errors="coerce").fillna(0.0)
+    if "nlos_flag" in work.columns:
+        work["nlos_flag_num"] = pd.to_numeric(work["nlos_flag"], errors="coerce").fillna(0.0)
+    else:
+        work["nlos_flag_num"] = 0.0
+    required_numeric_cols = [
+        "serving_distance_m",
+        "nearest_site_distance_m",
+        "mean_nearest3_site_distance_m",
+        "site_count_250m",
+        "site_count_500m",
+        "azimuth_delta_deg",
+        "building_area_ratio",
+        "building_count",
+        "los_blocked_ratio",
+        "los_blocker_count",
+        "green_ratio",
+        "water_ratio",
+        "road_length_m",
+        "terrain_slope_deg",
+        "terrain_relief_to_site_m",
+    ]
+    for col in required_numeric_cols:
+        if col not in work.columns:
+            work[col] = np.nan
+    if "clutter_class" not in work.columns:
+        work["clutter_class"] = ""
     grouped = work.groupby(["Cell ID", "Technology"], dropna=False)
     summary = grouped.agg(
         bad_sample_count=("Cell ID", "size"),

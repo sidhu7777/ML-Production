@@ -667,6 +667,8 @@ def run_prediction_only_optimized(opt_sites, k1k2_map, params):
     neighbor_site_count = int(params.get("neighbor_site_count", 2))
     max_interference_sites = int(params.get("max_interference_sites", 10))
     prediction_points_df = params.get("prediction_points_df")
+    strict_prediction_points = bool(params.get("strict_prediction_points", False))
+    explicit_recompute_cells = params.get("recompute_cells")
     if isinstance(prediction_points_df, pd.DataFrame) and not prediction_points_df.empty:
         prediction_points_df = prediction_points_df.copy()
         if "Node_Cell_ID" in prediction_points_df.columns:
@@ -678,11 +680,27 @@ def run_prediction_only_optimized(opt_sites, k1k2_map, params):
     else:
         prediction_points_df = pd.DataFrame()
 
-    affected_cells, affected_sites, changed_rows = _compute_affected_cells(
-        work_df,
-        impact_radius_m,
-        neighbor_site_count,
-    )
+    if explicit_recompute_cells is not None:
+        affected_cells = sorted({str(cell).strip() for cell in explicit_recompute_cells if str(cell).strip()})
+        available_cell_ids = set(work_df["Node_Cell_ID"].astype(str).tolist())
+        affected_cells = [
+            cell for cell in affected_cells
+            if cell in available_cell_ids
+        ]
+        affected_rows = work_df.loc[work_df["Node_Cell_ID"].astype(str).isin(affected_cells)].copy()
+        affected_sites = sorted(affected_rows["dashboard_site_id"].astype(str).dropna().unique().tolist())
+        changed_rows = work_df.loc[_build_change_mask(work_df)].copy()
+        print(
+            f"[LTE_OPT][AFFECTED_OVERRIDE] update_cell_count={changed_rows['Node_Cell_ID'].nunique()} "
+            f"recompute_cell_count={len(affected_cells)} affected_site_count={len(affected_sites)} "
+            f"source=explicit_recompute_cells"
+        )
+    else:
+        affected_cells, affected_sites, changed_rows = _compute_affected_cells(
+            work_df,
+            impact_radius_m,
+            neighbor_site_count,
+        )
     print(
         f"[LTE_OPT][AFFECTED] changed_cell_count={changed_rows['Node_Cell_ID'].nunique()} "
         f"affected_site_count={len(affected_sites)} affected_cell_count={len(affected_cells)} "
@@ -753,6 +771,9 @@ def run_prediction_only_optimized(opt_sites, k1k2_map, params):
             point_source = "baseline_prediction_points"
         else:
             pts = pd.DataFrame()
+        if pts.empty and strict_prediction_points and not prediction_points_df.empty:
+            print(f"[LTE_OPT][RUN] cell={cid} skipped_reason=no_prediction_points_strict")
+            continue
         if pts.empty:
             pts = generate_grid(
                 site_rows,

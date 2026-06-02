@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import contextlib
 import io
 import json
@@ -37,6 +38,9 @@ PROJECT_196_RSRP_TILT_THRESHOLD_FILE = PROJECT_196_RSRP_TILT_FIXTURE_ROOT / "lte
 def _quiet_build_cell_site_map(antenna_df: pd.DataFrame) -> pd.DataFrame:
     with contextlib.redirect_stdout(io.StringIO()):
         ant_work = base.opt_ml._normalize_site_df(antenna_df, log_stage="TILT_TEST_SITE_MAP")
+    baseline_df = getattr(base, "_rsrp_only_active_baseline_df", None)
+    if isinstance(baseline_df, pd.DataFrame) and not baseline_df.empty:
+        ant_work = _canonicalize_site_df_to_baseline(ant_work, baseline_df)
     ant_work["Cell ID"] = ant_work["Node_Cell_ID"].astype(str).map(base.TILT_SRC._norm_cell_id)
     ant_work["Site ID"] = ant_work["dashboard_site_id"].astype(str).str.strip()
     ant_work["Sector Suffix"] = ant_work["Cell ID"].map(base.TILT_SRC._cell_id_suffix)
@@ -49,6 +53,9 @@ def _quiet_apply_multiple_parameter_targets(
 ) -> pd.DataFrame:
     with contextlib.redirect_stdout(io.StringIO()):
         modified = base.opt_ml._normalize_site_df(site_df, log_stage="TILT_TEST_CLUSTER_CANDIDATE_INPUT")
+    baseline_df = getattr(base, "_rsrp_only_active_baseline_df", None)
+    if isinstance(baseline_df, pd.DataFrame) and not baseline_df.empty:
+        modified = _canonicalize_site_df_to_baseline(modified, baseline_df)
     for col in ["lat", "lon", "azimuth", "electrical_tilt", "mechanical_tilt", "tx_power", "antenna_height"]:
         modified[f"orig_{col}"] = pd.to_numeric(modified[col], errors="coerce")
 
@@ -92,7 +99,7 @@ class TiltRsrpOnlyRecommendationTestConfig:
     max_mean_sinr_drop_db: float = 1.0
     min_score_gain: float = 0.0
     min_recovered_bad_samples: int = 0
-    bad_grid_coverage_pct: float = 80.0
+    bad_grid_coverage_pct: float = 60.0
     max_group_cells: int = 0
     threshold_file_path: Optional[str] = None
     threshold_constraint_count: int = 0
@@ -106,6 +113,9 @@ class TiltRsrpOnlyRecommendationTestConfig:
     validation_fraction: float = DEFAULT_VALIDATION_FRACTION
     apply_residual_calibration: bool = True
     fixed_k1k2_for_local_inputs: bool = True
+    fixed_dt_calibration_k1: float = 170.0
+    fixed_dt_calibration_k2: float = 35.2
+    use_fixed_dt_calibration_fallback: bool = True
     output_root: Path = OUTPUT_ROOT
 
     def __post_init__(self) -> None:
@@ -259,6 +269,17 @@ def _fixed_raw_k1k2_map(cells: Sequence[str]) -> Dict[str, tuple[float, float]]:
     return {str(cell): (0.0, 0.0) for cell in cells if str(cell).strip()}
 
 
+def _fixed_dt_calibration_k1k2_map(
+    cells: Sequence[str],
+    config: TiltRsrpOnlyRecommendationTestConfig,
+) -> Dict[str, tuple[float, float]]:
+    return {
+        str(cell): (float(config.fixed_dt_calibration_k1), float(config.fixed_dt_calibration_k2))
+        for cell in cells
+        if str(cell).strip()
+    }
+
+
 def _config_as_base(config: TiltRsrpOnlyRecommendationTestConfig) -> base.TiltRecommendationTestConfig:
     base_config = base.TiltRecommendationTestConfig(
         project_id=int(config.project_id),
@@ -287,6 +308,9 @@ def _config_as_base(config: TiltRsrpOnlyRecommendationTestConfig) -> base.TiltRe
     )
     setattr(base_config, "bad_grid_coverage_pct", float(config.bad_grid_coverage_pct))
     setattr(base_config, "max_group_cells", int(config.max_group_cells))
+    setattr(base_config, "fixed_dt_calibration_k1", float(config.fixed_dt_calibration_k1))
+    setattr(base_config, "fixed_dt_calibration_k2", float(config.fixed_dt_calibration_k2))
+    setattr(base_config, "use_fixed_dt_calibration_fallback", bool(config.use_fixed_dt_calibration_fallback))
     return base_config
 
 
@@ -667,6 +691,29 @@ def _canonicalize_cell_list(cells: Sequence[object], baseline_df: Optional[pd.Da
             seen.add(key)
             out.append(key)
     return sorted(out)
+
+
+def _canonicalize_site_df_to_baseline(site_df: pd.DataFrame, baseline_df: pd.DataFrame) -> pd.DataFrame:
+    if site_df.empty or baseline_df.empty or "Node_Cell_ID" not in site_df.columns or "Node_Cell_ID" not in baseline_df.columns:
+        return site_df
+    out = site_df.copy()
+    baseline_keys = set(_identity_text(baseline_df["Node_Cell_ID"]).dropna().astype(str).tolist())
+    if not baseline_keys:
+        return out
+    raw = _identity_text(out["Node_Cell_ID"])
+    canonical_values = raw.map(lambda value: _canonicalize_cell_id(value, baseline_keys))
+    matched = canonical_values.isin(baseline_keys)
+    if bool(matched.any()):
+        out.loc[matched, "Node_Cell_ID"] = canonical_values.loc[matched].astype(str)
+        for col in ["cell_id", "node_cell_id", "frontend_site_sector_key"]:
+            if col in out.columns:
+                out.loc[matched, col] = canonical_values.loc[matched].astype(str)
+    if int(matched.sum()) != len(out):
+        print(
+            f"[TILT_RSRP_IDENTITY][WARN] site_df_canonical_match={int(matched.sum())}/{len(out)} "
+            f"sample_unmatched={raw.loc[~matched].dropna().astype(str).drop_duplicates().head(5).tolist()}"
+        )
+    return out
 
 
 def _canonicalize_prediction_identity_columns(pred_df: pd.DataFrame) -> pd.DataFrame:
@@ -1083,21 +1130,73 @@ def _mark_recompute_cells_for_prediction(
     changed_cells: Sequence[str],
     baseline_df: pd.DataFrame,
 ) -> pd.DataFrame:
-    out = site_df.copy()
-    recompute_set = set(_canonicalize_cell_list(recompute_cells, baseline_df))
-    changed_set = set(_canonicalize_cell_list(changed_cells, baseline_df))
-    synthetic_cells = sorted(recompute_set.difference(changed_set))
-    if not synthetic_cells or "Node_Cell_ID" not in out.columns:
-        return out
-    for col in ["lat", "lon", "azimuth", "electrical_tilt", "mechanical_tilt", "tx_power", "antenna_height"]:
-        if col in out.columns and f"orig_{col}" not in out.columns:
-            out[f"orig_{col}"] = pd.to_numeric(out[col], errors="coerce")
-    mask = out["Node_Cell_ID"].astype(str).isin(synthetic_cells)
-    if mask.any() and "azimuth" in out.columns:
-        out.loc[mask, "orig_azimuth"] = pd.to_numeric(out.loc[mask, "azimuth"], errors="coerce") + 0.123
-        out.loc[mask, "optimization_applied"] = True
-        print(f"[TILT_RSRP_GLOBAL_AFFECTED_EXPAND] synthetic_recompute_cells={len(synthetic_cells)} rows_marked={int(mask.sum())}")
-    return out
+    return _canonicalize_site_df_to_baseline(site_df, baseline_df)
+
+
+def _cell_level_recompute_scope(
+    antenna_df: pd.DataFrame,
+    baseline_df: pd.DataFrame,
+    changed_cells: Sequence[str],
+    max_neighbor_cells: Optional[int] = None,
+) -> Dict[str, object]:
+    update_cells = _canonicalize_cell_list(changed_cells, baseline_df)
+    update_set = set(update_cells)
+    if not update_set:
+        return {
+            "recompute_cells": [],
+            "same_site_cells": [],
+            "neighbor_cells": [],
+            "affected_sites": [],
+        }
+
+    ant = _canonicalize_site_df_to_baseline(antenna_df, baseline_df)
+    same_site_cells: set[str] = set()
+    affected_sites: set[str] = set()
+    if not ant.empty and {"Node_Cell_ID", "dashboard_site_id"}.issubset(ant.columns):
+        ant_ids = ant["Node_Cell_ID"].astype(str)
+        site_ids = ant.loc[ant_ids.isin(update_set), "dashboard_site_id"].astype(str).dropna().unique().tolist()
+        affected_sites.update(site_ids)
+        same_site_rows = ant.loc[ant["dashboard_site_id"].astype(str).isin(site_ids)]
+        same_site_cells.update(_canonicalize_cell_list(same_site_rows["Node_Cell_ID"].dropna().astype(str).tolist(), baseline_df))
+
+    neighbor_counts: Dict[str, int] = {}
+    if not baseline_df.empty and "Node_Cell_ID" in baseline_df.columns:
+        topology_cols = [col for col in ["best_interferer_cell_id", "neighbor_1_cell_id", "neighbor_2_cell_id"] if col in baseline_df.columns]
+        if topology_cols:
+            base_ids = baseline_df["Node_Cell_ID"].astype(str)
+            focus_mask = base_ids.isin(update_set.union(same_site_cells))
+            for col in topology_cols:
+                linked = baseline_df[col].dropna().astype(str).str.strip()
+                linked_to_updates = linked.isin(update_set)
+                focus_values = pd.concat([baseline_df.loc[focus_mask, col], baseline_df.loc[linked_to_updates, "Node_Cell_ID"]], ignore_index=True)
+                for cell in _canonicalize_cell_list(focus_values.dropna().astype(str).tolist(), baseline_df):
+                    if cell not in update_set and cell not in same_site_cells:
+                        neighbor_counts[cell] = neighbor_counts.get(cell, 0) + 1
+
+    if max_neighbor_cells is None:
+        max_neighbor_cells = max(10, len(update_cells))
+    ranked_neighbors = [
+        cell for cell, _ in sorted(neighbor_counts.items(), key=lambda item: (-item[1], item[0]))
+    ][: max(0, int(max_neighbor_cells))]
+    neighbor_cells = set(ranked_neighbors)
+
+    recompute_cells = _canonicalize_cell_list(update_set.union(same_site_cells).union(neighbor_cells), baseline_df)
+    if not ant.empty and {"Node_Cell_ID", "dashboard_site_id"}.issubset(ant.columns):
+        affected_sites.update(
+            ant.loc[ant["Node_Cell_ID"].astype(str).isin(recompute_cells), "dashboard_site_id"].astype(str).dropna().unique().tolist()
+        )
+    print(
+        f"[TILT_RSRP_RECOMPUTE_SCOPE] update_cell_count={len(update_cells)} "
+        f"same_site_cell_count={len(same_site_cells)} neighbor_cell_count={len(neighbor_cells)} "
+        f"recompute_cell_count={len(recompute_cells)} affected_site_count={len(affected_sites)} "
+        f"max_neighbor_cells={int(max_neighbor_cells)}"
+    )
+    return {
+        "recompute_cells": recompute_cells,
+        "same_site_cells": sorted(same_site_cells),
+        "neighbor_cells": sorted(neighbor_cells),
+        "affected_sites": sorted(affected_sites),
+    }
 
 
 def _aggregate_grid_metrics_from_predictions(
@@ -1581,18 +1680,25 @@ def _build_tilt_only_recommendations(
     geo_features_df: Optional[pd.DataFrame] = None,
     residual_models: Optional[Dict[str, Dict[str, object]]] = None,
     use_fixed_raw_k1k2: bool = False,
+    baseline_job_id: str = "",
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     ant_use = base._build_cell_site_map(antenna_df)
     if ant_use.empty or baseline_df.empty:
         return pd.DataFrame(), pd.DataFrame()
 
     tech_col = "Technology" if "Technology" in ant_use.columns else ""
-    baseline_job_id = base._fetch_latest_baseline_job_id(config.project_id, config.region)
+    baseline_job_id = str(baseline_job_id or "")
+    if not baseline_job_id:
+        baseline_job_id = base._fetch_latest_baseline_job_id(config.project_id, config.region)
     evaluation_rows: List[Dict[str, object]] = []
     recommendation_rows: List[Dict[str, object]] = []
     site_id = "GLOBAL_BAD_GRID_CELL_OPT"
     ant_use["Cell ID"] = ant_use["Cell ID"].astype(str).str.strip()
-    tunable_set = set(ant_use["Cell ID"].dropna().astype(str).str.strip())
+    ant_use["_canonical_cell_id"] = ""
+    for idx, raw_cell_id in ant_use["Cell ID"].dropna().astype(str).str.strip().items():
+        canonical = _canonicalize_cell_list([raw_cell_id], baseline_df)
+        ant_use.at[idx, "_canonical_cell_id"] = canonical[0] if canonical else str(raw_cell_id)
+    tunable_set = set(ant_use["_canonical_cell_id"].dropna().astype(str).str.strip())
     reference_grid = _grid_reference_metrics_from_analytics(grid_analytics_df, config.rsrp_threshold) if grid_analytics_df is not None else pd.DataFrame()
     work = baseline_df.copy()
     work["grid_id"] = _normalize_grid_id_series(work.get("grid_id")) if "grid_id" in work.columns else pd.Series(np.nan, index=work.index)
@@ -1601,6 +1707,11 @@ def _build_tilt_only_recommendations(
     work = work.dropna(subset=["grid_id", "pred_rsrp"])
     work = work.loc[work["Node_Cell_ID"].isin(tunable_set)].copy()
     if work.empty:
+        print(
+            f"[TILT_RSRP_GLOBAL_GROUP] action=skip reason=no_canonical_tunable_rows "
+            f"baseline_cells={baseline_df['Node_Cell_ID'].astype(str).nunique() if 'Node_Cell_ID' in baseline_df.columns else 0} "
+            f"tunable_cells={len(tunable_set)}"
+        )
         return pd.DataFrame(), pd.DataFrame()
 
     if not reference_grid.empty:
@@ -1615,17 +1726,30 @@ def _build_tilt_only_recommendations(
         bad_grid_ids = set(grid_avg.loc[pd.to_numeric(grid_avg["avg_rsrp"], errors="coerce") < float(config.rsrp_threshold), "grid_id"].astype(str))
         source = "recomputed_rf_grid"
     bad_work = work.loc[work["grid_id"].astype(str).isin(bad_grid_ids)].copy()
-    bad_work["_severity"] = (float(config.rsrp_threshold) - bad_work["pred_rsrp"]).clip(lower=0.0).fillna(0.0)
     contributor = (
         bad_work.groupby(["grid_id", "Node_Cell_ID"], dropna=False)
         .agg(
-            bad_sample_count=("pred_rsrp", lambda values: int((pd.to_numeric(values, errors="coerce") < float(config.rsrp_threshold)).sum())),
-            severity_sum=("_severity", "sum"),
+            bad_sample_count=("pred_rsrp", "count"),
+            before_cell_mean_rsrp=("pred_rsrp", "mean"),
+            before_cell_p10_rsrp=("pred_rsrp", lambda values: float(pd.to_numeric(values, errors="coerce").quantile(0.10))),
         )
         .reset_index()
     )
-    contributor = contributor.loc[contributor["bad_sample_count"] > 0].copy()
+    contributor["mean_weakness_db"] = (
+        float(config.rsrp_threshold) - pd.to_numeric(contributor["before_cell_mean_rsrp"], errors="coerce")
+    ).clip(lower=0.0).fillna(0.0)
+    contributor["p10_weakness_db"] = (
+        float(config.rsrp_threshold) - pd.to_numeric(contributor["before_cell_p10_rsrp"], errors="coerce")
+    ).clip(lower=0.0).fillna(0.0)
+    contributor["severity_sum"] = (
+        contributor["mean_weakness_db"] * pd.to_numeric(contributor["bad_sample_count"], errors="coerce").fillna(0.0)
+    )
+    contributor = contributor.loc[pd.to_numeric(contributor["bad_sample_count"], errors="coerce").fillna(0) > 0].copy()
     if contributor.empty:
+        print(
+            f"[TILT_RSRP_GLOBAL_GROUP] action=skip reason=no_bad_grid_contributors "
+            f"bad_grids={len(bad_grid_ids)} bad_work_rows={len(bad_work)}"
+        )
         return pd.DataFrame(), pd.DataFrame()
 
     global_cells = (
@@ -1635,7 +1759,7 @@ def _build_tilt_only_recommendations(
         .sort_values(["total_severity", "total_bad_samples", "bad_grid_count"], ascending=[False, False, False])
     )
     total_severity = float(pd.to_numeric(global_cells["total_severity"], errors="coerce").fillna(0.0).sum())
-    coverage_pct = float(np.clip(float(getattr(config, "bad_grid_coverage_pct", 80.0)), 1.0, 100.0))
+    coverage_pct = float(np.clip(float(getattr(config, "bad_grid_coverage_pct", 60.0)), 1.0, 100.0))
     max_group_cells = int(getattr(config, "max_group_cells", 0) or 0)
     global_cells["contribution_pct"] = pd.to_numeric(global_cells["total_severity"], errors="coerce").fillna(0.0) / max(total_severity, 1e-9) * 100.0
     global_cells["cumulative_contribution_pct"] = global_cells["contribution_pct"].cumsum()
@@ -1662,7 +1786,7 @@ def _build_tilt_only_recommendations(
     eval_lock = threading.Lock()
 
     def _cell_current(cell_id: str, column: str) -> float:
-        row = ant_use.loc[ant_use["Cell ID"].astype(str) == str(cell_id)]
+        row = ant_use.loc[ant_use["_canonical_cell_id"].astype(str) == str(cell_id)]
         if row.empty:
             return np.nan
         return pd.to_numeric(pd.Series([row.iloc[0].get(column)]), errors="coerce").iloc[0]
@@ -1716,9 +1840,9 @@ def _build_tilt_only_recommendations(
             "affected_cells": int(metrics.get("calibration_cell_count", 0.0) or 0),
             "affected_sites": int(metrics.get("affected_site_count", 0.0) or 0),
             "changed_cells": len(updates),
-            "tunable_site_count": int(ant_use.loc[ant_use["Cell ID"].isin(target_cells), "Site ID"].astype(str).nunique()) if "Site ID" in ant_use.columns else 0,
+            "tunable_site_count": int(ant_use.loc[ant_use["_canonical_cell_id"].isin(target_cells), "Site ID"].astype(str).nunique()) if "Site ID" in ant_use.columns else 0,
             "tunable_cell_count": len(target_cells),
-            "tunable_sites": ",".join(ant_use.loc[ant_use["Cell ID"].isin(target_cells), "Site ID"].astype(str).drop_duplicates().tolist()) if "Site ID" in ant_use.columns else "",
+            "tunable_sites": ",".join(ant_use.loc[ant_use["_canonical_cell_id"].isin(target_cells), "Site ID"].astype(str).drop_duplicates().tolist()) if "Site ID" in ant_use.columns else "",
             "target_action_cells": ",".join(target_cells),
             "cluster_eval_sample_count": int(len(baseline_df)),
             "cluster_baseline_bad_count": int(len(bad_grid_ids)),
@@ -1759,21 +1883,35 @@ def _build_tilt_only_recommendations(
             return _result(candidate_name, updates, cached)
         try:
             modified_site_df = base._apply_multiple_parameter_targets(antenna_df, updates)
-            radius_affected_cells, affected_sites, _ = base.opt_ml._compute_affected_cells(
-                modified_site_df,
-                float(config.impact_radius_m),
-                int(config.neighbor_site_count),
-            )
             update_cells = _canonicalize_cell_list([str(update.get("cell_id", "")) for update in updates], baseline_df)
-            radius_affected_cells = _canonicalize_cell_list(radius_affected_cells, baseline_df)
-            topology_seed_cells = sorted(set(radius_affected_cells).union(update_cells))
-            topology_affected_cells = _canonicalize_cell_list(base._expand_evaluation_cells_from_topology(baseline_df, topology_seed_cells), baseline_df)
-            calibration_cells = _canonicalize_cell_list(set(topology_affected_cells).union(update_cells), baseline_df)
+            recompute_scope = _cell_level_recompute_scope(
+                antenna_df,
+                baseline_df,
+                update_cells,
+                max_neighbor_cells=min(max(2 * len(update_cells), 2), 20),
+            )
+            recompute_cells = _canonicalize_cell_list(recompute_scope.get("recompute_cells", []), baseline_df)
+            calibration_cells = _canonicalize_cell_list(recompute_cells, baseline_df)
+            affected_sites = list(recompute_scope.get("affected_sites", []))
             if not calibration_cells:
                 raise ValueError("No global calibration cells found for candidate")
             prediction_site_df = _mark_recompute_cells(modified_site_df, calibration_cells, update_cells)
             baseline_prediction_site_df = _mark_recompute_cells(antenna_df, calibration_cells, [])
-            if use_fixed_raw_k1k2:
+            use_fixed_dt_fallback = bool(
+                use_fixed_raw_k1k2
+                and not residual_models
+                and bool(getattr(config, "use_fixed_dt_calibration_fallback", True))
+            )
+            if use_fixed_dt_fallback:
+                fixed_dt_config = TiltRsrpOnlyRecommendationTestConfig(
+                    project_id=int(config.project_id),
+                    region=str(config.region),
+                    fixed_dt_calibration_k1=float(getattr(config, "fixed_dt_calibration_k1", 170.0)),
+                    fixed_dt_calibration_k2=float(getattr(config, "fixed_dt_calibration_k2", 35.2)),
+                )
+                k1k2_map = _fixed_dt_calibration_k1k2_map(calibration_cells, fixed_dt_config)
+                calibration_mode = f"fixed_dt_calibration_k1k2_{float(getattr(config, 'fixed_dt_calibration_k1', 170.0)):g}_{float(getattr(config, 'fixed_dt_calibration_k2', 35.2)):g}"
+            elif use_fixed_raw_k1k2:
                 k1k2_map = _fixed_raw_k1k2_map(calibration_cells)
                 calibration_mode = "fixed_raw_k1k2_zero_plus_fixed_residual"
             else:
@@ -1793,6 +1931,8 @@ def _build_tilt_only_recommendations(
                 "baseline_job_id": baseline_job_id,
                 "prediction_points_df": baseline_df,
                 "geo_features_df": geo_features_df,
+                "strict_prediction_points": True,
+                "recompute_cells": calibration_cells,
             }
             baseline_rf_key = tuple(sorted(calibration_cells))
             with eval_lock:
@@ -1824,11 +1964,16 @@ def _build_tilt_only_recommendations(
                 {
                     "calibration_mode": calibration_mode,
                     "fixed_raw_k1k2_used": float(bool(use_fixed_raw_k1k2)),
+                    "fixed_dt_calibration_fallback_used": float(bool(use_fixed_dt_fallback)),
+                    "fixed_dt_calibration_k1": float(getattr(config, "fixed_dt_calibration_k1", np.nan)) if use_fixed_dt_fallback else np.nan,
+                    "fixed_dt_calibration_k2": float(getattr(config, "fixed_dt_calibration_k2", np.nan)) if use_fixed_dt_fallback else np.nan,
                     "residual_calibration_applied": float(bool(residual_models)),
-                    "radius_affected_cell_count": float(len(radius_affected_cells)),
-                    "topology_affected_cell_count": float(len(topology_affected_cells)),
+                    "radius_affected_cell_count": float(len(calibration_cells)),
+                    "topology_affected_cell_count": float(len(calibration_cells)),
                     "calibration_cell_count": float(len(calibration_cells)),
                     "affected_site_count": float(len(affected_sites)),
+                    "same_site_cell_count": float(len(recompute_scope.get("same_site_cells", []))),
+                    "neighbor_recompute_cell_count": float(len(recompute_scope.get("neighbor_cells", []))),
                     "optimized_row_count": float(len(optimized_df)),
                     "rf_baseline_row_count": float(len(baseline_rf_df)),
                     "merged_row_count": float(len(merged_df)),
@@ -1864,8 +2009,11 @@ def _build_tilt_only_recommendations(
     hold_result = _evaluate("hold", [])
     evaluation_rows.append(hold_result)
 
-    delta_options = (-6.0, -4.0, -2.0, -1.0, 0.0, 1.0, 2.0, 4.0, 6.0)
+    probe_delta_options = (-1.0, 1.0, -2.0, 2.0)
+    positive_expand_delta_options = (4.0, 6.0)
+    negative_expand_delta_options = (-4.0, -6.0)
     max_coordinate_passes = 3
+    max_candidate_workers = max(1, min(2, int(getattr(config, "workers", 1) or 1)))
     current_updates_by_cell: Dict[str, Dict[str, object]] = {}
     current_result = hold_result
     seen_coordinate_keys: set[tuple] = {base._candidate_cache_key(site_id, [])}
@@ -1886,41 +2034,123 @@ def _build_tilt_only_recommendations(
     def _safe_cell_label(cell_id: str) -> str:
         return str(cell_id).replace("|", "_").replace(".", "p").replace(",", "_")
 
+    def _build_cell_trial(
+        pass_idx: int,
+        cell_id: str,
+        delta: float,
+        state: Dict[str, Dict[str, object]],
+    ) -> Optional[Dict[str, object]]:
+        trial_state = dict(state)
+        if np.isclose(float(delta), 0.0):
+            if str(cell_id) not in trial_state:
+                return None
+            trial_state.pop(str(cell_id), None)
+        else:
+            update = _target_update(str(cell_id), float(delta))
+            if update is None:
+                return None
+            trial_state[str(cell_id)] = update
+        trial_updates = _updates_from_state(trial_state)
+        cache_key = base._candidate_cache_key(site_id, trial_updates)
+        if cache_key in seen_coordinate_keys:
+            return None
+        seen_coordinate_keys.add(cache_key)
+        return {
+            "delta": float(delta),
+            "state": trial_state,
+            "updates": trial_updates,
+            "name": (
+                f"coord_pass_{pass_idx}_cell_{_safe_cell_label(cell_id)}_"
+                f"etilt_{_delta_label(delta)}_active_{len(trial_updates)}"
+            ),
+        }
+
+    def _evaluate_trials(trials: Sequence[Dict[str, object]]) -> List[Dict[str, object]]:
+        if not trials:
+            return []
+        if max_candidate_workers <= 1 or len(trials) == 1:
+            return [
+                {**trial, "result": _evaluate(str(trial["name"]), trial["updates"])}
+                for trial in trials
+            ]
+        evaluated: List[Dict[str, object]] = []
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(max_candidate_workers, len(trials))) as executor:
+            future_map = {
+                executor.submit(_evaluate, str(trial["name"]), trial["updates"]): trial
+                for trial in trials
+            }
+            for future in concurrent.futures.as_completed(future_map):
+                trial = future_map[future]
+                evaluated.append({**trial, "result": future.result()})
+        return evaluated
+
     for pass_idx in range(1, max_coordinate_passes + 1):
         pass_changed = False
         print(
             f"[TILT_RSRP_COORDINATE_PASS] pass={pass_idx} cells={len(target_cells)} "
             f"active_updates={len(current_updates_by_cell)} current_score={float(current_result.get('score', 0.0)):.4f} "
-            f"current_net={float(current_result.get('net_bad_reduction', 0.0)):.0f}"
+            f"current_net={float(current_result.get('net_bad_reduction', 0.0)):.0f} "
+            f"probe_deltas={list(probe_delta_options)} candidate_workers={max_candidate_workers}"
         )
         for cell_id in target_cells:
             best_cell_state = dict(current_updates_by_cell)
             best_cell_result = current_result
             evaluated_for_cell = 0
-            for delta in delta_options:
-                trial_state = dict(current_updates_by_cell)
-                if np.isclose(float(delta), 0.0):
-                    trial_state.pop(str(cell_id), None)
-                else:
-                    update = _target_update(str(cell_id), float(delta))
-                    if update is None:
-                        continue
-                    trial_state[str(cell_id)] = update
-                trial_updates = _updates_from_state(trial_state)
-                cache_key = base._candidate_cache_key(site_id, trial_updates)
-                if cache_key in seen_coordinate_keys:
-                    continue
-                seen_coordinate_keys.add(cache_key)
-                candidate_name = (
-                    f"coord_pass_{pass_idx}_cell_{_safe_cell_label(cell_id)}_"
-                    f"etilt_{_delta_label(delta)}_active_{len(trial_updates)}"
-                )
-                trial_result = _evaluate(candidate_name, trial_updates)
+            probe_trials = [
+                trial
+                for delta in probe_delta_options
+                for trial in [_build_cell_trial(pass_idx, str(cell_id), float(delta), current_updates_by_cell)]
+                if trial is not None
+            ]
+            if str(cell_id) in current_updates_by_cell:
+                hold_trial = _build_cell_trial(pass_idx, str(cell_id), 0.0, current_updates_by_cell)
+                if hold_trial is not None:
+                    probe_trials.append(hold_trial)
+            evaluated_trials = _evaluate_trials(probe_trials)
+            for item in evaluated_trials:
+                trial_result = item["result"]
                 evaluation_rows.append(trial_result)
                 evaluated_for_cell += 1
                 if _result_rank(trial_result) > _result_rank(best_cell_result):
-                    best_cell_state = trial_state
+                    best_cell_state = item["state"]
                     best_cell_result = trial_result
+
+            positive_probe = [
+                item for item in evaluated_trials
+                if float(item["delta"]) > 0.0 and _result_rank(item["result"]) > _result_rank(current_result)
+            ]
+            negative_probe = [
+                item for item in evaluated_trials
+                if float(item["delta"]) < 0.0 and _result_rank(item["result"]) > _result_rank(current_result)
+            ]
+            positive_best = max(positive_probe, key=lambda item: _result_rank(item["result"]), default=None)
+            negative_best = max(negative_probe, key=lambda item: _result_rank(item["result"]), default=None)
+            direction = 0
+            if positive_best is not None or negative_best is not None:
+                if negative_best is None or (
+                    positive_best is not None and _result_rank(positive_best["result"]) >= _result_rank(negative_best["result"])
+                ):
+                    direction = 1
+                else:
+                    direction = -1
+
+            if direction != 0:
+                expand_options = positive_expand_delta_options if direction > 0 else negative_expand_delta_options
+                expand_trials = [
+                    trial
+                    for delta in expand_options
+                    for trial in [_build_cell_trial(pass_idx, str(cell_id), float(delta), current_updates_by_cell)]
+                    if trial is not None
+                ]
+                expanded_trials = _evaluate_trials(expand_trials)
+                for item in expanded_trials:
+                    trial_result = item["result"]
+                    evaluation_rows.append(trial_result)
+                    evaluated_for_cell += 1
+                    if _result_rank(trial_result) > _result_rank(best_cell_result):
+                        best_cell_state = item["state"]
+                        best_cell_result = trial_result
+
             if _result_rank(best_cell_result) > _result_rank(current_result):
                 previous_score = float(current_result.get("score", 0.0))
                 current_updates_by_cell = best_cell_state
@@ -1929,6 +2159,7 @@ def _build_tilt_only_recommendations(
                 print(
                     f"[TILT_RSRP_COORDINATE_KEEP] pass={pass_idx} cell={cell_id} "
                     f"evaluated={evaluated_for_cell} active_updates={len(current_updates_by_cell)} "
+                    f"direction={'plus' if direction > 0 else 'minus' if direction < 0 else 'probe'} "
                     f"score={float(current_result.get('score', 0.0)):.4f} previous_score={previous_score:.4f} "
                     f"net={float(current_result.get('net_bad_reduction', 0.0)):.0f}"
                 )
@@ -1936,6 +2167,7 @@ def _build_tilt_only_recommendations(
                 print(
                     f"[TILT_RSRP_COORDINATE_HOLD_CELL] pass={pass_idx} cell={cell_id} "
                     f"evaluated={evaluated_for_cell} active_updates={len(current_updates_by_cell)} "
+                    f"direction={'none' if direction == 0 else 'plus' if direction > 0 else 'minus'} "
                     f"score={float(current_result.get('score', 0.0)):.4f} "
                     f"net={float(current_result.get('net_bad_reduction', 0.0)):.0f}"
                 )
@@ -1972,9 +2204,9 @@ def _build_tilt_only_recommendations(
         f"good_to_bad={float(chosen_result.get('good_to_bad_grid_count', chosen_result.get('new_bad_samples', 0.0))):.0f}."
     )
     selected_cell_set = set(target_cells).union(updates_by_cell.keys())
-    selected_ant = ant_use.loc[ant_use["Cell ID"].astype(str).isin(selected_cell_set)].copy()
+    selected_ant = ant_use.loc[ant_use["_canonical_cell_id"].astype(str).isin(selected_cell_set)].copy()
     for _, sector_row in selected_ant.iterrows():
-        cell_id = str(sector_row["Cell ID"])
+        cell_id = str(sector_row["_canonical_cell_id"] or sector_row["Cell ID"])
         current_value = pd.to_numeric(pd.Series([sector_row.get("electrical_tilt")]), errors="coerce").iloc[0]
         recommended_value = updates_by_cell.get(cell_id, current_value)
         contributor_row = selected_cells_df.loc[selected_cells_df["Node_Cell_ID"].astype(str) == cell_id]
@@ -2034,6 +2266,37 @@ def _choose_best_candidate_row(evaluation_df: pd.DataFrame) -> Optional[pd.Serie
     return evaluation_df.loc[ranked_idx[0]]
 
 
+def _parse_updates_from_result(candidate_row: Dict[str, object] | pd.Series | None) -> List[Dict[str, object]]:
+    if candidate_row is None:
+        return []
+    raw_value = ""
+    try:
+        raw_value = str(candidate_row.get("target_value", "") or "[]")
+    except Exception:
+        raw_value = "[]"
+    try:
+        updates = json.loads(raw_value)
+    except Exception:
+        return []
+    if not isinstance(updates, list):
+        return []
+    parsed: List[Dict[str, object]] = []
+    for update in updates:
+        if not isinstance(update, dict):
+            continue
+        cell_id = str(update.get("cell_id", "")).strip()
+        parameter = str(update.get("parameter", "ETilt")).strip() or "ETilt"
+        target = pd.to_numeric(pd.Series([update.get("target_value")]), errors="coerce").iloc[0]
+        if not cell_id or pd.isna(target):
+            continue
+        parsed_update = dict(update)
+        parsed_update["cell_id"] = cell_id
+        parsed_update["parameter"] = parameter
+        parsed_update["target_value"] = float(target)
+        parsed.append(parsed_update)
+    return parsed
+
+
 def _materialize_candidate_scope(
     baseline_df: pd.DataFrame,
     antenna_df: pd.DataFrame,
@@ -2048,18 +2311,12 @@ def _materialize_candidate_scope(
     if candidate_row is None:
         return pd.DataFrame(), pd.DataFrame(), [], {}
 
-    target_value = str(candidate_row.get("target_value", "") or "[]")
-    try:
-        updates = json.loads(target_value)
-        if not isinstance(updates, list):
-            updates = []
-    except Exception:
-        updates = []
+    updates = _parse_updates_from_result(candidate_row)
 
     if not updates:
         affected_cells = str(candidate_row.get("target_action_cells", "") or "").split(",")
         affected_cells = _canonicalize_cell_list([cell.strip() for cell in affected_cells if cell.strip()], baseline_df)
-        eval_cells = _canonicalize_cell_list(base._expand_evaluation_cells_from_topology(baseline_df, affected_cells), baseline_df)
+        eval_cells = _canonicalize_cell_list(affected_cells, baseline_df)
         eval_grid_ids = _grid_ids_for_evaluation_cells(baseline_df, eval_cells)
         before_scope = _grid_scope_for_ids(baseline_df, eval_grid_ids)
         after_scope = before_scope.copy()
@@ -2078,18 +2335,31 @@ def _materialize_candidate_scope(
         return before_scope, after_scope, updates, meta
 
     modified_site_df = base._apply_multiple_parameter_targets(antenna_df, updates)
-    affected_cells, _, _ = base.opt_ml._compute_affected_cells(
-        modified_site_df,
-        float(config.impact_radius_m),
-        int(config.neighbor_site_count),
-    )
-    affected_cells = _canonicalize_cell_list(affected_cells, baseline_df)
     update_cells = _canonicalize_cell_list(
         [str(update.get("cell_id", "")) for update in updates if str(update.get("cell_id", "")).strip()],
         baseline_df,
     )
-    calibration_cells = _canonicalize_cell_list(set(affected_cells).union(update_cells), baseline_df)
-    if use_fixed_raw_k1k2:
+    recompute_scope = _cell_level_recompute_scope(
+        antenna_df,
+        baseline_df,
+        update_cells,
+        max_neighbor_cells=min(max(2 * len(update_cells), 2), 20),
+    )
+    calibration_cells = _canonicalize_cell_list(recompute_scope.get("recompute_cells", []), baseline_df)
+    use_fixed_dt_fallback = bool(
+        use_fixed_raw_k1k2
+        and not residual_models
+        and bool(getattr(config, "use_fixed_dt_calibration_fallback", True))
+    )
+    if use_fixed_dt_fallback:
+        fixed_dt_config = TiltRsrpOnlyRecommendationTestConfig(
+            project_id=int(config.project_id),
+            region=str(config.region),
+            fixed_dt_calibration_k1=float(getattr(config, "fixed_dt_calibration_k1", 170.0)),
+            fixed_dt_calibration_k2=float(getattr(config, "fixed_dt_calibration_k2", 35.2)),
+        )
+        k1k2_map = _fixed_dt_calibration_k1k2_map(calibration_cells, fixed_dt_config)
+    elif use_fixed_raw_k1k2:
         k1k2_map = _fixed_raw_k1k2_map(calibration_cells)
     else:
         k1k2_map = base.opt_ml.compute_k1k2_for_cells(baseline_df, modified_site_df, calibration_cells)
@@ -2107,6 +2377,8 @@ def _materialize_candidate_scope(
         "baseline_job_id": baseline_job_id,
         "prediction_points_df": baseline_df,
         "geo_features_df": geo_features_df,
+        "strict_prediction_points": True,
+        "recompute_cells": calibration_cells,
     }
     baseline_rf_df = base.opt_ml.run_prediction_only_optimized(
         baseline_prediction_site_df,
@@ -2127,7 +2399,7 @@ def _materialize_candidate_scope(
         baseline_df,
     )
     merged_df = _attach_grid_context_to_predictions(merged_df, baseline_df)
-    evaluation_cells = _canonicalize_cell_list(base._expand_evaluation_cells_from_topology(baseline_df, affected_cells), baseline_df)
+    evaluation_cells = _canonicalize_cell_list(calibration_cells, baseline_df)
     evaluation_grid_ids = _grid_ids_for_evaluation_cells(baseline_df, evaluation_cells)
     before_scope = _grid_scope_for_ids(baseline_df, evaluation_grid_ids)
     after_scope = _grid_scope_for_ids(merged_df, evaluation_grid_ids)
@@ -2143,6 +2415,9 @@ def _materialize_candidate_scope(
         "evaluation_cells": evaluation_cells,
         "evaluation_grid_ids": evaluation_grid_ids,
         "fixed_raw_k1k2_used": bool(use_fixed_raw_k1k2),
+        "fixed_dt_calibration_fallback_used": bool(use_fixed_dt_fallback),
+        "fixed_dt_calibration_k1": float(getattr(config, "fixed_dt_calibration_k1", np.nan)) if use_fixed_dt_fallback else np.nan,
+        "fixed_dt_calibration_k2": float(getattr(config, "fixed_dt_calibration_k2", np.nan)) if use_fixed_dt_fallback else np.nan,
         "residual_calibration_applied": bool(residual_models),
         **rf_delta_metrics,
     }
@@ -2216,12 +2491,15 @@ def run_tilt_rsrp_only_recommendation_test(config: TiltRsrpOnlyRecommendationTes
         log_df = _attach_grid_context_to_predictions(log_df, geo_df, grid_analytics_df)
     grid_validation = _grid_validation_payload(log_df, grid_analytics_df, config.rsrp_threshold)
     _log_grid_validation("BASELINE_VALIDATE", grid_validation)
+    setattr(base, "_rsrp_only_active_baseline_df", log_df)
     residual_models, residual_debug = _fit_fixed_residual_calibration(log_df, config)
     use_fixed_raw_k1k2 = bool(using_local_inputs and config.fixed_k1k2_for_local_inputs)
     print(
         f"[TILT_RSRP_RF_PIPELINE] baseline_anchor=stored_calibrated_baseline "
         f"candidate_delta_residual_calibration={bool(residual_models)} "
-        f"fixed_raw_k1k2={use_fixed_raw_k1k2}"
+        f"fixed_raw_k1k2={use_fixed_raw_k1k2} "
+        f"fixed_dt_calibration_fallback={bool(use_fixed_raw_k1k2 and not residual_models and config.use_fixed_dt_calibration_fallback)} "
+        f"fixed_dt_k1={float(config.fixed_dt_calibration_k1):g} fixed_dt_k2={float(config.fixed_dt_calibration_k2):g}"
     )
 
     bad_samples_df, summary_df = base.TILT_SRC.filter_bad_samples(log_df.copy(), base.TILT_SRC.ALLOWED_TECHS)
@@ -2254,6 +2532,7 @@ def run_tilt_rsrp_only_recommendation_test(config: TiltRsrpOnlyRecommendationTes
         geo_features_df=geo_df,
         residual_models=residual_models,
         use_fixed_raw_k1k2=use_fixed_raw_k1k2,
+        baseline_job_id=baseline_job_id,
     )
     recommendations_df = recommendations_all_df.copy()
     forecast_df = pd.DataFrame()
@@ -2349,6 +2628,9 @@ def run_tilt_rsrp_only_recommendation_test(config: TiltRsrpOnlyRecommendationTes
             "baseline_anchor": "stored_calibrated_baseline",
             "fixed_raw_k1k2_for_local_inputs": bool(use_fixed_raw_k1k2),
             "residual_calibration_applied": bool(residual_models),
+            "fixed_dt_calibration_fallback_used": bool(use_fixed_raw_k1k2 and not residual_models and config.use_fixed_dt_calibration_fallback),
+            "fixed_dt_calibration_k1": float(config.fixed_dt_calibration_k1),
+            "fixed_dt_calibration_k2": float(config.fixed_dt_calibration_k2),
         },
         "counts": {
             "baseline_rows": int(len(log_df)),
@@ -2389,7 +2671,7 @@ def _parse_args() -> TiltRsrpOnlyRecommendationTestConfig:
     parser.add_argument("--max-mean-sinr-drop-db", type=float, default=1.0)
     parser.add_argument("--min-score-gain", type=float, default=0.0)
     parser.add_argument("--min-recovered-bad-samples", type=int, default=0)
-    parser.add_argument("--bad-grid-coverage-pct", type=float, default=80.0)
+    parser.add_argument("--bad-grid-coverage-pct", type=float, default=60.0)
     parser.add_argument("--max-group-cells", type=int, default=0)
     parser.add_argument(
         "--threshold-file",
@@ -2431,6 +2713,9 @@ def _parse_args() -> TiltRsrpOnlyRecommendationTestConfig:
     parser.add_argument("--validation-fraction", type=float, default=DEFAULT_VALIDATION_FRACTION)
     parser.add_argument("--no-residual-calibration", action="store_true")
     parser.add_argument("--recompute-k1k2-from-baseline", action="store_true")
+    parser.add_argument("--fixed-dt-calibration-k1", type=float, default=170.0)
+    parser.add_argument("--fixed-dt-calibration-k2", type=float, default=35.2)
+    parser.add_argument("--no-fixed-dt-calibration-fallback", action="store_true")
     parser.add_argument("--output-root", type=Path, default=OUTPUT_ROOT)
     args = parser.parse_args()
     session_ids = tuple(int(value.strip()) for value in str(args.session_ids).split(",") if value.strip())
@@ -2461,6 +2746,9 @@ def _parse_args() -> TiltRsrpOnlyRecommendationTestConfig:
         validation_fraction=args.validation_fraction,
         apply_residual_calibration=not bool(args.no_residual_calibration),
         fixed_k1k2_for_local_inputs=not bool(args.recompute_k1k2_from_baseline),
+        fixed_dt_calibration_k1=float(args.fixed_dt_calibration_k1),
+        fixed_dt_calibration_k2=float(args.fixed_dt_calibration_k2),
+        use_fixed_dt_calibration_fallback=not bool(args.no_fixed_dt_calibration_fallback),
         output_root=args.output_root,
     )
 

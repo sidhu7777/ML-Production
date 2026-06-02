@@ -380,6 +380,7 @@ def _evaluate_sensitivity_candidate(
         "baseline_job_id": baseline_job_id,
         "prediction_points_df": prediction_points_df,
         "geo_features_df": geo_features_df,
+        "strict_prediction_points": True,
     }
     baseline_rf_df = base.opt_ml.run_prediction_only_optimized(
         baseline_prediction_site_df,
