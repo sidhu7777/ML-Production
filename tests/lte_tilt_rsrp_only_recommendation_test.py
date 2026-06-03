@@ -1724,6 +1724,7 @@ def _build_tilt_only_recommendations(
     geo_features_df: Optional[pd.DataFrame] = None,
     residual_models: Optional[Dict[str, Dict[str, object]]] = None,
     use_fixed_raw_k1k2: bool = False,
+    baseline_job_id: Optional[str] = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     ant_use = base._build_cell_site_map(antenna_df)
     if ant_use.empty or baseline_df.empty:
@@ -1736,7 +1737,14 @@ def _build_tilt_only_recommendations(
         or getattr(config, "geo_features_path", None)
         or getattr(config, "grid_analytics_path", None)
     )
-    baseline_job_id = "local_artifact_baseline" if using_local_inputs else base._fetch_latest_baseline_job_id(config.project_id, config.region)
+    baseline_job_id = str(
+        baseline_job_id
+        or (
+            "local_artifact_baseline"
+            if using_local_inputs
+            else base._fetch_latest_baseline_job_id(config.project_id, config.region)
+        )
+    )
     evaluation_rows: List[Dict[str, object]] = []
     recommendation_rows: List[Dict[str, object]] = []
     site_id = "GLOBAL_BAD_GRID_CELL_OPT"
@@ -2518,6 +2526,7 @@ def run_tilt_rsrp_only_recommendation_test(config: TiltRsrpOnlyRecommendationTes
         geo_features_df=geo_df,
         residual_models=residual_models,
         use_fixed_raw_k1k2=use_fixed_raw_k1k2,
+        baseline_job_id=baseline_job_id,
     )
     recommendations_df = recommendations_all_df.copy()
     forecast_df = pd.DataFrame()

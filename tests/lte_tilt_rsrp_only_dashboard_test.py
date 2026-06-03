@@ -299,6 +299,179 @@ def _render_static_map_image(
     return out_path
 
 
+def _grid_points_for_map(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty or not {"grid_id", "pred_rsrp"}.issubset(df.columns):
+        return pd.DataFrame()
+    work = df.copy()
+    work["grid_id"] = work["grid_id"].astype(str)
+    work["pred_rsrp"] = pd.to_numeric(work["pred_rsrp"], errors="coerce")
+    for col in ["lat", "lon"]:
+        if col in work.columns:
+            work[col] = pd.to_numeric(work[col], errors="coerce")
+    work = work.dropna(subset=["grid_id", "pred_rsrp"])
+    if work.empty:
+        return pd.DataFrame()
+    agg_map = {
+        "avg_rsrp": ("pred_rsrp", "mean"),
+        "sample_count": ("pred_rsrp", "count"),
+    }
+    if "lat" in work.columns:
+        agg_map["lat"] = ("lat", "mean")
+    if "lon" in work.columns:
+        agg_map["lon"] = ("lon", "mean")
+    out = work.groupby("grid_id", dropna=False).agg(**agg_map).reset_index()
+    return out.dropna(subset=["lat", "lon"]) if {"lat", "lon"}.issubset(out.columns) else pd.DataFrame()
+
+
+def _rsrp_bin_label(value: float) -> str:
+    if pd.isna(value):
+        return "No data"
+    if value >= -90.0:
+        return "-44 to -90"
+    if value >= -95.0:
+        return "-90 to -95"
+    if value >= -100.0:
+        return "-95 to -100"
+    if value >= -105.0:
+        return "-100 to -105"
+    return "< -105"
+
+
+def _delta_bin_label(value: float) -> str:
+    if pd.isna(value):
+        return "No data"
+    if value < 1.0:
+        return "< 1 dB"
+    if value < 2.0:
+        return "1 to 2 dB"
+    if value < 3.0:
+        return "2 to 3 dB"
+    if value < 4.0:
+        return "3 to 4 dB"
+    if value < 5.0:
+        return "4 to 5 dB"
+    return ">= 5 dB"
+
+
+def _render_binned_rsrp_maps(
+    before_df: pd.DataFrame,
+    after_df: pd.DataFrame,
+    antenna_df: pd.DataFrame,
+    best_summary: Dict,
+    trusted_grid_df: pd.DataFrame | None = None,
+) -> pd.DataFrame:
+    trusted = trusted_grid_df.copy() if isinstance(trusted_grid_df, pd.DataFrame) else pd.DataFrame()
+    use_trusted = (
+        not trusted.empty
+        and "grid_id" in trusted.columns
+        and "baseline_avg_rsrp" in trusted.columns
+        and ({"center_lat", "center_lon"}.issubset(trusted.columns) or {"lat", "lon"}.issubset(trusted.columns))
+    )
+    if use_trusted:
+        transition_df = _build_transition_df(before_df, after_df, -90.0)
+        trusted["grid_id"] = trusted["grid_id"].astype(str)
+        trusted["avg_rsrp_before"] = pd.to_numeric(trusted["baseline_avg_rsrp"], errors="coerce")
+        trusted["lat"] = pd.to_numeric(trusted["center_lat"] if "center_lat" in trusted.columns else trusted["lat"], errors="coerce")
+        trusted["lon"] = pd.to_numeric(trusted["center_lon"] if "center_lon" in trusted.columns else trusted["lon"], errors="coerce")
+        if not transition_df.empty and {"grid_id", "rsrp_delta"}.issubset(transition_df.columns):
+            delta_df = transition_df[["grid_id", "rsrp_delta"]].copy()
+            delta_df["grid_id"] = delta_df["grid_id"].astype(str)
+            delta_df["rsrp_delta"] = pd.to_numeric(delta_df["rsrp_delta"], errors="coerce")
+            merged = trusted.merge(delta_df, on="grid_id", how="left")
+        else:
+            merged = trusted.copy()
+            merged["rsrp_delta"] = 0.0
+        merged["rsrp_delta"] = pd.to_numeric(merged["rsrp_delta"], errors="coerce").fillna(0.0)
+        merged["avg_rsrp_after"] = merged["avg_rsrp_before"] + merged["rsrp_delta"]
+        source_label = "Trusted grid analytics + candidate RF delta"
+    else:
+        before_grid = _grid_points_for_map(before_df)
+        after_grid = _grid_points_for_map(after_df)
+        if before_grid.empty or after_grid.empty:
+            st.info("No before/after grid rows available for map visualization.")
+            return pd.DataFrame()
+        merged = before_grid.merge(after_grid, on="grid_id", how="outer", suffixes=("_before", "_after"))
+        merged["lat"] = pd.to_numeric(merged.get("lat_after"), errors="coerce").fillna(pd.to_numeric(merged.get("lat_before"), errors="coerce"))
+        merged["lon"] = pd.to_numeric(merged.get("lon_after"), errors="coerce").fillna(pd.to_numeric(merged.get("lon_before"), errors="coerce"))
+        merged["avg_rsrp_before"] = pd.to_numeric(merged.get("avg_rsrp_before"), errors="coerce")
+        merged["avg_rsrp_after"] = pd.to_numeric(merged.get("avg_rsrp_after"), errors="coerce")
+        merged["rsrp_delta"] = merged["avg_rsrp_after"] - merged["avg_rsrp_before"]
+        source_label = "Recomputed before/after scope"
+    merged = merged.dropna(subset=["lat", "lon"])
+    if merged.empty:
+        st.info("No mapped before/after grid rows available.")
+        return pd.DataFrame()
+
+    rsrp_order = ["-44 to -90", "-90 to -95", "-95 to -100", "-100 to -105", "< -105"]
+    rsrp_colors = {
+        "-44 to -90": "#16a34a",
+        "-90 to -95": "#a3e635",
+        "-95 to -100": "#facc15",
+        "-100 to -105": "#f97316",
+        "< -105": "#dc2626",
+    }
+    delta_order = ["< 1 dB", "1 to 2 dB", "2 to 3 dB", "3 to 4 dB", "4 to 5 dB", ">= 5 dB"]
+    delta_colors = {
+        "< 1 dB": "#cbd5e1",
+        "1 to 2 dB": "#93c5fd",
+        "2 to 3 dB": "#38bdf8",
+        "3 to 4 dB": "#22c55e",
+        "4 to 5 dB": "#facc15",
+        ">= 5 dB": "#dc2626",
+    }
+    merged["before_bin"] = merged["avg_rsrp_before"].map(_rsrp_bin_label)
+    merged["after_bin"] = merged["avg_rsrp_after"].map(_rsrp_bin_label)
+    merged["delta_bin"] = merged["rsrp_delta"].map(_delta_bin_label)
+
+    x0, x1, y0, y1 = _build_fixed_extent(before_df, after_df, antenna_df)
+    fig, axes = plt.subplots(1, 3, figsize=(18, 6), dpi=150)
+    panels = [
+        (axes[0], "Before RSRP", "before_bin", rsrp_order, rsrp_colors),
+        (axes[1], "After RSRP", "after_bin", rsrp_order, rsrp_colors),
+        (axes[2], "Delta RSRP", "delta_bin", delta_order, delta_colors),
+    ]
+    for ax, title, col, order, colors in panels:
+        ax.set_xlim(x0, x1)
+        ax.set_ylim(y0, y1)
+        ax.set_aspect("equal", adjustable="box")
+        ax.set_facecolor("#f8fafc")
+        ax.grid(color="#cbd5e1", alpha=0.35, linewidth=0.6)
+        for label in order:
+            group = merged.loc[merged[col] == label]
+            if group.empty:
+                continue
+            ax.scatter(group["lon"], group["lat"], s=18, c=colors[label], alpha=0.85, label=f"{label} ({len(group)})")
+        if not antenna_df.empty and {"lat", "lon"}.issubset(antenna_df.columns):
+            sites = antenna_df.copy()
+            sites["lat"] = pd.to_numeric(sites["lat"], errors="coerce")
+            sites["lon"] = pd.to_numeric(sites["lon"], errors="coerce")
+            sites = sites.dropna(subset=["lat", "lon"]).drop_duplicates(subset=["Node_Cell_ID"] if "Node_Cell_ID" in sites.columns else ["lat", "lon"])
+            ax.scatter(sites["lon"], sites["lat"], s=12, c="#111827", marker="^", alpha=0.45)
+        ax.set_title(title)
+        ax.set_xlabel("Longitude")
+        ax.set_ylabel("Latitude")
+        ax.legend(loc="best", fontsize=7, frameon=True)
+
+    selected_updates = best_summary.get("selected_updates", []) if isinstance(best_summary, dict) else []
+    candidate = str(best_summary.get("candidate_name", "selected candidate")) if isinstance(best_summary, dict) else "selected candidate"
+    update_count = len(selected_updates or [])
+    title_text = f"Best Score Recommendation: {update_count} ETilt changes"
+    if update_count <= 1:
+        title_text = f"Best Score Recommendation: {candidate}"
+    fig.suptitle(f"{title_text}\n{source_label}", fontsize=12)
+    fig.tight_layout()
+    st.markdown("**Before / After / Delta Map**")
+    st.pyplot(fig, use_container_width=True)
+    plt.close(fig)
+
+    rows = []
+    for state, col, order in [("before", "before_bin", rsrp_order), ("after", "after_bin", rsrp_order), ("delta", "delta_bin", delta_order)]:
+        counts = merged[col].value_counts()
+        for label in order:
+            rows.append({"map": state, "range": label, "grid_count": int(counts.get(label, 0))})
+    return pd.DataFrame(rows)
+
+
 def _build_transition_df(before_df: pd.DataFrame, after_df: pd.DataFrame, rsrp_threshold: float | None = None) -> pd.DataFrame:
     if before_df.empty and after_df.empty:
         return pd.DataFrame()
@@ -461,21 +634,9 @@ def _render_rsrp_cdf(
         st.info("No before/after RSRP rows available for CDF.")
         return
 
-    cdf_basis = st.radio(
-        "RSRP CDF basis",
-        options=["Grid average RSRP", "Raw prediction samples"],
-        index=0,
-        horizontal=True,
-        help="Grid average matches grid-level validation; raw samples shows every prediction point.",
-    )
-    if cdf_basis == "Grid average RSRP":
-        before_series = _grid_rsrp_series(before_df)
-        after_series = _grid_rsrp_series(after_df)
-        x_label = "Grid average RSRP (dBm)"
-    else:
-        before_series = pd.to_numeric(before_df["pred_rsrp"], errors="coerce")
-        after_series = pd.to_numeric(after_df["pred_rsrp"], errors="coerce")
-        x_label = "Prediction sample RSRP (dBm)"
+    before_series = _grid_rsrp_series(before_df)
+    after_series = _grid_rsrp_series(after_df)
+    x_label = "Grid average RSRP (dBm)"
 
     before_x, before_y = _rsrp_cdf_values(before_series)
     after_x, after_y = _rsrp_cdf_values(after_series)
@@ -495,7 +656,6 @@ def _render_rsrp_cdf(
     ax.grid(color="#cbd5e1", alpha=0.4, linewidth=0.6)
     ax.legend(loc="lower right")
     st.markdown("**Best Attempt Before/After RSRP CDF**")
-    st.caption("Shows the best non-HOLD candidate, even when its score is negative.")
     st.pyplot(fig, use_container_width=True)
     plt.close(fig)
 
@@ -959,27 +1119,76 @@ def _selected_action_table(best_summary: Dict, antenna_df: pd.DataFrame) -> pd.D
     if action_df.empty or "cell_id" not in action_df.columns:
         return pd.DataFrame()
     action_df["cell_id"] = action_df["cell_id"].astype(str)
-    action_df = action_df.rename(columns={"target_value": "after_etilt"})
+    action_df = action_df.rename(
+        columns={
+            "current_value": "before_etilt",
+            "target_value": "after_etilt",
+            "actual_delta": "etilt_delta",
+            "requested_delta": "requested_etilt_delta",
+        }
+    )
     meta = _cell_metadata(antenna_df)
     if not meta.empty:
-        meta = meta.rename(columns={"Node_Cell_ID": "cell_id", "electrical_tilt": "before_etilt"})
-        keep_cols = [col for col in ["cell_id", "dashboard_site_id", "before_etilt", "mechanical_tilt", "azimuth", "band", "earfcn"] if col in meta.columns]
+        meta = meta.drop(columns=["cell_id"], errors="ignore")
+        meta = meta.rename(columns={"Node_Cell_ID": "cell_id", "electrical_tilt": "antenna_before_etilt"})
+        meta = meta.loc[:, ~meta.columns.duplicated()].copy()
+        meta["cell_id"] = meta["cell_id"].astype(str)
+        keep_cols = [col for col in ["cell_id", "dashboard_site_id", "antenna_before_etilt", "mechanical_tilt", "azimuth", "band", "earfcn"] if col in meta.columns]
         action_df = action_df.merge(meta[keep_cols], on="cell_id", how="left")
     action_df["after_etilt"] = pd.to_numeric(action_df.get("after_etilt"), errors="coerce")
     action_df["before_etilt"] = pd.to_numeric(action_df.get("before_etilt"), errors="coerce")
-    action_df["etilt_delta"] = action_df["after_etilt"] - action_df["before_etilt"]
+    if "antenna_before_etilt" in action_df.columns:
+        action_df["before_etilt"] = action_df["before_etilt"].fillna(pd.to_numeric(action_df["antenna_before_etilt"], errors="coerce"))
+    action_df["etilt_delta"] = pd.to_numeric(action_df.get("etilt_delta"), errors="coerce")
+    action_df["etilt_delta"] = action_df["etilt_delta"].fillna(action_df["after_etilt"] - action_df["before_etilt"])
+    action_df["tilt_direction"] = np.select(
+        [action_df["etilt_delta"] < 0, action_df["etilt_delta"] > 0],
+        ["uptilt", "downtilt"],
+        default="unchanged",
+    )
     cols = [
         "cell_id",
         "dashboard_site_id",
         "before_etilt",
         "after_etilt",
         "etilt_delta",
+        "tilt_direction",
+        "requested_etilt_delta",
         "mechanical_tilt",
         "azimuth",
         "band",
         "earfcn",
     ]
     return action_df[[col for col in cols if col in action_df.columns]]
+
+
+def _format_metric_value(value, decimals: int = 2) -> str:
+    numeric = pd.to_numeric(pd.Series([value]), errors="coerce").iloc[0]
+    if pd.isna(numeric):
+        return "-"
+    if float(numeric).is_integer():
+        return f"{int(numeric):,}"
+    return f"{float(numeric):,.{decimals}f}"
+
+
+def _tilt_direction_counts(actions_df: pd.DataFrame) -> tuple[int, int, int]:
+    if actions_df.empty or "etilt_delta" not in actions_df.columns:
+        return 0, 0, 0
+    delta = pd.to_numeric(actions_df["etilt_delta"], errors="coerce").fillna(0.0)
+    uptilt = int((delta < 0).sum())
+    downtilt = int((delta > 0).sum())
+    unchanged = int((delta == 0).sum())
+    return uptilt, downtilt, unchanged
+
+
+def _format_runtime_minutes_seconds(value) -> str:
+    seconds = pd.to_numeric(pd.Series([value]), errors="coerce").iloc[0]
+    if pd.isna(seconds):
+        return "-"
+    total_seconds = int(round(float(seconds)))
+    minutes = total_seconds // 60
+    remaining_seconds = total_seconds % 60
+    return f"{minutes}min, {remaining_seconds}sec"
 
 
 def _candidate_results_table(candidate_df: pd.DataFrame) -> pd.DataFrame:
@@ -1521,157 +1730,94 @@ def main() -> None:
     antenna_df = _safe_read_csv(run_dir / "antenna_input.csv")
     best_summary_path = run_dir / "best_candidate_summary.json"
     best_summary = json.loads(best_summary_path.read_text(encoding="utf-8")) if best_summary_path.exists() else {}
+    if best_summary and not candidate_df.empty and "candidate_name" in candidate_df.columns:
+        candidate_name = str(best_summary.get("candidate_name", ""))
+        selected_candidate_rows = candidate_df.loc[candidate_df["candidate_name"].astype(str) == candidate_name]
+        if not selected_candidate_rows.empty:
+            selected_candidate_row = selected_candidate_rows.iloc[0]
+            for col in ["changed_cell_avg_rsrp_delta_mean", "changed_cell_bad_sample_reduction_sum"]:
+                if col in selected_candidate_row.index and col not in best_summary:
+                    value = pd.to_numeric(pd.Series([selected_candidate_row.get(col)]), errors="coerce").iloc[0]
+                    if pd.notna(value):
+                        best_summary[col] = float(value)
 
-    trusted_grid_df = grid_analytics_df if not grid_analytics_df.empty else baseline_grid_metrics_df
+    selected_actions = _selected_action_table(best_summary, antenna_df)
+    uptilt_count, downtilt_count, unchanged_count = _tilt_direction_counts(selected_actions)
+    counts = summary.get("counts", {})
 
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Runtime (sec)", summary.get("total_runtime_sec"))
-    c2.metric("Bad Samples", summary.get("counts", {}).get("bad_samples"))
-    trusted_counts_df = _trusted_grid_threshold_counts(trusted_grid_df, [-90.0])
-    trusted_bad_90 = int(trusted_counts_df["bad_grid_count"].iloc[0]) if not trusted_counts_df.empty else summary.get("counts", {}).get("baseline_bad_grid_count")
-    c3.metric("Trusted Bad Grids < -90", trusted_bad_90)
-    c4.metric("Selected Action", best_summary.get("candidate_name") if best_summary else None)
+    c1, c2, c3, c4, c5, c6 = st.columns(6)
+    c1.metric("Score", _format_metric_value(best_summary.get("score"), 4))
+    c2.metric("Before Bad Grids", _format_metric_value(best_summary.get("baseline_bad_count")))
+    c3.metric("After Bad Grids", _format_metric_value(best_summary.get("candidate_bad_count")))
+    c4.metric("Grid Reduction", _format_metric_value(float(best_summary.get("baseline_bad_count", 0) or 0) - float(best_summary.get("candidate_bad_count", 0) or 0)))
+    c5.metric("Overall RSRP Delta", f"{_format_metric_value(best_summary.get('mean_rsrp_delta'), 3)} dB")
+    c6.metric("Runtime", _format_runtime_minutes_seconds(summary.get("total_runtime_sec")))
 
-    _render_trusted_grid_threshold_counts(trusted_grid_df)
-
-    st.markdown("**Run Config**")
-    st.json(
-        {
-            "project_id": summary.get("project_id"),
-            "region": summary.get("region"),
-            "operator": summary.get("operator"),
-            "thresholds": summary.get("thresholds"),
-            "search": summary.get("search"),
-        }
-    )
+    changed_cell_delta = best_summary.get("changed_cell_avg_rsrp_delta_mean")
+    c7, c8, c9, c10, c11 = st.columns(5)
+    c7.metric("Tilt Changes", len(best_summary.get("selected_updates", []) or []))
+    c8.metric("Uptilt", uptilt_count)
+    c9.metric("Downtilt", downtilt_count)
+    c10.metric("Changed-Cell RSRP Delta", f"{_format_metric_value(changed_cell_delta, 3)} dB")
+    c11.metric("Bad Samples", _format_metric_value(counts.get("bad_samples")))
 
     best_overview = _best_candidate_overview(best_summary)
     if not best_overview.empty:
-        st.markdown("**Selected Candidate**")
+        st.markdown("**Best Score Recommendation**")
         st.dataframe(best_overview, use_container_width=True, hide_index=True)
 
-    selected_actions = _selected_action_table(best_summary, antenna_df)
-    st.markdown("**Selected ETilt Action**")
+    st.markdown("**Tilt Applied**")
     if selected_actions.empty:
         st.info("No ETilt action selected. Best result is HOLD.")
     else:
         st.dataframe(selected_actions, use_container_width=True, hide_index=True)
 
-    candidate_results = _candidate_results_table(candidate_df)
-    if not candidate_results.empty:
-        st.markdown("**Candidate Results**")
-        st.caption("Simple RSRP-only scoring table. Positive `net_bad_reduction` means bad grid count decreased.")
-        st.dataframe(candidate_results, use_container_width=True, hide_index=True)
+    trusted_grid_df = grid_analytics_df if not grid_analytics_df.empty else baseline_grid_metrics_df
+    bin_counts = _render_binned_rsrp_maps(before_df, after_df, antenna_df, best_summary, trusted_grid_df)
+    if not bin_counts.empty:
+        st.markdown("**Map Range Counts**")
+        st.dataframe(bin_counts, use_container_width=True, hide_index=True)
 
-    attempt_row = _best_attempt_candidate_row(candidate_df)
-    attempt_meta = _candidate_meta_from_row(attempt_row)
-    if attempt_meta:
-        st.markdown("**Best Attempted Action Impact**")
-        st.caption(
-            "This section shows the best non-HOLD candidate even when the final selected recommendation is HOLD. "
-            "Negative score is still shown so you can inspect before/after effect."
-        )
-        st.dataframe(_best_candidate_overview(attempt_meta), use_container_width=True, hide_index=True)
-        attempt_thresholds = _candidate_overall_threshold_table(attempt_meta)
-        if not attempt_thresholds.empty:
-            st.markdown("**Best Attempt Overall Trusted Grid Counts**")
-            st.caption("Overall grid counts from trusted grid analytics plus the candidate RF delta. This answers whether 817 bad grids decrease.")
-            st.dataframe(attempt_thresholds, use_container_width=True, hide_index=True)
-        attempt_actions = _build_attempt_action_table(attempt_meta, antenna_df)
-        if not attempt_actions.empty:
-            st.markdown("**Best Attempted Action Table**")
-            st.dataframe(attempt_actions, use_container_width=True, hide_index=True)
+    _render_rsrp_cdf(before_df, after_df, title="Best Score Recommendation RSRP CDF")
 
-        run_attempt_materialization = st.checkbox(
-            "Build best attempted before/after maps",
-            value=True,
-            help="Runs test-only RF materialization for the best non-HOLD candidate, so it can show real before/after maps even if final selected result is HOLD.",
-        )
-        if run_attempt_materialization:
-            attempt_before_df, attempt_after_df, attempt_meta = _materialize_best_attempt_scope(
-                summary=summary,
-                run_dir=run_dir,
-                candidate_row=attempt_row,
-                baseline_df=baseline_df,
-                antenna_df=antenna_df,
-                grid_analytics_df=grid_analytics_df,
-            )
-            if not attempt_before_df.empty and not attempt_after_df.empty:
-                threshold = float(summary.get("thresholds", {}).get("rsrp", -90.0))
-                attempt_summary = {
-                    **summary,
-                    "best_candidate": attempt_meta,
-                    "counts": {
-                        **summary.get("counts", {}),
-                        "before_bad_rsrp_count": int((pd.to_numeric(attempt_before_df.get("pred_rsrp"), errors="coerce") < threshold).fillna(False).sum()),
-                        "after_bad_rsrp_count": int((pd.to_numeric(attempt_after_df.get("pred_rsrp"), errors="coerce") < threshold).fillna(False).sum()),
-                    },
+    threshold = float(summary.get("thresholds", {}).get("rsrp", -90.0))
+    transition_df = _build_transition_df(before_df, after_df, threshold)
+    if not transition_df.empty:
+        transition_counts = transition_df["transition"].value_counts(dropna=False)
+        grid_change_df = pd.DataFrame(
+            [
+                {
+                    "threshold_dbm": threshold,
+                    "bad_to_good": int(transition_counts.get("bad_to_good", 0)),
+                    "good_to_bad": int(transition_counts.get("good_to_bad", 0)),
+                    "still_bad": int(transition_counts.get("bad_to_bad", 0)),
+                    "still_good": int(transition_counts.get("good_to_good", 0)),
+                    "mean_grid_rsrp_delta": float(pd.to_numeric(transition_df.get("rsrp_delta"), errors="coerce").mean()),
                 }
-                st.markdown("**Best Attempt Static Before/After Map**")
-                attempt_image_path = _render_static_map_image(
-                    run_dir,
-                    attempt_before_df,
-                    attempt_after_df,
-                    antenna_df,
-                    attempt_summary,
-                    image_name=ATTEMPT_MAP_IMAGE_NAME,
-                    title="Best Attempted Non-HOLD Candidate Map",
-                )
-                if attempt_image_path.exists():
-                    st.image(str(attempt_image_path), use_container_width=True)
+            ]
+        )
+        st.markdown("**Grid Changes**")
+        st.dataframe(grid_change_df, use_container_width=True, hide_index=True)
 
-                _render_rsrp_cdf(
-                    attempt_before_df,
-                    attempt_after_df,
-                    title="Best Attempted Non-HOLD Candidate RSRP CDF",
-                )
-
-                st.markdown("**Best Attempt Delta / New Bad Map**")
-                _render_transition_map(run_dir, attempt_before_df, attempt_after_df, antenna_df, attempt_summary)
-
-                attempt_cell_debug = _simple_cell_level_table(
-                    attempt_before_df,
-                    attempt_after_df,
-                    antenna_df,
-                    attempt_meta,
-                    threshold,
-                )
-                if not attempt_cell_debug.empty:
-                    st.markdown("**Best Attempt Cell-Level Before/After**")
-                    st.caption("Shows changed and impacted cells for the best attempted candidate, even if score is negative.")
-                    st.dataframe(attempt_cell_debug, use_container_width=True, hide_index=True)
-            else:
-                st.info("Best attempted candidate exists, but before/after scope could not be materialized for maps.")
-    else:
-        st.info("No non-HOLD attempted candidate found in this run.")
-
-    greedy_debug = _greedy_debug_table(candidate_df, antenna_df)
-    if not greedy_debug.empty:
-        st.markdown("**Sequential / Greedy Debug**")
-        if "changed_cell_local_metrics" not in candidate_df.columns:
-            st.warning(
-                "This run was created before local changed-cell metrics were saved. "
-                "Rerun the RSRP test to see per-candidate cell_before/cell_after values."
-            )
-        st.caption("Scope columns are full affected-grid validation. Cell-local columns appear only for new runs.")
-        st.dataframe(greedy_debug, use_container_width=True, hide_index=True)
-
-    cell_debug = _simple_cell_level_table(
-        before_df,
-        after_df,
-        antenna_df,
-        best_summary,
-        float(summary.get("thresholds", {}).get("rsrp", -90.0)),
-    )
-    if not cell_debug.empty:
-        st.markdown("**Cell-Level Debug**")
-        st.caption("Simple per-cell view: ETilt before/after, bad sample count before/after, average RSRP before/after, and deltas.")
-        st.dataframe(cell_debug, use_container_width=True, hide_index=True)
-
-    image_path = _render_static_map_image(run_dir, before_df, after_df, antenna_df, summary)
-    if image_path.exists():
-        st.markdown("**Fixed Before/After Map Image**")
-        st.image(str(image_path), use_container_width=True)
+    cell_summary = _simple_cell_level_table(before_df, after_df, antenna_df, best_summary, threshold)
+    if not cell_summary.empty:
+        keep_cols = [
+            "cell_id",
+            "dashboard_site_id",
+            "selected_changed_cell",
+            "before_etilt",
+            "after_etilt",
+            "etilt_delta",
+            "before_bad_sample_count",
+            "after_bad_sample_count",
+            "bad_sample_reduction",
+            "before_avg_rsrp",
+            "after_avg_rsrp",
+            "avg_rsrp_delta",
+        ]
+        keep_cols = [col for col in keep_cols if col in cell_summary.columns]
+        st.markdown("**Cell Summary**")
+        st.dataframe(cell_summary[keep_cols].head(80), use_container_width=True, hide_index=True)
 
 
 if __name__ == "__main__":
