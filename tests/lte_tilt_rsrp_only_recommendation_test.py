@@ -299,6 +299,9 @@ def _config_as_base(config: TiltRsrpOnlyRecommendationTestConfig) -> base.TiltRe
     )
     setattr(base_config, "bad_grid_coverage_pct", float(config.bad_grid_coverage_pct))
     setattr(base_config, "max_group_cells", int(config.max_group_cells))
+    setattr(base_config, "candidate_workers", int(config.candidate_workers))
+    setattr(base_config, "coordinate_passes", int(config.coordinate_passes))
+    setattr(base_config, "max_neighbors_per_update_cell", int(config.max_neighbors_per_update_cell))
     return base_config
 
 
@@ -1676,6 +1679,38 @@ def _changed_cell_local_metrics_global(
     }
 
 
+def _parse_updates_from_result(result: Dict[str, object]) -> List[Dict[str, object]]:
+    target_value = result.get("target_value", "[]")
+    if isinstance(target_value, list):
+        updates = target_value
+    else:
+        try:
+            updates = json.loads(str(target_value or "[]"))
+        except Exception:
+            updates = []
+    if not isinstance(updates, list):
+        return []
+    parsed: List[Dict[str, object]] = []
+    for update in updates:
+        if not isinstance(update, dict):
+            continue
+        cell_id = str(update.get("cell_id", "")).strip()
+        parameter = str(update.get("parameter", "")).strip()
+        target_value_num = pd.to_numeric(pd.Series([update.get("target_value")]), errors="coerce").iloc[0]
+        if not cell_id or not parameter or pd.isna(target_value_num):
+            continue
+        clean_update = dict(update)
+        clean_update["cell_id"] = cell_id
+        clean_update["parameter"] = parameter
+        clean_update["target_value"] = float(target_value_num)
+        for key in ["current_value", "requested_delta", "actual_delta"]:
+            if key in clean_update:
+                value = pd.to_numeric(pd.Series([clean_update.get(key)]), errors="coerce").iloc[0]
+                clean_update[key] = float(value) if pd.notna(value) else np.nan
+        parsed.append(clean_update)
+    return parsed
+
+
 # RSRP-only production test is intentionally global and cell-centric.
 # Site-first Optuna search was removed because it fragmented bad-grid causes by site.
 
@@ -1991,10 +2026,9 @@ def _build_tilt_only_recommendations(
     evaluation_rows.append(hold_result)
 
     first_probe_delta_options = (-1.0, 1.0)
-    second_probe_delta_options = (-2.0, 2.0)
     directional_delta_options = {
-        "minus": (-4.0,),
-        "plus": (4.0,),
+        "minus": (-2.0, -3.0, -4.0),
+        "plus": (2.0, 3.0, 4.0),
     }
     max_coordinate_passes = max(1, int(getattr(config, "coordinate_passes", 2) or 2))
     current_updates_by_cell: Dict[str, Dict[str, object]] = {}
@@ -2026,12 +2060,11 @@ def _build_tilt_only_recommendations(
             f"actual_delta={float(update.get('actual_delta', np.nan)):+.1f}"
         )
 
-    max_candidates_per_cell = len(first_probe_delta_options) + len(second_probe_delta_options) + max(len(values) for values in directional_delta_options.values())
+    max_candidates_per_cell = len(first_probe_delta_options) + max(len(values) for values in directional_delta_options.values())
     max_coordinate_candidate_evals = len(target_cells) * max_coordinate_passes * max_candidates_per_cell
     print(
         f"[TILT_RSRP_COORDINATE_PLAN] search=direction_guided cells={len(target_cells)} "
         f"passes={max_coordinate_passes} first_probe_deltas={list(first_probe_delta_options)} "
-        f"second_probe_deltas={list(second_probe_delta_options)} "
         f"directional_deltas={directional_delta_options} max_candidates_per_cell={max_candidates_per_cell} "
         f"max_coordinate_candidate_evals={max_coordinate_candidate_evals} hold_eval=1 "
         f"max_total_candidate_evals_including_hold={max_coordinate_candidate_evals + 1} "
@@ -2045,7 +2078,7 @@ def _build_tilt_only_recommendations(
             f"[TILT_RSRP_COORDINATE_PASS] pass={pass_idx} cells={len(target_cells)} "
             f"active_updates={len(current_updates_by_cell)} current_score={float(current_result.get('score', 0.0)):.4f} "
             f"current_net={float(current_result.get('net_bad_reduction', 0.0)):.0f} "
-            f"first_probe_deltas={list(first_probe_delta_options)} second_probe_deltas={list(second_probe_delta_options)} "
+            f"first_probe_deltas={list(first_probe_delta_options)} "
             f"directional_deltas={directional_delta_options}"
         )
         for cell_idx, cell_id in enumerate(target_cells, start=1):
@@ -2117,14 +2150,6 @@ def _build_tilt_only_recommendations(
                     best_cell_result = trial_result
                     best_probe_delta = float(delta)
 
-            if best_probe_delta is None:
-                for delta, trial_state, trial_result in _evaluate_delta_stage("second_probe", second_probe_delta_options):
-                    evaluated_for_cell += 1
-                    if _result_rank(trial_result) > _result_rank(best_cell_result):
-                        best_cell_state = trial_state
-                        best_cell_result = trial_result
-                        best_probe_delta = float(delta)
-
             if best_probe_delta is not None:
                 direction_key = "plus" if best_probe_delta > 0.0 else "minus"
                 print(
@@ -2132,11 +2157,28 @@ def _build_tilt_only_recommendations(
                     f"direction={direction_key} best_probe_delta={best_probe_delta:+.1f} "
                     f"extra_deltas={list(directional_delta_options[direction_key])}"
                 )
-                for delta, trial_state, trial_result in _evaluate_delta_stage("directional", directional_delta_options[direction_key]):
+                for delta in directional_delta_options[direction_key]:
+                    step_results = _evaluate_delta_stage("directional_step", (delta,))
+                    if not step_results:
+                        continue
+                    _, trial_state, trial_result = step_results[0]
                     evaluated_for_cell += 1
                     if _result_rank(trial_result) > _result_rank(best_cell_result):
                         best_cell_state = trial_state
                         best_cell_result = trial_result
+                        print(
+                            f"[TILT_RSRP_COORDINATE_DIRECTION_KEEP] pass={pass_idx} cell={cell_id} "
+                            f"delta={delta:+.1f} score={float(trial_result.get('score', 0.0)):.4f} "
+                            f"net={float(trial_result.get('net_bad_reduction', 0.0)):.0f}"
+                        )
+                    else:
+                        print(
+                            f"[TILT_RSRP_COORDINATE_DIRECTION_STOP] pass={pass_idx} cell={cell_id} "
+                            f"delta={delta:+.1f} reason=no_further_gain "
+                            f"score={float(trial_result.get('score', 0.0)):.4f} "
+                            f"net={float(trial_result.get('net_bad_reduction', 0.0)):.0f}"
+                        )
+                        break
             if _result_rank(best_cell_result) > _result_rank(current_result):
                 previous_score = float(current_result.get("score", 0.0))
                 current_updates_by_cell = best_cell_state
