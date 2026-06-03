@@ -632,6 +632,11 @@ def _clean_threshold_cell_id_test_only(value) -> str:
     if pd.isna(value):
         return ""
     text = str(value).strip()
+    if "|" in text:
+        text = text.split("|")[-1].strip()
+    head, sep, tail = text.partition("_")
+    if sep and head.endswith(".0"):
+        text = f"{head[:-2]}_{tail}"
     text = text[:-2] if text.endswith(".0") else text
     return TILT_SRC._norm_cell_id(text)
 
