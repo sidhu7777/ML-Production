@@ -5,6 +5,10 @@ from typing import Dict, List
 
 import numpy as np
 import pandas as pd
+from tools.lte_tilt_recommandation.cell_identity import (
+    canonical_cell_id,
+    canonical_pair_series,
+)
 
 MIN_BAD_SAMPLE_COUNT_FOR_ACTION = 25
 MEDIUM_CONFIDENCE_BAD_SAMPLE_COUNT = 120
@@ -76,10 +80,7 @@ def _safe_str(x) -> str:
 
 
 def _norm_cell_id(value) -> str:
-    s = _safe_str(value)
-    if s.endswith(".0"):
-        s = s[:-2]
-    return s
+    return canonical_cell_id(value)
 
 
 def _cell_id_suffix(value) -> str:
@@ -119,35 +120,36 @@ def _circular_mean_deg(values: pd.Series) -> float:
 
 
 def _get_cell_key_from_log(log_df: pd.DataFrame) -> pd.Series:
+    for col in ["Node_Cell_ID", "node_cell_id", "frontend_site_sector_key", "nodeb_id_cell_id"]:
+        existing_col = _find_col(log_df, [col], required=False)
+        if existing_col:
+            existing = log_df[existing_col].map(canonical_cell_id)
+            if existing.astype(str).str.strip().ne("").any():
+                return existing
+
     nodeb_col = _find_col(log_df, ["nodeb_id", "nodeb", "enodeb_id", "gnodeb_id", "site_id"], required=False)
     cell_col = _find_col(log_df, ["cell_id", "eci", "ecgi_cell_id", "local_cell_id"], required=False)
     if nodeb_col and cell_col:
-        nodeb = log_df[nodeb_col].map(_norm_cell_id)
-        cell = log_df[cell_col].map(_norm_cell_id)
-        return pd.Series(np.where((nodeb != "") & (cell != ""), nodeb + "_" + cell, ""), index=log_df.index)
+        return canonical_pair_series(log_df[nodeb_col], log_df[cell_col])
     if cell_col:
-        return log_df[cell_col].map(_norm_cell_id)
+        return log_df[cell_col].map(canonical_cell_id)
     raise KeyError("Could not derive Cell ID from log data.")
 
 
 def _derive_antenna_cell_key(antenna_df: pd.DataFrame) -> pd.Series:
-    node_cell_col = _find_col(antenna_df, ["Node_Cell_ID", "node_cell_id"], required=False)
+    node_cell_col = _find_col(antenna_df, ["Node_Cell_ID", "node_cell_id", "frontend_site_sector_key", "nodeb_id_cell_id"], required=False)
     if node_cell_col:
-        node_cell = antenna_df[node_cell_col].map(_norm_cell_id)
+        node_cell = antenna_df[node_cell_col].map(canonical_cell_id)
         if (node_cell != "").any():
             return node_cell
     nodeb_col = _find_col(antenna_df, ["nodeb_id", "nodeb", "site_id"], required=False)
     cell_col = _find_col(antenna_df, ["cell_id", "eci", "local_cell_id"], required=False)
     if nodeb_col and cell_col:
-        nodeb = antenna_df[nodeb_col].map(_norm_cell_id)
-        cell = antenna_df[cell_col].map(_norm_cell_id)
-        combined = pd.Series(np.where((nodeb != "") & (cell != ""), nodeb + "_" + cell, ""), index=antenna_df.index)
+        combined = canonical_pair_series(antenna_df[nodeb_col], antenna_df[cell_col])
         if (combined != "").any():
             return combined
-        if (cell != "").any():
-            return cell
     if cell_col:
-        return antenna_df[cell_col].map(_norm_cell_id)
+        return antenna_df[cell_col].map(canonical_cell_id)
     return pd.Series("", index=antenna_df.index)
 
 

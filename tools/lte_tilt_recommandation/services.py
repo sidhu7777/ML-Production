@@ -2,15 +2,98 @@ import uuid
 import threading
 import pandas as pd
 import os
-import subprocess
 import datetime
+import json
+import traceback
 from sqlalchemy import create_engine, text
 from openpyxl import load_workbook
+from tools.lte_tilt_recommandation.recommendation_engine import (
+    TiltEngineConfig,
+    export_engine_report,
+    run_recommendation_engine,
+)
+from tools.lte_tilt_recommandation.candidate_validation import (
+    build_combined_kpi_grid_impact,
+    prepare_grid_metrics_export,
+    prepare_scope_export,
+)
+from tools.lte_tilt_recommandation.cell_identity import canonical_cell_id
 
 # Global dictionary to track job status
 JOBS = {}
 DEFAULT_THRESHOLD_PROJECT_ID = 216
 DEFAULT_THRESHOLD_FILE = "lte_tilt_recommendation_transformed.csv"
+
+BASELINE_IDENTITY_COLUMNS = [
+    "project_id",
+    "job_id",
+    "grid_id",
+    "lat",
+    "lon",
+    "nodeb_id_cell_id",
+    "frontend_site_sector_key",
+    "sector",
+    "site_id",
+    "node_b_id",
+    "nodeb_id",
+    "cell_id",
+    "operator",
+    "Technology",
+    "technology",
+    "pred_rsrp",
+    "pred_rsrq",
+    "pred_sinr",
+]
+
+BASELINE_TOPOLOGY_COLUMNS = [
+    "serving_pci",
+    "serving_earfcn",
+    "serving_frequency_mhz",
+    "best_interferer_cell_id",
+    "best_interferer_pci",
+    "best_interferer_earfcn",
+    "best_interferer_distance_m",
+    "best_interferer_azimuth_delta_deg",
+    "best_interferer_proxy_phys_dbm",
+    "neighbor_1_cell_id",
+    "neighbor_1_pci",
+    "neighbor_1_earfcn",
+    "neighbor_1_proxy_rsrp_dbm",
+    "neighbor_1_distance_m",
+    "neighbor_1_azimuth_delta_deg",
+    "neighbor_2_cell_id",
+    "neighbor_2_pci",
+    "neighbor_2_earfcn",
+    "neighbor_2_proxy_rsrp_dbm",
+    "neighbor_2_distance_m",
+    "neighbor_2_azimuth_delta_deg",
+    "interference_gap_db",
+    "interference_ratio_linear",
+    "interference_sum_proxy_dbm",
+    "sinr_proxy_db",
+    "rsrq_proxy_db",
+    "same_earfcn_interferer_count",
+    "dominant_interferer_count",
+    "interference_selection_mode",
+]
+
+GRID_ANALYTICS_COLUMNS = [
+    "project_id",
+    "grid_id",
+    "center_lat",
+    "center_lon",
+    "min_lat",
+    "max_lat",
+    "min_lon",
+    "max_lon",
+    "baseline_point_count",
+    "baseline_avg_rsrp",
+    "baseline_avg_rsrq",
+    "baseline_avg_sinr",
+    "operator",
+    "created_at",
+    "scenario_id",
+]
 
 
 def _clean_id_series(series: pd.Series) -> pd.Series:
@@ -21,12 +104,75 @@ def _clean_id_series(series: pd.Series) -> pd.Series:
 def _build_node_cell_id(nodeb_series: pd.Series, cell_series: pd.Series) -> pd.Series:
     nodeb = _clean_id_series(nodeb_series)
     cell = _clean_id_series(cell_series)
-    return (nodeb + "_" + cell).str.strip("_")
+    cell_has_node = cell.str.contains("_", regex=False).fillna(False)
+    missing_nodeb = nodeb.isin(["", "None", "none", "nan", "NaN", "<NA>"])
+    direct_cell = cell.where(cell_has_node & missing_nodeb, "")
+    built = (nodeb + "_" + cell).str.strip("_")
+    return direct_cell.where(direct_cell.ne(""), built)
+
+
+def _build_site_sector_node_cell_id(site_series: pd.Series, cell_series: pd.Series) -> pd.Series:
+    site = site_series.astype(str).str.strip()
+    site = site.mask(site.isin(["", "None", "none", "nan", "NaN", "<NA>"]), "")
+    cell = _clean_id_series(cell_series)
+    sector = cell.str.extract(r"_([^_]+)$", expand=False).fillna("")
+    sector_key = (site + "|" + sector).str.strip("|")
+    return (sector_key + "_" + cell).str.strip("_")
+
+
+def _get_table_columns(current_engine, table_name: str) -> set[str]:
+    query = text(
+        """
+        SELECT column_name
+        FROM information_schema.columns
+        WHERE table_schema = DATABASE()
+          AND table_name = :table_name
+        """
+    )
+    with current_engine.connect() as conn:
+        schema_df = pd.read_sql(query, conn, params={"table_name": table_name})
+    if schema_df.empty:
+        return set()
+    schema_col = "column_name" if "column_name" in schema_df.columns else schema_df.columns[0]
+    return set(schema_df[schema_col].astype(str).tolist())
+
+
+def _select_existing_columns(current_engine, table_name: str, requested_cols: list[str]) -> list[str]:
+    available = _get_table_columns(current_engine, table_name)
+    return [col for col in requested_cols if col in available]
+
+
+def _fetch_latest_baseline_job_id(current_engine, project_id: int) -> str:
+    query = text(
+        """
+        SELECT job_id
+        FROM lte_prediction_baseline_results
+        WHERE project_id = :project_id
+        ORDER BY created_at DESC
+        LIMIT 1
+        """
+    )
+    with current_engine.connect() as conn:
+        row = conn.execute(query, {"project_id": int(project_id)}).fetchone()
+    if not row or row[0] is None:
+        raise ValueError(f"No baseline results found for project {project_id}")
+    return str(row[0])
 
 
 def _prepare_tilt_antenna_df(antenna_df: pd.DataFrame) -> pd.DataFrame:
     out = antenna_df.copy()
-    if "Node_Cell_ID" not in out.columns and {"nodeb_id", "cell_id"}.issubset(out.columns):
+    out = out.loc[:, ~out.columns.duplicated()].copy()
+    if "cell_id" in out.columns and "local_cell_id" not in out.columns:
+        out["local_cell_id"] = _clean_id_series(out["cell_id"])
+    if "Node_Cell_ID" not in out.columns and {"site", "cell_id"}.issubset(out.columns):
+        if "nodeb_id" in out.columns:
+            nodeb_available = ~_clean_id_series(out["nodeb_id"]).isin(["", "None", "none", "nan", "NaN", "<NA>"])
+            out["Node_Cell_ID"] = _build_node_cell_id(out["nodeb_id"], out["cell_id"])
+        else:
+            nodeb_available = pd.Series(False, index=out.index)
+            out["Node_Cell_ID"] = _clean_id_series(out["cell_id"])
+        out.loc[~nodeb_available, "Node_Cell_ID"] = _build_site_sector_node_cell_id(out.loc[~nodeb_available, "site"], out.loc[~nodeb_available, "cell_id"])
+    elif "Node_Cell_ID" not in out.columns and {"nodeb_id", "cell_id"}.issubset(out.columns):
         out["Node_Cell_ID"] = _build_node_cell_id(out["nodeb_id"], out["cell_id"])
     if "lat" not in out.columns and "latitude" in out.columns:
         out["lat"] = out["latitude"]
@@ -40,11 +186,39 @@ def _prepare_tilt_antenna_df(antenna_df: pd.DataFrame) -> pd.DataFrame:
         out["antenna_height"] = out["height"]
     if "dashboard_site_id" not in out.columns and "nodeb_id" in out.columns:
         out["dashboard_site_id"] = _clean_id_series(out["nodeb_id"])
+    if "Node_Cell_ID" in out.columns:
+        out["Node_Cell_ID"] = out["Node_Cell_ID"].astype(str).str.strip()
+        out["cell_id"] = out["Node_Cell_ID"]
+    alias_cols = {
+        "latitude": "lat",
+        "longitude": "lon",
+        "e_tilt": "electrical_tilt",
+        "m_tilt": "mechanical_tilt",
+        "height": "antenna_height",
+    }
+    drop_aliases = [alias for alias, canonical in alias_cols.items() if alias in out.columns and canonical in out.columns]
+    if drop_aliases:
+        out = out.drop(columns=drop_aliases)
+        print(f"[TILT][ANTENNA_PREP] dropped_optimizer_alias_columns={drop_aliases}")
     return out
 
 
 def _prepare_tilt_log_df(log_df: pd.DataFrame, antenna_df: pd.DataFrame) -> pd.DataFrame:
     out = log_df.copy()
+    if "nodeb_id_cell_id" in out.columns and "Node_Cell_ID" not in out.columns:
+        out["Node_Cell_ID"] = out["nodeb_id_cell_id"].astype(str).str.strip()
+    if "frontend_site_sector_key" in out.columns:
+        frontend_key = _clean_id_series(out["frontend_site_sector_key"])
+        out["Node_Cell_ID"] = frontend_key.where(frontend_key.ne(""), out.get("Node_Cell_ID", frontend_key))
+    if "Node_Cell_ID" in out.columns:
+        node_cell = out["Node_Cell_ID"].astype(str).str.strip()
+        split_source = node_cell.str.split("_", n=1, expand=True)
+        if "node_b_id" not in out.columns and split_source.shape[1] >= 1:
+            out["node_b_id"] = split_source[0]
+        if "nodeb_id" not in out.columns and split_source.shape[1] >= 1:
+            out["nodeb_id"] = split_source[0]
+        if "cell_id" not in out.columns and split_source.shape[1] >= 2:
+            out["cell_id"] = split_source[1]
     if "node_b_id" in out.columns and "nodeb_id" not in out.columns:
         out["nodeb_id"] = _clean_id_series(out["node_b_id"])
     elif "nodeb_id" in out.columns:
@@ -79,7 +253,103 @@ def _prepare_tilt_log_df(log_df: pd.DataFrame, antenna_df: pd.DataFrame) -> pd.D
         out["Technology"] = "4G"
     else:
         out["Technology"] = out["Technology"].fillna("4G")
+    if "operator" not in out.columns:
+        out["operator"] = "Unknown"
     return out
+
+
+def _fetch_baseline_log_df(current_engine, project_id: int, operator_input, is_all_operators: bool) -> tuple[pd.DataFrame, str]:
+    baseline_job_id = _fetch_latest_baseline_job_id(current_engine, int(project_id))
+    requested_cols = list(dict.fromkeys(BASELINE_IDENTITY_COLUMNS + BASELINE_TOPOLOGY_COLUMNS + ["created_at"]))
+    select_cols = _select_existing_columns(current_engine, "lte_prediction_baseline_results", requested_cols)
+    required_cols = {"lat", "lon", "pred_rsrp", "pred_rsrq", "pred_sinr"}
+    missing_required = sorted(required_cols.difference(select_cols))
+    if missing_required:
+        raise ValueError(f"Baseline table is missing required columns: {missing_required}")
+    if "job_id" not in select_cols:
+        raise ValueError("Baseline table is missing required job_id column for latest-run isolation.")
+
+    filters = ["project_id = :pid", "job_id = :job_id"]
+    params = {"pid": int(project_id), "job_id": baseline_job_id}
+    if not is_all_operators and "operator" in select_cols:
+        filters.append("operator = :op")
+        params["op"] = operator_input
+
+    query = text(
+        f"""
+        SELECT {", ".join(f"`{col}`" for col in select_cols)}
+        FROM lte_prediction_baseline_results
+        WHERE {" AND ".join(filters)}
+        """
+    )
+    log_dfs = []
+    with current_engine.connect() as conn:
+        for chunk in pd.read_sql(query, conn, params=params, chunksize=50000):
+            print(f"[TILT][BASELINE_FETCH] chunk_rows={len(chunk)} baseline_job_id={baseline_job_id}")
+            log_dfs.append(chunk)
+    if not log_dfs:
+        raise ValueError(f"No baseline rows found for project {project_id} job_id={baseline_job_id}")
+    log_df = pd.concat(log_dfs, ignore_index=True)
+    print(
+        f"[TILT][BASELINE_FETCH] rows={len(log_df)} baseline_job_id={baseline_job_id} "
+        f"columns_loaded={len(select_cols)} topology_columns={len([c for c in BASELINE_TOPOLOGY_COLUMNS if c in select_cols])}"
+    )
+    return log_df, baseline_job_id
+
+
+def _fetch_grid_analytics_df(current_engine, project_id: int, operator_input, is_all_operators: bool) -> pd.DataFrame:
+    select_cols = _select_existing_columns(current_engine, "grid_analytics_results", GRID_ANALYTICS_COLUMNS)
+    if not {"project_id", "grid_id"}.issubset(select_cols):
+        print("[TILT][GRID_ANALYTICS_FETCH] skipped reason=missing_table_or_required_columns")
+        return pd.DataFrame()
+
+    filters = ["project_id = :pid"]
+    params = {"pid": int(project_id)}
+    if not is_all_operators and "operator" in select_cols:
+        filters.append("LOWER(TRIM(operator)) = :op")
+        params["op"] = str(operator_input).strip().lower()
+
+    selected_scenario_id = None
+    scenario_filter = ""
+    if "scenario_id" in select_cols:
+        scenario_query = text(
+            f"""
+            SELECT scenario_id, MAX(created_at) AS max_created, COUNT(*) AS row_count
+            FROM grid_analytics_results
+            WHERE {" AND ".join(filters)}
+            GROUP BY scenario_id
+            ORDER BY max_created DESC, row_count DESC
+            LIMIT 1
+            """
+        )
+        with current_engine.connect() as conn:
+            scenario_row = conn.execute(scenario_query, params).fetchone()
+        if scenario_row is not None:
+            selected_scenario_id = scenario_row[0]
+            if selected_scenario_id is None:
+                scenario_filter = " AND scenario_id IS NULL"
+            else:
+                scenario_filter = " AND scenario_id = :scenario_id"
+                params["scenario_id"] = selected_scenario_id
+
+    order_cols = [col for col in ["created_at", "grid_id"] if col in select_cols]
+    order_sql = ", ".join(f"{col} DESC" if col == "created_at" else f"{col} ASC" for col in order_cols)
+    query = text(
+        f"""
+        SELECT {", ".join(f"`{col}`" for col in select_cols)}
+        FROM grid_analytics_results
+        WHERE {" AND ".join(filters)}
+        {scenario_filter}
+        {f"ORDER BY {order_sql}" if order_sql else ""}
+        """
+    )
+    with current_engine.connect() as conn:
+        grid_df = pd.read_sql(query, conn, params=params)
+    print(
+        f"[TILT][GRID_ANALYTICS_FETCH] rows={len(grid_df)} selected_scenario_id={selected_scenario_id} "
+        f"operator_filter_applied={bool(not is_all_operators and 'operator' in select_cols)}"
+    )
+    return grid_df
 
 
 def _safe_nunique(df, col):
@@ -115,10 +385,11 @@ def _normalize_constraint_bool(value) -> bool:
 
 
 def _to_clean_cell_id(value) -> str:
-    if pd.isna(value):
-        return ""
-    text = str(value).strip()
-    return text[:-2] if text.endswith(".0") else text
+    return canonical_cell_id(value)
+
+
+def _to_threshold_cell_id(value) -> str:
+    return canonical_cell_id(value)
 
 
 def _resolve_threshold_file_path(cfg: dict, project_id: int, project_root: str) -> str:
@@ -160,7 +431,7 @@ def _load_constraint_df(file_path: str) -> pd.DataFrame:
         if required in lower_map:
             rename_map[lower_map[required]] = required
     df = df.rename(columns=rename_map)
-    df["cell_id"] = df["cell_id"].map(_to_clean_cell_id)
+    df["cell_id"] = df["cell_id"].map(_to_threshold_cell_id)
     if "optimised" not in df.columns:
         df["optimised"] = False
     df["optimised"] = df["optimised"].map(_normalize_constraint_bool)
@@ -215,7 +486,7 @@ def _apply_constraint_ranges(reco_df: pd.DataFrame, constraint_df: pd.DataFrame)
     out["Allowed Max"] = pd.NA
 
     for idx, row in out.iterrows():
-        cell_id = _to_clean_cell_id(row.get("Cell ID"))
+        cell_id = _to_threshold_cell_id(row.get("Cell ID"))
         param = str(row.get("Parameter", "")).strip().lower()
         cfg = constraint_map.get(cell_id)
         if not cfg or not bool(cfg.get("optimised")):
@@ -277,7 +548,7 @@ def _log_constraint_summary(raw_reco_df: pd.DataFrame, constrained_reco_df: pd.D
     eligible_rows = 0
     if not raw_reco_df.empty and not constraint_df.empty:
         optimised_cells = set(constraint_df.loc[constraint_df["optimised"] == True, "cell_id"].astype(str).tolist()) if "optimised" in constraint_df.columns else set()
-        eligible_rows = int(raw_reco_df["Cell ID"].map(_to_clean_cell_id).isin(optimised_cells).sum())
+        eligible_rows = int(raw_reco_df["Cell ID"].map(_to_threshold_cell_id).isin(optimised_cells).sum())
 
     applied_rows = 0
     if "Constraint Applied" in constrained_reco_df.columns:
@@ -399,29 +670,13 @@ class RFOptimizationService:
             # ==========================================
             # 3. FETCH LARGE LOG DATA IN CHUNKS
             # ==========================================
-            self._update(job_id, "running", "Downloading large log data in chunks...")
-            
-            # Select only needed columns to speed up the network transfer without DB indexing
-            log_cols = "node_b_id, cell_id, operator, pred_rsrp, pred_rsrq, pred_sinr, lat, lon"
-            
-            if not is_all_operators:
-                log_query = text(f"SELECT {log_cols} FROM lte_prediction_baseline_results WHERE project_id = :pid AND operator = :op")
-                log_params = {"pid": project_id, "op": operator_input}
-            else:
-                log_query = text(f"SELECT {log_cols} FROM lte_prediction_baseline_results WHERE project_id = :pid")
-                log_params = {"pid": project_id}
-
-            log_dfs = []
-            with current_engine.connect() as conn:
-                for chunk in pd.read_sql(log_query, conn, params=log_params, chunksize=50000):
-                    print(f"[TILT][BASELINE_FETCH] chunk_rows={len(chunk)}")
-                    log_dfs.append(chunk)
-
-            if not log_dfs:
-                raise ValueError(f"No log data found for project {project_id}")
-            
-            log_df = pd.concat(log_dfs, ignore_index=True)
-            del log_dfs # Free up memory
+            self._update(job_id, "running", "Downloading calibrated baseline rows...")
+            log_df, baseline_job_id = _fetch_baseline_log_df(
+                current_engine,
+                project_id,
+                operator_input,
+                is_all_operators,
+            )
             log_df = _prepare_tilt_log_df(log_df, antenna_df)
             _log_df("BASELINE_FETCH_COMBINED", log_df)
 
@@ -430,33 +685,23 @@ class RFOptimizationService:
             # ==========================================
             self._update(job_id, "running", "Processing optimization script...")
 
-            log_df["clean_key"] = (
-                _clean_id_series(log_df["node_b_id"]) + "_" +
-                _clean_id_series(log_df["cell_id"])
-            )
+            if "Node_Cell_ID" in log_df.columns:
+                log_df["clean_key"] = _clean_id_series(log_df["Node_Cell_ID"])
+            else:
+                log_df["clean_key"] = (
+                    _clean_id_series(log_df["node_b_id"]) + "_" +
+                    _clean_id_series(log_df["cell_id"])
+                )
             operator_map = log_df.drop_duplicates("clean_key").set_index("clean_key")["operator"].to_dict()
             print(f"[TILT][OPERATOR_MAP] mapped_keys={len(operator_map)}")
 
             # ==========================================
-            # 5. PREPARE PATHS & TRIGGER SCRIPT
+            # 5. PREPARE PATHS & RUN PRODUCTION ENGINE
             # ==========================================
             current_dir = os.path.dirname(os.path.abspath(__file__))
             root_dir = os.path.normpath(os.path.join(current_dir, "..", ".."))
             temp_dir = os.path.normpath(os.path.join(root_dir, "outputs", f"temp_{job_id}"))
             os.makedirs(temp_dir, exist_ok=True)
-
-            log_csv = os.path.join(temp_dir, "input_log.csv")
-            ant_csv = os.path.join(temp_dir, "input_ant.csv")
-            geo_csv = os.path.join(temp_dir, "input_geo.csv")
-            
-            log_df_script = log_df.rename(columns={
-                "pred_rsrp": "rsrp", "pred_rsrq": "rsrq",
-                "pred_sinr": "sinr",
-            })
-            
-            # Fast disk writing
-            log_df_script.to_csv(log_csv, index=False, chunksize=50000)
-            antenna_df.to_csv(ant_csv, index=False)
 
             self._update(job_id, "running", "Fetching geo-feature rows...")
             geo_query = text(
@@ -497,42 +742,135 @@ class RFOptimizationService:
                 geo_df = pd.read_sql(geo_query, conn, params={"pid": project_id, "region": region})
             if "nodeb_id_cell_id" in geo_df.columns:
                 geo_df["Node_Cell_ID"] = geo_df["nodeb_id_cell_id"].astype(str).str.strip()
-            geo_df.to_csv(geo_csv, index=False)
             _log_df("GEO_FETCH", geo_df)
 
+            self._update(job_id, "running", "Fetching frontend grid analytics...")
+            grid_analytics_df = _fetch_grid_analytics_df(
+                current_engine,
+                project_id,
+                operator_input,
+                is_all_operators,
+            )
+            _log_df("GRID_ANALYTICS_FETCH", grid_analytics_df)
+
             scenario_id = self._get_next_scenario_id(project_id, current_engine)
-            script_path = os.path.normpath(os.path.join(current_dir, "etilt_optimizer_cd2.py"))
             threshold_file_path = _resolve_threshold_file_path(cfg, project_id, root_dir)
             if threshold_file_path:
                 print(f"[TILT][CONSTRAINT_FILE] path={threshold_file_path}")
             else:
                 print(f"[TILT][CONSTRAINT_FILE] path=n/a project_id={project_id}")
-            
-            process = subprocess.run(
-                ["python", script_path, log_csv, ant_csv, r_thresh, q_thresh, s_thresh, geo_csv],
-                capture_output=True, text=True
-            )
-            if process.stdout:
-                print("[TILT][SCRIPT_STDOUT_BEGIN]")
-                print(process.stdout)
-                print("[TILT][SCRIPT_STDOUT_END]")
-
-            if process.returncode != 0:
-                raise Exception(f"Script Error: {process.stderr}")
-
-            # ==========================================
-            # 6. SAVE RESULTS MAPPING CORRECT OPERATOR
-            # ==========================================
-            self._update(job_id, "running", "Saving recommendations to database...")
-            
-            output_file = os.path.join(temp_dir, "RF_Optimization_Report.xlsx")
-            reco_df = pd.read_excel(output_file, sheet_name="Recommendations")
             constraint_df = _load_constraint_df(threshold_file_path) if threshold_file_path else pd.DataFrame()
             if not constraint_df.empty:
                 print(
                     f"[TILT][CONSTRAINT_FETCH] rows={len(constraint_df)} "
                     f"optimised_rows={int(constraint_df['optimised'].sum()) if 'optimised' in constraint_df.columns else 0}"
                 )
+
+            self._update(job_id, "running", "Running production tilt recommendation engine...")
+            engine_config = TiltEngineConfig(
+                project_id=int(project_id),
+                region=region,
+                operator=None if is_all_operators else operator_input,
+                mode=cfg.get("mode") or cfg.get("kpi_mode") or cfg.get("recommendation_mode") or "combined_weighted",
+                rsrp_threshold=float(r_thresh),
+                rsrq_threshold=float(q_thresh),
+                sinr_threshold=float(s_thresh),
+                rsrp_weight=float(cfg.get("rsrp_weight", 34.0)),
+                rsrq_weight=float(cfg.get("rsrq_weight", 33.0)),
+                sinr_weight=float(cfg.get("sinr_weight", 33.0)),
+                validate_candidates=bool(cfg.get("validate_candidates", True)),
+                max_validation_candidates=int(cfg.get("max_validation_candidates", cfg.get("max_candidates", 25))),
+                radius_m=float(cfg.get("radius_m", cfg.get("radius", 500.0))),
+                grid_resolution_m=float(cfg.get("grid_resolution_m", cfg.get("grid_resolution", 30.0))),
+                workers=int(cfg.get("n_workers", cfg.get("workers", 1))),
+                impact_radius_m=float(cfg.get("impact_radius_m", cfg.get("radius_m", cfg.get("radius", 500.0)))),
+                neighbor_site_count=int(cfg.get("neighbor_site_count", 3)),
+                max_interference_sites=int(cfg.get("max_interference_sites", 10)),
+                baseline_job_id=baseline_job_id,
+                coordinate_passes=int(cfg.get("coordinate_passes", 2)),
+                candidate_workers=int(cfg.get("candidate_workers", 1)),
+                bad_grid_coverage_pct=float(cfg.get("bad_grid_coverage_pct", 80.0)),
+                max_group_cells=int(cfg.get("max_group_cells", 0)),
+                max_neighbors_per_update_cell=int(cfg.get("max_neighbors_per_update_cell", 2)),
+                rf_debug_log_path=os.path.join(temp_dir, "tilt_rf_debug.log"),
+                constraint_map=constraint_df.set_index("cell_id").to_dict("index") if not constraint_df.empty else {},
+            )
+            engine_outputs = run_recommendation_engine(
+                log_df=log_df,
+                antenna_df=antenna_df,
+                geo_df=geo_df,
+                grid_analytics_df=grid_analytics_df,
+                config=engine_config,
+            )
+            output_file = os.path.join(temp_dir, "RF_Optimization_Report.xlsx")
+            export_engine_report(engine_outputs, output_file)
+            candidate_eval_df = engine_outputs.get("candidate_evaluations", pd.DataFrame())
+            if isinstance(candidate_eval_df, pd.DataFrame) and not candidate_eval_df.empty:
+                candidate_eval_df.to_csv(os.path.join(temp_dir, "candidate_validation_results.csv"), index=False)
+            grid_scores_df = engine_outputs.get("grid_scores", pd.DataFrame())
+            if isinstance(grid_scores_df, pd.DataFrame) and not grid_scores_df.empty:
+                grid_scores_df.to_csv(os.path.join(temp_dir, "frontend_grid_scores.csv"), index=False)
+            best_after_df = engine_outputs.get("best_candidate_after", pd.DataFrame())
+            if isinstance(best_after_df, pd.DataFrame) and not best_after_df.empty:
+                weights = {
+                    "rsrp": float(engine_config.rsrp_weight) / max(float(engine_config.rsrp_weight + engine_config.rsrq_weight + engine_config.sinr_weight), 1e-9),
+                    "rsrq": float(engine_config.rsrq_weight) / max(float(engine_config.rsrp_weight + engine_config.rsrq_weight + engine_config.sinr_weight), 1e-9),
+                    "sinr": float(engine_config.sinr_weight) / max(float(engine_config.rsrp_weight + engine_config.rsrq_weight + engine_config.sinr_weight), 1e-9),
+                }
+                thresholds = {"rsrp": float(r_thresh), "rsrq": float(q_thresh), "sinr": float(s_thresh)}
+                before_scope_df = prepare_scope_export(log_df, thresholds, weights, "before")
+                after_scope_df = prepare_scope_export(best_after_df, thresholds, weights, "after")
+                before_scope_df.to_csv(os.path.join(temp_dir, "best_candidate_before_scope.csv.gz"), index=False, compression="gzip")
+                after_scope_df.to_csv(os.path.join(temp_dir, "best_candidate_after_scope.csv.gz"), index=False, compression="gzip")
+                before_bad_combined = before_scope_df.loc[before_scope_df["is_bad_combined"].fillna(False)].copy()
+                after_bad_combined = after_scope_df.loc[after_scope_df["is_bad_combined"].fillna(False)].copy()
+                before_bad_combined.to_csv(os.path.join(temp_dir, "best_candidate_before_bad_combined.csv.gz"), index=False, compression="gzip")
+                after_bad_combined.to_csv(os.path.join(temp_dir, "best_candidate_after_bad_combined.csv.gz"), index=False, compression="gzip")
+                before_grid_df = prepare_grid_metrics_export(before_scope_df, thresholds, weights)
+                after_grid_df = prepare_grid_metrics_export(after_scope_df, thresholds, weights)
+                before_grid_df.to_csv(os.path.join(temp_dir, "best_candidate_before_grid_metrics.csv"), index=False)
+                after_grid_df.to_csv(os.path.join(temp_dir, "best_candidate_after_grid_metrics.csv"), index=False)
+                combined_impact_df = build_combined_kpi_grid_impact(before_grid_df, after_grid_df, thresholds, weights)
+                if not combined_impact_df.empty:
+                    combined_impact_df.to_csv(os.path.join(temp_dir, "combined_kpi_grid_impact.csv"), index=False)
+                best_summary = {}
+                best_metrics_df = engine_outputs.get("best_candidate_metrics", pd.DataFrame())
+                if isinstance(best_metrics_df, pd.DataFrame) and not best_metrics_df.empty:
+                    best_summary = best_metrics_df.iloc[0].to_dict()
+                elif isinstance(candidate_eval_df, pd.DataFrame) and not candidate_eval_df.empty:
+                    ranked_eval = candidate_eval_df.copy()
+                    for col in ["constraints_passed", "score", "net_bad_reduction", "combined_weighted_tie_break", "new_bad_samples"]:
+                        if col in ranked_eval.columns:
+                            ranked_eval[col] = pd.to_numeric(ranked_eval[col], errors="coerce")
+                    sort_cols = [col for col in ["constraints_passed", "score", "net_bad_reduction", "combined_weighted_tie_break"] if col in ranked_eval.columns]
+                    ascending = [False] * len(sort_cols)
+                    if "new_bad_samples" in ranked_eval.columns:
+                        sort_cols.append("new_bad_samples")
+                        ascending.append(True)
+                    if sort_cols:
+                        ranked_eval = ranked_eval.sort_values(sort_cols, ascending=ascending, na_position="last")
+                    best_summary = ranked_eval.iloc[0].to_dict()
+                best_summary.update({
+                    "kpi_mode": str(engine_config.mode),
+                    "thresholds": thresholds,
+                    "weights": weights,
+                    "artifact_source": "production_coordinate_search_rf_validated_combined_weighted",
+                    "candidate_summary_source": "best_candidate_metrics" if isinstance(best_metrics_df, pd.DataFrame) and not best_metrics_df.empty else "ranked_candidate_evaluations",
+                })
+                with open(os.path.join(temp_dir, "best_candidate_summary.json"), "w", encoding="utf-8") as fh:
+                    json.dump(best_summary, fh, indent=2, default=str)
+            reco_df = engine_outputs["recommendations"].copy()
+            if reco_df.empty:
+                print(
+                    f"[TILT][RECOMMENDATIONS_EMPTY] project_id={project_id} "
+                    f"baseline_job_id={baseline_job_id} reason=no_actionable_rows"
+                )
+
+            # ==========================================
+            # 6. SAVE RESULTS MAPPING CORRECT OPERATOR
+            # ==========================================
+            self._update(job_id, "running", "Saving recommendations to database...")
+            if not constraint_df.empty:
                 raw_reco_df = reco_df.copy()
                 reco_df = _apply_constraint_ranges(reco_df, constraint_df)
                 _log_constraint_summary(raw_reco_df, reco_df, constraint_df, threshold_file_path)
@@ -540,6 +878,13 @@ class RFOptimizationService:
             else:
                 print("[TILT][CONSTRAINT_APPLY] used=False reason=no_constraint_file_or_no_rows")
             _log_df("RECOMMENDATIONS_FETCH", reco_df)
+            if reco_df.empty:
+                print(
+                    f"[TILT][DB_WRITE] skipped=True reason=no_rf_validated_recommendations "
+                    f"project_id={project_id} scenario_id={scenario_id}"
+                )
+                JOBS[job_id].update({"status": "done", "output": output_file, "scenario": scenario_id})
+                return
             
             # Ensure "ALL" is replaced by the actual cell's operator
             reco_df["final_operator"] = reco_df["Cell ID"].astype(str).map(operator_map).fillna(
@@ -576,6 +921,7 @@ class RFOptimizationService:
 
         except Exception as e:
             print(f"Error in RF Service: {str(e)}")
+            traceback.print_exc()
             JOBS[job_id].update({"status": "failed", "error": str(e)})
 
     def _update(self, job_id, status, msg):

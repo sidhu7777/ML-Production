@@ -30,6 +30,11 @@ engine_dict = {
 }
 
 JOBS = {}
+BASELINE_SMOOTHED_COLUMNS = {
+    "pred_rsrp_smoothed": "DOUBLE NULL",
+    "pred_rsrq_smoothed": "DOUBLE NULL",
+    "pred_sinr_smoothed": "DOUBLE NULL",
+}
 
 
 def _df_records_with_none(df: pd.DataFrame):
@@ -113,6 +118,18 @@ def _coalesce_columns(df, target, candidates, default=None):
             series = _clean_text_series(series)
         out = out.where(out.notna(), series)
     df[target] = out
+    return df
+
+
+def _prefer_columns(df, target, candidates, default=None):
+    result = pd.Series([default] * len(df), index=df.index, dtype="object")
+    for col in candidates:
+        if col not in df.columns:
+            continue
+        values = df[col]
+        take_mask = result.isna() & values.notna()
+        result.loc[take_mask] = values.loc[take_mask]
+    df[target] = result
     return df
 
 
@@ -266,7 +283,30 @@ class LTEPredictionService:
             print(f"[LTE][DEM] auto_resolved=False reason={exc}")
             return requested_path
 
+    def _ensure_baseline_smoothed_columns(self, conn):
+        table_name = "lte_prediction_baseline_results"
+        existing_cols = {
+            row[0]
+            for row in conn.execute(
+                text(
+                    """
+                    SELECT COLUMN_NAME
+                    FROM INFORMATION_SCHEMA.COLUMNS
+                    WHERE TABLE_SCHEMA = DATABASE()
+                      AND TABLE_NAME = :table_name
+                    """
+                ),
+                {"table_name": table_name},
+            )
+        }
+        for col, sql_type in BASELINE_SMOOTHED_COLUMNS.items():
+            if col in existing_cols:
+                continue
+            conn.execute(text(f"ALTER TABLE {table_name} ADD COLUMN {col} {sql_type}"))
+            print(f"[LTE][BASELINE_SCHEMA] added_column={col} table={table_name}")
+
     def _compute_baseline_delta(self, conn, out: pd.DataFrame, project_id: int) -> pd.DataFrame:
+        self._ensure_baseline_smoothed_columns(conn)
         existing = pd.read_sql(
             text(
                 """
@@ -278,6 +318,9 @@ class LTEPredictionService:
                     pred_rsrp,
                     pred_rsrq,
                     pred_sinr,
+                    pred_rsrp_smoothed,
+                    pred_rsrq_smoothed,
+                    pred_sinr_smoothed,
                     node_b_id,
                     cell_id,
                     operator,
@@ -299,6 +342,9 @@ class LTEPredictionService:
             "pred_rsrp",
             "pred_rsrq",
             "pred_sinr",
+            "pred_rsrp_smoothed",
+            "pred_rsrq_smoothed",
+            "pred_sinr_smoothed",
             "node_b_id",
             "cell_id",
             "operator",
@@ -309,6 +355,9 @@ class LTEPredictionService:
             "pred_rsrp": 0.05,
             "pred_rsrq": 0.05,
             "pred_sinr": 0.05,
+            "pred_rsrp_smoothed": 0.05,
+            "pred_rsrq_smoothed": 0.05,
+            "pred_sinr_smoothed": 0.05,
         }
 
         existing = existing.rename(columns={col: f"{col}__old" for col in compare_cols})
@@ -376,12 +425,16 @@ class LTEPredictionService:
                 f"""
                 INSERT INTO {table_name} (
                     id, project_id, job_id, lat, lat_6dp, lon, lon_6dp,
-                    pred_rsrp, pred_rsrq, pred_sinr, node_b_id, cell_id,
+                    pred_rsrp, pred_rsrq, pred_sinr,
+                    pred_rsrp_smoothed, pred_rsrq_smoothed, pred_sinr_smoothed,
+                    node_b_id, cell_id,
                     operator, created_at, site_id, nodeb_id_cell_id, Technology
                 )
                 SELECT
                     id, project_id, job_id, lat, lat_6dp, lon, lon_6dp,
-                    pred_rsrp, pred_rsrq, pred_sinr, node_b_id, cell_id,
+                    pred_rsrp, pred_rsrq, pred_sinr,
+                    pred_rsrp_smoothed, pred_rsrq_smoothed, pred_sinr_smoothed,
+                    node_b_id, cell_id,
                     operator, created_at, site_id, nodeb_id_cell_id, Technology
                 FROM {staging_table}
                 ON DUPLICATE KEY UPDATE
@@ -389,6 +442,9 @@ class LTEPredictionService:
                     pred_rsrp = VALUES(pred_rsrp),
                     pred_rsrq = VALUES(pred_rsrq),
                     pred_sinr = VALUES(pred_sinr),
+                    pred_rsrp_smoothed = VALUES(pred_rsrp_smoothed),
+                    pred_rsrq_smoothed = VALUES(pred_rsrq_smoothed),
+                    pred_sinr_smoothed = VALUES(pred_sinr_smoothed),
                     node_b_id = VALUES(node_b_id),
                     cell_id = VALUES(cell_id),
                     operator = VALUES(operator),
@@ -783,10 +839,14 @@ class LTEPredictionService:
         if "node_cell_id" in out.columns:
             out["node_cell_id"] = _clean_text_series(out["node_cell_id"])
 
-        # Save final display KPI values into the existing baseline prediction columns.
-        out = _coalesce_columns(out, "pred_rsrp", ["pred_rsrp"])
-        out = _coalesce_columns(out, "pred_rsrq", ["pred_rsrq"])
-        out = _coalesce_columns(out, "pred_sinr", ["pred_sinr"])
+        # Existing baseline KPI columns store calibrated pre-smoothing values.
+        # Smoothed/demo overlay values are preserved separately for display/audit.
+        out = _prefer_columns(out, "pred_rsrp_smoothed", ["pred_rsrp_demo", "pred_rsrp"])
+        out = _prefer_columns(out, "pred_rsrq_smoothed", ["pred_rsrq_demo", "pred_rsrq"])
+        out = _prefer_columns(out, "pred_sinr_smoothed", ["pred_sinr_demo", "pred_sinr"])
+        out = _prefer_columns(out, "pred_rsrp", ["pred_rsrp_calibrated", "pred_rsrp_geo", "pred_rsrp"])
+        out = _prefer_columns(out, "pred_rsrq", ["pred_rsrq_calibrated", "pred_rsrq_geo", "pred_rsrq"])
+        out = _prefer_columns(out, "pred_sinr", ["pred_sinr_calibrated", "pred_sinr_geo", "pred_sinr"])
 
         if site_df is not None and not site_df.empty:
             site_meta = site_df.copy()
@@ -832,18 +892,23 @@ class LTEPredictionService:
         out["created_at"] = datetime.now()
 
         out = _coalesce_columns(out, "node_b_id", ["node_b_id", "nodeb_id", "site_nodeb_id", "derived_nodeb_id"])
-        out = _coalesce_columns(out, "cell_id", ["derived_cell_id", "cell_id"])
+        out = _coalesce_columns(out, "cell_id", ["original_cell_id", "derived_cell_id", "cell_id"])
         out = _coalesce_columns(out, "operator", ["operator", "site_operator"], default=operator)
         out = _coalesce_columns(out, "site_id", ["site_id", "site_site_id", "node_b_id"])
 
         for col in ["node_b_id", "cell_id", "operator", "site_id"]:
             out[col] = _clean_text_series(out[col])
 
-        out["nodeb_id_cell_id"] = np.where(
+        legacy_nodeb_cell_id = np.where(
             out["node_b_id"].notna() & out["cell_id"].notna(),
             out["node_b_id"].astype(str) + "_" + out["cell_id"].astype(str),
             out.get("node_cell_id")
         )
+        out["legacy_nodeb_id_cell_id"] = _clean_text_series(pd.Series(legacy_nodeb_cell_id, index=out.index))
+        if "frontend_site_sector_key" in out.columns:
+            out["nodeb_id_cell_id"] = _clean_text_series(out["frontend_site_sector_key"]).fillna(out["legacy_nodeb_id_cell_id"])
+        else:
+            out["nodeb_id_cell_id"] = out["legacy_nodeb_id_cell_id"]
         out["nodeb_id_cell_id"] = _clean_text_series(out["nodeb_id_cell_id"])
 
         self._save_geo_features(
@@ -867,6 +932,9 @@ class LTEPredictionService:
             "pred_rsrp",
             "pred_rsrq",
             "pred_sinr",
+            "pred_rsrp_smoothed",
+            "pred_rsrq_smoothed",
+            "pred_sinr_smoothed",
             "node_b_id",
             "cell_id",
             "operator",
@@ -884,6 +952,15 @@ class LTEPredictionService:
         if "Technology" not in out.columns:
             out["Technology"] = "4G"
         out["Technology"] = _clean_text_series(out["Technology"]).fillna("4G")
+        for col, low, high in [
+            ("pred_rsrp", -140, -44),
+            ("pred_rsrq", -20, -3),
+            ("pred_sinr", -10, 30),
+            ("pred_rsrp_smoothed", -140, -44),
+            ("pred_rsrq_smoothed", -20, -3),
+            ("pred_sinr_smoothed", -10, 30),
+        ]:
+            out[col] = pd.to_numeric(out[col], errors="coerce").clip(low, high)
 
         out = out[final_cols]
         out = out.dropna(subset=["project_id", "nodeb_id_cell_id", "lat_6dp", "lon_6dp"]).copy()

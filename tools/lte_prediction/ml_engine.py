@@ -11,7 +11,9 @@ from .geo_correction_pipeline import (
     apply_full_display_correction,
     align_building_geometries_to_project,
     align_project_polygon_to_points,
+    attach_site_identity_to_predictions,
     building_df_to_gdf,
+    filter_sites_to_project_polygon,
     prepare_building_df_for_rf,
     prepare_site_df_for_source_rf_export,
 )
@@ -457,19 +459,32 @@ def run_rf_prediction_fast(site_df, drive_df, building_df, params):
 
     current_engine = engine.get(params.get("region", "india").lower(), engine["india"])
     polygons = _resolve_prediction_polygons(params, current_engine)
-    site_export_df = prepare_site_df_for_source_rf_export(site_df)
+    serving_site_df = site_df.copy()
     building_export_df = building_df.copy()
     if polygons:
-        try:
-            import geopandas as gpd
+        import geopandas as gpd
 
-            polygon_gdf = gpd.GeoDataFrame({"geometry": polygons}, crs="EPSG:4326")
-            polygon_gdf, _ = align_project_polygon_to_points(polygon_gdf, site_export_df)
+        polygon_gdf = gpd.GeoDataFrame({"geometry": polygons}, crs="EPSG:4326")
+        polygon_gdf, polygon_alignment = align_project_polygon_to_points(polygon_gdf, site_df)
+        serving_site_df = filter_sites_to_project_polygon(site_df, polygon_gdf)
+        if serving_site_df.empty:
+            raise ValueError("No serving LTE sites found inside the aligned project polygon")
+        print(
+            f"[LTE][RF_SITE_POLYGON] alignment={polygon_alignment} "
+            f"all_project_site_rows={len(site_df)} serving_site_rows={len(serving_site_df)}"
+        )
+        try:
             building_gdf = building_df_to_gdf(building_df)
             building_gdf, _ = align_building_geometries_to_project(building_gdf, polygon_gdf)
             building_export_df = prepare_building_df_for_rf(building_df, building_gdf)
         except Exception as exc:
             print(f"[LTE][RF_INPUT] building_geometry_precheck_failed={exc}")
+    site_export_df = prepare_site_df_for_source_rf_export(serving_site_df)
+    expected_unique_frontend = (
+        int(site_export_df["frontend_site_sector_key"].nunique(dropna=True))
+        if "frontend_site_sector_key" in site_export_df.columns
+        else _safe_nunique(site_export_df, "cell_id")
+    )
     site_export_df.to_csv(site_path, index=False)
     building_export_df.to_csv(building_path, index=False)
 
@@ -481,6 +496,7 @@ def run_rf_prediction_fast(site_df, drive_df, building_df, params):
     )
     print(
         f"[LTE][RF_INPUT] unique_cells={_safe_nunique(site_export_df, 'cell_id')} "
+        f"unique_frontend_site_sector={expected_unique_frontend} "
         f"unique_pci={_safe_nunique(site_export_df, 'PCI') if 'PCI' in site_export_df.columns else _safe_nunique(site_export_df, 'pci')}"
     )
 
@@ -523,6 +539,7 @@ def run_rf_prediction_fast(site_df, drive_df, building_df, params):
         pred_df, polygon_stats = _apply_prediction_polygon_filter(
             pred_df, params["project_id"], current_engine
         )
+    pred_df = attach_site_identity_to_predictions(pred_df, site_df)
     print(
         f"[LTE][RF_OUTPUT_COUNTS] rows_before_polygon={polygon_stats['rows_before']} "
         f"rows_after_polygon={len(pred_df)} "
@@ -542,6 +559,7 @@ def run_rf_prediction_fast(site_df, drive_df, building_df, params):
         pred_df,
         extra={
             "unique_predicted_cells": _safe_nunique(pred_df, "Node_Cell_ID"),
+            "unique_frontend_site_sector": _safe_nunique(pred_df, "frontend_site_sector_key"),
             "pred_rsrp_range": _safe_minmax(pred_df, "pred_rsrp"),
             "pred_rsrq_range": _safe_minmax(pred_df, "pred_rsrq"),
             "pred_sinr_range": _safe_minmax(pred_df, "pred_sinr"),

@@ -10,6 +10,10 @@ import numpy as np
 from openpyxl import Workbook
 from openpyxl.styles import PatternFill, Font, Alignment
 from openpyxl.utils import get_column_letter
+from tools.lte_tilt_recommandation.cell_identity import (
+    canonical_cell_id,
+    canonical_pair_series,
+)
 
 
 # =========================
@@ -124,12 +128,7 @@ def _safe_str(x) -> str:
 
 
 def _norm_cell_id(value) -> str:
-    s = _safe_str(value)
-    if not s:
-        return ""
-    if s.endswith(".0"):
-        s = s[:-2]
-    return s
+    return canonical_cell_id(value)
 
 
 def _cell_id_suffix(value) -> str:
@@ -177,6 +176,13 @@ def _circular_mean_deg(values: pd.Series) -> float:
 
 
 def _get_cell_key_from_log(log_df: pd.DataFrame) -> pd.Series:
+    for col in ["Node_Cell_ID", "node_cell_id", "frontend_site_sector_key", "nodeb_id_cell_id"]:
+        existing_col = _find_col(log_df, [col], required=False)
+        if existing_col:
+            existing = log_df[existing_col].map(canonical_cell_id)
+            if existing.astype(str).str.strip().ne("").any():
+                return existing
+
     nodeb_candidates = ["nodeb_id", "nodeb", "enodeb_id", "gnodeb_id", "site_id"]
     cell_candidates = ["cell_id", "eci", "ecgi_cell_id", "local_cell_id"]
 
@@ -184,29 +190,30 @@ def _get_cell_key_from_log(log_df: pd.DataFrame) -> pd.Series:
     cell_col = _find_col(log_df, cell_candidates, required=False)
 
     if nodeb_col and cell_col:
-        nodeb = log_df[nodeb_col].map(_norm_cell_id)
-        cell = log_df[cell_col].map(_norm_cell_id)
-        key = np.where((nodeb != "") & (cell != ""), nodeb + "_" + cell, "")
-        return pd.Series(key, index=log_df.index)
+        return canonical_pair_series(log_df[nodeb_col], log_df[cell_col])
 
     if cell_col:
-        return log_df[cell_col].map(_norm_cell_id)
+        return log_df[cell_col].map(canonical_cell_id)
 
     raise KeyError("Could not derive Cell ID from log data.")
 
 
 def _get_cell_key_from_antenna(antenna_df: pd.DataFrame) -> pd.Series:
+    for col in ["Node_Cell_ID", "node_cell_id", "frontend_site_sector_key", "nodeb_id_cell_id"]:
+        existing_col = _find_col(antenna_df, [col], required=False)
+        if existing_col:
+            existing = antenna_df[existing_col].map(canonical_cell_id)
+            if existing.astype(str).str.strip().ne("").any():
+                return existing
+
     nodeb_col = _find_col(antenna_df, ["nodeb_id", "nodeb", "site_id"], required=False)
     cell_col = _find_col(antenna_df, ["cell_id", "eci", "local_cell_id"], required=False)
 
     if nodeb_col and cell_col:
-        nodeb = antenna_df[nodeb_col].map(_norm_cell_id)
-        cell = antenna_df[cell_col].map(_norm_cell_id)
-        key = np.where((nodeb != "") & (cell != ""), nodeb + "_" + cell, "")
-        return pd.Series(key, index=antenna_df.index)
+        return canonical_pair_series(antenna_df[nodeb_col], antenna_df[cell_col])
 
     if cell_col:
-        return antenna_df[cell_col].map(_norm_cell_id)
+        return antenna_df[cell_col].map(canonical_cell_id)
 
     raise KeyError("Could not derive Cell ID from antenna data.")
 

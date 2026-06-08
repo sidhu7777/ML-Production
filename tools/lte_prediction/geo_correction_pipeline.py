@@ -14,6 +14,7 @@ from shapely.geometry import LineString, Point, Polygon
 from shapely.ops import transform
 from shapely.wkt import loads as load_wkt
 from sklearn.cluster import KMeans
+from sklearn.linear_model import Ridge
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from sklearn.neighbors import BallTree
 from sklearn.preprocessing import StandardScaler
@@ -316,8 +317,123 @@ def normalize_site_for_geo(site_df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+def _clean_identity_part(series: pd.Series) -> pd.Series:
+    out = series.astype("string").str.strip()
+    return out.mask(out.isin(["", "nan", "NaN", "None", "<NA>"]))
+
+
+def _canonical_identity_token(value: object) -> Optional[str]:
+    if pd.isna(value):
+        return None
+    text = str(value).strip()
+    if not text or text.lower() in {"nan", "none", "<na>"}:
+        return None
+    if text.endswith(".0"):
+        text = text[:-2]
+    return text
+
+
+def _canonical_sector_token(value: object) -> Optional[str]:
+    text = _canonical_identity_token(value)
+    if not text:
+        return None
+    if "|" in text:
+        text = text.split("|", 1)[1]
+    if "_" in text:
+        text = text.rsplit("_", 1)[-1]
+    text = _canonical_identity_token(text)
+    if text and text.endswith(".0"):
+        text = text[:-2]
+    return text or None
+
+
+def _canonical_site_token(value: object) -> Optional[str]:
+    text = _canonical_identity_token(value)
+    if not text:
+        return None
+    if "|" in text:
+        text = text.split("|", 1)[0]
+    return _canonical_identity_token(text)
+
+
+def _canonical_sector_ids(site_key: pd.Series, sector_or_cell: pd.Series, fallback_cell: pd.Series) -> pd.Series:
+    site = site_key.map(_canonical_site_token)
+    sector = sector_or_cell.map(_canonical_sector_token)
+    fallback_sector = fallback_cell.map(_canonical_sector_token)
+    sector = sector.where(sector.notna(), fallback_sector)
+    canonical = site.astype("string") + "|" + sector.astype("string")
+    canonical = canonical.mask(site.isna() | sector.isna())
+    return canonical.astype("string")
+
+
+def add_sector_identity_columns(site_df: pd.DataFrame, use_as_node_cell_id: bool = False) -> pd.DataFrame:
+    out = site_df.copy()
+    if out.empty:
+        return out
+
+    if "original_node_cell_id" not in out.columns:
+        if "Node_Cell_ID" in out.columns:
+            out["original_node_cell_id"] = _clean_identity_part(out["Node_Cell_ID"])
+        elif "cell_id" in out.columns:
+            out["original_node_cell_id"] = _clean_identity_part(out["cell_id"])
+        else:
+            out["original_node_cell_id"] = pd.Series(pd.NA, index=out.index, dtype="string")
+
+    if "original_cell_id" not in out.columns:
+        out["original_cell_id"] = _clean_identity_part(out["cell_id"]) if "cell_id" in out.columns else out["original_node_cell_id"]
+
+    site_col = next((col for col in ["site", "Site ID", "site_id", "site_name"] if col in out.columns), None)
+    if site_col:
+        site_key = _clean_identity_part(out[site_col]).fillna("unknown-site")
+    elif "nodeb_id" in out.columns:
+        site_key = _clean_identity_part(out["nodeb_id"]).fillna("unknown-site")
+    else:
+        site_key = out["original_node_cell_id"].fillna("unknown-site")
+
+    sector_key = _clean_identity_part(out["sector"]) if "sector" in out.columns else pd.Series(pd.NA, index=out.index, dtype="string")
+    cell_key = _clean_identity_part(out["cell_id"]) if "cell_id" in out.columns else out["original_node_cell_id"]
+    sector_or_cell = sector_key.fillna(cell_key)
+
+    out["site_identity_key"] = site_key
+    out["sector_identity"] = sector_or_cell
+    out["frontend_site_sector_key"] = site_key.astype(str) + "|" + sector_or_cell.astype(str)
+    out["node_cell_sector_key"] = out["original_node_cell_id"].astype(str) + "|" + sector_or_cell.astype(str)
+    out["canonical_sector_id"] = _canonical_sector_ids(site_key, sector_or_cell, out["original_cell_id"])
+    out.loc[sector_or_cell.isna(), ["frontend_site_sector_key", "node_cell_sector_key"]] = pd.NA
+
+    if use_as_node_cell_id:
+        out["Node_Cell_ID"] = out["frontend_site_sector_key"]
+    return out
+
+
+def filter_sites_to_project_polygon(site_df: pd.DataFrame, polygon_gdf: gpd.GeoDataFrame) -> pd.DataFrame:
+    if site_df.empty or polygon_gdf.empty or not {"lat", "lon"}.issubset(site_df.columns):
+        return site_df.copy()
+
+    work = site_df.copy()
+    work["lat"] = pd.to_numeric(work["lat"], errors="coerce")
+    work["lon"] = pd.to_numeric(work["lon"], errors="coerce")
+    valid = work["lat"].notna() & work["lon"].notna()
+    if not valid.any():
+        return work.iloc[0:0].copy()
+
+    point_gdf = gpd.GeoDataFrame(
+        work.loc[valid].copy(),
+        geometry=gpd.points_from_xy(work.loc[valid, "lon"], work.loc[valid, "lat"]),
+        crs=polygon_gdf.crs or "EPSG:4326",
+    )
+    polygon_union = polygon_gdf.geometry.union_all()
+    inside_index = point_gdf.loc[point_gdf.geometry.apply(lambda geom: bool(polygon_union.contains(geom)))].index
+    return work.loc[inside_index].copy()
+
+
 def prepare_site_df_for_source_rf_export(site_df: pd.DataFrame) -> pd.DataFrame:
     rf_df = normalize_site_for_geo(site_df)
+    rf_df = add_sector_identity_columns(rf_df, use_as_node_cell_id=True)
+    if "cell_id" in rf_df.columns and "rf_source_cell_id" not in rf_df.columns:
+        rf_df["rf_source_cell_id"] = rf_df["cell_id"]
+    if "Node_Cell_ID" in rf_df.columns:
+        rf_df["cell_id"] = rf_df["Node_Cell_ID"]
     duplicate_aliases = {
         "Etilt": "electrical_tilt",
         "Mtilt": "mechanical_tilt",
@@ -328,6 +444,43 @@ def prepare_site_df_for_source_rf_export(site_df: pd.DataFrame) -> pd.DataFrame:
         if legacy_col in rf_df.columns and normalized_col in rf_df.columns:
             rf_df = rf_df.drop(columns=[legacy_col])
     return rf_df.loc[:, ~rf_df.columns.duplicated()].copy()
+
+
+def attach_site_identity_to_predictions(pred_df: pd.DataFrame, site_df: pd.DataFrame) -> pd.DataFrame:
+    out = pred_df.copy()
+    if out.empty or site_df.empty or "Node_Cell_ID" not in out.columns:
+        return out
+
+    site_identity = add_sector_identity_columns(site_df, use_as_node_cell_id=True)
+    keep_cols = [
+        col
+        for col in [
+            "Node_Cell_ID",
+            "original_node_cell_id",
+            "original_cell_id",
+            "site_identity_key",
+            "sector_identity",
+            "frontend_site_sector_key",
+            "node_cell_sector_key",
+            "site",
+            "Site ID",
+            "sector",
+            "nodeb_id",
+            "pci",
+            "PCI",
+            "earfcn",
+            "azimuth",
+            "canonical_sector_id",
+        ]
+        if col in site_identity.columns
+    ]
+    site_identity = site_identity[keep_cols].drop_duplicates(subset=["Node_Cell_ID"], keep="first")
+    out["Node_Cell_ID"] = out["Node_Cell_ID"].astype(str).str.strip()
+    site_identity["Node_Cell_ID"] = site_identity["Node_Cell_ID"].astype(str).str.strip()
+    overlap_cols = [col for col in site_identity.columns if col != "Node_Cell_ID" and col in out.columns]
+    if overlap_cols:
+        out = out.drop(columns=overlap_cols, errors="ignore")
+    return out.merge(site_identity, on="Node_Cell_ID", how="left")
 
 
 def _candidate_building_height_columns(df: pd.DataFrame) -> List[str]:
@@ -1514,6 +1667,228 @@ def evaluate_geo_against_dt(
     return holdout, baseline_metrics, geo_metrics
 
 
+def split_drive_train_holdout(
+    drive_df: pd.DataFrame,
+    validation_fraction: float = 0.25,
+) -> Tuple[pd.DataFrame, pd.DataFrame, Dict[str, object]]:
+    dt = _prepare_drive_measurements(drive_df)
+    summary: Dict[str, object] = {
+        "enabled": False,
+        "strategy": "deterministic_row_hash",
+        "validation_fraction": float(validation_fraction),
+        "dt_rows": int(len(dt)),
+        "train_rows": 0,
+        "holdout_rows": 0,
+    }
+    if dt.empty:
+        summary["reason"] = "empty_drive_measurements"
+        return dt.copy(), dt.copy(), summary
+
+    holdout_frac = float(np.clip(validation_fraction, 0.1, 0.5))
+    if len(dt) < 40:
+        holdout_size = max(1, int(round(len(dt) * holdout_frac)))
+        holdout_df = dt.iloc[:holdout_size].copy()
+        train_df = dt.iloc[holdout_size:].copy()
+    else:
+        split_key = pd.DataFrame(
+            {
+                "session_id": dt["session_id"] if "session_id" in dt.columns else pd.Series(0, index=dt.index),
+                "lat_5dp": pd.to_numeric(dt["lat"], errors="coerce").round(5),
+                "lon_5dp": pd.to_numeric(dt["lon"], errors="coerce").round(5),
+                "node_cell_id": dt["Node_Cell_ID"] if "Node_Cell_ID" in dt.columns else pd.Series("", index=dt.index),
+            },
+            index=dt.index,
+        )
+        hashed = pd.util.hash_pandas_object(split_key, index=False).astype("uint64")
+        dt = dt.assign(_split_rand=(hashed % 10_000) / 10_000.0)
+        holdout_mask = dt["_split_rand"] < holdout_frac
+        if holdout_mask.sum() < max(30, int(0.1 * len(dt))):
+            cutoff = np.quantile(dt["_split_rand"], holdout_frac)
+            holdout_mask = dt["_split_rand"] <= cutoff
+        if (~holdout_mask).sum() < max(30, int(0.2 * len(dt))):
+            order = dt["_split_rand"].sort_values().index
+            holdout_count = max(30, min(len(dt) - 30, int(round(len(dt) * holdout_frac))))
+            holdout_mask = pd.Series(False, index=dt.index)
+            holdout_mask.loc[order[:holdout_count]] = True
+        train_df = dt.loc[~holdout_mask].drop(columns=["_split_rand"], errors="ignore").copy()
+        holdout_df = dt.loc[holdout_mask].drop(columns=["_split_rand"], errors="ignore").copy()
+
+    summary.update(
+        {
+            "enabled": not train_df.empty and not holdout_df.empty,
+            "validation_fraction": holdout_frac,
+            "train_rows": int(len(train_df)),
+            "holdout_rows": int(len(holdout_df)),
+        }
+    )
+    if not summary["enabled"]:
+        summary["reason"] = "insufficient_train_or_holdout_rows"
+    return train_df, holdout_df, summary
+
+
+def _build_dt_calibration_feature_frame(df: pd.DataFrame) -> pd.DataFrame:
+    numeric_cols = [
+        "pred_rsrp",
+        "pred_rsrq",
+        "pred_sinr",
+        "pred_rsrp_geo",
+        "pred_rsrq_geo",
+        "pred_sinr_geo",
+        "morphology_cluster",
+        "building_count",
+        "building_area_ratio",
+        "avg_building_area_m2",
+        "road_length_m",
+        "green_ratio",
+        "water_ratio",
+        "los_blocker_count",
+        "los_blocked_ratio",
+        "max_blocker_height_m",
+        "diffraction_proxy_db",
+        "nlos_flag",
+        "terrain_elevation_m",
+        "terrain_slope_deg",
+        "terrain_relief_to_site_m",
+        "site_count_250m",
+        "site_count_500m",
+        "serving_distance_m",
+        "nearest_site_distance_m",
+        "mean_nearest3_site_distance_m",
+        "azimuth_delta_deg",
+        "serving_proxy_rsrp_phys_dbm",
+        "rsrq_proxy_db",
+        "sinr_proxy_db",
+        "interference_gap_db",
+        "interference_ratio_linear",
+    ]
+    numeric = pd.DataFrame(index=df.index)
+    for col in numeric_cols:
+        if col in df.columns:
+            numeric[col] = pd.to_numeric(df[col], errors="coerce")
+
+    categorical = pd.DataFrame(index=df.index)
+    if "clutter_class" in df.columns:
+        categorical = pd.get_dummies(df["clutter_class"].fillna("unknown").astype(str), prefix="clutter")
+
+    features = pd.concat([numeric, categorical], axis=1)
+    return features.replace([np.inf, -np.inf], 0.0).fillna(0.0)
+
+
+def fit_dt_holdout_calibration(
+    train_eval: pd.DataFrame,
+) -> Tuple[Dict[str, Dict[str, object]], Dict[str, object]]:
+    model_specs = {
+        "RSRP": ("RSRP_meas", "pred_rsrp_geo", -12.0, 12.0),
+        "RSRQ": ("RSRQ_meas", "pred_rsrq_geo", -8.0, 8.0),
+        "SINR": ("SINR_meas", "pred_sinr_geo", -10.0, 10.0),
+    }
+    model_bundle: Dict[str, Dict[str, object]] = {}
+    debug: Dict[str, object] = {
+        "enabled": False,
+        "train_rows": int(len(train_eval)),
+        "models": {},
+    }
+    if train_eval.empty:
+        debug["reason"] = "empty_train_eval"
+        return model_bundle, debug
+
+    for metric_name, (meas_col, pred_col, low_clip, high_clip) in model_specs.items():
+        valid = train_eval.dropna(subset=[meas_col, pred_col]).copy()
+        if len(valid) < 60:
+            debug["models"][metric_name] = {
+                "used": False,
+                "reason": "train_rows_lt_60",
+                "rows": int(len(valid)),
+            }
+            continue
+
+        features = _build_dt_calibration_feature_frame(valid)
+        if features.empty or features.shape[1] == 0:
+            debug["models"][metric_name] = {
+                "used": False,
+                "reason": "no_features",
+                "rows": int(len(valid)),
+            }
+            continue
+
+        residual = (
+            pd.to_numeric(valid[meas_col], errors="coerce")
+            - pd.to_numeric(valid[pred_col], errors="coerce")
+        ).clip(lower=low_clip, upper=high_clip)
+        scaler = StandardScaler()
+        x_scaled = scaler.fit_transform(features)
+        ridge = Ridge(alpha=3.0, random_state=42)
+        ridge.fit(x_scaled, residual.to_numpy(dtype=float))
+
+        model_bundle[metric_name] = {
+            "metric_name": metric_name,
+            "pred_col": pred_col,
+            "scaler": scaler,
+            "model": ridge,
+            "feature_columns": features.columns.tolist(),
+            "low_clip": float(low_clip),
+            "high_clip": float(high_clip),
+        }
+        debug["models"][metric_name] = {
+            "used": True,
+            "rows": int(len(valid)),
+            "feature_count": int(features.shape[1]),
+            "residual_mae": round(float(np.abs(residual).mean()), 4),
+            "residual_bias": round(float(residual.mean()), 4),
+        }
+
+    debug["enabled"] = bool(model_bundle)
+    if not model_bundle:
+        debug["reason"] = "no_metric_models_fit"
+    return model_bundle, debug
+
+
+def apply_dt_holdout_calibration(
+    pred_df: pd.DataFrame,
+    model_bundle: Dict[str, Dict[str, object]],
+) -> pd.DataFrame:
+    if pred_df.empty or not model_bundle:
+        return pred_df
+
+    out = pred_df.copy()
+    metric_ranges = {
+        "RSRP": (-140.0, -44.0),
+        "RSRQ": (-20.0, -3.0),
+        "SINR": (-10.0, 30.0),
+    }
+    for metric_name, bundle in model_bundle.items():
+        pred_col = str(bundle["pred_col"])
+        if pred_col not in out.columns:
+            continue
+        features = _build_dt_calibration_feature_frame(out)
+        feature_columns = list(bundle["feature_columns"])
+        for col in feature_columns:
+            if col not in features.columns:
+                features[col] = 0.0
+        features = features.reindex(columns=feature_columns, fill_value=0.0)
+        x_scaled = bundle["scaler"].transform(features)
+        residual_pred = pd.Series(bundle["model"].predict(x_scaled), index=out.index, dtype=float)
+        residual_pred = residual_pred.clip(lower=float(bundle["low_clip"]), upper=float(bundle["high_clip"]))
+        clip_min, clip_max = metric_ranges[metric_name]
+        base_values = pd.to_numeric(out[pred_col], errors="coerce")
+        out[pred_col] = (base_values + residual_pred).clip(lower=clip_min, upper=clip_max)
+    return out
+
+
+def preserve_calibrated_kpis(pred_df: pd.DataFrame) -> pd.DataFrame:
+    out = pred_df.copy()
+    calibrated_specs = [
+        ("pred_rsrp_calibrated", "pred_rsrp_geo", "pred_rsrp", -140.0, -44.0),
+        ("pred_rsrq_calibrated", "pred_rsrq_geo", "pred_rsrq", -20.0, -3.0),
+        ("pred_sinr_calibrated", "pred_sinr_geo", "pred_sinr", -10.0, 30.0),
+    ]
+    for out_col, geo_col, raw_col, clip_min, clip_max in calibrated_specs:
+        source_col = geo_col if geo_col in out.columns else raw_col
+        if source_col in out.columns:
+            out[out_col] = pd.to_numeric(out[source_col], errors="coerce").clip(clip_min, clip_max)
+    return out
+
+
 def apply_demo_dt_overlay(
     pred_df: pd.DataFrame,
     drive_df: pd.DataFrame,
@@ -1828,7 +2203,15 @@ def apply_full_display_correction(
         pred_work = _refine_experimental_forward_features(pred_work)
         pred_work = attach_fixed_serving_sinr_rsrq_proxy(pred_work, site_norm)
         pred_work, geo_summary = apply_experimental_geo_adjustments(pred_work, weights=weights)
-        _, baseline_metrics, geo_metrics = evaluate_geo_against_dt(drive_df, pred_work)
+        drive_train_df, drive_holdout_df, split_summary = split_drive_train_holdout(
+            drive_df,
+            validation_fraction=float(params.get("dt_validation_fraction", 0.25)),
+        )
+        train_eval, _, train_geo_metrics = evaluate_geo_against_dt(drive_train_df, pred_work)
+        dt_calibration_models, dt_calibration_debug = fit_dt_holdout_calibration(train_eval)
+        pred_work = apply_dt_holdout_calibration(pred_work, dt_calibration_models)
+        pred_work = preserve_calibrated_kpis(pred_work)
+        _, baseline_metrics, geo_metrics = evaluate_geo_against_dt(drive_holdout_df, pred_work)
         pred_work, demo_summary = apply_demo_dt_overlay(
             pred_work,
             drive_df,
@@ -1848,6 +2231,11 @@ def apply_full_display_correction(
             "geo_status": {"dem_status": dem_status},
             "baseline_validation_metrics": baseline_metrics,
             "geo_validation_metrics": geo_metrics,
+            "train_geo_metrics": train_geo_metrics,
+            "dt_calibration_summary": {
+                "split": split_summary,
+                "calibration": dt_calibration_debug,
+            },
             "demo_summary": demo_summary,
             "grid_rows": 0,
             "building_rows": int(len(building_gdf)),
@@ -1867,7 +2255,15 @@ def apply_full_display_correction(
         pred_work["Node_Cell_ID"] = pred_work["node_cell_id"].astype(str)
     pred_work = attach_fixed_serving_sinr_rsrq_proxy(pred_work, site_norm)
     pred_work, geo_summary = apply_experimental_geo_adjustments(pred_work, weights=weights)
-    _, baseline_metrics, geo_metrics = evaluate_geo_against_dt(drive_df, pred_work)
+    drive_train_df, drive_holdout_df, split_summary = split_drive_train_holdout(
+        drive_df,
+        validation_fraction=float(params.get("dt_validation_fraction", 0.25)),
+    )
+    train_eval, _, train_geo_metrics = evaluate_geo_against_dt(drive_train_df, pred_work)
+    dt_calibration_models, dt_calibration_debug = fit_dt_holdout_calibration(train_eval)
+    pred_work = apply_dt_holdout_calibration(pred_work, dt_calibration_models)
+    pred_work = preserve_calibrated_kpis(pred_work)
+    _, baseline_metrics, geo_metrics = evaluate_geo_against_dt(drive_holdout_df, pred_work)
     pred_work, demo_summary = apply_demo_dt_overlay(
         pred_work,
         drive_df,
@@ -1901,6 +2297,11 @@ def apply_full_display_correction(
         "geo_status": geo_status,
         "baseline_validation_metrics": baseline_metrics,
         "geo_validation_metrics": geo_metrics,
+        "train_geo_metrics": train_geo_metrics,
+        "dt_calibration_summary": {
+            "split": split_summary,
+            "calibration": dt_calibration_debug,
+        },
         "demo_summary": demo_summary,
         "grid_rows": int(len(grid_df)),
         "building_rows": int(len(building_gdf)),

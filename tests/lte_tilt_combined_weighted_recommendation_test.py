@@ -121,6 +121,80 @@ def _add_combined_grid_fields(out: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+def _weighted_kpi_cell_order(summary: pd.DataFrame) -> pd.DataFrame:
+    if summary.empty:
+        return summary
+    total_cells = int(len(summary))
+    kpi_weights = [("rsrp", _ACTIVE_WEIGHTS.rsrp), ("rsrq", _ACTIVE_WEIGHTS.rsrq), ("sinr", _ACTIVE_WEIGHTS.sinr)]
+    active = [(kpi, float(weight)) for kpi, weight in kpi_weights if float(weight) > 0.0]
+    if not active:
+        return summary
+    max_weight = max(weight for _, weight in active)
+    priority_kpis = [kpi for kpi, weight in active if weight == max_weight]
+
+    if len(priority_kpis) == 1:
+        kpi = priority_kpis[0]
+        bad_col = f"Bad {kpi.upper()}"
+        sev_col = f"{kpi}_bad_severity"
+        priority = summary.loc[pd.to_numeric(summary.get(bad_col), errors="coerce").fillna(0) > 0].copy()
+        if priority.empty:
+            return priority
+        priority["_selection_kpi"] = kpi.upper()
+        priority["_selection_weight"] = float(max_weight)
+        priority = priority.sort_values(
+            [bad_col, sev_col, "Bad Grid Count", "combined_grid_severity", "Cell ID"],
+            ascending=[False, False, False, False, True],
+        ).reset_index(drop=True)
+        priority["_selection_rank"] = np.arange(1, len(priority) + 1)
+        return priority
+
+    selected: list[pd.DataFrame] = []
+    selected_cells: set[str] = set()
+    remaining_slots = total_cells
+    for index, (kpi, weight) in enumerate(active):
+        if remaining_slots <= 0:
+            break
+        if index == len(active) - 1:
+            budget = remaining_slots
+        else:
+            budget = int(round(total_cells * weight))
+            budget = max(1, min(budget, remaining_slots))
+        bad_col = f"Bad {kpi.upper()}"
+        sev_col = f"{kpi}_bad_severity"
+        candidates = summary.loc[
+            (~summary["Cell ID"].astype(str).isin(selected_cells))
+            & (pd.to_numeric(summary.get(bad_col), errors="coerce").fillna(0) > 0)
+        ].copy()
+        if candidates.empty:
+            continue
+        candidates["_selection_kpi"] = kpi.upper()
+        candidates["_selection_weight"] = weight
+        candidates = candidates.sort_values(
+            [bad_col, sev_col, "Bad Grid Count", "combined_grid_severity", "Cell ID"],
+            ascending=[False, False, False, False, True],
+        ).head(budget)
+        selected.append(candidates)
+        selected_cells.update(candidates["Cell ID"].astype(str).tolist())
+        remaining_slots = total_cells - len(selected_cells)
+
+    if len(selected_cells) < total_cells:
+        fill = summary.loc[~summary["Cell ID"].astype(str).isin(selected_cells)].copy()
+        if not fill.empty:
+            fill["_selection_kpi"] = "COMBINED_FILL"
+            fill["_selection_weight"] = 0.0
+            fill = fill.sort_values(
+                ["combined_grid_severity", "Bad Grid Count", "Bad Samples", "Cell ID"],
+                ascending=[False, False, False, True],
+            )
+            selected.append(fill)
+
+    if not selected:
+        return summary
+    out = pd.concat(selected, ignore_index=True)
+    out["_selection_rank"] = np.arange(1, len(out) + 1)
+    return out.drop_duplicates(subset=["Cell ID"], keep="first").reset_index(drop=True)
+
+
 def _filter_bad_samples_combined(log_df: pd.DataFrame, allowed_techs) -> tuple[pd.DataFrame, pd.DataFrame]:
     work = log_df.copy()
     if "Cell ID" not in work.columns and "Node_Cell_ID" in work.columns:
@@ -218,43 +292,85 @@ def _build_grid_ranked_summary_combined(
         grid_metrics = _aggregate_grid_metrics_combined(baseline_df, threshold)
     if grid_metrics.empty:
         return pd.DataFrame(), grid_metrics
-    bad_grid_ids = set(grid_metrics.loc[grid_metrics["is_bad_combined"].fillna(False), "grid_id"].tolist())
-    if not bad_grid_ids:
-        return pd.DataFrame(), grid_metrics
+
     work = baseline_df.copy()
     work["grid_id"] = fast_runtime._normalize_grid_id_series(work.get("grid_id"))
-    work = work.loc[work["grid_id"].isin(bad_grid_ids)].copy()
-    if work.empty:
+    work = work.loc[work["grid_id"].notna()].copy()
+    if work.empty or "Node_Cell_ID" not in work.columns:
         return pd.DataFrame(), grid_metrics
     work["Cell ID"] = work["Node_Cell_ID"].astype(str)
+
+    cell_rows: Dict[str, Dict[str, object]] = {}
+    cell_grid_sets: Dict[str, set[str]] = {}
     for kpi in ["rsrp", "rsrq", "sinr"]:
+        weight = float(getattr(_ACTIVE_WEIGHTS, kpi))
+        bad_col = f"Bad {kpi.upper()}"
+        sev_col = f"{kpi}_bad_severity"
+        if weight <= 0.0:
+            continue
+        grid_flag_col = f"is_bad_{kpi}_kpi" if f"is_bad_{kpi}_kpi" in grid_metrics.columns else f"is_bad_{kpi}"
+        if grid_flag_col not in grid_metrics.columns:
+            continue
+        kpi_bad_grid_ids = set(grid_metrics.loc[grid_metrics[grid_flag_col].fillna(False), "grid_id"].astype(str).tolist())
+        if not kpi_bad_grid_ids:
+            continue
         col = f"pred_{kpi}"
-        work[col] = pd.to_numeric(work.get(col), errors="coerce")
-        work[f"Bad {kpi.upper()}"] = (
-            work[col] < _ACTIVE_THRESHOLDS[kpi]
-            if getattr(_ACTIVE_WEIGHTS, kpi) > 0.0
-            else False
+        if col not in work.columns:
+            continue
+        kpi_work = work.loc[work["grid_id"].astype(str).isin(kpi_bad_grid_ids)].copy()
+        if kpi_work.empty:
+            continue
+        kpi_work[col] = pd.to_numeric(kpi_work[col], errors="coerce")
+        kpi_work["_is_bad"] = kpi_work[col] < _ACTIVE_THRESHOLDS[kpi]
+        kpi_work["_raw_severity"] = _severity(kpi_work[col], _ACTIVE_THRESHOLDS[kpi])
+        kpi_work = kpi_work.loc[kpi_work["_is_bad"].fillna(False)].copy()
+        if kpi_work.empty:
+            continue
+        grouped = (
+            kpi_work.groupby("Cell ID", dropna=False)
+            .agg(
+                bad_samples=("_is_bad", "sum"),
+                bad_grid_count=("grid_id", "nunique"),
+                bad_severity=("_raw_severity", "sum"),
+            )
+            .reset_index()
         )
-        work[f"{kpi}_weighted_severity"] = _severity(work[col], _ACTIVE_THRESHOLDS[kpi]) * getattr(_ACTIVE_WEIGHTS, kpi)
-    work["_severity"] = work[["rsrp_weighted_severity", "rsrq_weighted_severity", "sinr_weighted_severity"]].sum(axis=1)
-    site_map = fast_runtime.base._build_cell_site_map(antenna_df)[["Cell ID", "Site ID"]].copy()
-    work = work.merge(site_map, on="Cell ID", how="left")
-    summary = (
-        work.groupby("Cell ID", dropna=False)
-        .agg(
-            **{
-                "Bad RSRP": ("Bad RSRP", "sum"),
-                "Bad RSRQ": ("Bad RSRQ", "sum"),
-                "Bad SINR": ("Bad SINR", "sum"),
-                "Bad Grid Count": ("grid_id", "nunique"),
-                "combined_grid_severity": ("_severity", "sum"),
-            }
-        )
-        .reset_index()
+        for _, row in grouped.iterrows():
+            cell_id = str(row["Cell ID"])
+            record = cell_rows.setdefault(
+                cell_id,
+                {
+                    "Cell ID": cell_id,
+                    "Bad RSRP": 0,
+                    "Bad RSRQ": 0,
+                    "Bad SINR": 0,
+                    "rsrp_bad_severity": 0.0,
+                    "rsrq_bad_severity": 0.0,
+                    "sinr_bad_severity": 0.0,
+                },
+            )
+            record[bad_col] = int(row["bad_samples"])
+            record[sev_col] = float(row["bad_severity"])
+        for cell_id, cell_grids in kpi_work.groupby("Cell ID")["grid_id"]:
+            cell_grid_sets.setdefault(str(cell_id), set()).update(cell_grids.astype(str).tolist())
+
+    if not cell_rows:
+        return pd.DataFrame(), grid_metrics
+
+    summary = pd.DataFrame(cell_rows.values())
+    summary["Bad Grid Count"] = summary["Cell ID"].astype(str).map(lambda cell_id: len(cell_grid_sets.get(cell_id, set())))
+    summary["combined_grid_severity"] = (
+        summary["rsrp_bad_severity"] * float(_ACTIVE_WEIGHTS.rsrp)
+        + summary["rsrq_bad_severity"] * float(_ACTIVE_WEIGHTS.rsrq)
+        + summary["sinr_bad_severity"] * float(_ACTIVE_WEIGHTS.sinr)
     )
     summary["Bad Samples"] = summary[["Bad RSRP", "Bad RSRQ", "Bad SINR"]].sum(axis=1)
     summary["total_bad_samples"] = summary["Bad Samples"]
-    return summary.sort_values(["Bad Grid Count", "combined_grid_severity", "Bad Samples", "Cell ID"], ascending=[False, False, False, True]).reset_index(drop=True), grid_metrics
+    site_map = fast_runtime.base._build_cell_site_map(antenna_df)[["Cell ID", "Site ID"]].copy()
+    if not site_map.empty:
+        summary = summary.merge(site_map, on="Cell ID", how="left")
+    summary = summary.sort_values(["Bad Grid Count", "combined_grid_severity", "Bad Samples", "Cell ID"], ascending=[False, False, False, True]).reset_index(drop=True)
+    return _weighted_kpi_cell_order(summary), grid_metrics
 
 
 def _grid_validation_payload_combined(
@@ -367,23 +483,53 @@ def _prepare_scope_export_combined(df: pd.DataFrame, threshold: float, stage: st
 
 
 def _score_candidate_on_frontend_grids(
+    baseline_df: pd.DataFrame,
     candidate_df: pd.DataFrame,
     config,
     grid_analytics_df: Optional[pd.DataFrame],
 ) -> Optional[Dict[str, float]]:
     if grid_analytics_df is None or grid_analytics_df.empty:
         return None
-    baseline_grid = _grid_reference_metrics_combined(grid_analytics_df, threshold=0.0)
+    frontend_grid = _grid_reference_metrics_combined(grid_analytics_df, threshold=0.0)
+    model_baseline_grid = _aggregate_grid_metrics_combined(baseline_df, threshold=0.0)
     candidate_grid = _aggregate_grid_metrics_combined(candidate_df, threshold=0.0)
-    if baseline_grid.empty or candidate_grid.empty:
+    if frontend_grid.empty or model_baseline_grid.empty or candidate_grid.empty:
         return None
+
     compare_cols = ["grid_id", "avg_rsrp", "avg_rsrq", "avg_sinr"]
-    merged = baseline_grid[compare_cols].merge(
+    delta_source = model_baseline_grid[compare_cols].merge(
         candidate_grid[compare_cols],
         on="grid_id",
         how="inner",
-        suffixes=("_base", "_cand"),
+        suffixes=("_model_base", "_model_cand"),
     )
+    if delta_source.empty:
+        return None
+    for kpi in ["rsrp", "rsrq", "sinr"]:
+        delta_source[f"avg_{kpi}_delta"] = (
+            pd.to_numeric(delta_source[f"avg_{kpi}_model_cand"], errors="coerce")
+            - pd.to_numeric(delta_source[f"avg_{kpi}_model_base"], errors="coerce")
+        )
+
+    merged = frontend_grid[compare_cols].rename(
+        columns={
+            "avg_rsrp": "avg_rsrp_base",
+            "avg_rsrq": "avg_rsrq_base",
+            "avg_sinr": "avg_sinr_base",
+        }
+    )
+    merged = merged.merge(
+        delta_source[["grid_id", "avg_rsrp_delta", "avg_rsrq_delta", "avg_sinr_delta"]],
+        on="grid_id",
+        how="left",
+    )
+    for kpi in ["rsrp", "rsrq", "sinr"]:
+        base_col = f"avg_{kpi}_base"
+        delta_col = f"avg_{kpi}_delta"
+        cand_col = f"avg_{kpi}_cand"
+        merged[base_col] = pd.to_numeric(merged[base_col], errors="coerce")
+        merged[cand_col] = merged[base_col] + pd.to_numeric(merged[delta_col], errors="coerce").fillna(0.0)
+    merged = merged.dropna(subset=["grid_id"]).copy()
     if merged.empty:
         return None
 
@@ -436,12 +582,54 @@ def _score_candidate_on_frontend_grids(
 
     recovered_combined = int((base_bad_any & ~cand_bad_any).sum())
     new_bad_combined = int((~base_bad_any & cand_bad_any).sum())
-    baseline_bad_count = int(base_bad_any.sum())
-    candidate_bad_count = int(cand_bad_any.sum())
-    net_bad_reduction = baseline_bad_count - candidate_bad_count
-    baseline_good = int((~base_bad_any).sum())
-    good_area_loss_pct = (float(new_bad_combined) / float(baseline_good) * 100.0) if baseline_good > 0 else 0.0
-    net_bad_reduction_share = float(net_bad_reduction) / evaluation_grid_count
+    combined_baseline_bad_count = int(base_bad_any.sum())
+    combined_candidate_bad_count = int(cand_bad_any.sum())
+    combined_net_bad_reduction = combined_baseline_bad_count - combined_candidate_bad_count
+
+    active_weights = {
+        kpi: float(getattr(_ACTIVE_WEIGHTS, kpi))
+        for kpi in ["rsrp", "rsrq", "sinr"]
+        if float(getattr(_ACTIVE_WEIGHTS, kpi)) > 0.0
+    }
+    weight_sum = max(float(sum(active_weights.values())), 1.0)
+    weighted_before_bad_count = sum(
+        (weight / weight_sum) * _safe_float(metrics.get(f"frontend_{kpi}_before_bad_grid_count"))
+        for kpi, weight in active_weights.items()
+    )
+    weighted_after_bad_count = sum(
+        (weight / weight_sum) * _safe_float(metrics.get(f"frontend_{kpi}_after_bad_grid_count"))
+        for kpi, weight in active_weights.items()
+    )
+    weighted_recovered_bad = sum(
+        (weight / weight_sum) * _safe_float(metrics.get(f"{kpi}_recovered_bad"))
+        for kpi, weight in active_weights.items()
+    )
+    weighted_new_bad = sum(
+        (weight / weight_sum) * _safe_float(metrics.get(f"{kpi}_new_bad"))
+        for kpi, weight in active_weights.items()
+    )
+    weighted_net_bad_reduction = weighted_before_bad_count - weighted_after_bad_count
+
+    max_weight = max(_ACTIVE_WEIGHTS.rsrp, _ACTIVE_WEIGHTS.rsrq, _ACTIVE_WEIGHTS.sinr)
+    priority_kpis = [kpi for kpi in ["rsrp", "rsrq", "sinr"] if float(getattr(_ACTIVE_WEIGHTS, kpi)) == float(max_weight) and max_weight > 0.0]
+    if len(priority_kpis) == 1:
+        decision_kpi = priority_kpis[0]
+        baseline_bad_count = _safe_float(metrics.get(f"frontend_{decision_kpi}_before_bad_grid_count"))
+        candidate_bad_count = _safe_float(metrics.get(f"frontend_{decision_kpi}_after_bad_grid_count"))
+        recovered_bad_count = _safe_float(metrics.get(f"{decision_kpi}_recovered_bad"))
+        new_bad_count = _safe_float(metrics.get(f"{decision_kpi}_new_bad"))
+        net_bad_reduction = baseline_bad_count - candidate_bad_count
+        decision_scope = f"priority_kpi_frontend_{decision_kpi}"
+    else:
+        baseline_bad_count = weighted_before_bad_count
+        candidate_bad_count = weighted_after_bad_count
+        recovered_bad_count = weighted_recovered_bad
+        new_bad_count = weighted_new_bad
+        net_bad_reduction = weighted_net_bad_reduction
+        decision_scope = "weighted_frontend_kpi_blend"
+
+    good_area_loss_pct = (float(weighted_new_bad) / evaluation_grid_count) * 100.0
+    net_bad_reduction_share = float(weighted_net_bad_reduction) / evaluation_grid_count
     weighted_score = (
         _ACTIVE_WEIGHTS.rsrp * _frontend_grid_component(metrics, "rsrp")
         + _ACTIVE_WEIGHTS.rsrq * _frontend_grid_component(metrics, "rsrq")
@@ -450,8 +638,6 @@ def _score_candidate_on_frontend_grids(
         - good_area_loss_pct * 0.0025
     )
 
-    max_weight = max(_ACTIVE_WEIGHTS.rsrp, _ACTIVE_WEIGHTS.rsrq, _ACTIVE_WEIGHTS.sinr)
-    priority_kpis = [kpi for kpi in ["rsrp", "rsrq", "sinr"] if float(getattr(_ACTIVE_WEIGHTS, kpi)) == float(max_weight) and max_weight > 0.0]
     priority_worsened = any(_safe_float(metrics.get(f"frontend_{kpi}_net_bad_grid_reduction")) < 0.0 for kpi in priority_kpis)
     constraints_passed = good_area_loss_pct <= max(float(config.max_good_area_loss_pct), 15.0) and not priority_worsened
     if not constraints_passed:
@@ -461,12 +647,21 @@ def _score_candidate_on_frontend_grids(
         {
             "baseline_bad_count": float(baseline_bad_count),
             "candidate_bad_count": float(candidate_bad_count),
-            "recovered_bad_samples": float(recovered_combined),
-            "new_bad_samples": float(new_bad_combined),
+            "recovered_bad_samples": float(recovered_bad_count),
+            "new_bad_samples": float(new_bad_count),
             "net_bad_reduction": float(net_bad_reduction),
             "net_bad_reduction_share": float(net_bad_reduction_share),
-            "recovered_bad_share": float(recovered_combined) / evaluation_grid_count,
-            "new_bad_share": float(new_bad_combined) / evaluation_grid_count,
+            "recovered_bad_share": float(recovered_bad_count) / evaluation_grid_count,
+            "new_bad_share": float(new_bad_count) / evaluation_grid_count,
+            "weighted_frontend_before_bad_grid_count": float(weighted_before_bad_count),
+            "weighted_frontend_after_bad_grid_count": float(weighted_after_bad_count),
+            "weighted_frontend_net_bad_grid_reduction": float(weighted_net_bad_reduction),
+            "combined_any_before_bad_grid_count": float(combined_baseline_bad_count),
+            "combined_any_after_bad_grid_count": float(combined_candidate_bad_count),
+            "combined_any_net_bad_grid_reduction": float(combined_net_bad_reduction),
+            "combined_any_recovered_bad": float(recovered_combined),
+            "combined_any_new_bad": float(new_bad_combined),
+            "decision_scope": decision_scope,
             "total_severity_reduction": float(total_severity_reduction),
             "combined_weighted_severity_reduction": float(weighted_severity_reduction),
             "good_area_loss_pct": float(good_area_loss_pct),
@@ -474,8 +669,8 @@ def _score_candidate_on_frontend_grids(
             "constraints_passed": float(1 if constraints_passed else 0),
             "priority_kpi_worsened": float(1 if priority_worsened else 0),
             "frontend_scoring_used": 1.0,
-            "grid_scoring_source": "frontend_grid_analytics_common_grid_weighted_kpi_formula",
-            "validation_scope": "frontend_grid_analytics_common_grid_population",
+            "grid_scoring_source": "frontend_grid_analytics_plus_candidate_rf_delta_weighted_kpi_formula",
+            "validation_scope": "frontend_grid_analytics_population_with_candidate_rf_delta",
         }
     )
     return metrics
@@ -488,7 +683,7 @@ def _score_candidate_combined(
     config,
     grid_analytics_df: Optional[pd.DataFrame] = None,
 ) -> Dict[str, float]:
-    frontend_metrics = _score_candidate_on_frontend_grids(candidate_df, config, grid_analytics_df)
+    frontend_metrics = _score_candidate_on_frontend_grids(baseline_df, candidate_df, config, grid_analytics_df)
     if frontend_metrics is not None:
         frontend_metrics["combined_rsrp_weight"] = float(_ACTIVE_WEIGHTS.rsrp)
         frontend_metrics["combined_rsrq_weight"] = float(_ACTIVE_WEIGHTS.rsrq)
@@ -751,7 +946,8 @@ def _move_run_dir_to_combined_name(run_dir: Path) -> Path:
             "sinr": _ACTIVE_WEIGHTS.sinr,
         }
         payload.setdefault("search", {})["kpi_formula_source"] = "tests.lte_tilt_combined_weighted_recommendation_test._score_candidate_combined"
-        payload.setdefault("search", {})["ranking_source"] = "combined_weighted_normalized_kpi_score"
+        payload.setdefault("search", {})["ranking_source"] = "weighted_kpi_cell_prioritization_plus_frontend_weighted_score"
+        payload.setdefault("search", {})["cell_prioritization"] = "weighted_per_kpi_bad_cell_slices_from_cli_weights"
         if isinstance(payload.get("best_candidate"), dict):
             payload["best_candidate"]["root_cause"] = "global_bad_grid_combined_weighted"
             payload["best_candidate"]["topology_root_cause"] = "global_bad_grid_combined_weighted"
