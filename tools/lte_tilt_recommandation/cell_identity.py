@@ -25,8 +25,7 @@ def canonical_cell_id(value: object) -> str:
     text = clean_cell_token(value).replace("p0", "")
     if not text:
         return ""
-    if "|" in text:
-        text = text.split("|")[-1].strip()
+    text = text.replace("|", "_")
     text = re.sub(r"\.0(?=_)|(?<=_)\.0", "", text)
     parts = [clean_cell_token(part).replace("p0", "") for part in text.split("_") if clean_cell_token(part)]
     if len(parts) >= 3:

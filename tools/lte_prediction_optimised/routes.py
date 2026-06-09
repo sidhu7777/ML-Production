@@ -28,6 +28,24 @@ def run_optimized():
 
 
 # ==========================================================
+# RUN OPTIMIZED PREDICTION FROM SAVED TILT RECOMMENDATIONS
+# ==========================================================
+@lte_prediction_op.route("/recommendation-optimized", methods=["POST"])
+def run_recommendation_optimized():
+    data = request.get_json() or {}
+
+    required_fields = ["project_id", "radius", "grid_resolution"]
+    for field in required_fields:
+        if field not in data:
+            return jsonify({"error": f"{field} is required"}), 400
+
+    data["region"] = str(data.get("region", "india")).lower()
+
+    result = service.submit_recommendation_optimization(data)
+    return jsonify(result), 202
+
+
+# ==========================================================
 # CHECK STATUS
 # ==========================================================
 @lte_prediction_op.route("/status/<job_id>", methods=["GET"])

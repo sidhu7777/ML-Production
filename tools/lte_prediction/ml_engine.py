@@ -17,6 +17,11 @@ from .geo_correction_pipeline import (
     prepare_building_df_for_rf,
     prepare_site_df_for_source_rf_export,
 )
+from .grid_sampling import (
+    assign_samples_to_relevant_cells,
+    build_grid_sample_points,
+    fetch_frontend_grid_cells,
+)
 from .Sector_wise_prediction_code_copy import run_prediction_from_api
 
 
@@ -461,11 +466,13 @@ def run_rf_prediction_fast(site_df, drive_df, building_df, params):
     polygons = _resolve_prediction_polygons(params, current_engine)
     serving_site_df = site_df.copy()
     building_export_df = building_df.copy()
+    aligned_prediction_polygons = polygons
     if polygons:
         import geopandas as gpd
 
         polygon_gdf = gpd.GeoDataFrame({"geometry": polygons}, crs="EPSG:4326")
         polygon_gdf, polygon_alignment = align_project_polygon_to_points(polygon_gdf, site_df)
+        aligned_prediction_polygons = list(polygon_gdf.geometry)
         serving_site_df = filter_sites_to_project_polygon(site_df, polygon_gdf)
         if serving_site_df.empty:
             raise ValueError("No serving LTE sites found inside the aligned project polygon")
@@ -500,6 +507,41 @@ def run_rf_prediction_fast(site_df, drive_df, building_df, params):
         f"unique_pci={_safe_nunique(site_export_df, 'PCI') if 'PCI' in site_export_df.columns else _safe_nunique(site_export_df, 'pci')}"
     )
 
+    prediction_points_df = pd.DataFrame()
+    use_frontend_grid_sampling = bool(params.get("use_frontend_grid_sampling", True))
+    if use_frontend_grid_sampling:
+        grid_df, frontend_grid_scenario_id = fetch_frontend_grid_cells(
+            current_engine,
+            int(params["project_id"]),
+            scenario_id=params.get("grid_analytics_scenario_id"),
+            grid_size_meters=params.get("frontend_grid_size_meters"),
+        )
+        if not grid_df.empty:
+            sample_df = build_grid_sample_points(
+                grid_df,
+                samples_per_axis=int(params.get("samples_per_grid_axis", 3) or 3),
+                clip_polygons=aligned_prediction_polygons,
+            )
+            prediction_points_df = assign_samples_to_relevant_cells(
+                sample_df,
+                site_export_df,
+                radius_m=float(params.get("radius", 500) or 500),
+                max_cells_per_grid=int(params.get("max_cells_per_grid", 3) or 3),
+                min_cells_per_grid=int(params.get("min_cells_per_grid", 1) or 1),
+                ensure_all_cells=bool(params.get("ensure_all_cells", True)),
+                min_grids_per_cell=int(params.get("min_grids_per_cell", 1) or 1),
+            )
+            if not prediction_points_df.empty:
+                print(
+                    f"[LTE][RF_SAMPLE_SOURCE] source=frontend_grid scenario_id={frontend_grid_scenario_id} "
+                    f"rows={len(prediction_points_df)} grids={prediction_points_df['frontend_grid_id'].nunique()} "
+                    f"cells={prediction_points_df['Node_Cell_ID'].nunique()}"
+                )
+        if prediction_points_df.empty:
+            print("[LTE][RF_SAMPLE_SOURCE] source=circular_cell_grid reason=no_frontend_grid_samples")
+    else:
+        print("[LTE][RF_SAMPLE_SOURCE] source=circular_cell_grid reason=frontend_grid_sampling_disabled")
+
     run_prediction_from_api({
         "site": site_path,
         "drive": None,
@@ -515,12 +557,26 @@ def run_rf_prediction_fast(site_df, drive_df, building_df, params):
         "outdir": temp_dir,
         "n_workers": params["workers"],
         "max_interference_sites": params.get("max_interference_sites", 50),
-        "calibrate": False
+        "calibrate": False,
+        "prediction_points_df": prediction_points_df,
     })
 
     pred_df = pd.read_csv(f"{temp_dir}/prediction_ALL_SITES.csv")
     override_polygon_wkt = str(params.get("polygon_wkt") or "").strip()
-    if override_polygon_wkt:
+    if not prediction_points_df.empty:
+        polygon_stats = {
+            "polygons_found": len(polygons or []),
+            "rows_before": len(pred_df),
+            "rows_after": len(pred_df),
+            "swapped": False,
+            "skipped": True,
+            "reason": "frontend_grid_samples_already_define_prediction_surface",
+        }
+        print(
+            f"[LTE][RF_OUTPUT_POLYGON] skipped=True reason={polygon_stats['reason']} "
+            f"rows_before={polygon_stats['rows_before']} rows_after={polygon_stats['rows_after']}"
+        )
+    elif override_polygon_wkt:
         polygons = _resolve_prediction_polygons(params, current_engine)
         pred_df = _filter_df_by_polygons(pred_df, polygons)
         polygon_stats = {

@@ -101,6 +101,14 @@ def _clean_id_series(series: pd.Series) -> pd.Series:
     return out.str[:-2].where(out.str.endswith(".0"), out)
 
 
+def _rf_identity_series(series: pd.Series) -> pd.Series:
+    out = series.astype(str).str.strip()
+    out = out.replace({"": pd.NA, "None": pd.NA, "none": pd.NA, "nan": pd.NA, "NaN": pd.NA, "<NA>": pd.NA})
+    out = out.str.replace("|", "_", regex=False)
+    out = out.str.replace(r"\.0(?=_|$)", "", regex=True)
+    return out
+
+
 def _build_node_cell_id(nodeb_series: pd.Series, cell_series: pd.Series) -> pd.Series:
     nodeb = _clean_id_series(nodeb_series)
     cell = _clean_id_series(cell_series)
@@ -113,11 +121,10 @@ def _build_node_cell_id(nodeb_series: pd.Series, cell_series: pd.Series) -> pd.S
 
 def _build_site_sector_node_cell_id(site_series: pd.Series, cell_series: pd.Series) -> pd.Series:
     site = site_series.astype(str).str.strip()
+    site = site.str[:-2].where(site.str.endswith(".0"), site)
     site = site.mask(site.isin(["", "None", "none", "nan", "NaN", "<NA>"]), "")
     cell = _clean_id_series(cell_series)
-    sector = cell.str.extract(r"_([^_]+)$", expand=False).fillna("")
-    sector_key = (site + "|" + sector).str.strip("|")
-    return (sector_key + "_" + cell).str.strip("_")
+    return (site + "_" + cell).str.strip("_")
 
 
 def _get_table_columns(current_engine, table_name: str) -> set[str]:
@@ -187,8 +194,7 @@ def _prepare_tilt_antenna_df(antenna_df: pd.DataFrame) -> pd.DataFrame:
     if "dashboard_site_id" not in out.columns and "nodeb_id" in out.columns:
         out["dashboard_site_id"] = _clean_id_series(out["nodeb_id"])
     if "Node_Cell_ID" in out.columns:
-        out["Node_Cell_ID"] = out["Node_Cell_ID"].astype(str).str.strip()
-        out["cell_id"] = out["Node_Cell_ID"]
+        out["Node_Cell_ID"] = _rf_identity_series(out["Node_Cell_ID"])
     alias_cols = {
         "latitude": "lat",
         "longitude": "lon",
@@ -205,11 +211,19 @@ def _prepare_tilt_antenna_df(antenna_df: pd.DataFrame) -> pd.DataFrame:
 
 def _prepare_tilt_log_df(log_df: pd.DataFrame, antenna_df: pd.DataFrame) -> pd.DataFrame:
     out = log_df.copy()
+    canonical_node_cell = pd.Series(pd.NA, index=out.index, dtype="object")
     if "nodeb_id_cell_id" in out.columns and "Node_Cell_ID" not in out.columns:
         out["Node_Cell_ID"] = out["nodeb_id_cell_id"].astype(str).str.strip()
+    if "nodeb_id_cell_id" in out.columns:
+        nodeb_cell_key = _rf_identity_series(out["nodeb_id_cell_id"])
+        canonical_node_cell = canonical_node_cell.where(canonical_node_cell.notna(), nodeb_cell_key)
     if "frontend_site_sector_key" in out.columns:
-        frontend_key = _clean_id_series(out["frontend_site_sector_key"])
+        frontend_key = _rf_identity_series(out["frontend_site_sector_key"])
+        canonical_node_cell = canonical_node_cell.where(canonical_node_cell.notna(), frontend_key)
         out["Node_Cell_ID"] = frontend_key.where(frontend_key.ne(""), out.get("Node_Cell_ID", frontend_key))
+    if "Node_Cell_ID" in out.columns:
+        node_cell_key = _rf_identity_series(out["Node_Cell_ID"])
+        canonical_node_cell = canonical_node_cell.where(canonical_node_cell.notna(), node_cell_key)
     if "Node_Cell_ID" in out.columns:
         node_cell = out["Node_Cell_ID"].astype(str).str.strip()
         split_source = node_cell.str.split("_", n=1, expand=True)
@@ -226,7 +240,9 @@ def _prepare_tilt_log_df(log_df: pd.DataFrame, antenna_df: pd.DataFrame) -> pd.D
     if "cell_id" in out.columns:
         out["cell_id"] = _clean_id_series(out["cell_id"])
         out["local_cell_id"] = out["cell_id"]
-    if {"nodeb_id", "cell_id"}.issubset(out.columns):
+    if canonical_node_cell.notna().any():
+        out["Node_Cell_ID"] = canonical_node_cell
+    elif {"nodeb_id", "cell_id"}.issubset(out.columns):
         out["Node_Cell_ID"] = _build_node_cell_id(out["nodeb_id"], out["cell_id"])
 
     if "Node_Cell_ID" in antenna_df.columns:
@@ -318,7 +334,7 @@ def _fetch_grid_analytics_df(current_engine, project_id: int, operator_input, is
             FROM grid_analytics_results
             WHERE {" AND ".join(filters)}
             GROUP BY scenario_id
-            ORDER BY max_created DESC, row_count DESC
+            ORDER BY row_count DESC, max_created DESC
             LIMIT 1
             """
         )
@@ -690,8 +706,9 @@ class RFOptimizationService:
             else:
                 log_df["clean_key"] = (
                     _clean_id_series(log_df["node_b_id"]) + "_" +
-                    _clean_id_series(log_df["cell_id"])
+            _clean_id_series(log_df["cell_id"])
                 )
+            log_df["clean_key"] = _rf_identity_series(log_df["clean_key"])
             operator_map = log_df.drop_duplicates("clean_key").set_index("clean_key")["operator"].to_dict()
             print(f"[TILT][OPERATOR_MAP] mapped_keys={len(operator_map)}")
 

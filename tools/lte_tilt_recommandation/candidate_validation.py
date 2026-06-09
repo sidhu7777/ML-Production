@@ -739,6 +739,9 @@ def _select_coordinate_target_cells(
         return []
     ant = opt_ml._normalize_site_df(_prepare_optimizer_site_df(antenna_df), log_stage="TILT_COORDINATE_TARGETS")
     tunable = set(ant["Node_Cell_ID"].astype(str).str.strip().tolist()) if "Node_Cell_ID" in ant.columns else set()
+    for alias_col in ["local_cell_id", "cell_id"]:
+        if alias_col in ant.columns:
+            tunable.update(ant[alias_col].astype(str).str.strip().tolist())
     if {"nodeb_id", "cell_id"}.issubset(ant.columns):
         tunable.update((ant["nodeb_id"].map(_clean_id) + "_" + ant["cell_id"].map(_clean_id)).astype(str).tolist())
     if {"node_b_id", "cell_id"}.issubset(ant.columns):

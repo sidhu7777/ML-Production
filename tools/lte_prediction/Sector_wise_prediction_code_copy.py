@@ -815,6 +815,17 @@ def main(args):
 
     # ── 6. RUN CELL-WISE PREDICTION ─────────────────────────────
     final_list = []
+    prediction_points_df = getattr(args, "prediction_points_df", None)
+    if isinstance(prediction_points_df, pd.DataFrame) and not prediction_points_df.empty:
+        prediction_points_df = prediction_points_df.copy()
+        prediction_points_df["Node_Cell_ID"] = prediction_points_df["Node_Cell_ID"].astype(str)
+        print(
+            f"[LTE][PREDICTION_POINTS_OVERRIDE] enabled=True rows={len(prediction_points_df)} "
+            f"cells={prediction_points_df['Node_Cell_ID'].nunique()} "
+            f"grids={prediction_points_df['frontend_grid_id'].nunique() if 'frontend_grid_id' in prediction_points_df.columns else 'n/a'}"
+        )
+    else:
+        prediction_points_df = pd.DataFrame()
 
     total_prediction_cells = len(unique_cells)
     for idx, cid in enumerate(unique_cells, start=1):
@@ -880,8 +891,32 @@ def main(args):
             "n_workers": args.n_workers,
         }
 
-        pts = generate_grid(site_rows, args.radius, args.grid_resolution)
-        print(f" Grid points: {len(pts)}")
+        if not prediction_points_df.empty:
+            point_cols = [
+                col for col in [
+                    "lat",
+                    "lon",
+                    "frontend_grid_id",
+                    "grid_id",
+                    "sample_index",
+                    "grid_center_lat",
+                    "grid_center_lon",
+                    "assignment_source",
+                ] if col in prediction_points_df.columns
+            ]
+            pts = prediction_points_df.loc[
+                prediction_points_df["Node_Cell_ID"].astype(str) == str(cid),
+                point_cols,
+            ].copy()
+            pts = pts.dropna(subset=["lat", "lon"]).drop_duplicates()
+            point_source = "frontend_grid_samples"
+        else:
+            pts = generate_grid(site_rows, args.radius, args.grid_resolution)
+            point_source = "circular_cell_grid"
+        print(f" Grid points: {len(pts)} source={point_source}")
+        if pts.empty:
+            print(f"[LTE][CELL_SKIP] cell={cid} reason=no_prediction_points source={point_source}")
+            continue
 
         rsrp, rsrq, sinr = compute_predictions_parallel(
             pts, site_rows, params, n_workers=args.n_workers, use_shared_pool=True

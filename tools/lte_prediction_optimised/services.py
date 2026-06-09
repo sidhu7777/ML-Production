@@ -1,6 +1,7 @@
 import uuid
 import threading
 import pandas as pd
+import numpy as np
 import os
 import datetime
 import traceback
@@ -13,8 +14,12 @@ from .ml_engine import (
     fetch_optimized_sites,
     compute_k1k2_for_cells,
     _compute_affected_cells,
+    _normalize_site_df,
     run_prediction_only_optimized,
+    replace_cells,
 )
+from ..lte_tilt_recommandation.cell_identity import canonical_cell_id
+from ..lte_tilt_recommandation.candidate_validation import _apply_rf_delta as _apply_recommendation_rf_delta
 
 # Global dictionary to track job status
 JOBS = {}
@@ -32,7 +37,7 @@ def _metric_range(df, col):
 def _df_summary(stage, df):
     print(f"[LTE_OPT][{stage}] shape={df.shape}")
     print(f"[LTE_OPT][{stage}] columns={list(df.columns)}")
-    for col in ["Node_Cell_ID", "cell_id", "node_b_id", "site_id", "Operator"]:
+    for col in ["Node_Cell_ID", "canonical_cell_id", "cell_id", "node_b_id", "site_id", "nodeb_id_cell_id", "Operator"]:
         if col in df.columns:
             print(f"[LTE_OPT][{stage}] distinct_{col}={int(df[col].nunique(dropna=True))}")
     for col in ["pred_rsrp", "pred_rsrq", "pred_sinr"]:
@@ -69,6 +74,213 @@ def _latest_baseline_job_id(project_id, region="india"):
     with current_engine.connect() as conn:
         row = conn.execute(query, {"project_id": int(project_id)}).fetchone()
     return str(row[0]) if row and row[0] is not None else None
+
+
+def _clean_id(value):
+    return canonical_cell_id(value)
+
+
+def _rf_id(value):
+    if pd.isna(value):
+        return ""
+    text = str(value).strip()
+    if text.lower() in {"", "none", "nan", "null", "<na>"}:
+        return ""
+    text = text.replace("|", "_")
+    while ".0_" in text:
+        text = text.replace(".0_", "_")
+    if text.endswith(".0"):
+        text = text[:-2]
+    return text.strip("_")
+
+
+def _cell_suffix(value):
+    text_value = _clean_id(value)
+    return text_value.rsplit("_", 1)[-1] if text_value else ""
+
+
+def _values_changed(current_value, recommended_value):
+    current_num = pd.to_numeric(pd.Series([current_value]), errors="coerce").iloc[0]
+    recommended_num = pd.to_numeric(pd.Series([recommended_value]), errors="coerce").iloc[0]
+    if pd.notna(current_num) and pd.notna(recommended_num):
+        return not np.isclose(float(current_num), float(recommended_num), equal_nan=True)
+    return str(current_value).strip() != str(recommended_value).strip()
+
+
+def _latest_recommendation_scenario_id(project_id, region, operator=None):
+    current_engine = _resolve_engine(region)
+    where_parts = ["project_id = :project_id"]
+    params = {"project_id": int(project_id)}
+    if operator:
+        where_parts.append("LOWER(TRIM(operator)) = :operator")
+        params["operator"] = str(operator).strip().lower()
+    query = text(
+        f"""
+        SELECT MAX(scenario_id)
+        FROM rf_optimization_results
+        WHERE {' AND '.join(where_parts)}
+        """
+    )
+    with current_engine.connect() as conn:
+        scenario_id = conn.execute(query, params).scalar()
+    if scenario_id is None:
+        op_msg = f" operator={operator}" if operator else ""
+        raise FileNotFoundError(f"No tilt recommendation rows found for project_id={project_id}{op_msg}")
+    return int(scenario_id)
+
+
+def _fetch_recommendation_rows(project_id, region, operator=None, recommendation_scenario_id=None):
+    scenario_id = recommendation_scenario_id
+    if scenario_id is None:
+        scenario_id = _latest_recommendation_scenario_id(project_id, region, operator=operator)
+
+    current_engine = _resolve_engine(region)
+    where_parts = ["project_id = :project_id", "scenario_id = :scenario_id"]
+    params = {"project_id": int(project_id), "scenario_id": int(scenario_id)}
+    if operator:
+        where_parts.append("LOWER(TRIM(operator)) = :operator")
+        params["operator"] = str(operator).strip().lower()
+
+    query = text(
+        f"""
+        SELECT
+            project_id,
+            scenario_id,
+            operator,
+            cell_id,
+            technology,
+            parameter,
+            current_value,
+            recommended_value,
+            reason,
+            swap_sector_detected,
+            rsrp_threshold,
+            rsrq_threshold,
+            sinr_threshold,
+            created_at
+        FROM rf_optimization_results
+        WHERE {' AND '.join(where_parts)}
+        ORDER BY cell_id, parameter, id
+        """
+    )
+    with current_engine.connect() as conn:
+        reco_df = pd.read_sql(query, conn, params=params)
+    if reco_df.empty:
+        raise FileNotFoundError(
+            f"No rows found in rf_optimization_results for project_id={project_id} scenario_id={scenario_id}"
+        )
+    return int(scenario_id), reco_df
+
+
+def _actionable_recommendations(reco_df):
+    work = reco_df.copy()
+    work["cell_id_clean"] = work["cell_id"].map(_rf_id)
+    work["parameter_norm"] = work["parameter"].astype(str).str.strip().str.lower()
+    changed_mask = work.apply(lambda row: _values_changed(row["current_value"], row["recommended_value"]), axis=1)
+    work = work.loc[changed_mask].copy()
+    supported = {
+        "etilt",
+        "e tilt",
+        "electrical tilt",
+        "azimuth",
+        "tx power",
+        "power",
+        "mechanical tilt",
+        "mtilt",
+        "height",
+        "antenna height",
+    }
+    work = work.loc[work["parameter_norm"].isin(supported)].copy()
+    if work.empty:
+        raise ValueError("Recommendation scenario has no actionable supported parameter changes")
+    return work
+
+
+def _site_match_mask(site_df, recommendation_cell_id):
+    rec_rf_id = _rf_id(recommendation_cell_id)
+    rec_id = _clean_id(recommendation_cell_id)
+    rec_suffix = _cell_suffix(rec_id)
+    node_cell_rf = site_df["Node_Cell_ID"].astype(str).map(_rf_id)
+    mask = node_cell_rf == rec_rf_id
+    if not mask.any() and "cell_id" in site_df.columns:
+        cell_rf = site_df["cell_id"].astype(str).map(_rf_id)
+        mask = cell_rf == rec_rf_id
+    if not mask.any():
+        node_cell = site_df["Node_Cell_ID"].astype(str).map(_clean_id)
+        mask = node_cell == rec_id
+    if not mask.any() and "cell_id" in site_df.columns:
+        cell_id = site_df["cell_id"].astype(str).map(_clean_id)
+        mask = cell_id == rec_id
+    if not mask.any() and rec_suffix and "cell_id" in site_df.columns:
+        cell_suffix = site_df["cell_id"].astype(str).map(_cell_suffix)
+        mask = cell_suffix == rec_suffix
+    return mask
+
+
+def _apply_recommendations_to_sites(site_df, actionable_df):
+    modified = _normalize_site_df(site_df, log_stage="RECOMMENDATION_OPT_INPUT")
+    compare_cols = ["lat", "lon", "azimuth", "electrical_tilt", "mechanical_tilt", "tx_power", "antenna_height"]
+    for col in compare_cols:
+        modified[f"orig_{col}"] = pd.to_numeric(modified[col], errors="coerce")
+
+    parameter_map = {
+        "etilt": "electrical_tilt",
+        "e tilt": "electrical_tilt",
+        "electrical tilt": "electrical_tilt",
+        "azimuth": "azimuth",
+        "tx power": "tx_power",
+        "power": "tx_power",
+        "mechanical tilt": "mechanical_tilt",
+        "mtilt": "mechanical_tilt",
+        "height": "antenna_height",
+        "antenna height": "antenna_height",
+    }
+
+    applied_rows = []
+    modified["optimization_applied"] = False
+    for _, row in actionable_df.iterrows():
+        target_col = parameter_map.get(str(row["parameter_norm"]))
+        if not target_col:
+            continue
+        mask = _site_match_mask(modified, row["cell_id_clean"])
+        if not mask.any():
+            applied_rows.append({
+                "recommendation_cell_id": row["cell_id"],
+                "parameter": row["parameter"],
+                "status": "not_matched_to_site",
+                "recommended_value": row["recommended_value"],
+            })
+            continue
+
+        rec_value = pd.to_numeric(pd.Series([row["recommended_value"]]), errors="coerce").iloc[0]
+        if pd.isna(rec_value):
+            applied_rows.append({
+                "recommendation_cell_id": row["cell_id"],
+                "parameter": row["parameter"],
+                "status": "invalid_recommended_value",
+                "recommended_value": row["recommended_value"],
+            })
+            continue
+
+        before_values = modified.loc[mask, target_col].tolist()
+        modified.loc[mask, target_col] = float(rec_value)
+        modified.loc[mask, "optimization_applied"] = True
+        for node_cell_id, before_value in zip(modified.loc[mask, "Node_Cell_ID"].astype(str), before_values):
+            applied_rows.append({
+                "recommendation_cell_id": row["cell_id"],
+                "matched_node_cell_id": node_cell_id,
+                "parameter": row["parameter"],
+                "target_column": target_col,
+                "current_value": before_value,
+                "recommended_value": float(rec_value),
+                "status": "applied",
+                "reason": row.get("reason"),
+            })
+
+    applied_df = pd.DataFrame(applied_rows)
+    if applied_df.empty or not (applied_df["status"].astype(str) == "applied").any():
+        raise ValueError("No tilt recommendation rows could be applied to site_prediction rows")
+    return modified, applied_df
 
 
 def _build_scenario_name(cfg):
@@ -157,6 +369,51 @@ class LTEPredictionService_optimised:
 
         return {"job_id": job_id, "scenario_id": scenario_id, "scenario_row_id": scenario_row_id}
 
+    def submit_recommendation_optimization(self, cfg):
+        job_id = str(uuid.uuid4())
+        region = str(cfg.get("region", "india")).lower()
+        recommendation_scenario_id = cfg.get("recommendation_scenario_id")
+        operator = cfg.get("operator")
+        if recommendation_scenario_id is None:
+            recommendation_scenario_id = _latest_recommendation_scenario_id(
+                cfg["project_id"],
+                region,
+                operator=operator,
+            )
+        cfg["recommendation_scenario_id"] = int(recommendation_scenario_id)
+        cfg.setdefault("target_type", "recommendation")
+        cfg.setdefault("target_id", f"rf_scenario_{int(recommendation_scenario_id)}")
+        cfg.setdefault("scenario_name", f"Tilt Recommendation Optimization - RF Scenario {int(recommendation_scenario_id)}")
+        cfg.setdefault(
+            "scenario_description",
+            f"Apply saved tilt recommendation scenario {int(recommendation_scenario_id)} and run cell-level optimized prediction",
+        )
+
+        scenario_row_id, scenario_id = self._create_scenario(cfg, job_id, region)
+        cfg["scenario_row_id"] = scenario_row_id
+        cfg["scenario_id"] = scenario_id
+
+        JOBS[job_id] = {
+            "status": "queued",
+            "scenario_row_id": scenario_row_id,
+            "scenario_id": scenario_id,
+            "recommendation_scenario_id": int(recommendation_scenario_id),
+            "project_id": int(cfg["project_id"]),
+        }
+
+        threading.Thread(
+            target=self._run_recommendation_optimization,
+            args=(job_id, cfg),
+            daemon=True,
+        ).start()
+
+        return {
+            "job_id": job_id,
+            "scenario_id": scenario_id,
+            "scenario_row_id": scenario_row_id,
+            "recommendation_scenario_id": int(recommendation_scenario_id),
+        }
+
     def get(self, job_id):
         return JOBS.get(job_id)
 
@@ -178,14 +435,19 @@ class LTEPredictionService_optimised:
             project_id = cfg["project_id"]
             operator = cfg.get("operator", "Airtel")
 
-            baseline_df = fetch_baseline(project_id, region=region)
+            baseline_df = fetch_baseline(project_id, region=region, operator=operator)
             _df_summary("BASELINE_DF", baseline_df)
             baseline_job_id = None
             if "job_id" in baseline_df.columns and not baseline_df["job_id"].dropna().empty:
                 baseline_job_id = str(baseline_df["job_id"].dropna().iloc[0]).strip()
 
             self._update(job_id, "running", "Loading site data")
-            site_df = fetch_site_data(project_id, region=region, operator=operator)
+            site_df = fetch_site_data(
+                project_id,
+                region=region,
+                operator=operator,
+                allowed_cells=baseline_df["Node_Cell_ID"].astype(str).unique().tolist(),
+            )
             _df_summary("SITE_DF", site_df)
 
             self._update(job_id, "running", f"Loading optimized sites for {operator}")
@@ -201,10 +463,13 @@ class LTEPredictionService_optimised:
                 opt_sites,
                 float(cfg.get("impact_radius_m", cfg.get("radius", 500)) or cfg.get("radius", 500) or 500),
                 int(cfg.get("neighbor_site_count", 2) or 2),
+                baseline_df=baseline_df,
+                max_neighbors_per_update_cell=cfg.get("max_neighbors_per_update_cell", cfg.get("neighbor_site_count", 2) or 2),
             )
-            calibration_cells = sorted(changed_rows["Node_Cell_ID"].astype(str).unique().tolist())
+            changed_cells = sorted(changed_rows["Node_Cell_ID"].astype(str).unique().tolist())
+            calibration_cells = sorted(affected_cells)
             print(
-                f"[LTE_OPT][K1K2_LOCAL_SCOPE] changed_cells={len(calibration_cells)} "
+                f"[LTE_OPT][K1K2_LOCAL_SCOPE] changed_cells={len(changed_cells)} "
                 f"affected_cells={len(affected_cells)} calibration_cells={calibration_cells}"
             )
             k1k2_map = compute_k1k2_for_cells(baseline_df, opt_sites, calibration_cells)
@@ -226,6 +491,9 @@ class LTEPredictionService_optimised:
                 "impact_radius_m": cfg.get("impact_radius_m", cfg.get("radius", 500) or 500),
                 "neighbor_site_count": cfg.get("neighbor_site_count", 2) or 2,
                 "max_interference_sites": cfg.get("max_interference_sites", 10) or 10,
+                "max_neighbors_per_update_cell": cfg.get("max_neighbors_per_update_cell", cfg.get("neighbor_site_count", 2) or 2),
+                "baseline_df": baseline_df,
+                "recompute_cells": affected_cells,
             }
 
             self._update(job_id, "running", "Running prediction")
@@ -241,13 +509,154 @@ class LTEPredictionService_optimised:
             # Save the CSV
             file_path = self._save_csv(optimized_df, project_id, operator)
 
-            db_df = self._format_for_db(optimized_df, project_id, job_id, operator, scenario_id=scenario_id)
+            db_df = self._format_for_db(optimized_df, project_id, job_id, operator, scenario_id=scenario_row_id)
             _df_summary("OPTIMIZED_DB_PAYLOAD", db_df)
 
             self._save_to_db(db_df, region=region)
 
             JOBS[job_id]["output"] = file_path
             JOBS[job_id]["rows"] = len(optimized_df)
+
+            if scenario_row_id:
+                self._update_scenario_status(int(scenario_row_id), "done", region=region, job_id=job_id)
+            self._update(job_id, "done", "Completed")
+
+        except Exception as e:
+            JOBS[job_id]["status"] = "failed"
+            JOBS[job_id]["error"] = str(e)
+            if scenario_row_id:
+                self._update_scenario_status(int(scenario_row_id), "failed", region=region, job_id=job_id)
+            print(" ERROR:", traceback.format_exc())
+
+    def _run_recommendation_optimization(self, job_id, cfg):
+        scenario_id = cfg.get("scenario_id")
+        scenario_row_id = cfg.get("scenario_row_id")
+        recommendation_scenario_id = cfg.get("recommendation_scenario_id")
+        region = str(cfg.get("region", "india")).lower()
+        try:
+            project_id = cfg["project_id"]
+            operator = cfg.get("operator")
+            print(
+                f"[LTE_OPT][RECOMMENDATION_JOB_START] job_id={job_id} project_id={project_id} "
+                f"region={region} operator={operator} recommendation_scenario_id={recommendation_scenario_id}"
+            )
+            if scenario_row_id:
+                self._update_scenario_status(int(scenario_row_id), "running", region=region, job_id=job_id)
+
+            self._update(job_id, "running", "Loading recommendation rows")
+            recommendation_scenario_id, reco_df = _fetch_recommendation_rows(
+                project_id,
+                region,
+                operator=operator,
+                recommendation_scenario_id=recommendation_scenario_id,
+            )
+            actionable_df = _actionable_recommendations(reco_df)
+            _df_summary("RECOMMENDATION_ROWS", reco_df)
+            _df_summary("RECOMMENDATION_ACTIONABLE_ROWS", actionable_df)
+
+            self._update(job_id, "running", "Loading baseline")
+            baseline_df = fetch_baseline(project_id, region=region, operator=operator)
+            _df_summary("BASELINE_DF", baseline_df)
+            baseline_job_id = None
+            if "job_id" in baseline_df.columns and not baseline_df["job_id"].dropna().empty:
+                baseline_job_id = str(baseline_df["job_id"].dropna().iloc[0]).strip()
+
+            self._update(job_id, "running", "Loading site data")
+            site_df = fetch_site_data(
+                project_id,
+                region=region,
+                operator=operator,
+                allowed_cells=baseline_df["Node_Cell_ID"].astype(str).unique().tolist(),
+            )
+            _df_summary("SITE_DF", site_df)
+
+            self._update(job_id, "running", "Applying recommendation changes")
+            modified_site_df, applied_df = _apply_recommendations_to_sites(site_df, actionable_df)
+            _df_summary("RECOMMENDATION_APPLIED_ROWS", applied_df)
+            _df_summary("RECOMMENDATION_MODIFIED_SITE_DF", modified_site_df)
+
+            affected_cells, affected_sites, changed_rows = _compute_affected_cells(
+                modified_site_df,
+                float(cfg.get("impact_radius_m", cfg.get("radius", 500)) or cfg.get("radius", 500) or 500),
+                int(cfg.get("neighbor_site_count", 2) or 2),
+                baseline_df=baseline_df,
+                max_neighbors_per_update_cell=cfg.get("max_neighbors_per_update_cell", cfg.get("neighbor_site_count", 2) or 2),
+            )
+            changed_cells = sorted(changed_rows["Node_Cell_ID"].astype(str).unique().tolist())
+            calibration_cells = sorted(affected_cells)
+            print(
+                f"[LTE_OPT][RECOMMENDATION_SCOPE] changed_cells={len(changed_cells)} "
+                f"affected_cells={len(affected_cells)} affected_sites={len(affected_sites)} "
+                f"recommendation_scenario_id={recommendation_scenario_id}"
+            )
+
+            self._update(job_id, "running", "Calculating local K1/K2")
+            k1k2_map = compute_k1k2_for_cells(baseline_df, modified_site_df, calibration_cells)
+            if not k1k2_map:
+                raise ValueError("No calibrated cells found after applying recommendation changes")
+
+            params = {
+                "radius": cfg.get("radius", 500),
+                "grid_resolution": cfg.get("grid_resolution", 10),
+                "n_workers": cfg.get("n_workers"),
+                "antenna_gain": 18,
+                "cable_loss": 2,
+                "ue_height": 1.5,
+                "frequency_mhz": 1800,
+                "bandwidth_mhz": 10,
+                "project_id": project_id,
+                "region": region,
+                "baseline_job_id": baseline_job_id,
+                "baseline_df": baseline_df,
+                "prediction_points_df": baseline_df,
+                "strict_prediction_points": True,
+                "impact_radius_m": cfg.get("impact_radius_m", cfg.get("radius", 500) or 500),
+                "neighbor_site_count": cfg.get("neighbor_site_count", 2) or 2,
+                "max_interference_sites": cfg.get("max_interference_sites", 10) or 10,
+                "max_neighbors_per_update_cell": cfg.get("max_neighbors_per_update_cell", cfg.get("neighbor_site_count", 2) or 2),
+                "recompute_cells": affected_cells,
+            }
+
+            self._update(job_id, "running", "Running recommendation optimized prediction")
+            baseline_rf_df = run_prediction_only_optimized(site_df, k1k2_map, params)
+            optimized_df = run_prediction_only_optimized(modified_site_df, k1k2_map, params)
+            if optimized_df.empty:
+                raise RuntimeError("Recommendation optimization produced no prediction rows")
+            merged_df, rf_delta_metrics = _apply_recommendation_rf_delta(
+                baseline_df,
+                baseline_rf_df,
+                optimized_df,
+            )
+            print(f"[LTE_OPT][RECOMMENDATION_RF_DELTA] {rf_delta_metrics}")
+            _df_summary("RECOMMENDATION_BASELINE_RF_OUTPUT_DF", baseline_rf_df)
+            _df_summary("RECOMMENDATION_OPTIMIZED_RF_OUTPUT_DF", optimized_df)
+            _df_summary("RECOMMENDATION_OPTIMIZED_DELTA_APPLIED_DF", merged_df)
+
+            self._update(job_id, "running", "Saving CSV")
+            file_path = self._save_csv(merged_df, project_id, operator or "recommendation")
+
+            db_df = self._format_for_db(
+                merged_df,
+                project_id,
+                job_id,
+                operator or "Recommendation",
+                scenario_id=scenario_row_id,
+            )
+            _df_summary("RECOMMENDATION_OPTIMIZED_DB_PAYLOAD", db_df)
+            self._save_to_db(db_df, region=region)
+
+            JOBS[job_id].update({
+                "output": file_path,
+                "rows": len(merged_df),
+                "optimized_rows": len(optimized_df),
+                "merged_rows": len(merged_df),
+                "recommendation_scenario_id": int(recommendation_scenario_id),
+                "actionable_recommendation_rows": int(len(actionable_df)),
+                "applied_recommendation_rows": int((applied_df["status"].astype(str) == "applied").sum()),
+                "changed_cells": int(changed_rows["Node_Cell_ID"].nunique()),
+                "affected_cells": int(len(affected_cells)),
+                "affected_sites": int(len(affected_sites)),
+            })
 
             if scenario_row_id:
                 self._update_scenario_status(int(scenario_row_id), "done", region=region, job_id=job_id)
@@ -297,15 +706,21 @@ class LTEPredictionService_optimised:
         import datetime
 
         df = df.copy()
+        if "Node_Cell_ID" not in df.columns:
+            if "nodeb_id_cell_id" in df.columns:
+                df["Node_Cell_ID"] = df["nodeb_id_cell_id"].astype(str)
+            else:
+                raise ValueError("Missing Node_Cell_ID/nodeb_id_cell_id in optimized output")
 
-        split_cols = df["Node_Cell_ID"].str.split("_", expand=True)
-
+        raw_node_cell = df["nodeb_id_cell_id"].astype(str) if "nodeb_id_cell_id" in df.columns else df["Node_Cell_ID"].astype(str)
+        canonical = df["canonical_cell_id"].astype(str) if "canonical_cell_id" in df.columns else df["Node_Cell_ID"].map(_clean_id)
+        split_cols = canonical.astype(str).str.split("_", expand=True)
         if split_cols.shape[1] < 2:
-            raise ValueError(" Invalid Node_Cell_ID format")
+            raise ValueError("Invalid canonical cell identity format")
 
-        df["node_b_id"] = split_cols[0].astype(str)
-        df["cell_id"] = split_cols[1].astype(str)
-        df["nodeb_id_cell_id"] = df["node_b_id"] + "_" + df["cell_id"]
+        df["node_b_id"] = df["node_b_id"].astype(str) if "node_b_id" in df.columns else split_cols[0].astype(str)
+        df["cell_id"] = df["cell_id"].astype(str) if "cell_id" in df.columns else canonical
+        df["nodeb_id_cell_id"] = raw_node_cell.astype(str)
 
         df["project_id"] = project_id
         df["job_id"] = job_id
@@ -343,23 +758,83 @@ class LTEPredictionService_optimised:
 
     def _get_next_project_scenario_id(self, project_id, current_engine):
         query = text("""
-            SELECT COALESCE(MAX(scenario_id), 0) + 1
+            SELECT scenario_id
+            FROM lte_optimization_scenarios
+            WHERE project_id = :project_id
+              AND scenario_id IS NOT NULL
+            ORDER BY scenario_id ASC
+        """)
+        with current_engine.connect() as conn:
+            used_ids = {
+                int(row[0])
+                for row in conn.execute(query, {"project_id": int(project_id)}).fetchall()
+                if row[0] is not None
+            }
+        for scenario_id in range(1, 7):
+            if scenario_id not in used_ids:
+                return scenario_id
+        raise ValueError(
+            f"No available public scenario slot for project_id={int(project_id)}. "
+            "Scenario pruning did not free a 1..6 slot."
+        )
+
+    def _prune_oldest_project_scenario_if_needed(self, project_id, current_engine, max_scenarios=6):
+        count_query = text("""
+            SELECT COUNT(*)
             FROM lte_optimization_scenarios
             WHERE project_id = :project_id
         """)
-        with current_engine.connect() as conn:
-            next_id = conn.execute(query, {"project_id": int(project_id)}).scalar()
-        return int(next_id or 1)
+        oldest_query = text("""
+            SELECT id, scenario_id
+            FROM lte_optimization_scenarios
+            WHERE project_id = :project_id
+            ORDER BY COALESCE(created_at, updated_at, '1970-01-01') ASC, id ASC
+            LIMIT 1
+        """)
+        delete_results_query = text("""
+            DELETE FROM lte_prediction_optimised_results
+            WHERE scenario_id = :scenario_row_id
+        """)
+        delete_scenario_query = text("""
+            DELETE FROM lte_optimization_scenarios
+            WHERE id = :scenario_row_id
+        """)
+        with current_engine.begin() as conn:
+            pruned = []
+            while True:
+                scenario_count = int(conn.execute(count_query, {"project_id": int(project_id)}).scalar() or 0)
+                if scenario_count < int(max_scenarios):
+                    break
+                oldest = conn.execute(oldest_query, {"project_id": int(project_id)}).fetchone()
+                if not oldest:
+                    break
+                oldest_row_id = int(oldest[0])
+                oldest_public_scenario_id = int(oldest[1]) if oldest[1] is not None else None
+                results_deleted = conn.execute(
+                    delete_results_query,
+                    {"scenario_row_id": oldest_row_id},
+                ).rowcount
+                conn.execute(delete_scenario_query, {"scenario_row_id": oldest_row_id})
+                pruned.append(
+                    {
+                        "row_id": oldest_row_id,
+                        "scenario_id": oldest_public_scenario_id,
+                        "result_rows": int(results_deleted or 0),
+                    }
+                )
+        for item in pruned:
+            print(
+                f"[LTE_OPT][SCENARIO_PRUNE] project_id={int(project_id)} "
+                f"deleted_row_id={item['row_id']} deleted_public_scenario_id={item['scenario_id']} "
+                f"deleted_result_rows={item['result_rows']} max_scenarios={int(max_scenarios)}"
+            )
+        return pruned
 
     def _create_scenario(self, cfg, job_id, region):
         current_engine = _resolve_engine(region)
         baseline_job_id = cfg.get("baseline_job_id") or _latest_baseline_job_id(cfg["project_id"], region=region)
+        self._prune_oldest_project_scenario_if_needed(cfg["project_id"], current_engine, max_scenarios=6)
         public_scenario_id = self._get_next_project_scenario_id(cfg["project_id"], current_engine)
-        if public_scenario_id > 6:
-            raise ValueError(
-                f"Maximum scenario limit reached for project_id={int(cfg['project_id'])}. "
-                f"Only 6 scenarios are allowed per project."
-            )
         payload = {
             "project_id": int(cfg["project_id"]),
             "scenario_id": public_scenario_id,

@@ -199,7 +199,14 @@ class LTEPredictionService:
                     "radius": cfg["radius_m"],
                     "grid": cfg["grid_resolution"],
                     "workers": cfg["n_workers"],
-                    "max_interference_sites": cfg.get("max_interference_sites", 50)
+                    "max_interference_sites": cfg.get("max_interference_sites", 50),
+                    "use_frontend_grid_sampling": cfg.get("use_frontend_grid_sampling", True),
+                    "samples_per_grid_axis": cfg.get("samples_per_grid_axis", 3),
+                    "max_cells_per_grid": cfg.get("max_cells_per_grid", 3),
+                    "min_cells_per_grid": cfg.get("min_cells_per_grid", 1),
+                    "ensure_all_cells": cfg.get("ensure_all_cells", True),
+                    "min_grids_per_cell": cfg.get("min_grids_per_cell", 1),
+                    "grid_analytics_scenario_id": cfg.get("grid_analytics_scenario_id"),
                 }
             )
 
@@ -384,7 +391,12 @@ class LTEPredictionService:
             f"[LTE][BASELINE_DELTA] project_id={project_id} existing_rows={len(existing)} "
             f"delta_rows={len(delta)} unchanged_rows={unchanged}"
         )
-        return delta
+        if unchanged:
+            print(
+                f"[LTE][BASELINE_DELTA] write_full_payload=True reason=latest_job_id_requires_complete_snapshot "
+                f"rows={len(out)}"
+            )
+        return out
 
     def _upsert_baseline_results(self, save_engine, out: pd.DataFrame, project_id: int):
         table_name = "lte_prediction_baseline_results"
@@ -1007,6 +1019,8 @@ class LTEPredictionService:
 
         if "grid_id" not in geo_out.columns:
             geo_out["grid_id"] = pd.NA
+        if "frontend_grid_id" in geo_out.columns:
+            geo_out["grid_id"] = geo_out["frontend_grid_id"]
 
         geo_out["polygon_alignment"] = str(production_summary.get("polygon_alignment") or "")
         geo_out["building_alignment"] = str(production_summary.get("building_alignment") or "")
