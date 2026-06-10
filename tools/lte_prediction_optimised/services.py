@@ -509,7 +509,14 @@ class LTEPredictionService_optimised:
             # Save the CSV
             file_path = self._save_csv(optimized_df, project_id, operator)
 
-            db_df = self._format_for_db(optimized_df, project_id, job_id, operator, scenario_id=scenario_row_id)
+            db_df = self._format_for_db(
+                optimized_df,
+                project_id,
+                job_id,
+                operator,
+                scenario_id=scenario_row_id,
+                public_scenario_id=scenario_id,
+            )
             _df_summary("OPTIMIZED_DB_PAYLOAD", db_df)
 
             self._save_to_db(db_df, region=region)
@@ -641,6 +648,7 @@ class LTEPredictionService_optimised:
                 job_id,
                 operator or "Recommendation",
                 scenario_id=scenario_row_id,
+                public_scenario_id=scenario_id,
             )
             _df_summary("RECOMMENDATION_OPTIMIZED_DB_PAYLOAD", db_df)
             self._save_to_db(db_df, region=region)
@@ -687,6 +695,7 @@ class LTEPredictionService_optimised:
     
     def _save_to_db(self, df, region="india"):
         current_engine = _resolve_engine(region)
+        self._ensure_public_scenario_id_column(current_engine)
         print(
             f"[LTE_OPT][DB_WRITE] table=lte_prediction_optimised_results "
             f"mode=append rows={len(df)} region={region}"
@@ -701,8 +710,26 @@ class LTEPredictionService_optimised:
             method="multi"
         )
         print(" Data saved to DB")
+
+    def _ensure_public_scenario_id_column(self, current_engine):
+        check_sql = text("""
+            SELECT COUNT(*)
+            FROM information_schema.columns
+            WHERE table_schema = DATABASE()
+              AND table_name = 'lte_prediction_optimised_results'
+              AND column_name = 'public_scenario_id'
+        """)
+        alter_sql = text("""
+            ALTER TABLE lte_prediction_optimised_results
+            ADD COLUMN public_scenario_id INT NULL AFTER scenario_id
+        """)
+        with current_engine.begin() as conn:
+            exists = int(conn.execute(check_sql).scalar() or 0)
+            if not exists:
+                conn.execute(alter_sql)
+                print("[LTE_OPT][SCHEMA] added lte_prediction_optimised_results.public_scenario_id")
     
-    def _format_for_db(self, df, project_id, job_id, operator, scenario_id=None):
+    def _format_for_db(self, df, project_id, job_id, operator, scenario_id=None, public_scenario_id=None):
         import datetime
 
         df = df.copy()
@@ -730,6 +757,7 @@ class LTEPredictionService_optimised:
         df["created_at"] = datetime.datetime.now()
         df["site_id"] = df["node_b_id"]
         df["scenario_id"] = scenario_id
+        df["public_scenario_id"] = public_scenario_id
 
         final_df = df[[
             "project_id",
@@ -747,6 +775,7 @@ class LTEPredictionService_optimised:
             "nodeb_id_cell_id",
             "Operator",
             "scenario_id",
+            "public_scenario_id",
         ]]
 
         return final_df
