@@ -1,5 +1,6 @@
 import os
 import time
+import json
 
 import numpy as np
 import pandas as pd
@@ -20,6 +21,7 @@ from ..lte_prediction.geo_correction_pipeline import (
     apply_experimental_geo_adjustments,
 )
 from ..lte_tilt_recommandation.cell_identity import canonical_cell_id, canonical_pair
+from utils.python_bridge import get_bridge_client
 
 
 load_dotenv()
@@ -91,6 +93,30 @@ def _print_fetch_summary(stage, table_name, filters, df, extra=None):
     if extra:
         for key, value in extra.items():
             print(f"[LTE_OPT][{stage}] {key}={value}")
+
+
+def _sortable_series(series: pd.Series) -> pd.Series:
+    def _sortable_value(value):
+        if isinstance(value, (dict, list, tuple, set)):
+            try:
+                return json.dumps(value, sort_keys=True, default=str)
+            except TypeError:
+                return str(value)
+        return value
+
+    return series.map(_sortable_value)
+
+
+def _sort_site_rows(df: pd.DataFrame, sort_cols: list[str]) -> pd.DataFrame:
+    if not sort_cols:
+        return df
+    work = df.copy()
+    helper_cols = []
+    for col in sort_cols:
+        helper_col = f"__sort_{col}"
+        work[helper_col] = _sortable_series(work[col])
+        helper_cols.append(helper_col)
+    return work.sort_values(helper_cols).drop(columns=helper_cols)
 
 
 def _ensure_canonical_identity(df):
@@ -195,6 +221,13 @@ def _normalize_site_df(site_df, log_stage="SITE_INPUT"):
 
 
 def _fetch_latest_baseline_job_id(project_id, region="india"):
+    bridge = get_bridge_client()
+    if bridge:
+        payload = bridge._request("GET", "GetLatestLteBaselineJobId", params={"projectId": int(project_id)})
+        job_id = payload.get("JobId") or payload.get("jobId")
+        if not job_id:
+            raise FileNotFoundError(f"No baseline results found for project_id={project_id}")
+        return str(job_id)
     current_engine = engine.get(region.lower(), engine["india"])
     query = f"""
     SELECT job_id
@@ -210,6 +243,44 @@ def _fetch_latest_baseline_job_id(project_id, region="india"):
 
 
 def fetch_baseline(project_id, region="india", operator=None, baseline_job_id=None):
+    bridge = get_bridge_client()
+    if bridge:
+        if baseline_job_id is None:
+            baseline_job_id = _fetch_latest_baseline_job_id(project_id, region=region)
+        params = {
+            "projectId": int(project_id),
+            "region": region,
+            "jobId": str(baseline_job_id),
+        }
+        if operator:
+            params["operator"] = operator
+        page_limit = int(os.getenv("PYTHON_BRIDGE_BASELINE_PAGE_SIZE", "50000"))
+        df = bridge.get_rows("GetLteBaselineRows", params, limit=page_limit)
+        if df.empty:
+            raise FileNotFoundError(f"No baseline results found for project_id={project_id}")
+        if "job_id" in df.columns:
+            df = df.loc[df["job_id"].astype(str) == str(baseline_job_id)].copy()
+        if operator and "operator" in df.columns:
+            df = df.loc[df["operator"].astype(str).str.strip().str.lower() == str(operator).strip().lower()].copy()
+        if df.empty:
+            raise FileNotFoundError(f"No baseline results found for project_id={project_id} job_id={baseline_job_id}")
+        if "nodeb_id_cell_id" in df.columns:
+            df["Node_Cell_ID"] = df["nodeb_id_cell_id"].map(_rf_cell_id)
+            df["canonical_cell_id"] = df["nodeb_id_cell_id"].map(canonical_cell_id)
+        else:
+            df["Node_Cell_ID"] = df["cell_id"].map(_rf_cell_id)
+            df["canonical_cell_id"] = df["cell_id"].map(canonical_cell_id)
+        for col in ["best_interferer_cell_id", "neighbor_1_cell_id", "neighbor_2_cell_id"]:
+            if col in df.columns:
+                df[col] = df[col].map(_rf_cell_id)
+        df["rsrp"] = pd.to_numeric(df["pred_rsrp"], errors="coerce")
+        _print_fetch_summary(
+            "BASELINE_FETCH",
+            "lte_prediction_baseline_results via python_bridge",
+            {"project_id": project_id, "region": region, "operator": operator, "job_id": baseline_job_id},
+            df,
+        )
+        return df
     current_engine = engine.get(region.lower(), engine["india"])
     base_cols = ["lat", "lon", "pred_rsrp", "pred_rsrq", "pred_sinr", "cell_id", "nodeb_id_cell_id", "job_id"]
     optional_identity_cols = ["operator"]
@@ -281,6 +352,23 @@ def fetch_baseline(project_id, region="india", operator=None, baseline_job_id=No
 
 
 def fetch_geo_features(project_id, region="india", affected_cells=None, baseline_job_id=None):
+    bridge = get_bridge_client()
+    if bridge:
+        df = bridge.get_rows("GetLtePredictionGeoFeatures", {"projectId": int(project_id), "region": region}, limit=50000)
+        if "nodeb_id_cell_id" in df.columns:
+            df["Node_Cell_ID"] = df["nodeb_id_cell_id"].map(_rf_cell_id)
+        else:
+            df["Node_Cell_ID"] = pd.Series(dtype=str)
+        affected_cell_set = {_rf_cell_id(x) for x in (affected_cells or []) if _rf_cell_id(x)}
+        if affected_cell_set:
+            df = df.loc[df["Node_Cell_ID"].astype(str).isin(affected_cell_set)].copy()
+        _print_fetch_summary(
+            "GEO_FETCH",
+            "lte_prediction_geo_features via python_bridge",
+            {"project_id": project_id, "region": region, "affected_cell_count": len(affected_cells or [])},
+            df,
+        )
+        return df
     current_engine = engine.get(region.lower(), engine["india"])
     query = """
     SELECT
@@ -405,12 +493,86 @@ def _expand_site_rows_to_allowed_cells(df: pd.DataFrame, allowed_cells) -> pd.Da
     return out
 
 
-def fetch_site_data(project_id, region="india", operator=None, allowed_cells=None):
+def _parse_polygon_ids(polygon_ids=None):
+    if polygon_ids is None:
+        return []
+    if isinstance(polygon_ids, (list, tuple, set)):
+        raw_items = polygon_ids
+    else:
+        raw_items = str(polygon_ids).split(",")
+    ids = []
+    for item in raw_items:
+        try:
+            value = int(str(item).strip())
+        except (TypeError, ValueError):
+            continue
+        if value > 0 and value not in ids:
+            ids.append(value)
+    return ids
+
+
+def _site_polygon_filter_sql(table_name, polygon_ids):
+    if not polygon_ids:
+        return ""
+    id_list = ",".join(str(int(value)) for value in polygon_ids)
+    return f"""
+    AND EXISTS (
+        SELECT 1
+        FROM map_regions mr_filter
+        WHERE mr_filter.tbl_project_id = {table_name}.tbl_project_id
+          AND mr_filter.id IN ({id_list})
+          AND (
+            ST_Contains(
+              mr_filter.region,
+              ST_GeomFromText(CONCAT('POINT(', {table_name}.longitude, ' ', {table_name}.latitude, ')'), 4326)
+            )
+            OR ST_Contains(
+              mr_filter.region,
+              ST_GeomFromText(CONCAT('POINT(', {table_name}.latitude, ' ', {table_name}.longitude, ')'), 4326)
+            )
+          )
+    )
+    """
+
+
+def fetch_site_data(project_id, region="india", operator=None, allowed_cells=None, polygon_ids=None):
+    polygon_id_list = _parse_polygon_ids(polygon_ids)
+    bridge = get_bridge_client()
+    if bridge:
+        params = {"projectId": int(project_id)}
+        if polygon_id_list:
+            params["polygon_ids"] = ",".join(str(value) for value in polygon_id_list)
+        start_time = time.perf_counter()
+        raw_df = bridge.get_rows("GetLteSitePredictionRows", params, limit=50000)
+        elapsed_ms = (time.perf_counter() - start_time) * 1000
+        print(
+            f"[LTE_OPT][PYTHON_BRIDGE_TIMING] endpoint=GetLteSitePredictionRows "
+            f"project_id={project_id} region={region} rows={len(raw_df)} "
+            f"elapsed_ms={elapsed_ms:.0f} polygon_ids={params.get('polygon_ids', 'all')}"
+        )
+        df = _normalize_site_df(raw_df, log_stage="SITE_FETCH")
+        if operator:
+            operator_norm = str(operator).strip().lower()
+            if "cluster" in df.columns:
+                before_rows = len(df)
+                df = df.loc[df["cluster"].astype(str).str.strip().str.lower() == operator_norm].copy()
+                print(f"[LTE_OPT][SITE_FETCH] operator_filter={operator} rows_before={before_rows} rows_after={len(df)}")
+        if allowed_cells is not None:
+            before_rows = len(df)
+            before_cells = _safe_nunique(df, "Node_Cell_ID")
+            df = _expand_site_rows_to_allowed_cells(df, allowed_cells)
+            print(
+                f"[LTE_OPT][SITE_FETCH] baseline_population_filter=True rows_before={before_rows} rows_after={len(df)} "
+                f"cells_before={before_cells} cells_after={_safe_nunique(df, 'Node_Cell_ID')}"
+            )
+        _print_fetch_summary("SITE_FETCH", "site_prediction via python_bridge", {"project_id": project_id, "region": region, "operator": operator}, df)
+        return df
     current_engine = engine.get(region.lower(), engine["india"])
     query = f"""
     SELECT *
     FROM site_prediction
     WHERE tbl_project_id = {project_id}
+    {_site_polygon_filter_sql("site_prediction", polygon_id_list)}
     """
 
     raw_df = pd.read_sql(query, current_engine)
@@ -448,13 +610,126 @@ def fetch_site_data(project_id, region="india", operator=None, allowed_cells=Non
     return df
 
 
-def fetch_optimized_sites(project_id, operator, region="india"):
+def _resolve_latest_site_prediction_scenario(project_id, operator=None, region="india"):
+    current_engine = engine.get(region.lower(), engine["india"])
+    where = [f"tbl_project_id = {int(project_id)}", "scenario IS NOT NULL", "scenario > 0"]
+    if operator:
+        safe_operator = str(operator).replace("'", "''")
+        where.append(f"cluster = '{safe_operator}'")
+    query = f"""
+    SELECT MAX(scenario) AS scenario
+    FROM site_prediction_optimized
+    WHERE {" AND ".join(where)}
+    """
+    value = pd.read_sql(query, current_engine).iloc[0]["scenario"]
+    if pd.isna(value):
+        return None
+    return int(value)
+
+
+def fetch_optimized_sites(project_id, operator, region="india", polygon_ids=None, scenario=None):
+    polygon_id_list = _parse_polygon_ids(polygon_ids)
+    selected_scenario = None
+    if scenario is not None:
+        try:
+            selected_scenario = int(scenario)
+        except (TypeError, ValueError):
+            selected_scenario = None
+        if selected_scenario is not None and selected_scenario <= 0:
+            selected_scenario = None
+    bridge = get_bridge_client()
+    if bridge:
+        params = {"projectId": int(project_id), "operator": operator}
+        if selected_scenario is not None:
+            params["scenario"] = selected_scenario
+        if polygon_id_list:
+            params["polygon_ids"] = ",".join(str(value) for value in polygon_id_list)
+        start_time = time.perf_counter()
+        opt_raw = bridge.get_rows(
+            "GetSitePredictionOptimized",
+            params,
+            limit=50000,
+        )
+        elapsed_ms = (time.perf_counter() - start_time) * 1000
+        print(
+            f"[LTE_OPT][PYTHON_BRIDGE_TIMING] endpoint=GetSitePredictionOptimized "
+            f"project_id={project_id} region={region} operator={operator} rows={len(opt_raw)} "
+            f"elapsed_ms={elapsed_ms:.0f} scenario={params.get('scenario', 'latest')} "
+            f"polygon_ids={params.get('polygon_ids', 'all')}"
+        )
+        if opt_raw.empty:
+            _print_fetch_summary(
+                "OPTIMIZED_SITE_FETCH",
+                "site_prediction_optimized via python_bridge",
+                {"project_id": project_id, "operator": operator, "region": region, "scenario": params.get("scenario", "latest")},
+                opt_raw,
+            )
+            return opt_raw
+        current_df = fetch_site_data(project_id, region=region, operator=operator, polygon_ids=polygon_id_list)
+        opt_df = _normalize_site_df(opt_raw, log_stage="OPTIMIZED_SITE_FETCH")
+        sort_cols = [col for col in ["version", "updated_at", "created_at", "id", "Node_Cell_ID"] if col in opt_df.columns]
+        if sort_cols:
+            opt_df = _sort_site_rows(opt_df, sort_cols)
+        opt_df = opt_df.drop_duplicates(subset=["Node_Cell_ID"], keep="last")
+        compare_cols = [
+            "lat",
+            "lon",
+            "azimuth",
+            "electrical_tilt",
+            "mechanical_tilt",
+            "tx_power",
+            "antenna_height",
+            "frequency_mhz",
+        ]
+        merged_df = current_df.copy()
+        for col in [c for c in compare_cols if c != "frequency_mhz"]:
+            if col in merged_df.columns:
+                merged_df[f"orig_{col}"] = pd.to_numeric(merged_df[col], errors="coerce")
+
+        opt_df = opt_df.set_index("Node_Cell_ID", drop=False)
+        mask = merged_df["Node_Cell_ID"].astype(str).isin(opt_df.index.astype(str))
+        for col in compare_cols:
+            if col in opt_df.columns:
+                mapping = opt_df[col].to_dict()
+                merged_df.loc[mask, col] = merged_df.loc[mask, "Node_Cell_ID"].astype(str).map(mapping)
+
+        merged_df["optimization_applied"] = mask
+        changed_mask = _build_change_mask(merged_df)
+        _print_fetch_summary(
+            "OPTIMIZED_SITE_FETCH",
+            "site_prediction_optimized via python_bridge",
+            {"project_id": project_id, "operator": operator, "region": region, "scenario": params.get("scenario", "latest")},
+            merged_df,
+            extra={
+                "optimized_rows": len(opt_df),
+                "overlay_rows": int(mask.sum()),
+                "changed_rows": int(changed_mask.sum()),
+                "changed_cells": int(merged_df.loc[changed_mask, "Node_Cell_ID"].nunique()) if changed_mask.any() else 0,
+                "distinct_pci": _safe_nunique(merged_df, "pci"),
+                "distinct_cell_id": _safe_nunique(merged_df, "cell_id"),
+                "distinct_nodeb_id": _safe_nunique(merged_df, "nodeb_id"),
+            },
+        )
+        return merged_df
+    if selected_scenario is None:
+        selected_scenario = _resolve_latest_site_prediction_scenario(project_id, operator=operator, region=region)
+    if selected_scenario is None:
+        empty = pd.DataFrame()
+        _print_fetch_summary(
+            "OPTIMIZED_SITE_FETCH",
+            "site_prediction_optimized",
+            {"project_id": project_id, "operator": operator, "region": region, "scenario": "latest"},
+            empty,
+        )
+        return empty
     current_engine = engine.get(region.lower(), engine["india"])
     query = f"""
     SELECT *
     FROM site_prediction_optimized
     WHERE tbl_project_id = {project_id}
     AND cluster = '{operator}'
+    AND scenario = {int(selected_scenario)}
+    {_site_polygon_filter_sql("site_prediction_optimized", polygon_id_list)}
     """
 
     opt_raw = pd.read_sql(query, current_engine)
@@ -462,16 +737,16 @@ def fetch_optimized_sites(project_id, operator, region="india"):
         _print_fetch_summary(
             "OPTIMIZED_SITE_FETCH",
             "site_prediction_optimized",
-            {"project_id": project_id, "operator": operator, "region": region},
+            {"project_id": project_id, "operator": operator, "region": region, "scenario": selected_scenario},
             opt_raw,
         )
         return opt_raw
 
-    current_df = fetch_site_data(project_id, region=region, operator=operator)
+    current_df = fetch_site_data(project_id, region=region, operator=operator, polygon_ids=polygon_id_list)
     opt_df = _normalize_site_df(opt_raw, log_stage="OPTIMIZED_SITE_FETCH")
     sort_cols = [col for col in ["version", "updated_at", "created_at", "id", "Node_Cell_ID"] if col in opt_df.columns]
     if sort_cols:
-        opt_df = opt_df.sort_values(sort_cols)
+        opt_df = _sort_site_rows(opt_df, sort_cols)
     opt_df = opt_df.drop_duplicates(subset=["Node_Cell_ID"], keep="last")
 
     compare_cols = [
@@ -500,7 +775,7 @@ def fetch_optimized_sites(project_id, operator, region="india"):
     _print_fetch_summary(
         "OPTIMIZED_SITE_FETCH",
         "site_prediction_optimized",
-        {"project_id": project_id, "operator": operator, "region": region},
+        {"project_id": project_id, "operator": operator, "region": region, "scenario": selected_scenario},
         merged_df,
         extra={
             "optimized_rows": len(opt_df),

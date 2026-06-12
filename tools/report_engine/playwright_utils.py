@@ -1,7 +1,53 @@
 # src/playwright_utils.py
 
-from playwright.sync_api import sync_playwright
 import os
+
+from playwright.sync_api import sync_playwright
+
+
+def _candidate_browser_paths():
+    env_path = os.getenv("REPORT_CHROMIUM_PATH") or os.getenv("PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH")
+    if env_path:
+        yield env_path
+
+    local_app_data = os.getenv("LOCALAPPDATA") or ""
+    program_files = os.getenv("PROGRAMFILES") or r"C:\Program Files"
+    program_files_x86 = os.getenv("PROGRAMFILES(X86)") or r"C:\Program Files (x86)"
+
+    yield os.path.join(program_files, "Microsoft", "Edge", "Application", "msedge.exe")
+    yield os.path.join(program_files_x86, "Microsoft", "Edge", "Application", "msedge.exe")
+    yield os.path.join(program_files, "Google", "Chrome", "Application", "chrome.exe")
+    yield os.path.join(program_files_x86, "Google", "Chrome", "Application", "chrome.exe")
+    if local_app_data:
+        yield os.path.join(local_app_data, "Google", "Chrome", "Application", "chrome.exe")
+
+
+def _launch_chromium(playwright):
+    try:
+        return playwright.chromium.launch()
+    except Exception as first_error:
+        launch_errors = [str(first_error)]
+
+    for channel in ("msedge", "chrome"):
+        try:
+            return playwright.chromium.launch(channel=channel)
+        except Exception as exc:
+            launch_errors.append(str(exc))
+
+    for browser_path in _candidate_browser_paths():
+        if not browser_path or not os.path.exists(browser_path):
+            continue
+        try:
+            return playwright.chromium.launch(executable_path=browser_path)
+        except Exception as exc:
+            launch_errors.append(f"{browser_path}: {exc}")
+
+    raise RuntimeError(
+        "Unable to launch a Chromium browser for report rendering. "
+        "Run `ML\\venv\\Scripts\\python.exe -m playwright install chromium` "
+        "or set REPORT_CHROMIUM_PATH to chrome.exe/msedge.exe. "
+        f"Launch errors: {' | '.join(launch_errors)}"
+    )
 
 
 def html_to_png(
@@ -16,7 +62,7 @@ def html_to_png(
     html_url = "file:///" + html_path.replace("\\", "/")
 
     with sync_playwright() as p:
-        browser = p.chromium.launch()
+        browser = _launch_chromium(p)
         context = browser.new_context(
             viewport={"width": width, "height": height},
             device_scale_factor=device_scale_factor,
@@ -29,26 +75,33 @@ def html_to_png(
         # Wait for the map container to be present
         page.wait_for_selector(".folium-map, .leaflet-container", timeout=30000)
 
-        # Wait for Folium/Leaflet to initialize the map object
-        page.wait_for_function(
-            """() => {
-                const el = document.querySelector('.folium-map');
-                const map = el && el.id && window[el.id];
-                return !!(map && map._loaded);
-            }""",
-            timeout=30000,
-        )
+        # Wait for Folium/Leaflet when possible, but do not fail the report if
+        # offline tiles/scripts prevent Leaflet from setting its internal flag.
+        try:
+            page.wait_for_function(
+                """() => {
+                    const el = document.querySelector('.folium-map');
+                    const map = el && el.id && window[el.id];
+                    return !!(map && map._loaded);
+                }""",
+                timeout=15000,
+            )
+        except Exception as e:
+            print(f"Warning: Leaflet map load check timed out, continuing screenshot: {e}")
 
         # Invalidate map size to ensure proper rendering
-        page.evaluate(
-            """() => {
-                const el = document.querySelector('.folium-map');
-                const map = el && el.id && window[el.id];
-                if (map && typeof map.invalidateSize === 'function') {
-                    map.invalidateSize(true);
-                }
-            }"""
-        )
+        try:
+            page.evaluate(
+                """() => {
+                    const el = document.querySelector('.folium-map');
+                    const map = el && el.id && window[el.id];
+                    if (map && typeof map.invalidateSize === 'function') {
+                        map.invalidateSize(true);
+                    }
+                }"""
+            )
+        except Exception as e:
+            print(f"Warning: Map invalidateSize failed, continuing screenshot: {e}")
 
         # Wait for tiles to load - flexible approach
         # Check multiple times to ensure tiles are actually loaded
@@ -84,15 +137,18 @@ def html_to_png(
         page.wait_for_timeout(2000)
 
         # Force one more map refresh
-        page.evaluate(
-            """() => {
-                const el = document.querySelector('.folium-map');
-                const map = el && el.id && window[el.id];
-                if (map && typeof map.invalidateSize === 'function') {
-                    map.invalidateSize(true);
-                }
-            }"""
-        )
+        try:
+            page.evaluate(
+                """() => {
+                    const el = document.querySelector('.folium-map');
+                    const map = el && el.id && window[el.id];
+                    if (map && typeof map.invalidateSize === 'function') {
+                        map.invalidateSize(true);
+                    }
+                }"""
+            )
+        except Exception as e:
+            print(f"Warning: Final map refresh failed, continuing screenshot: {e}")
 
         # Small delay after final refresh
         page.wait_for_timeout(500)

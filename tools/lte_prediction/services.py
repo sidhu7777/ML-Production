@@ -3,6 +3,8 @@ import threading
 import pandas as pd
 import os
 import numpy as np
+import traceback
+import sys
 from datetime import datetime
 import time
 import uuid as uuid_lib
@@ -20,6 +22,7 @@ from .ml_engine import (
 from .dem_utils import ensure_project_dem
 
 from extensions import db
+from utils.python_bridge import get_bridge_client
 
 load_dotenv()
 engine_dict = {
@@ -166,7 +169,12 @@ class LTEPredictionService:
 
             self._update(job_id, "running", f"Fetching site data from {region.upper()} database")
 
-            site_df, operator = fetch_site_data(cfg["project_id"], region=region)
+            site_df, operator = fetch_site_data(
+                cfg["project_id"],
+                region=region,
+                polygon_ids=cfg.get("polygon_ids") or cfg.get("polygonIds"),
+                operator=cfg.get("operator"),
+            )
             _job_df_summary("SITE_DF", site_df)
 
             self._update(job_id, "running", f"Operator: {operator}")
@@ -180,7 +188,12 @@ class LTEPredictionService:
 
             self._update(job_id, "running", "Fetching drive data")
             drive_df = fetch_drive_data(
-                cfg["session_ids"], operator, cfg["project_id"], region=region
+                cfg["session_ids"],
+                operator,
+                cfg["project_id"],
+                region=region,
+                frontend_drive_rows=cfg.get("drive_rows"),
+                frontend_drive_rows_source=cfg.get("drive_rows_source"),
             )
             _job_df_summary("DRIVE_DF", drive_df)
 
@@ -267,7 +280,9 @@ class LTEPredictionService:
         except Exception as e:
             JOBS[job_id]["status"] = "failed"
             JOBS[job_id]["error"] = str(e)
-            print(f"Error in Job {job_id}: {str(e)}")
+            print(f"Error in Job {job_id}: {str(e)}", flush=True)
+            traceback.print_exc(file=sys.stdout)
+            sys.stdout.flush()
 
     def _update(self, job_id, status, msg):
         JOBS[job_id]["status"] = status
@@ -986,7 +1001,19 @@ class LTEPredictionService:
             f"mode=upsert rows={len(out)} project_id={project_id} job_id={job_id}"
         )
         baseline_save_started = time.perf_counter()
-        written_rows = self._upsert_baseline_results(save_engine, out, project_id=project_id)
+        bridge = get_bridge_client()
+        if bridge:
+            written_rows = bridge.save_dataframe(
+                "SaveLtePredictionBaselineResults",
+                out,
+                project_id=int(project_id),
+                job_id=str(job_id),
+                region=str(region).lower(),
+                chunk_size=20000,
+            )
+            print("[LTE][BASELINE_DB_WRITE] source=python_bridge")
+        else:
+            written_rows = self._upsert_baseline_results(save_engine, out, project_id=project_id)
         baseline_save_elapsed = time.perf_counter() - baseline_save_started
         print(
             f"[LTE][BASELINE_DB_WRITE_DONE] table=lte_prediction_baseline_results "
@@ -1120,12 +1147,24 @@ class LTEPredictionService:
         )
 
         geo_save_started = time.perf_counter()
-        written_rows = self._upsert_geo_features(
-            save_engine,
-            geo_out,
-            project_id=int(project_id),
-            region=str(region).lower(),
-        )
+        bridge = get_bridge_client()
+        if bridge:
+            written_rows = bridge.save_dataframe(
+                "SaveLtePredictionGeoFeatures",
+                geo_out,
+                project_id=int(project_id),
+                job_id=str(baseline_job_id),
+                region=str(region).lower(),
+                replace_existing=True,
+            )
+            print("[LTE][GEO_DB_WRITE] source=python_bridge")
+        else:
+            written_rows = self._upsert_geo_features(
+                save_engine,
+                geo_out,
+                project_id=int(project_id),
+                region=str(region).lower(),
+            )
         geo_save_elapsed = time.perf_counter() - geo_save_started
         print(
             f"[LTE][GEO_DB_WRITE_DONE] table=lte_prediction_geo_features rows={written_rows} "

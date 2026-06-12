@@ -18,10 +18,10 @@ from tools.lte_tilt_recommandation.candidate_validation import (
     prepare_scope_export,
 )
 from tools.lte_tilt_recommandation.cell_identity import canonical_cell_id
+from utils.python_bridge import PythonBridgeError, get_bridge_client
 
 # Global dictionary to track job status
 JOBS = {}
-DEFAULT_THRESHOLD_PROJECT_ID = 216
 DEFAULT_THRESHOLD_FILE = "lte_tilt_recommendation_transformed.csv"
 
 BASELINE_IDENTITY_COLUMNS = [
@@ -368,6 +368,87 @@ def _fetch_grid_analytics_df(current_engine, project_id: int, operator_input, is
     return grid_df
 
 
+def _bridge_latest_baseline_job_id(bridge, project_id: int) -> str:
+    payload = bridge._request("GET", "GetLatestLteBaselineJobId", params={"projectId": int(project_id)})
+    job_id = payload.get("JobId") or payload.get("jobId")
+    if not job_id:
+        raise ValueError(f"No baseline results found for project {project_id}")
+    return str(job_id)
+
+
+def _bridge_fetch_baseline_log_df(bridge, project_id: int, region: str, operator_input, is_all_operators: bool) -> tuple[pd.DataFrame, str]:
+    baseline_job_id = _bridge_latest_baseline_job_id(bridge, int(project_id))
+    params = {
+        "projectId": int(project_id),
+        "region": region,
+        "jobId": baseline_job_id,
+    }
+    if not is_all_operators:
+        params["operator"] = operator_input
+    page_limit = int(os.getenv("PYTHON_BRIDGE_BASELINE_PAGE_SIZE", "50000"))
+    log_df = bridge.get_rows(
+        "GetLteBaselineRows",
+        params,
+        limit=page_limit,
+        progress_label="lte_baseline",
+    )
+    if log_df.empty:
+        raise ValueError(f"No baseline rows found for project {project_id} job_id={baseline_job_id}")
+    if "job_id" in log_df.columns:
+        log_df = log_df.loc[log_df["job_id"].astype(str) == baseline_job_id].copy()
+    if not is_all_operators and "operator" in log_df.columns:
+        log_df = log_df.loc[log_df["operator"].astype(str).str.strip() == str(operator_input).strip()].copy()
+    if log_df.empty:
+        raise ValueError(f"No baseline rows found for project {project_id} job_id={baseline_job_id}")
+    print(f"[TILT][BASELINE_FETCH] source=python_bridge rows={len(log_df)} baseline_job_id={baseline_job_id}")
+    return log_df, baseline_job_id
+
+
+def _bridge_fetch_grid_analytics_df(bridge, project_id: int, operator_input, is_all_operators: bool) -> pd.DataFrame:
+    try:
+        grid_df, _grid_size = bridge.get_grid_analytics(int(project_id))
+    except PythonBridgeError as exc:
+        print(f"[TILT][GRID_ANALYTICS_FETCH] source=python_bridge skipped=True reason={exc}")
+        return pd.DataFrame()
+    if not is_all_operators and "operator" in grid_df.columns:
+        grid_df = grid_df.loc[grid_df["operator"].astype(str).str.strip().str.lower() == str(operator_input).strip().lower()].copy()
+    print(f"[TILT][GRID_ANALYTICS_FETCH] source=python_bridge rows={len(grid_df)}")
+    return grid_df
+
+
+def _bridge_next_scenario_id(bridge, project_id: int) -> int:
+    payload = bridge._request("GET", "GetNextRfOptimizationScenarioId", params={"projectId": int(project_id)})
+    return int(payload.get("ScenarioId") or payload.get("scenarioId") or 1)
+
+
+def _bridge_save_rf_optimization_results(bridge, project_id: int, scenario_id: int, df: pd.DataFrame) -> int:
+    rows = []
+    safe_df = df.replace({pd.NA: None}).where(pd.notna(df), None)
+    for row in safe_df.to_dict(orient="records"):
+        rows.append(
+            {
+                "operator": row.get("operator"),
+                "cell_id": row.get("cell_id"),
+                "technology": row.get("technology"),
+                "parameter": row.get("parameter"),
+                "current_value": None if row.get("current_value") is None else str(row.get("current_value")),
+                "recommended_value": None if row.get("recommended_value") is None else str(row.get("recommended_value")),
+                "reason": row.get("reason"),
+                "swap_sector_detected": row.get("swap_sector_detected"),
+                "rsrp_threshold": row.get("rsrp_threshold"),
+                "rsrq_threshold": row.get("rsrq_threshold"),
+                "sinr_threshold": row.get("sinr_threshold"),
+                "created_at": row.get("created_at").isoformat() if hasattr(row.get("created_at"), "isoformat") else row.get("created_at"),
+            }
+        )
+    payload = bridge._request(
+        "POST",
+        "SaveRfOptimizationResults",
+        json={"ProjectId": int(project_id), "ScenarioId": int(scenario_id), "Rows": rows},
+    )
+    return int(payload.get("Inserted") or payload.get("inserted") or 0)
+
+
 def _safe_nunique(df, col):
     return int(df[col].nunique(dropna=True)) if col in df.columns else "n/a"
 
@@ -412,10 +493,9 @@ def _resolve_threshold_file_path(cfg: dict, project_id: int, project_root: str) 
     supplied = str(cfg.get("threshold_file_path", "") or cfg.get("threshold_file", "")).strip()
     if supplied:
         return supplied
-    if int(project_id) == DEFAULT_THRESHOLD_PROJECT_ID:
-        default_path = os.path.join(project_root, DEFAULT_THRESHOLD_FILE)
-        if os.path.exists(default_path):
-            return default_path
+    default_path = os.path.join(project_root, DEFAULT_THRESHOLD_FILE)
+    if os.path.exists(default_path):
+        return default_path
     return ""
 
 
@@ -654,8 +734,10 @@ class RFOptimizationService:
             # ==========================================
             region = str(cfg.get("region", "india")).lower()
             current_engine = engine.get(region)
-            
-            if current_engine is None:
+            bridge = get_bridge_client()
+            use_bridge = bridge is not None
+
+            if current_engine is None and not use_bridge:
                 raise ValueError(f"Database config for region '{region}' not found or .env variable is missing.")
 
             self._update(job_id, "running", f"Initializing {region.upper()} optimization job...")
@@ -677,9 +759,13 @@ class RFOptimizationService:
             # 2. FETCH ANTENNA DATA FIRST (Prevents Timeout)
             # ==========================================
             self._update(job_id, "running", "Fetching antenna records...")
-            ant_query = text("SELECT * FROM site_prediction WHERE tbl_project_id = :pid")
-            with current_engine.connect() as conn:
-                antenna_df = pd.read_sql(ant_query, conn, params={"pid": project_id})
+            if use_bridge:
+                antenna_df = bridge.get_rows("GetLteTiltAntennaRows", {"projectId": int(project_id)}, limit=50000)
+                print(f"[TILT][ANTENNA_FETCH] source=python_bridge rows={len(antenna_df)}")
+            else:
+                ant_query = text("SELECT * FROM site_prediction WHERE tbl_project_id = :pid")
+                with current_engine.connect() as conn:
+                    antenna_df = pd.read_sql(ant_query, conn, params={"pid": project_id})
             antenna_df = _prepare_tilt_antenna_df(antenna_df)
             _log_df("ANTENNA_FETCH", antenna_df)
 
@@ -687,12 +773,21 @@ class RFOptimizationService:
             # 3. FETCH LARGE LOG DATA IN CHUNKS
             # ==========================================
             self._update(job_id, "running", "Downloading calibrated baseline rows...")
-            log_df, baseline_job_id = _fetch_baseline_log_df(
-                current_engine,
-                project_id,
-                operator_input,
-                is_all_operators,
-            )
+            if use_bridge:
+                log_df, baseline_job_id = _bridge_fetch_baseline_log_df(
+                    bridge,
+                    project_id,
+                    region,
+                    operator_input,
+                    is_all_operators,
+                )
+            else:
+                log_df, baseline_job_id = _fetch_baseline_log_df(
+                    current_engine,
+                    project_id,
+                    operator_input,
+                    is_all_operators,
+                )
             log_df = _prepare_tilt_log_df(log_df, antenna_df)
             _log_df("BASELINE_FETCH_COMBINED", log_df)
 
@@ -721,56 +816,73 @@ class RFOptimizationService:
             os.makedirs(temp_dir, exist_ok=True)
 
             self._update(job_id, "running", "Fetching geo-feature rows...")
-            geo_query = text(
-                """
-                SELECT
-                    lat,
-                    lon,
-                    nodeb_id_cell_id,
-                    clutter_class,
-                    morphology_cluster,
-                    building_count,
-                    building_area_ratio,
-                    avg_building_area_m2,
-                    road_length_m,
-                    green_ratio,
-                    water_ratio,
-                    los_blocker_count,
-                    los_blocked_ratio,
-                    max_blocker_height_m,
-                    diffraction_proxy_db,
-                    nlos_flag,
-                    terrain_elevation_m,
-                    terrain_slope_deg,
-                    proxy_site_elevation_m,
-                    terrain_relief_to_site_m,
-                    site_count_250m,
-                    site_count_500m,
-                    serving_distance_m,
-                    nearest_site_distance_m,
-                    mean_nearest3_site_distance_m,
-                    azimuth_delta_deg
-                FROM lte_prediction_geo_features
-                WHERE project_id = :pid
-                  AND region = :region
-                """
-            )
-            with current_engine.connect() as conn:
-                geo_df = pd.read_sql(geo_query, conn, params={"pid": project_id, "region": region})
+            if use_bridge:
+                geo_df = bridge.get_rows(
+                    "GetLtePredictionGeoFeatures",
+                    {"projectId": int(project_id), "region": region},
+                    limit=50000,
+                    progress_label="lte_geo_features",
+                )
+                print(f"[TILT][GEO_FETCH] source=python_bridge rows={len(geo_df)}")
+            else:
+                geo_query = text(
+                    """
+                    SELECT
+                        lat,
+                        lon,
+                        nodeb_id_cell_id,
+                        clutter_class,
+                        morphology_cluster,
+                        building_count,
+                        building_area_ratio,
+                        avg_building_area_m2,
+                        road_length_m,
+                        green_ratio,
+                        water_ratio,
+                        los_blocker_count,
+                        los_blocked_ratio,
+                        max_blocker_height_m,
+                        diffraction_proxy_db,
+                        nlos_flag,
+                        terrain_elevation_m,
+                        terrain_slope_deg,
+                        proxy_site_elevation_m,
+                        terrain_relief_to_site_m,
+                        site_count_250m,
+                        site_count_500m,
+                        serving_distance_m,
+                        nearest_site_distance_m,
+                        mean_nearest3_site_distance_m,
+                        azimuth_delta_deg
+                    FROM lte_prediction_geo_features
+                    WHERE project_id = :pid
+                      AND region = :region
+                    """
+                )
+                with current_engine.connect() as conn:
+                    geo_df = pd.read_sql(geo_query, conn, params={"pid": project_id, "region": region})
             if "nodeb_id_cell_id" in geo_df.columns:
                 geo_df["Node_Cell_ID"] = geo_df["nodeb_id_cell_id"].astype(str).str.strip()
             _log_df("GEO_FETCH", geo_df)
 
             self._update(job_id, "running", "Fetching frontend grid analytics...")
-            grid_analytics_df = _fetch_grid_analytics_df(
-                current_engine,
-                project_id,
-                operator_input,
-                is_all_operators,
-            )
+            if use_bridge:
+                grid_analytics_df = _bridge_fetch_grid_analytics_df(
+                    bridge,
+                    project_id,
+                    operator_input,
+                    is_all_operators,
+                )
+            else:
+                grid_analytics_df = _fetch_grid_analytics_df(
+                    current_engine,
+                    project_id,
+                    operator_input,
+                    is_all_operators,
+                )
             _log_df("GRID_ANALYTICS_FETCH", grid_analytics_df)
 
-            scenario_id = self._get_next_scenario_id(project_id, current_engine)
+            scenario_id = _bridge_next_scenario_id(bridge, project_id) if use_bridge else self._get_next_scenario_id(project_id, current_engine)
             threshold_file_path = _resolve_threshold_file_path(cfg, project_id, root_dir)
             if threshold_file_path:
                 print(f"[TILT][CONSTRAINT_FILE] path={threshold_file_path}")
@@ -811,6 +923,23 @@ class RFOptimizationService:
                 max_neighbors_per_update_cell=int(cfg.get("max_neighbors_per_update_cell", 2)),
                 rf_debug_log_path=os.path.join(temp_dir, "tilt_rf_debug.log"),
                 constraint_map=constraint_df.set_index("cell_id").to_dict("index") if not constraint_df.empty else {},
+            )
+            print(
+                "[TILT][ENGINE_CONFIG] "
+                f"project_id={engine_config.project_id} region={engine_config.region} "
+                f"operator={engine_config.operator or 'all'} "
+                f"thresholds=({engine_config.rsrp_threshold},{engine_config.rsrq_threshold},{engine_config.sinr_threshold}) "
+                f"weights=({engine_config.rsrp_weight},{engine_config.rsrq_weight},{engine_config.sinr_weight}) "
+                f"validate_candidates={engine_config.validate_candidates} "
+                f"radius_m={engine_config.radius_m} grid_resolution_m={engine_config.grid_resolution_m} "
+                f"workers={engine_config.workers} impact_radius_m={engine_config.impact_radius_m} "
+                f"neighbor_site_count={engine_config.neighbor_site_count} "
+                f"max_interference_sites={engine_config.max_interference_sites} "
+                f"candidate_workers={engine_config.candidate_workers} "
+                f"coordinate_passes={engine_config.coordinate_passes} "
+                f"bad_grid_coverage_pct={engine_config.bad_grid_coverage_pct} "
+                f"max_group_cells={engine_config.max_group_cells} "
+                f"max_neighbors_per_update_cell={engine_config.max_neighbors_per_update_cell}"
             )
             engine_outputs = run_recommendation_engine(
                 log_df=log_df,
@@ -900,7 +1029,13 @@ class RFOptimizationService:
                     f"[TILT][DB_WRITE] skipped=True reason=no_rf_validated_recommendations "
                     f"project_id={project_id} scenario_id={scenario_id}"
                 )
-                JOBS[job_id].update({"status": "done", "output": output_file, "scenario": scenario_id})
+                JOBS[job_id].update({
+                    "status": "done",
+                    "output": output_file,
+                    "scenario": scenario_id,
+                    "recommendation_rows": 0,
+                    "inserted": 0,
+                })
                 return
             
             # Ensure "ALL" is replaced by the actual cell's operator
@@ -930,11 +1065,22 @@ class RFOptimizationService:
                 f"rows={len(db_save_df)} project_id={project_id} scenario_id={scenario_id}"
             )
 
-            # Fast DB saving with chunks using the correct regional engine
-            with current_engine.begin() as conn:
-                db_save_df.to_sql("rf_optimization_results", conn, if_exists="append", index=False, method="multi", chunksize=1000)
+            if use_bridge:
+                inserted = _bridge_save_rf_optimization_results(bridge, project_id, scenario_id, db_save_df)
+                print(f"[TILT][DB_WRITE_DONE] source=python_bridge rows={inserted}")
+            else:
+                # Fast DB saving with chunks using the correct regional engine
+                with current_engine.begin() as conn:
+                    db_save_df.to_sql("rf_optimization_results", conn, if_exists="append", index=False, method="multi", chunksize=1000)
+                inserted = len(db_save_df)
 
-            JOBS[job_id].update({"status": "done", "output": output_file, "scenario": scenario_id})
+            JOBS[job_id].update({
+                "status": "done",
+                "output": output_file,
+                "scenario": scenario_id,
+                "recommendation_rows": len(db_save_df),
+                "inserted": inserted,
+            })
 
         except Exception as e:
             print(f"Error in RF Service: {str(e)}")

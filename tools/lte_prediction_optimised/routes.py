@@ -9,6 +9,7 @@ service = LTEPredictionService_optimised()
 # ==========================================================
 # RUN OPTIMIZED PREDICTION
 # ==========================================================
+@lte_prediction_op.route("/run", methods=["POST"])
 @lte_prediction_op.route("/optimized", methods=["POST"])
 def run_optimized():
     data = request.get_json()

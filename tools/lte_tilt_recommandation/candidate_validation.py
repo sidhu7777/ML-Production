@@ -752,6 +752,8 @@ def _select_coordinate_target_cells(
     bad_node_ids = set(bad_work["Node_Cell_ID"].astype(str).str.strip().tolist())
     overlap_ids = bad_node_ids & tunable
     overlap_rows = int(bad_work["Node_Cell_ID"].astype(str).str.strip().isin(tunable).sum())
+    missing_overlap_ids = bad_node_ids - tunable
+    match_pct = len(overlap_ids) / max(len(bad_node_ids), 1) * 100.0
     print(
         "[TILT_TARGET_SELECTION_OVERLAP] "
         f"bad_grid_count={len(bad_grid_ids)} bad_grid_rows={len(bad_work)} "
@@ -759,6 +761,13 @@ def _select_coordinate_target_cells(
         f"overlap_ids={len(overlap_ids)} overlap_rows={overlap_rows} "
         f"sample_bad_ids={sorted(list(bad_node_ids))[:5]} "
         f"sample_tunable_ids={sorted(list(tunable))[:5]}"
+    )
+    print(
+        "[TILT_TARGET_SELECTION_EXACT_UPDATEABLE] "
+        f"source_bad_ids={len(bad_node_ids)} exact_updateable_ids={len(overlap_ids)} "
+        f"source_alias_only_ids={len(missing_overlap_ids)} exact_match_pct={match_pct:.2f} "
+        "mode=good_ml_exact_antenna_key "
+        f"sample_alias_only_ids={sorted(list(missing_overlap_ids))[:10]}"
     )
     work = bad_work.loc[bad_work["Node_Cell_ID"].astype(str).str.strip().isin(tunable)].copy()
     if work.empty:
@@ -832,6 +841,11 @@ def _select_coordinate_target_cells(
         f"[TILT_COORDINATE_TARGETS] bad_grids={len(bad_grid_ids)} contributor_cells={len(grouped)} "
         f"selected_cells={len(cells)} coverage_target={coverage:.1f} "
         f"selection=weighted_kpi_priority contribution={contribution_col} cells={cells}"
+    )
+    print(
+        "[TILT_TARGET_SELECTION_FINAL] "
+        f"contributors_after_match={len(grouped)} selected_for_coordinate_search={len(cells)} "
+        f"coverage_target_pct={coverage:.1f} max_group_cells={int(config.max_group_cells or 0)}"
     )
     return cells
 

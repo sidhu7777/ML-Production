@@ -4,6 +4,9 @@ import os
 import logging
 from werkzeug.exceptions import HTTPException
 
+os.environ.setdefault("LOKY_MAX_CPU_COUNT", str(os.cpu_count() or 1))
+print(f"[PYTHON_BOOT] lte_patch=2026-06-10-latlon-trace loky_max_cpu_count={os.environ.get('LOKY_MAX_CPU_COUNT')}", flush=True)
+
 # Import config, blueprints, and db
 from config import config
 from tools.buildings.routes import buildings_bp
@@ -36,7 +39,8 @@ def create_app(config_name='default'):
     # Silence noisy logs
     for noisy in [
         "botocore", "boto3", "s3transfer", "httpx",
-        "urllib3", "matplotlib", "PIL", "groq", "asyncio"
+        "urllib3", "matplotlib", "PIL", "groq", "asyncio",
+        "werkzeug",
     ]:
         logging.getLogger(noisy).setLevel(logging.WARNING)
 
@@ -102,7 +106,9 @@ def create_app(config_name='default'):
     def health_check():
         return jsonify({
             'status': 'healthy',
-            'service': 'Python ML Backend'
+            'service': 'Python ML Backend',
+            'lte_patch': '2026-06-10-latlon-trace',
+            'loky_max_cpu_count': os.environ.get('LOKY_MAX_CPU_COUNT')
         }), 200
 
     # ---------------- ERROR HANDLERS ----------------

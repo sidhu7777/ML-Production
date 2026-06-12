@@ -1,4 +1,4 @@
-from flask import Blueprint, request, jsonify, current_app, send_file, redirect, Response, stream_with_context
+from flask import Blueprint, request, jsonify, current_app, send_file, Response, stream_with_context
 import os
 import threading
 import uuid
@@ -92,8 +92,7 @@ def background_report_task(app, project_id, user_id, report_id):
                 report_id=report_id,
                 db_engine=db.engine,
             )
-            project = get_project_by_id(project_id)
-            download_url = (project or {}).get("Download_path")
+            download_url = f"/api/report/download/{report_id}"
             _set_job(
                 report_id,
                 status="ready",
@@ -221,9 +220,5 @@ def download(report_id):
             as_attachment=True,
             download_name="drive_test_report.pdf",
         )
-
-    job = _get_job(report_id)
-    if job and job.get("status") == "ready" and job.get("download_url"):
-        return redirect(job["download_url"], code=302)
 
     return jsonify({"error": "Report not found"}), 404

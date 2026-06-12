@@ -1588,8 +1588,34 @@ def attach_fixed_serving_sinr_rsrq_proxy(points_df: pd.DataFrame, site_df: pd.Da
     return out
 
 
+def _copy_first_present(df: pd.DataFrame, target: str, candidates: list[str]) -> None:
+    if target in df.columns:
+        return
+    by_lower = {str(col).strip().lower(): col for col in df.columns}
+    for candidate in candidates:
+        source = by_lower.get(str(candidate).strip().lower())
+        if source is not None:
+            df[target] = df[source]
+            return
+
+
+def _normalize_lat_lon_columns(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    out.columns = out.columns.str.strip()
+    _copy_first_present(out, "lat", ["latitude", "Lat", "Latitude", "LAT", "lat_deg", "y"])
+    _copy_first_present(out, "lon", ["longitude", "lng", "Lng", "Longitude", "LON", "lon_deg", "long", "x"])
+    for col in ["lat", "lon"]:
+        if col in out.columns:
+            out[col] = pd.to_numeric(out[col], errors="coerce")
+    return out
+
+
 def _prepare_drive_measurements(drive_df: pd.DataFrame) -> pd.DataFrame:
-    dt = drive_df.dropna(subset=["lat", "lon"]).copy()
+    dt = _normalize_lat_lon_columns(drive_df)
+    if not {"lat", "lon"}.issubset(dt.columns):
+        print(f"[LTE][DRIVE_MEASUREMENTS] skipped=True reason=missing_lat_lon columns={list(dt.columns)}")
+        return pd.DataFrame()
+    dt = dt.dropna(subset=["lat", "lon"]).copy()
     if dt.empty:
         return dt
     rcol = next((c for c in dt.columns if "rsrp" in c.lower()), None)
@@ -1607,6 +1633,12 @@ def _prepare_drive_measurements(drive_df: pd.DataFrame) -> pd.DataFrame:
 
 def _attach_prediction_grid_to_points(points_df: pd.DataFrame, pred_df: pd.DataFrame) -> pd.DataFrame:
     points = points_df.copy()
+    if points.empty or pred_df.empty or not {"lat", "lon"}.issubset(pred_df.columns):
+        print(
+            f"[LTE][DT_EVAL_GRID_ATTACH] skipped=True reason=missing_prediction_lat_lon "
+            f"pred_cols={list(pred_df.columns)}"
+        )
+        return points
     keep_cols = [
         "lat",
         "lon",
@@ -1624,6 +1656,12 @@ def _attach_prediction_grid_to_points(points_df: pd.DataFrame, pred_df: pd.DataF
         "clutter_class",
     ]
     pred_keep_cols = [col for col in keep_cols if col in pred_df.columns]
+    if not {"lat", "lon"}.issubset(pred_keep_cols):
+        print(
+            f"[LTE][DT_EVAL_GRID_ATTACH] skipped=True reason=missing_keep_lat_lon "
+            f"pred_keep_cols={pred_keep_cols}"
+        )
+        return points
     preds = pred_df[pred_keep_cols].dropna(subset=["lat", "lon"]).copy()
     if points.empty or preds.empty:
         return points

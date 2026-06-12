@@ -21,7 +21,6 @@ from .cdf_kpi import generate_all_cdf_plots
 from .llm_integration import generate_report_text
 from .pdf_generator import generate_pdf_report
 from .email_service import send_report_ready_email
-from .s3_uploader import upload_pdf
 from .db import get_user_by_id, init_engine, update_project_download_path
 
 import shutil
@@ -281,25 +280,13 @@ def main(
     print(f"\nPDF Report generated: {pdf_path}")
     print("Pipeline completed successfully.")
 
-    # Upload to S3 and use S3 URL for sharing
-    s3_url = None
-    try:
-        s3_key = f"reports/{report_id}/report.pdf"
-        s3_url = upload_pdf(pdf_path, s3_key)
-        print(f"Uploaded PDF to S3: {s3_url}")
-    except Exception as e:
-        print(f"Warning: failed to upload PDF to S3: {e}")
-
-    # Persist download link/path in DB (overwrite old)
-    if s3_url:
-        download_link = s3_url
+    # Keep report download local. The frontend downloads through the Python API,
+    # so the browser never needs direct S3 access.
+    base_url = os.getenv("BASE_URL", "").rstrip("/")
+    if base_url:
+        download_link = f"{base_url}/api/report/download/{report_id}"
     else:
-        base_url = os.getenv("BASE_URL", "").rstrip("/")
-        if base_url:
-            download_link = f"{base_url}/api/report/download/{report_id}"
-        else:
-            # Fallback to relative path if BASE_URL not set
-            download_link = f"/api/report/download/{report_id}"
+        download_link = f"/api/report/download/{report_id}"
     try:
         update_project_download_path(project_id, download_link)
         print(f"Updated tbl_project.Download_path: {download_link}")
@@ -334,14 +321,6 @@ def main(
         print("Warning: user_id not provided, skipping email send.")     
      
 
-
-    # Remove final PDF from local disk if we have a durable S3 copy
-    if not keep_tmp and s3_url and os.path.exists(pdf_path):
-        try:
-            os.remove(pdf_path)
-            print(f"Removed local PDF: {pdf_path}")
-        except Exception as e:
-            print(f"Warning: failed to remove local PDF: {e}")
 
     if not keep_tmp:
         clean_directory(report_tmp_dir)

@@ -3,6 +3,7 @@
 import os
 import sys
 import math
+import json
 from typing import Dict, Tuple, List
 
 import pandas as pd
@@ -125,6 +126,38 @@ def _safe_str(x) -> str:
     if pd.isna(x):
         return ""
     return str(x).strip()
+
+
+def _excel_safe_value(value):
+    if value is None:
+        return None
+
+    try:
+        if pd.isna(value):
+            return None
+    except (TypeError, ValueError):
+        pass
+
+    if isinstance(value, np.generic):
+        return value.item()
+
+    if isinstance(value, dict):
+        date_keys = {"Year", "Month", "Day", "Hour", "Minute", "Second"}
+        if date_keys.issubset(value.keys()):
+            return (
+                f"{int(value.get('Year', 0)):04d}-"
+                f"{int(value.get('Month', 0)):02d}-"
+                f"{int(value.get('Day', 0)):02d} "
+                f"{int(value.get('Hour', 0)):02d}:"
+                f"{int(value.get('Minute', 0)):02d}:"
+                f"{int(value.get('Second', 0)):02d}"
+            )
+        return json.dumps(value, ensure_ascii=False, default=str)
+
+    if isinstance(value, (list, tuple, set)):
+        return json.dumps(list(value), ensure_ascii=False, default=str)
+
+    return value
 
 
 def _norm_cell_id(value) -> str:
@@ -1293,7 +1326,7 @@ def export_to_excel(
         for row_idx, row in enumerate(df.itertuples(index=False), start=2):
             row_fill = alt_fill if row_idx % 2 == 0 else white_fill
             for col_idx, value in enumerate(row, start=1):
-                c = ws.cell(row=row_idx, column=col_idx, value=value)
+                c = ws.cell(row=row_idx, column=col_idx, value=_excel_safe_value(value))
                 c.fill = row_fill
 
         # Freeze header

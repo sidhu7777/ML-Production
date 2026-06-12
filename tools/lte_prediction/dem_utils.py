@@ -16,6 +16,8 @@ from rasterio.merge import merge
 from sqlalchemy import create_engine
 from shapely.wkt import loads as load_wkt
 
+from utils.python_bridge import get_bridge_client
+
 try:
     import rasterio
 except Exception:  # pragma: no cover - optional dependency
@@ -39,14 +41,21 @@ def _engine_for_region(region: str):
 
 
 def _load_project_polygon(project_id: int, region: str, site_df: Optional[pd.DataFrame] = None) -> gpd.GeoDataFrame:
-    engine = _engine_for_region(region)
-    query = """
-    SELECT ST_AsText(region) AS region_wkt
-    FROM map_regions
-    WHERE tbl_project_id = %(project_id)s
-      AND status = 1
-    """
-    df = pd.read_sql(query, engine, params={"project_id": int(project_id)})
+    bridge = get_bridge_client()
+    if bridge:
+        df = bridge.get_rows("GetProjectRegions", {"projectId": int(project_id)})
+        source = "python_bridge"
+    else:
+        engine = _engine_for_region(region)
+        query = """
+        SELECT ST_AsText(region) AS region_wkt
+        FROM map_regions
+        WHERE tbl_project_id = %(project_id)s
+          AND status = 1
+        """
+        df = pd.read_sql(query, engine, params={"project_id": int(project_id)})
+        source = "database"
+    print(f"[DEM][PROJECT_REGION_FETCH] source={source} rows={len(df)}")
     polygons = []
     for raw in df.get("region_wkt", pd.Series(dtype=str)).dropna():
         raw = str(raw).strip()

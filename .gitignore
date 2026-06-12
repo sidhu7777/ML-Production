@@ -10,6 +10,7 @@ __pycache__/
 venv/
 env/
 ENV/
+venv-win/
 .python-version
 
 # Environment / local secrets

@@ -20,6 +20,7 @@ from .ml_engine import (
 )
 from ..lte_tilt_recommandation.cell_identity import canonical_cell_id
 from ..lte_tilt_recommandation.candidate_validation import _apply_rf_delta as _apply_recommendation_rf_delta
+from utils.python_bridge import PythonBridgeError, get_bridge_client
 
 # Global dictionary to track job status
 JOBS = {}
@@ -63,6 +64,11 @@ def _resolve_engine(region="india"):
 
 
 def _latest_baseline_job_id(project_id, region="india"):
+    bridge = get_bridge_client()
+    if bridge:
+        payload = bridge._request("GET", "GetLatestLteBaselineJobId", params={"projectId": int(project_id)})
+        job_id = payload.get("JobId") or payload.get("jobId")
+        return str(job_id) if job_id is not None else None
     current_engine = _resolve_engine(region)
     query = text("""
         SELECT job_id
@@ -108,6 +114,18 @@ def _values_changed(current_value, recommended_value):
 
 
 def _latest_recommendation_scenario_id(project_id, region, operator=None):
+    bridge = get_bridge_client()
+    if bridge:
+        params = {"projectId": int(project_id)}
+        if operator:
+            params["operator"] = operator
+        payload = bridge._request("GET", "GetLatestRfOptimizationScenarioId", params=params)
+        scenario_id = payload.get("ScenarioId") or payload.get("scenarioId")
+        if scenario_id is None:
+            op_msg = f" operator={operator}" if operator else ""
+            raise FileNotFoundError(f"No tilt recommendation rows found for project_id={project_id}{op_msg}")
+        return int(scenario_id)
+
     current_engine = _resolve_engine(region)
     where_parts = ["project_id = :project_id"]
     params = {"project_id": int(project_id)}
@@ -133,6 +151,29 @@ def _fetch_recommendation_rows(project_id, region, operator=None, recommendation
     scenario_id = recommendation_scenario_id
     if scenario_id is None:
         scenario_id = _latest_recommendation_scenario_id(project_id, region, operator=operator)
+
+    bridge = get_bridge_client()
+    if bridge:
+        params = {"projectId": int(project_id), "scenarioId": int(scenario_id)}
+        if operator:
+            params["operator"] = operator
+        reco_df = bridge.get_rows("GetRfOptimizationRows", params, limit=50000)
+        if reco_df.empty and operator:
+            print(
+                f"[LTE_OPT][RECOMMENDATION_ROWS] scenario_id={scenario_id} "
+                f"operator={operator} rows=0 retry_without_operator=True"
+            )
+            reco_df = bridge.get_rows(
+                "GetRfOptimizationRows",
+                {"projectId": int(project_id), "scenarioId": int(scenario_id)},
+                limit=50000,
+            )
+        if reco_df.empty:
+            raise FileNotFoundError(
+                f"No rows found in rf_optimization_results for project_id={project_id} "
+                f"scenario_id={scenario_id} operator={operator or 'all'}"
+            )
+        return int(scenario_id), reco_df
 
     current_engine = _resolve_engine(region)
     where_parts = ["project_id = :project_id", "scenario_id = :scenario_id"]
@@ -165,9 +206,43 @@ def _fetch_recommendation_rows(project_id, region, operator=None, recommendation
     )
     with current_engine.connect() as conn:
         reco_df = pd.read_sql(query, conn, params=params)
+    if reco_df.empty and operator:
+        fallback_query = text(
+            """
+            SELECT
+                project_id,
+                scenario_id,
+                operator,
+                cell_id,
+                technology,
+                parameter,
+                current_value,
+                recommended_value,
+                reason,
+                swap_sector_detected,
+                rsrp_threshold,
+                rsrq_threshold,
+                sinr_threshold,
+                created_at
+            FROM rf_optimization_results
+            WHERE project_id = :project_id AND scenario_id = :scenario_id
+            ORDER BY cell_id, parameter, id
+            """
+        )
+        print(
+            f"[LTE_OPT][RECOMMENDATION_ROWS] scenario_id={scenario_id} "
+            f"operator={operator} rows=0 retry_without_operator=True"
+        )
+        with current_engine.connect() as conn:
+            reco_df = pd.read_sql(
+                fallback_query,
+                conn,
+                params={"project_id": int(project_id), "scenario_id": int(scenario_id)},
+            )
     if reco_df.empty:
         raise FileNotFoundError(
-            f"No rows found in rf_optimization_results for project_id={project_id} scenario_id={scenario_id}"
+            f"No rows found in rf_optimization_results for project_id={project_id} "
+            f"scenario_id={scenario_id} operator={operator or 'all'}"
         )
     return int(scenario_id), reco_df
 
@@ -283,6 +358,275 @@ def _apply_recommendations_to_sites(site_df, actionable_df):
     return modified, applied_df
 
 
+def _json_safe(value):
+    if value is None:
+        return None
+    if pd.isna(value):
+        return None
+    if isinstance(value, np.generic):
+        return value.item()
+    return value
+
+
+def _first_present(row, names):
+    for name in names:
+        if name in row.index:
+            value = row.get(name)
+            if value is not None and not pd.isna(value):
+                return value
+    return None
+
+
+def _build_site_prediction_update_rows(project_id, public_scenario_id, modified_site_df, applied_df):
+    applied = applied_df.loc[applied_df["status"].astype(str) == "applied"].copy()
+    if applied.empty:
+        return []
+
+    applied_cells = {
+        _clean_id(value)
+        for value in applied["matched_node_cell_id"].dropna().astype(str)
+        if str(value).strip()
+    }
+    work = modified_site_df.copy()
+    work["_recommendation_cell_key"] = work["Node_Cell_ID"].astype(str).map(_clean_id)
+    work = work.loc[work["_recommendation_cell_key"].isin(applied_cells)].copy()
+    if work.empty:
+        return []
+
+    value_map = {
+        "lat": ["lat", "latitude"],
+        "lon": ["lon", "longitude"],
+        "azimuth": ["azimuth"],
+        "e_tilt": ["electrical_tilt", "Etilt", "e_tilt"],
+        "m_tilt": ["mechanical_tilt", "Mtilt", "m_tilt"],
+        "tx_power": ["tx_power", "maximum_transmission_power_of_resource"],
+        "height": ["antenna_height", "Height", "height"],
+    }
+
+    records = []
+    seen_source_ids = set()
+    for _, row in work.iterrows():
+        source_id = _first_present(row, ["source_id", "site_prediction_id", "original_id", "id"])
+        try:
+            source_id = int(source_id)
+        except (TypeError, ValueError):
+            source_id = None
+        if not source_id or source_id in seen_source_ids:
+            continue
+        seen_source_ids.add(source_id)
+
+        payload = {
+            "id": source_id,
+            "source_id": source_id,
+            "project_id": int(project_id),
+            "scenario": int(public_scenario_id),
+        }
+        for api_key, source_names in value_map.items():
+            value = _first_present(row, source_names)
+            if value is not None and not pd.isna(value):
+                payload[api_key] = _json_safe(value)
+        records.append(payload)
+
+    if not records:
+        raise ValueError("No source site_prediction rows could be resolved for recommendation site scenario save")
+    return records
+
+
+def _site_prediction_api_root(bridge):
+    api_root = str(getattr(bridge, "api_root_url", "") or "").rstrip("/")
+    suffix = "/api/pythonbridge"
+    if api_root.lower().endswith(suffix):
+        api_root = api_root[: -len(suffix)]
+    return api_root
+
+
+def _save_site_prediction_updates_via_api(project_id, public_scenario_id, update_rows):
+    bridge = get_bridge_client()
+    if not bridge:
+        return None
+    api_root = _site_prediction_api_root(bridge)
+    if not api_root:
+        return None
+    try:
+        result = bridge._request_url(
+            "POST",
+            f"{api_root}/api/MapView/UpdateSitePrediction",
+            json=update_rows,
+            timeout=int(os.getenv("PYTHON_BRIDGE_SITE_UPDATE_TIMEOUT_SECONDS", "120")),
+        )
+    except PythonBridgeError as exc:
+        print(
+            f"[LTE_OPT][SITE_SCENARIO_SAVE] source=mapview_api project_id={project_id} "
+            f"scenario={public_scenario_id} fallback=direct_db reason={exc}"
+        )
+        return None
+    rows_affected = int(result.get("RowsAffected") or result.get("rowsAffected") or 0)
+    print(
+        f"[LTE_OPT][SITE_SCENARIO_SAVE] source=mapview_api project_id={project_id} "
+        f"scenario={public_scenario_id} payload_rows={len(update_rows)} rows_affected={rows_affected}"
+    )
+    return rows_affected
+
+
+def _table_columns(conn, table_name):
+    rows = conn.execute(
+        text(
+            """
+            SELECT COLUMN_NAME
+            FROM INFORMATION_SCHEMA.COLUMNS
+            WHERE TABLE_SCHEMA = DATABASE()
+              AND TABLE_NAME = :table_name
+            """
+        ),
+        {"table_name": table_name},
+    ).fetchall()
+    return {str(row[0]) for row in rows if row and row[0] is not None}
+
+
+def _ensure_site_prediction_optimized_table(conn):
+    conn.execute(text("CREATE TABLE IF NOT EXISTS site_prediction_optimized LIKE site_prediction"))
+    existing = _table_columns(conn, "site_prediction_optimized")
+    required = {
+        "scenario": "INT NOT NULL DEFAULT 1",
+        "site_prediction_id": "INT NULL",
+        "is_updated": "TINYINT(1) NOT NULL DEFAULT 1",
+        "version": "INT NOT NULL DEFAULT 1",
+        "status": "VARCHAR(20) NULL DEFAULT 'updated'",
+        "created_at": "DATETIME NULL",
+        "updated_at": "DATETIME NULL",
+        "updated_by": "VARCHAR(100) NULL",
+    }
+    for column, definition in required.items():
+        if column not in existing:
+            conn.execute(text(f"ALTER TABLE site_prediction_optimized ADD COLUMN `{column}` {definition}"))
+
+
+def _save_site_prediction_updates_direct(project_id, public_scenario_id, update_rows, region):
+    current_engine = _resolve_engine(region)
+    with current_engine.begin() as conn:
+        _ensure_site_prediction_optimized_table(conn)
+        source_columns = _table_columns(conn, "site_prediction")
+        optimized_columns = _table_columns(conn, "site_prediction_optimized")
+        reserved = {
+            "id",
+            "site_prediction_id",
+            "scenario",
+            "scenario_id",
+            "is_updated",
+            "version",
+            "status",
+            "created_at",
+            "updated_at",
+            "updated_by",
+        }
+        copy_columns = [
+            column
+            for column in source_columns
+            if column in optimized_columns and column not in reserved
+        ]
+        if not copy_columns:
+            raise ValueError("No common site prediction columns available for optimized scenario save")
+
+        insert_columns = ", ".join(f"`{column}`" for column in copy_columns)
+        select_columns = ", ".join(f"sp.`{column}`" for column in copy_columns)
+        total_updated = 0
+        for row in update_rows:
+            source_id = int(row["source_id"])
+            conn.execute(
+                text(
+                    f"""
+                    INSERT INTO site_prediction_optimized (
+                        site_prediction_id, scenario, {insert_columns},
+                        is_updated, version, status, created_at, updated_at, updated_by
+                    )
+                    SELECT
+                        sp.id, :scenario, {select_columns},
+                        1, 0, 'updated', UTC_TIMESTAMP(), UTC_TIMESTAMP(), 'backend'
+                    FROM site_prediction sp
+                    WHERE sp.id = :source_id
+                      AND sp.tbl_project_id = :project_id
+                      AND NOT EXISTS (
+                          SELECT 1
+                          FROM site_prediction_optimized spo
+                          WHERE spo.site_prediction_id = sp.id
+                            AND spo.scenario = :scenario
+                      )
+                    """
+                ),
+                {
+                    "scenario": int(public_scenario_id),
+                    "source_id": source_id,
+                    "project_id": int(project_id),
+                },
+            )
+
+            update_pairs = []
+            params = {
+                "scenario": int(public_scenario_id),
+                "source_id": source_id,
+                "project_id": int(project_id),
+            }
+            for key, db_column in {
+                "lat": "latitude",
+                "lon": "longitude",
+                "azimuth": "azimuth",
+                "e_tilt": "e_tilt",
+                "m_tilt": "m_tilt",
+                "tx_power": "tx_power",
+                "height": "height",
+            }.items():
+                if key in row and db_column in optimized_columns:
+                    param_name = f"value_{key}"
+                    update_pairs.append(f"spo.`{db_column}` = :{param_name}")
+                    params[param_name] = row[key]
+
+            if not update_pairs:
+                continue
+
+            result = conn.execute(
+                text(
+                    f"""
+                    UPDATE site_prediction_optimized spo
+                    SET {", ".join(update_pairs)},
+                        spo.is_updated = 1,
+                        spo.status = 'updated',
+                        spo.version = COALESCE(spo.version, 0) + 1,
+                        spo.updated_at = UTC_TIMESTAMP(),
+                        spo.updated_by = 'backend'
+                    WHERE spo.site_prediction_id = :source_id
+                      AND spo.scenario = :scenario
+                      AND COALESCE(spo.tbl_project_id, 0) = :project_id
+                    """
+                ),
+                params,
+            )
+            total_updated += int(result.rowcount or 0)
+
+    print(
+        f"[LTE_OPT][SITE_SCENARIO_SAVE] source=direct_db project_id={project_id} "
+        f"scenario={public_scenario_id} payload_rows={len(update_rows)} rows_affected={total_updated}"
+    )
+    return total_updated
+
+
+def _save_recommendation_site_prediction_scenario(project_id, public_scenario_id, modified_site_df, applied_df, region):
+    update_rows = _build_site_prediction_update_rows(
+        project_id,
+        public_scenario_id,
+        modified_site_df,
+        applied_df,
+    )
+    rows_affected = _save_site_prediction_updates_via_api(project_id, public_scenario_id, update_rows)
+    if rows_affected is None:
+        rows_affected = _save_site_prediction_updates_direct(project_id, public_scenario_id, update_rows, region)
+    if rows_affected <= 0:
+        raise RuntimeError(
+            f"Recommendation site scenario save wrote 0 rows for project_id={project_id} "
+            f"scenario={public_scenario_id}"
+        )
+    return rows_affected
+
+
 def _build_scenario_name(cfg):
     provided = str(cfg.get("scenario_name", "")).strip()
     if provided:
@@ -350,6 +694,25 @@ class LTEPredictionService_optimised:
             scenario_id = int(scenario_id)
             scenario_row_id = int(scenario_row_id)
         else:
+            site_prediction_scenario_id = (
+                cfg.get("site_prediction_scenario_id")
+                or cfg.get("sitePredictionScenarioId")
+                or cfg.get("scenario")
+            )
+            if site_prediction_scenario_id is not None:
+                try:
+                    requested_scenario_id = int(site_prediction_scenario_id)
+                except (TypeError, ValueError):
+                    requested_scenario_id = None
+                if requested_scenario_id and requested_scenario_id > 0:
+                    cfg["requested_public_scenario_id"] = requested_scenario_id
+                    cfg.setdefault("target_type", "manual_site_prediction")
+                    cfg.setdefault("target_id", f"site_prediction_scenario_{requested_scenario_id}")
+                    cfg.setdefault("scenario_name", f"Manual Optimization - Site Scenario {requested_scenario_id}")
+                    cfg.setdefault(
+                        "scenario_description",
+                        f"Apply saved site_prediction_optimized scenario {requested_scenario_id} and run manual LTE optimized prediction",
+                    )
             scenario_row_id, scenario_id = self._create_scenario(cfg, job_id, region)
             cfg["scenario_row_id"] = scenario_row_id
             cfg["scenario_id"] = scenario_id
@@ -434,6 +797,12 @@ class LTEPredictionService_optimised:
 
             project_id = cfg["project_id"]
             operator = cfg.get("operator", "Airtel")
+            polygon_ids = cfg.get("polygon_ids") or cfg.get("polygonIds")
+            site_prediction_scenario_id = (
+                cfg.get("site_prediction_scenario_id")
+                or cfg.get("sitePredictionScenarioId")
+                or cfg.get("scenario")
+            )
 
             baseline_df = fetch_baseline(project_id, region=region, operator=operator)
             _df_summary("BASELINE_DF", baseline_df)
@@ -447,14 +816,22 @@ class LTEPredictionService_optimised:
                 region=region,
                 operator=operator,
                 allowed_cells=baseline_df["Node_Cell_ID"].astype(str).unique().tolist(),
+                polygon_ids=polygon_ids,
             )
             _df_summary("SITE_DF", site_df)
 
             self._update(job_id, "running", f"Loading optimized sites for {operator}")
-            opt_sites = fetch_optimized_sites(project_id, operator, region=region)
+            opt_sites = fetch_optimized_sites(
+                project_id,
+                operator,
+                region=region,
+                polygon_ids=polygon_ids,
+                scenario=site_prediction_scenario_id,
+            )
             if opt_sites.empty:
                 raise ValueError(
-                    f"No rows found in site_prediction_optimized for project_id={project_id} operator={operator}"
+                    f"No rows found in site_prediction_optimized for project_id={project_id} "
+                    f"operator={operator} scenario={site_prediction_scenario_id or 'latest'}"
                 )
             _df_summary("OPTIMIZED_SITE_DF", opt_sites)
 
@@ -543,6 +920,7 @@ class LTEPredictionService_optimised:
         try:
             project_id = cfg["project_id"]
             operator = cfg.get("operator")
+            polygon_ids = cfg.get("polygon_ids") or cfg.get("polygonIds")
             print(
                 f"[LTE_OPT][RECOMMENDATION_JOB_START] job_id={job_id} project_id={project_id} "
                 f"region={region} operator={operator} recommendation_scenario_id={recommendation_scenario_id}"
@@ -574,6 +952,7 @@ class LTEPredictionService_optimised:
                 region=region,
                 operator=operator,
                 allowed_cells=baseline_df["Node_Cell_ID"].astype(str).unique().tolist(),
+                polygon_ids=polygon_ids,
             )
             _df_summary("SITE_DF", site_df)
 
@@ -581,6 +960,15 @@ class LTEPredictionService_optimised:
             modified_site_df, applied_df = _apply_recommendations_to_sites(site_df, actionable_df)
             _df_summary("RECOMMENDATION_APPLIED_ROWS", applied_df)
             _df_summary("RECOMMENDATION_MODIFIED_SITE_DF", modified_site_df)
+
+            self._update(job_id, "running", "Saving recommendation site scenario")
+            saved_site_rows = _save_recommendation_site_prediction_scenario(
+                project_id,
+                scenario_id,
+                modified_site_df,
+                applied_df,
+                region,
+            )
 
             affected_cells, affected_sites, changed_rows = _compute_affected_cells(
                 modified_site_df,
@@ -661,6 +1049,7 @@ class LTEPredictionService_optimised:
                 "recommendation_scenario_id": int(recommendation_scenario_id),
                 "actionable_recommendation_rows": int(len(actionable_df)),
                 "applied_recommendation_rows": int((applied_df["status"].astype(str) == "applied").sum()),
+                "saved_site_prediction_rows": int(saved_site_rows),
                 "changed_cells": int(changed_rows["Node_Cell_ID"].nunique()),
                 "affected_cells": int(len(affected_cells)),
                 "affected_sites": int(len(affected_sites)),
@@ -694,6 +1083,41 @@ class LTEPredictionService_optimised:
         return file_path
     
     def _save_to_db(self, df, region="india"):
+        bridge = get_bridge_client()
+        if bridge:
+            safe_df = df.replace({pd.NA: None}).where(pd.notna(df), None)
+            rows = []
+            for row in safe_df.to_dict(orient="records"):
+                rows.append(
+                    {
+                        "lat": row.get("lat"),
+                        "lon": row.get("lon"),
+                        "pred_rsrp": row.get("pred_rsrp"),
+                        "pred_rsrq": row.get("pred_rsrq"),
+                        "pred_sinr": row.get("pred_sinr"),
+                        "node_b_id": row.get("node_b_id"),
+                        "cell_id": row.get("cell_id"),
+                        "Technology": row.get("Technology"),
+                        "operator": row.get("Operator"),
+                        "operator_name": row.get("Operator"),
+                        "created_at": row.get("created_at").isoformat() if hasattr(row.get("created_at"), "isoformat") else row.get("created_at"),
+                        "site_id": row.get("site_id"),
+                        "nodeb_id_cell_id": row.get("nodeb_id_cell_id"),
+                        "scenario_id": row.get("scenario_id"),
+                        "public_scenario_id": row.get("public_scenario_id"),
+                    }
+                )
+            payload = bridge._request(
+                "POST",
+                "SaveLtePredictionOptimisedResults",
+                json={
+                    "ProjectId": int(df["project_id"].iloc[0]),
+                    "JobId": str(df["job_id"].iloc[0]) if "job_id" in df.columns else "",
+                    "Rows": rows,
+                },
+            )
+            print(f"[LTE_OPT][DB_WRITE_DONE] source=python_bridge rows={payload.get('Inserted') or payload.get('inserted') or 0}")
+            return
         current_engine = _resolve_engine(region)
         self._ensure_public_scenario_id_column(current_engine)
         print(
@@ -860,10 +1284,46 @@ class LTEPredictionService_optimised:
         return pruned
 
     def _create_scenario(self, cfg, job_id, region):
+        bridge = get_bridge_client()
+        if bridge:
+            baseline_job_id = cfg.get("baseline_job_id") or _latest_baseline_job_id(cfg["project_id"], region=region)
+            payload = {
+                "ProjectId": int(cfg["project_id"]),
+                "ScenarioId": int(cfg["requested_public_scenario_id"]) if cfg.get("requested_public_scenario_id") else None,
+                "BaselineJobId": baseline_job_id,
+                "ScenarioName": _build_scenario_name(cfg),
+                "ScenarioDescription": _build_scenario_description(cfg),
+                "Region": region,
+                "Operator": str(cfg.get("operator", "Airtel")),
+                "TargetType": str(cfg.get("target_type", "")).strip() or None,
+                "TargetId": str(cfg.get("target_id", "")).strip() or None,
+                "ImpactRadiusM": float(cfg.get("impact_radius_m", cfg.get("radius", 500)) or 500),
+                "NeighborSiteCount": int(cfg.get("neighbor_site_count", 2) or 2),
+                "MaxInterferenceSites": int(cfg.get("max_interference_sites", 10) or 10),
+                "DeltaLat": float(cfg.get("delta_lat", 0) or 0),
+                "DeltaLon": float(cfg.get("delta_lon", 0) or 0),
+                "DeltaAzimuth": float(cfg.get("delta_azimuth", 0) or 0),
+                "DeltaElectricalTilt": float(cfg.get("delta_electrical_tilt", 0) or 0),
+                "DeltaMechanicalTilt": float(cfg.get("delta_mechanical_tilt", 0) or 0),
+                "DeltaTxPower": float(cfg.get("delta_tx_power", 0) or 0),
+                "DeltaAntennaHeight": float(cfg.get("delta_antenna_height", 0) or 0),
+                "Status": "created",
+                "CreatedBy": str(cfg.get("created_by", "backend")),
+            }
+            result = bridge._request("POST", "CreateLteOptimizationScenario", json=payload)
+            scenario_row_id = int(result.get("ScenarioRowId") or result.get("scenarioRowId"))
+            public_scenario_id = int(result.get("ScenarioId") or result.get("scenarioId"))
+            print(f"[LTE_OPT][SCENARIO_CREATE] source=python_bridge row_id={scenario_row_id} scenario_id={public_scenario_id} job_id={job_id}")
+            return scenario_row_id, public_scenario_id
         current_engine = _resolve_engine(region)
         baseline_job_id = cfg.get("baseline_job_id") or _latest_baseline_job_id(cfg["project_id"], region=region)
         self._prune_oldest_project_scenario_if_needed(cfg["project_id"], current_engine, max_scenarios=6)
-        public_scenario_id = self._get_next_project_scenario_id(cfg["project_id"], current_engine)
+        requested_public_scenario_id = cfg.get("requested_public_scenario_id")
+        if requested_public_scenario_id is not None:
+            requested_public_scenario_id = int(requested_public_scenario_id)
+            if requested_public_scenario_id <= 0:
+                requested_public_scenario_id = None
+        public_scenario_id = requested_public_scenario_id or self._get_next_project_scenario_id(cfg["project_id"], current_engine)
         payload = {
             "project_id": int(cfg["project_id"]),
             "scenario_id": public_scenario_id,
@@ -912,6 +1372,20 @@ class LTEPredictionService_optimised:
         return scenario_row_id, public_scenario_id
 
     def _update_scenario_status(self, scenario_row_id, status, region="india", job_id=None):
+        bridge = get_bridge_client()
+        if bridge:
+            baseline_job_id = None
+            try:
+                baseline_job_id = _latest_baseline_job_id(JOBS.get(job_id, {}).get("project_id"), region) if job_id and JOBS.get(job_id, {}).get("project_id") else None
+            except Exception:
+                baseline_job_id = None
+            bridge._request(
+                "POST",
+                "UpdateLteOptimizationScenarioStatus",
+                json={"ScenarioRowId": int(scenario_row_id), "Status": status, "BaselineJobId": baseline_job_id},
+            )
+            print(f"[LTE_OPT][SCENARIO_STATUS] source=python_bridge row_id={scenario_row_id} status={status}")
+            return
         current_engine = _resolve_engine(region)
         update_sql = text("""
             UPDATE lte_optimization_scenarios

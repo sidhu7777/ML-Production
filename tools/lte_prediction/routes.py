@@ -18,6 +18,7 @@ def run_prediction():
             "project_id": int(data["project_id"]),
             "session_ids": data["session_ids"],
             "region": str(data.get("region", "india")).lower(),
+            "operator": str(data.get("operator", "") or "").strip(),
             "radius_m": float(data.get("radius", data.get("radius_m", 500))),
             "grid_resolution": float(data.get("grid_resolution", 25)),
             "building": bool(data.get("building", True)),
@@ -30,6 +31,10 @@ def run_prediction():
             "ensure_all_cells": bool(data.get("ensure_all_cells", True)),
             "min_grids_per_cell": int(data.get("min_grids_per_cell", 1)),
             "grid_analytics_scenario_id": data.get("grid_analytics_scenario_id"),
+            "grid_analytics_auth_header": request.headers.get("Authorization") or data.get("grid_analytics_auth_header"),
+            "grid_analytics_cookie_header": request.headers.get("Cookie") or data.get("grid_analytics_cookie_header"),
+            "drive_rows": data.get("drive_rows") or data.get("network_logs"),
+            "drive_rows_source": data.get("drive_rows_source") or data.get("network_logs_source"),
             "dem_raster_path": data.get("dem_raster_path"),
             "output_folder": current_app.config['OUTPUT_FOLDER']
         }

@@ -31,7 +31,7 @@ class Config:
     S3_REGION = os.getenv('S3_REGION', 'us-east-1')
     CLOUDINARY_URL = os.getenv('CLOUDINARY_URL')
 
-    SQLALCHEMY_DATABASE_URI = os.getenv("DATABASE_URL")
+    SQLALCHEMY_DATABASE_URI = os.getenv("DATABASE_URL") or "sqlite:///s_tracer_backend.db"
     SQLALCHEMY_TRACK_MODIFICATIONS = False
     SQLALCHEMY_ENGINE_OPTIONS = {
         "pool_pre_ping": True,

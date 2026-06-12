@@ -539,7 +539,7 @@ def generate_accuracy_report(drive_df, site_df, params):
     scol = next((c for c in dt.columns if "sinr" in c.lower()), None)
 
     if rcol is None:
-        print("⚠ No valid RSRP column found for validation.")
+        print("[WARN] No valid RSRP column found for validation.")
         return
 
     dt["RSRP_meas"] = pd.to_numeric(dt[rcol], errors="coerce")
@@ -578,7 +578,7 @@ def generate_accuracy_report(drive_df, site_df, params):
             print(f"   RMSE : {np.sqrt(mean_squared_error(vq['RSRQ_meas'], vq['RSRQ_pred'])):.2f} dB")
             print(f"   R2   : {r2_score(vq['RSRQ_meas'], vq['RSRQ_pred']):.4f}")
     else:
-        print("\n⚠ No RSRQ column found in DT file.")
+        print("\n[WARN] No RSRQ column found in DT file.")
 
     # SINR
     if scol:
@@ -590,7 +590,7 @@ def generate_accuracy_report(drive_df, site_df, params):
             print(f"   RMSE : {np.sqrt(mean_squared_error(vs['SINR_meas'], vs['SINR_pred'])):.2f} dB")
             print(f"   R2   : {r2_score(vs['SINR_meas'], vs['SINR_pred']):.4f}")
     else:
-        print("\n⚠ No SINR column found in DT file.")
+        print("\n[WARN] No SINR column found in DT file.")
 
     print("\n" + "="*60 + "\n")
 

@@ -1,4 +1,5 @@
 import os
+import time
 
 import pandas as pd
 from sqlalchemy import create_engine
@@ -23,6 +24,7 @@ from .grid_sampling import (
     fetch_frontend_grid_cells,
 )
 from .Sector_wise_prediction_code_copy import run_prediction_from_api
+from utils.python_bridge import PythonBridgeError, get_bridge_client
 
 
 load_dotenv()
@@ -37,6 +39,15 @@ engine = {
         pool_size=10, max_overflow=20, pool_recycle=300, pool_pre_ping=True
     ) if os.getenv("DATABASE_URL_Taiwan") else None
 }
+
+
+def _require_engine(current_engine, region, operation):
+    if current_engine is None:
+        raise RuntimeError(
+            f"No direct database engine configured for region '{region}' while {operation}. "
+            "Set PYTHON_BRIDGE_BASE_URL for bridge access or DATABASE_URL for direct DB access."
+        )
+    return current_engine
 
 
 def _safe_nunique(df, col):
@@ -54,6 +65,55 @@ def _safe_minmax(df, col):
     if series.empty:
         return "n/a"
     return f"{series.min():.4f}..{series.max():.4f}"
+
+
+def _copy_first_present(df, target, candidates):
+    if target in df.columns:
+        return
+    by_lower = {str(col).strip().lower(): col for col in df.columns}
+    for candidate in candidates:
+        if candidate in df.columns:
+            df[target] = df[candidate]
+            return
+        source = by_lower.get(str(candidate).strip().lower())
+        if source is not None:
+            df[target] = df[source]
+            return
+
+
+def _normalize_prediction_coordinates(df):
+    if df.empty:
+        return df
+    out = df.copy()
+    out.columns = out.columns.str.strip()
+    _copy_first_present(out, "lat", ["latitude", "Lat", "Latitude", "LAT", "grid_lat", "center_lat", "lat_pred"])
+    _copy_first_present(out, "lon", ["longitude", "lng", "Lng", "Longitude", "LON", "grid_lon", "center_lon", "lon_pred"])
+    for col in ["lat", "lon"]:
+        if col in out.columns:
+            out[col] = pd.to_numeric(out[col], errors="coerce")
+    return out
+
+
+def _normalize_drive_dataframe(df):
+    expected_cols = ["lat", "lon", "rsrp", "rsrq", "sinr", "cell_id", "nodeb_id", "pci", "earfcn", "session_id"]
+    if df.empty:
+        return pd.DataFrame(columns=expected_cols)
+    out = df.copy()
+    out.columns = out.columns.str.strip()
+    _copy_first_present(out, "lat", ["latitude", "Lat", "Latitude", "LAT", "lat_deg", "y"])
+    _copy_first_present(out, "lon", ["longitude", "lng", "Lng", "Longitude", "LON", "lon_deg", "long", "x"])
+    _copy_first_present(out, "cell_id", ["CellId", "Cell_ID", "cellId", "Cell ID"])
+    _copy_first_present(out, "nodeb_id", ["NodebId", "NodeBId", "nodeBId", "NodeB_ID", "node_b_id", "Node_B_ID"])
+    _copy_first_present(out, "pci", ["PCI", "Pci"])
+    _copy_first_present(out, "earfcn", ["EARFCN", "Earfcn"])
+    for col in ["lat", "lon", "rsrp", "rsrq", "sinr"]:
+        if col in out.columns:
+            out[col] = pd.to_numeric(out[col], errors="coerce")
+    return out
+
+
+def _empty_drive_dataframe():
+    return _normalize_drive_dataframe(pd.DataFrame())
 
 
 def _print_fetch_summary(stage, table_name, filters, df, extra=None):
@@ -84,6 +144,34 @@ def _print_df_profile(stage, df):
 
 
 def _load_project_polygons(project_id, current_engine):
+    bridge = get_bridge_client()
+    if bridge:
+        region_df = bridge.get_rows("GetProjectRegions", {"projectId": int(project_id)})
+        source = "python_bridge"
+    else:
+        source = "database"
+        query = f"""
+        SELECT ST_AsText(region) AS region_wkt
+        FROM map_regions
+        WHERE tbl_project_id = {project_id}
+          AND status = 1
+        """
+
+        region_df = pd.read_sql(query, current_engine)
+    print(f"[LTE][PROJECT_REGION_FETCH] source={source} rows={len(region_df)}")
+    polygons = []
+    for raw_region in region_df.get("region_wkt", pd.Series(dtype=str)).dropna():
+        raw_region = str(raw_region).strip()
+        if not raw_region:
+            continue
+        try:
+            polygons.append(load_wkt(raw_region))
+        except Exception:
+            continue
+    return polygons
+
+
+def _load_project_polygons_from_db(project_id, current_engine):
     query = f"""
     SELECT ST_AsText(region) AS region_wkt
     FROM map_regions
@@ -234,23 +322,83 @@ def _resolve_operator(df):
     raise ValueError("Unable to resolve operator from site_prediction data")
 
 
-def fetch_site_data(project_id, region="india"):
-    current_engine = engine.get(region.lower(), engine["india"])
-    query = f"""
-    SELECT *
-    FROM site_prediction
-    WHERE tbl_project_id = {project_id}
+def _parse_polygon_ids(polygon_ids=None):
+    if polygon_ids is None:
+        return []
+    if isinstance(polygon_ids, (list, tuple, set)):
+        raw_items = polygon_ids
+    else:
+        raw_items = str(polygon_ids).split(",")
+    ids = []
+    for item in raw_items:
+        try:
+            value = int(str(item).strip())
+        except (TypeError, ValueError):
+            continue
+        if value > 0 and value not in ids:
+            ids.append(value)
+    return ids
+
+
+def _site_polygon_filter_sql(polygon_ids):
+    if not polygon_ids:
+        return ""
+    id_list = ",".join(str(int(value)) for value in polygon_ids)
+    return f"""
+        AND EXISTS (
+            SELECT 1
+            FROM map_regions mr_filter
+            WHERE mr_filter.tbl_project_id = site_prediction.tbl_project_id
+              AND mr_filter.id IN ({id_list})
+              AND (
+                ST_Contains(
+                  mr_filter.region,
+                  ST_GeomFromText(CONCAT('POINT(', site_prediction.longitude, ' ', site_prediction.latitude, ')'), 4326)
+                )
+                OR ST_Contains(
+                  mr_filter.region,
+                  ST_GeomFromText(CONCAT('POINT(', site_prediction.latitude, ' ', site_prediction.longitude, ')'), 4326)
+                )
+              )
+        )
     """
 
-    df = pd.read_sql(query, current_engine)
+
+def fetch_site_data(project_id, region="india", polygon_ids=None, operator=None):
+    current_engine = engine.get(region.lower(), engine["india"])
+    polygon_id_list = _parse_polygon_ids(polygon_ids)
+    bridge = get_bridge_client()
+    if bridge:
+        params = {"projectId": int(project_id)}
+        if polygon_id_list:
+            params["polygon_ids"] = ",".join(str(value) for value in polygon_id_list)
+        start_time = time.perf_counter()
+        df = bridge.get_rows("GetLteSitePredictionRows", params)
+        elapsed_ms = (time.perf_counter() - start_time) * 1000
+        print(
+            f"[LTE_PRED][PYTHON_BRIDGE_TIMING] endpoint=GetLteSitePredictionRows "
+            f"project_id={project_id} region={region} rows={len(df)} "
+            f"elapsed_ms={elapsed_ms:.0f} polygon_ids={params.get('polygon_ids', 'all')}"
+        )
+        source = "python_bridge"
+    else:
+        query = f"""
+        SELECT *
+        FROM site_prediction
+        WHERE tbl_project_id = {project_id}
+        {_site_polygon_filter_sql(polygon_id_list)}
+        """
+        current_engine = _require_engine(current_engine, region, "fetching LTE site data")
+        df = pd.read_sql(query, current_engine)
+        source = "database"
 
     if df.empty:
         raise ValueError("No site data found")
 
     _print_fetch_summary(
         "SITE_FETCH_RAW",
-        "site_prediction",
-        {"project_id": project_id, "region": region},
+        f"site_prediction via {source}",
+        {"project_id": project_id, "region": region, "source": source},
         df,
         extra={
             "distinct_pci": _safe_nunique(df, "pci"),
@@ -301,87 +449,266 @@ def fetch_site_data(project_id, region="india"):
 
     df = df.dropna(subset=["lat", "lon"])
 
+    requested_operator = str(operator or "").strip()
+    if requested_operator and requested_operator.lower() not in {"all", "auto"}:
+        operator_candidates = ["operator", "network", "cluster", "Technology"]
+        operator_mask = pd.Series([False] * len(df), index=df.index)
+        matched_columns = []
+        for col in operator_candidates:
+            if col not in df.columns:
+                continue
+            col_mask = (
+                df[col]
+                .astype(str)
+                .str.strip()
+                .str.lower()
+                .eq(requested_operator.lower())
+            )
+            if bool(col_mask.any()):
+                matched_columns.append(col)
+                operator_mask = operator_mask | col_mask
+        matched_rows = int(operator_mask.sum())
+        print(
+            f"[LTE][SITE_OPERATOR_FILTER] requested={requested_operator} "
+            f"matched_rows={matched_rows} matched_columns={matched_columns}"
+        )
+        if matched_rows <= 0:
+            raise ValueError(f"No site prediction rows found for operator={requested_operator}")
+        df = df.loc[operator_mask].copy()
+
     print("[LTE][SITE_FETCH_READY] converted_to_prediction_engine_format=True")
     _print_df_profile("SITE_FETCH_READY", df)
-    return df, _resolve_operator(df)
+    return df, requested_operator if requested_operator and requested_operator.lower() not in {"all", "auto"} else _resolve_operator(df)
 
 
-def fetch_drive_data(session_ids, operator, project_id, region="india"):
+def fetch_drive_data(
+    session_ids,
+    operator,
+    project_id,
+    region="india",
+    frontend_drive_rows=None,
+    frontend_drive_rows_source=None,
+):
     session_str = ",".join(map(str, session_ids))
     key = f"{project_id}_{operator}_{session_str}"
     path = f"cache/drive_{key}.parquet"
-    required_drive_cols = {"cell_id", "nodeb_id"}
+    required_drive_cols = {"lat", "lon", "cell_id", "nodeb_id"}
+    current_engine = engine.get(region.lower(), engine["india"])
 
-    if os.path.exists(path):
-        print("[LTE][DRIVE_FETCH_CACHE] cache_hit=True")
-        cached = pd.read_parquet(path)
-        missing_cache_cols = sorted(required_drive_cols - set(cached.columns))
-        if not missing_cache_cols:
-            cached["cell_id"] = cached["cell_id"].astype(str).str.strip()
-            cached["nodeb_id"] = cached["nodeb_id"].astype(str).str.strip()
+    if isinstance(frontend_drive_rows, list) and frontend_drive_rows:
+        frontend_source = str(frontend_drive_rows_source or "frontend_payload").strip() or "frontend_payload"
+        provided_rows = len(frontend_drive_rows)
+        frontend_df = _normalize_drive_dataframe(pd.DataFrame(frontend_drive_rows))
+        if {"lat", "lon"}.issubset(frontend_df.columns):
+            frontend_df = frontend_df.dropna(subset=["lat", "lon"]).copy()
+        else:
+            frontend_df = _empty_drive_dataframe()
+
+        primary_col = None
+        for candidate_col in ("primary", "Primary", "is_primary"):
+            if candidate_col in frontend_df.columns:
+                primary_col = candidate_col
+                break
+        if primary_col is not None and not frontend_df.empty:
+            primary_mask = frontend_df[primary_col].astype(str).str.strip().str.lower().isin(
+                {"yes", "true", "1", "primary"}
+            )
+            if primary_mask.any():
+                frontend_df = frontend_df.loc[primary_mask].copy()
+
+        operator_filter_col = None
+        for candidate_col in ("provider", "m_alpha_long", "m_alpha_short", "operator", "network"):
+            if candidate_col in frontend_df.columns:
+                values = frontend_df[candidate_col].dropna().astype(str).str.strip()
+                if not values.empty and (values != "").any():
+                    operator_filter_col = candidate_col
+                    break
+        operator_match_rows = None
+        if operator_filter_col is not None and operator:
+            operator_mask = (
+                frontend_df[operator_filter_col]
+                .astype(str)
+                .str.strip()
+                .str.lower()
+                .eq(str(operator).strip().lower())
+            )
+            operator_match_rows = int(operator_mask.sum())
+            if operator_match_rows > 0:
+                frontend_df = frontend_df.loc[operator_mask].copy()
+
+        print(
+            f"[LTE][DRIVE_FETCH_FRONTEND] source={frontend_source} "
+            f"provided_rows={provided_rows} usable_rows={len(frontend_df)} "
+            f"primary_col={primary_col} operator_filter_col={operator_filter_col} "
+            f"operator_match_rows={operator_match_rows}"
+        )
+
+        missing_frontend_cols = sorted(required_drive_cols - set(frontend_df.columns))
+        if not frontend_df.empty and not missing_frontend_cols:
+            for col in ["cell_id", "nodeb_id", "pci", "earfcn"]:
+                if col in frontend_df.columns:
+                    frontend_df[col] = frontend_df[col].astype(str).str.strip()
+            frontend_df, polygon_stats = _apply_drive_polygon_filter(
+                frontend_df, project_id, current_engine
+            )
             _print_fetch_summary(
-                "DRIVE_FETCH_CACHE",
-                "cache/drive parquet",
+                "DRIVE_FETCH_FRONTEND",
+                frontend_source,
                 {
                     "session_ids": session_ids,
                     "operator": operator,
                     "project_id": project_id,
-                    "region": region
+                    "region": region,
+                    "source": frontend_source,
                 },
-                cached,
+                frontend_df,
                 extra={
                     "distinct_sessions_requested": len(session_ids),
-                    "lat_range": _safe_minmax(cached, "lat"),
-                    "lon_range": _safe_minmax(cached, "lon"),
-                }
+                    "provided_rows": provided_rows,
+                    "missing_required_columns": missing_frontend_cols,
+                    "polygon_removed": polygon_stats["rows_before"] - len(frontend_df),
+                    "polygon_swapped": polygon_stats["swapped"],
+                },
             )
-            return cached
+            print(
+                f"[LTE][DRIVE_FETCH_SOURCE] selected={frontend_source} "
+                f"fallback_used=False rows={len(frontend_df)}"
+            )
+            _print_df_profile("DRIVE_FETCH_COMBINED", frontend_df)
+            os.makedirs("cache", exist_ok=True)
+            frontend_df.to_parquet(path)
+            return frontend_df
 
         print(
-            f"[LTE][DRIVE_FETCH_CACHE] refreshing_cache_missing_columns={missing_cache_cols}"
+            f"[LTE][DRIVE_FETCH_FRONTEND] fallback=python_bridge_or_database "
+            f"reason=no_usable_frontend_rows missing_required_columns={missing_frontend_cols}"
         )
 
-    current_engine = engine.get(region.lower(), engine["india"])
+    if os.path.exists(path):
+        print("[LTE][DRIVE_FETCH_CACHE] cache_hit=True")
+        cached = _normalize_drive_dataframe(pd.read_parquet(path))
+        missing_cache_cols = sorted(required_drive_cols - set(cached.columns))
+        if not missing_cache_cols:
+            cached["cell_id"] = cached["cell_id"].astype(str).str.strip()
+            cached["nodeb_id"] = cached["nodeb_id"].astype(str).str.strip()
+            cached = cached.dropna(subset=["lat", "lon"])
+            if cached.empty:
+                print("[LTE][DRIVE_FETCH_CACHE] refreshing_cache_reason=no_usable_lat_lon_rows")
+            else:
+                _print_fetch_summary(
+                    "DRIVE_FETCH_CACHE",
+                    "cache/drive parquet",
+                    {
+                        "session_ids": session_ids,
+                        "operator": operator,
+                        "project_id": project_id,
+                        "region": region
+                    },
+                    cached,
+                    extra={
+                        "distinct_sessions_requested": len(session_ids),
+                        "lat_range": _safe_minmax(cached, "lat"),
+                        "lon_range": _safe_minmax(cached, "lon"),
+                    }
+                )
+                return cached
+        else:
+            print(
+                f"[LTE][DRIVE_FETCH_CACHE] refreshing_cache_missing_columns={missing_cache_cols}"
+            )
 
-    main_query = f"""
-    SELECT lat, lon, rsrp, rsrq, sinr, cell_id, nodeb_id, pci, earfcn
-    FROM tbl_network_log
-    WHERE session_id IN ({session_str})
-    AND LOWER(COALESCE(m_alpha_long, m_alpha_short)) = LOWER('{operator}')
-    AND LOWER(COALESCE(`primary`, '')) = 'yes'
-    """
+    bridge = get_bridge_client()
 
-    neighbour_query = f"""
-    SELECT lat, lon, rsrp, rsrq, sinr, cell_id, nodeb_id, pci, earfcn
-    FROM tbl_network_log_neighbour
-    WHERE session_id IN ({session_str})
-    AND LOWER(COALESCE(m_alpha_long, m_alpha_short)) = LOWER('{operator}')
-    AND LOWER(COALESCE(`primary`, '')) = 'yes'
-    """
+    if bridge:
+        def _bridge_drive_rows(primary_only, operator_value):
+            body = {
+                "SessionIds": [int(sid) for sid in session_ids],
+                "IncludeNeighbour": True,
+                "PrimaryOnly": bool(primary_only),
+            }
+            if operator_value:
+                body["Operator"] = operator_value
+            return _normalize_drive_dataframe(bridge.post_rows("GetDriveTestRows", body))
 
-    raw_main_query = f"""
-    SELECT lat, lon, rsrp, rsrq, sinr, cell_id, nodeb_id, pci, earfcn
-    FROM tbl_network_log
-    WHERE session_id IN ({session_str})
-    AND LOWER(COALESCE(m_alpha_long, m_alpha_short)) = LOWER('{operator}')
-    """
+        raw_df = _bridge_drive_rows(primary_only=False, operator_value=operator)
+        df = _bridge_drive_rows(primary_only=True, operator_value=operator)
+        fallback_reason = None
+        if df.empty and not raw_df.empty:
+            df = raw_df.copy()
+            fallback_reason = "primary_only_empty_using_all_operator_rows"
+        if df.empty:
+            raw_all_operator_df = _bridge_drive_rows(primary_only=False, operator_value=None)
+            primary_all_operator_df = _bridge_drive_rows(primary_only=True, operator_value=None)
+            if not primary_all_operator_df.empty:
+                df = primary_all_operator_df
+                raw_df = raw_all_operator_df
+                fallback_reason = "operator_filter_empty_using_primary_all_operators"
+            elif not raw_all_operator_df.empty:
+                df = raw_all_operator_df
+                raw_df = raw_all_operator_df
+                fallback_reason = "operator_filter_empty_using_all_session_rows"
+        if fallback_reason:
+            print(f"[LTE][DRIVE_FETCH_FALLBACK] source=python_bridge reason={fallback_reason}")
+        main_df = df
+        neighbour_df = pd.DataFrame()
+        raw_total_rows = len(raw_df)
+        primary_filtered_rows = len(df)
+        source = "python_bridge"
+    else:
+        main_query = f"""
+        SELECT lat, lon, rsrp, rsrq, sinr, cell_id, nodeb_id, pci, earfcn
+        FROM tbl_network_log
+        WHERE session_id IN ({session_str})
+        AND LOWER(COALESCE(m_alpha_long, m_alpha_short)) = LOWER('{operator}')
+        AND LOWER(COALESCE(`primary`, '')) = 'yes'
+        """
 
-    raw_neighbour_query = f"""
-    SELECT lat, lon, rsrp, rsrq, sinr, cell_id, nodeb_id, pci, earfcn
-    FROM tbl_network_log_neighbour
-    WHERE session_id IN ({session_str})
-    AND LOWER(COALESCE(m_alpha_long, m_alpha_short)) = LOWER('{operator}')
-    """
+        neighbour_query = f"""
+        SELECT lat, lon, rsrp, rsrq, sinr, cell_id, nodeb_id, pci, earfcn
+        FROM tbl_network_log_neighbour
+        WHERE session_id IN ({session_str})
+        AND LOWER(COALESCE(m_alpha_long, m_alpha_short)) = LOWER('{operator}')
+        AND LOWER(COALESCE(`primary`, '')) = 'yes'
+        """
 
-    raw_main_df = pd.read_sql(raw_main_query, current_engine)
-    raw_neighbour_df = pd.read_sql(raw_neighbour_query, current_engine)
-    main_df = pd.read_sql(main_query, current_engine)
-    neighbour_df = pd.read_sql(neighbour_query, current_engine)
+        raw_main_query = f"""
+        SELECT lat, lon, rsrp, rsrq, sinr, cell_id, nodeb_id, pci, earfcn
+        FROM tbl_network_log
+        WHERE session_id IN ({session_str})
+        AND LOWER(COALESCE(m_alpha_long, m_alpha_short)) = LOWER('{operator}')
+        """
+
+        raw_neighbour_query = f"""
+        SELECT lat, lon, rsrp, rsrq, sinr, cell_id, nodeb_id, pci, earfcn
+        FROM tbl_network_log_neighbour
+        WHERE session_id IN ({session_str})
+        AND LOWER(COALESCE(m_alpha_long, m_alpha_short)) = LOWER('{operator}')
+        """
+
+        current_engine = _require_engine(current_engine, region, "fetching LTE drive data")
+        raw_main_df = pd.read_sql(raw_main_query, current_engine)
+        raw_neighbour_df = pd.read_sql(raw_neighbour_query, current_engine)
+        main_df = pd.read_sql(main_query, current_engine)
+        neighbour_df = pd.read_sql(neighbour_query, current_engine)
+        raw_total_rows = len(raw_main_df) + len(raw_neighbour_df)
+        primary_filtered_rows = len(main_df) + len(neighbour_df)
+        df = _normalize_drive_dataframe(pd.concat([main_df, neighbour_df], ignore_index=True))
+        source = "database"
+
+    df = _normalize_drive_dataframe(df)
+    if not {"lat", "lon"}.issubset(df.columns):
+        raise ValueError(f"Drive-test data is missing lat/lon columns. columns={list(df.columns)}")
+    df = df.dropna(subset=["lat", "lon"]).copy()
+    if df.empty:
+        print(
+            f"[LTE][DRIVE_FETCH_EMPTY] no usable drive-test rows after bridge/database fetch "
+            f"session_ids={session_ids} operator={operator} project_id={project_id}"
+        )
 
     _print_fetch_summary(
         "DRIVE_FETCH_MAIN",
-        "tbl_network_log",
-        {"session_ids": session_ids, "operator": operator, "project_id": project_id, "region": region},
+        f"tbl_network_log via {source}",
+        {"session_ids": session_ids, "operator": operator, "project_id": project_id, "region": region, "source": source},
         main_df,
         extra={"distinct_sessions_requested": len(session_ids)}
     )
@@ -393,10 +720,6 @@ def fetch_drive_data(session_ids, operator, project_id, region="india"):
         extra={"distinct_sessions_requested": len(session_ids)}
     )
 
-    raw_total_rows = len(raw_main_df) + len(raw_neighbour_df)
-    primary_filtered_rows = len(main_df) + len(neighbour_df)
-
-    df = pd.concat([main_df, neighbour_df], ignore_index=True)
     for col in ["cell_id", "nodeb_id", "pci", "earfcn"]:
         if col in df.columns:
             df[col] = df[col].astype(str).str.strip()
@@ -418,25 +741,32 @@ def fetch_drive_data(session_ids, operator, project_id, region="india"):
 
 def fetch_building_data(project_id, region="india"):
     current_engine = engine.get(region.lower(), engine["india"])
-    query = f"""
-    SELECT
-        id,
-        name,
-        region,
-        project_id,
-        area,
-        geometry,
-        ST_AsText(region) AS region_wkt,
-        ST_AsText(geometry) AS geometry_wkt
-    FROM tbl_savepolygon
-    WHERE project_id = {project_id}
-    """
+    bridge = get_bridge_client()
+    if bridge:
+        df = bridge.get_rows("GetLteBuildingRows", {"projectId": int(project_id)})
+        source = "python_bridge"
+    else:
+        query = f"""
+        SELECT
+            id,
+            name,
+            region,
+            project_id,
+            area,
+            geometry,
+            ST_AsText(region) AS region_wkt,
+            ST_AsText(geometry) AS geometry_wkt
+        FROM tbl_savepolygon
+        WHERE project_id = {project_id}
+        """
 
-    df = pd.read_sql(query, current_engine)
+        current_engine = _require_engine(current_engine, region, "fetching LTE building data")
+        df = pd.read_sql(query, current_engine)
+        source = "database"
     _print_fetch_summary(
         "BUILDING_FETCH",
-        "tbl_savepolygon",
-        {"project_id": project_id, "region": region},
+        f"tbl_savepolygon via {source}",
+        {"project_id": project_id, "region": region, "source": source},
         df,
         extra={
             "distinct_project_id": _safe_nunique(df, "project_id"),
@@ -510,12 +840,34 @@ def run_rf_prediction_fast(site_df, drive_df, building_df, params):
     prediction_points_df = pd.DataFrame()
     use_frontend_grid_sampling = bool(params.get("use_frontend_grid_sampling", True))
     if use_frontend_grid_sampling:
-        grid_df, frontend_grid_scenario_id = fetch_frontend_grid_cells(
-            current_engine,
-            int(params["project_id"]),
-            scenario_id=params.get("grid_analytics_scenario_id"),
-            grid_size_meters=params.get("frontend_grid_size_meters"),
-        )
+        bridge = get_bridge_client()
+        if bridge:
+            try:
+                grid_df, fetched_grid_size = bridge.get_grid_analytics(
+                    int(params["project_id"]),
+                    scenario_id=params.get("grid_analytics_scenario_id"),
+                    auth_header=params.get("grid_analytics_auth_header"),
+                    cookie_header=params.get("grid_analytics_cookie_header"),
+                )
+                frontend_grid_scenario_id = params.get("grid_analytics_scenario_id")
+                if not grid_df.empty:
+                    if "grid_size_meters" not in grid_df.columns and fetched_grid_size is not None:
+                        grid_df["grid_size_meters"] = fetched_grid_size
+                    print(
+                        f"[LTE][FRONTEND_GRID_FETCH] source=GridAnalyticsController "
+                        f"rows={len(grid_df)} scenario_id={frontend_grid_scenario_id}"
+                    )
+            except PythonBridgeError as exc:
+                print(f"[LTE][FRONTEND_GRID_FETCH] source=GridAnalyticsController skipped=True reason={exc}")
+                grid_df = pd.DataFrame()
+                frontend_grid_scenario_id = params.get("grid_analytics_scenario_id")
+        else:
+            grid_df, frontend_grid_scenario_id = fetch_frontend_grid_cells(
+                current_engine,
+                int(params["project_id"]),
+                scenario_id=params.get("grid_analytics_scenario_id"),
+                grid_size_meters=params.get("frontend_grid_size_meters"),
+            )
         if not grid_df.empty:
             sample_df = build_grid_sample_points(
                 grid_df,
@@ -561,7 +913,11 @@ def run_rf_prediction_fast(site_df, drive_df, building_df, params):
         "prediction_points_df": prediction_points_df,
     })
 
-    pred_df = pd.read_csv(f"{temp_dir}/prediction_ALL_SITES.csv")
+    pred_df = _normalize_prediction_coordinates(pd.read_csv(f"{temp_dir}/prediction_ALL_SITES.csv"))
+    print(
+        f"[LTE][RF_OUTPUT_RAW] rows={len(pred_df)} cols={list(pred_df.columns)} "
+        f"lat_range={_safe_minmax(pred_df, 'lat')} lon_range={_safe_minmax(pred_df, 'lon')}"
+    )
     override_polygon_wkt = str(params.get("polygon_wkt") or "").strip()
     if not prediction_points_df.empty:
         polygon_stats = {
