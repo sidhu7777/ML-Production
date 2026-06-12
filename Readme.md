@@ -13,7 +13,7 @@ This document provides a concise system overview and navigation index. Detailed 
 | LTE Tilt Recommendation | Evaluates bad RF areas and writes validated RF optimization recommendations. | [tools/lte_tilt_recommandation/README.md](tools/lte_tilt_recommandation/README.md) |
 | Report Engine | Generates project PDF reports and exposes report status/download APIs. | [tools/report_engine/README.md](tools/report_engine/README.md) |
 
-## API Entry Points
+
 
 | Module | Endpoint |
 | --- | --- |
