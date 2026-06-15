@@ -130,7 +130,14 @@ def load_project_data(project_id: int):
             raise ValueError("No valid session IDs found for project")
 
         # 2 Raw network logs
-        raw_df = get_network_logs_for_sessions(session_ids, conn)
+        raw_df = get_network_logs_for_sessions(
+            session_ids,
+            conn,
+            project_id=project_id,
+            provider=project.get("provider"),
+            start_date=project.get("from_date"),
+            end_date=project.get("to_date"),
+        )
 
         
 

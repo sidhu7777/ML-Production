@@ -389,6 +389,29 @@ def build_metadata(
         "pci_summary": pci_summary,
     }
 
+def _json_safe_metadata(value):
+    if value is None:
+        return None
+    if value is pd.NA:
+        return None
+    if isinstance(value, dict):
+        return {k: _json_safe_metadata(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_json_safe_metadata(v) for v in value]
+    if isinstance(value, tuple):
+        return [_json_safe_metadata(v) for v in value]
+    if isinstance(value, pd.Timestamp):
+        return value.isoformat()
+    if hasattr(value, "item"):
+        try:
+            return _json_safe_metadata(value.item())
+        except Exception:
+            pass
+    if pd.isna(value):
+        return None
+    return value
+
+
 def write_metadata_file(metadata: Dict, output_path: str):
     with open(output_path, "w", encoding="utf-8") as f:
-        json.dump(metadata, f, indent=2)
+        json.dump(_json_safe_metadata(metadata), f, indent=2, ensure_ascii=False)

@@ -6,6 +6,7 @@ import json
 import pandas as pd
 import math
 import os
+import re
 
 # Helper function to add legend to folium map
 
@@ -431,6 +432,135 @@ def generate_distinct_colors(n):
         )
     return colors
 
+
+FRONTEND_DYNAMIC_COLOR_PALETTE = [
+    "#FF5733", "#33FF57", "#3357FF", "#FF33A1", "#A133FF",
+    "#33FFF5", "#FFD133", "#FF8C33", "#8CFF33", "#338CFF",
+    "#FF3333", "#33FF8C", "#5733FF", "#FF33D1", "#33FFD1",
+    "#D1FF33", "#FF6633", "#66FF33", "#3366FF", "#FF3366",
+    "#C70039", "#900C3F", "#581845", "#1A5276", "#148F77",
+    "#D4AC0D", "#AF601A", "#6C3483", "#1E8449", "#2874A6",
+    "#CB4335", "#7D3C98", "#2E86C1", "#17A589", "#D68910",
+    "#BA4A00", "#8E44AD", "#3498DB", "#16A085", "#F39C12",
+]
+
+
+FRONTEND_BAND_COLORS = {
+    "B1": "#EF4444",
+    "B2": "#F59E0B",
+    "B3": "#EF4444",
+    "B4": "#F59E0B",
+    "B5": "#F59E0B",
+    "B6": "#EF4444",
+    "B7": "#10B981",
+    "B8": "#10B981",
+    "B9": "#F59E0B",
+    "B12": "#3B82F6",
+    "B13": "#3B82F6",
+    "B17": "#3B82F6",
+    "B18": "#10B981",
+    "B19": "#EF4444",
+    "B20": "#3B82F6",
+    "B25": "#8B5CF6",
+    "B26": "#8B5CF6",
+    "B28": "#EC4899",
+    "B38": "#6366F1",
+    "B39": "#6366F1",
+    "B40": "#3B82F6",
+    "B41": "#8B5CF6",
+    "n5": "#F59E0B",
+    "n28": "#EC4899",
+    "n78": "#F472B6",
+    "Unknown": "#a8a6a2",
+}
+
+
+def _frontend_hash_color(value):
+    normalized = str(value or "").lower().strip()
+    h = 0
+    for ch in normalized:
+        h = ((h << 5) - h) + ord(ch)
+        h = ((h + 2**31) % 2**32) - 2**31
+    return FRONTEND_DYNAMIC_COLOR_PALETTE[abs(h) % len(FRONTEND_DYNAMIC_COLOR_PALETTE)]
+
+
+def normalize_band_name(band):
+    """Python equivalent of the frontend normalizeBandName() helper."""
+    if band is None:
+        return "Unknown"
+
+    raw = str(band).strip()
+    if not raw:
+        return "Unknown"
+
+    upper_raw = raw.upper()
+    if upper_raw in {"UNKNOWN", "N/A", "NA", "NULL", "UNDEFINED", "-1"}:
+        return "Unknown"
+
+    nr_match = re.match(r"^N\s*[-_\s]*([+-]?\d+)$", raw, flags=re.IGNORECASE)
+    if nr_match:
+        val = abs(int(nr_match.group(1)))
+        return f"n{val}" if val > 0 else "Unknown"
+
+    lte_match = re.match(r"^(?:B|BAND)\s*[-_\s]*([+-]?\d+)$", raw, flags=re.IGNORECASE)
+    if lte_match:
+        val = abs(int(lte_match.group(1)))
+        return f"B{val}" if val > 0 else "Unknown"
+
+    try:
+        numeric = int(float(raw))
+        if numeric != 0:
+            return f"B{abs(numeric)}"
+    except (TypeError, ValueError):
+        pass
+
+    return raw
+
+
+def get_frontend_band_color(band):
+    normalized = normalize_band_name(band)
+    if normalized in FRONTEND_BAND_COLORS:
+        return FRONTEND_BAND_COLORS[normalized]
+    return _frontend_hash_color(normalized)
+
+
+def normalize_tech_name(tech, band=None):
+    if band is not None:
+        band_str = str(band).strip().lower()
+        if re.match(r"^n\d+", band_str):
+            return "5G"
+        if band_str in {
+            "n78", "n77", "n41", "n1", "n28", "n3", "n5", "n7",
+            "n8", "n20", "n38", "n40", "n66", "n71", "n257",
+            "n258", "n260", "n261"
+        }:
+            return "5G"
+
+    if tech is None:
+        return "Unknown"
+
+    tech_str = str(tech).strip()
+    if tech_str in {
+        "000", "00", "Unknown/No Service", "Unknown / No Service",
+        "UNKNOWN / NO SERVICE", "Unknown", "undefined", "null",
+        "404440", "404011"
+    }:
+        return "Unknown"
+
+    t = tech_str.upper()
+    if "LTE ANCHOR" in t or "LTE-ANCHOR" in t or "LTE_ANCHOR" in t or "ENDC" in t or "EN-DC" in t:
+        return "4G" if ("4G" in t or "LTE" in t) else "5G"
+    if "5G" in t or "NR" in t or "NSA" in t or "SA" in t:
+        return "5G"
+    if "LTE" in t or "4G" in t or "4G+" in t:
+        return "4G"
+    if "3G" in t or "WCDMA" in t or "UMTS" in t or "HSPA" in t:
+        return "3G"
+    if "2G" in t or "EDGE" in t or "GSM" in t or "GPRS" in t:
+        return "2G"
+
+    return tech_str
+
 # Categorical KPI map generation function
 
 def generate_categorical_kpi_map(df, kpi_column, output_html, polygon_wkt=None):
@@ -454,39 +584,76 @@ def generate_categorical_kpi_map(df, kpi_column, output_html, polygon_wkt=None):
 
     add_fullscreen_css(m)
 
-    # 1 Get unique categorical values
-    unique_values = sorted(df[kpi_column].unique())
+    # For categorical maps, draw the boundary first and keep it subtle. A thick
+    # red boundary drawn last can visually cover the band colors in the PDF.
+    if polygon_wkt:
+        geom = loads(polygon_wkt)
+        polygon_latlon = [(coord[1], coord[0]) for coord in geom.exterior.coords]
 
-    # 2 Generate distinct colors dynamically
-    colors = generate_distinct_colors(len(unique_values))
+        folium.Polygon(
+            locations=polygon_latlon,
+            color="#111827",
+            weight=2,
+            fill=False,
+            opacity=0.45,
+            dash_array="6,6",
+            tooltip="Polygon Boundary"
+        ).add_to(m)
 
-    value_color_map = {
-        val: colors[i]
-        for i, val in enumerate(unique_values)
-    }
+    is_band_map = kpi_column.lower() == "band"
+    category_col = "__report_category"
+
+    if is_band_map:
+        df = df.copy()
+        df[category_col] = df[kpi_column].apply(normalize_band_name)
+        value_counts = df[category_col].value_counts()
+        value_color_map = {
+            value: get_frontend_band_color(value)
+            for value in value_counts.index
+        }
+        # Draw dominant bands first and smaller bands last so the PDF image does
+        # not collapse visually into one color when points overlap.
+        draw_df = df.assign(
+            __category_count=df[category_col].map(value_counts)
+        ).sort_values("__category_count", ascending=False)
+        radius = 3
+        fill_opacity = 0.72
+    else:
+        # 1 Get unique categorical values
+        unique_values = sorted(df[kpi_column].unique())
+
+        # 2 Generate distinct colors dynamically
+        colors = generate_distinct_colors(len(unique_values))
+
+        value_color_map = {
+            val: colors[i]
+            for i, val in enumerate(unique_values)
+        }
+        draw_df = df
+        category_col = kpi_column
+        radius = 4
+        fill_opacity = 0.9
 
     # 3 Plot points
-    for _, row in df.iterrows():
-        value = row[kpi_column]
+    for _, row in draw_df.iterrows():
+        value = row[category_col]
 
         if value not in value_color_map:
             continue
 
-        color = value_color_map[value]
-
-
         folium.CircleMarker(
             location=(row["lat"], row["lon"]),
-            radius=4,
+            radius=radius,
             color=value_color_map[value],
             fill=True,
-            fill_opacity=0.9,
+            fill_opacity=fill_opacity,
+            opacity=0.85,
             tooltip=f"{kpi_column}: {value}"
         ).add_to(m)
 
     
     # 4 Build legend with top N categories + "Others"
-    value_counts = df[kpi_column].value_counts()
+    value_counts = df[category_col].value_counts()
 
     top_n = 6
     legend_items = []
@@ -498,21 +665,6 @@ def generate_categorical_kpi_map(df, kpi_column, output_html, polygon_wkt=None):
     if others > 0:
         legend_items.append(("Others", "#999999", others))
     add_legend(m, kpi_column, legend_items)
-    
-    # Add polygon boundary on top for visibility
-    if polygon_wkt:
-        geom = loads(polygon_wkt)
-        # WKT format is (lon, lat), convert to (lat, lon) for folium
-        polygon_latlon = [(coord[1], coord[0]) for coord in geom.exterior.coords]
-
-        folium.Polygon(
-            locations=polygon_latlon,
-            color="#FF0000",  # Bright red
-            weight=5,
-            fill=False,
-            opacity=1.0,
-            tooltip="Polygon Boundary"
-        ).add_to(m)
     
     # Fit view tightly to data + polygon with minimal padding
     bounds = get_df_bounds(df)
@@ -569,6 +721,10 @@ def detect_handover_events(df: pd.DataFrame, use_global_detection=True, min_run_
     ['timestamp','lat','lon','m_alpha_long','session_id', ...]
     Returns list of events with keys: session_id,timestamp,lat,lon,from_provider,to_provider,from_network,to_network
     """
+    frontend_events = _detect_frontend_style_handover_events(df)
+    if frontend_events:
+        return frontend_events
+
     events = []
     if df is None or df.empty:
         return events
@@ -711,6 +867,165 @@ def detect_handover_events(df: pd.DataFrame, use_global_detection=True, min_run_
         unique.append(ev)
 
     return unique
+
+
+def _first_present(row, candidates):
+    for col in candidates:
+        if col in row.index:
+            value = row.get(col)
+            if isinstance(value, (dict, list, tuple, set)):
+                if value:
+                    return value
+                continue
+            if pd.notna(value) and str(value).strip() != "":
+                return value
+    return None
+
+
+def _safe_scalar(value):
+    if value is None:
+        return None
+    if isinstance(value, dict):
+        return json.dumps(value, sort_keys=True, default=str)
+    if isinstance(value, (list, tuple, set)):
+        return json.dumps(list(value), sort_keys=True, default=str)
+    return value
+
+
+def _safe_sort_value(value):
+    value = _safe_scalar(value)
+    if value is None or pd.isna(value):
+        return ""
+    return str(value)
+
+
+def _clean_transition_value(value):
+    value = _safe_scalar(value)
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    if text.lower() in {"unknown", "n/a", "na", "null", "undefined", "-"}:
+        return None
+    return text
+
+
+def _safe_session_id(value):
+    value = _safe_scalar(value)
+    if value is None or pd.isna(value):
+        return None
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return str(value)
+
+
+def _detect_frontend_style_handover_events(df: pd.DataFrame):
+    """
+    Detect the same practical handover families shown by the frontend:
+    technology, band, and PCI transitions, per session in timestamp/order.
+    """
+    if df is None or df.empty:
+        return []
+
+    data = df.rename(columns={c: c.lower() for c in df.columns}).copy()
+    if not {"lat", "lon"}.issubset(data.columns):
+        return []
+
+    data = data.dropna(subset=["lat", "lon"]).reset_index(drop=False)
+    if data.empty:
+        return []
+
+    session_col = "session_id" if "session_id" in data.columns else None
+    if session_col:
+        data["__session_sort"] = data[session_col].apply(_safe_sort_value)
+        data["__session_group"] = data[session_col].apply(_safe_sort_value)
+    if "timestamp" in data.columns:
+        data["__timestamp_sort"] = data["timestamp"].apply(_safe_sort_value)
+    if "id" in data.columns:
+        data["__id_sort"] = data["id"].apply(_safe_sort_value)
+
+    sort_cols = []
+    if session_col:
+        sort_cols.append("__session_sort")
+    if "timestamp" in data.columns:
+        sort_cols.append("__timestamp_sort")
+    elif "id" in data.columns:
+        sort_cols.append("__id_sort")
+    sort_cols.append("index")
+    data = data.sort_values(sort_cols)
+
+    groups = data.groupby("__session_group", dropna=False) if session_col else [(None, data)]
+    events = []
+
+    value_resolvers = {
+        "technology": lambda r: normalize_tech_name(
+            _first_present(r, ("network", "technology", "networktype", "tech")),
+            _first_present(r, ("band", "neighbourband", "neighborband", "neighbour_band")),
+        ),
+        "band": lambda r: normalize_band_name(
+            _first_present(r, ("band", "neighbourband", "neighborband", "neighbour_band"))
+        ),
+        "pci": lambda r: _clean_transition_value(
+            _first_present(r, ("pci", "best_pci", "physical_cell_id", "cell_id"))
+        ),
+    }
+
+    for sid, group in groups:
+        previous_by_type = {}
+        previous_row_by_type = {}
+
+        for _, row in group.iterrows():
+            for event_type, resolver in value_resolvers.items():
+                current = _clean_transition_value(resolver(row))
+                if current is None:
+                    continue
+
+                previous = previous_by_type.get(event_type)
+                previous_row = previous_row_by_type.get(event_type)
+
+                if previous is not None and previous != current and previous_row is not None:
+                    events.append({
+                        "type": event_type,
+                        "session_id": _safe_session_id(sid),
+                        "timestamp": row.get("timestamp"),
+                        "lat": float(row["lat"]),
+                        "lon": float(row["lon"]),
+                        "from_value": previous,
+                        "to_value": current,
+                        "from_lat": float(previous_row["lat"]),
+                        "from_lon": float(previous_row["lon"]),
+                        "from_provider": _clean_transition_value(
+                            _first_present(previous_row, ("m_alpha_long", "provider", "operator"))
+                        ),
+                        "to_provider": _clean_transition_value(
+                            _first_present(row, ("m_alpha_long", "provider", "operator"))
+                        ),
+                        "from_network": previous if event_type == "technology" else None,
+                        "to_network": current if event_type == "technology" else None,
+                    })
+
+                previous_by_type[event_type] = current
+                previous_row_by_type[event_type] = row
+
+    unique = []
+    seen = set()
+    for ev in events:
+        key = (
+            ev["type"],
+            ev.get("session_id"),
+            round(float(ev["lat"]), 6),
+            round(float(ev["lon"]), 6),
+            ev["from_value"],
+            ev["to_value"],
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(ev)
+
+    return unique[:500]
 
 
 def _build_region_candidates(poor_df, grid_size):
@@ -953,7 +1268,7 @@ def generate_handover_map(filtered_df, events, output_html, polygon_wkt=None):
     Generate HTML for handover visualization. `events` is a list of handover dicts
     as returned by `detect_handover_events`.
     """
-    df = filtered_df.dropna(subset=["lat", "lon"]) if filtered_df is not None else pd.DataFrame()
+    df = filtered_df.dropna(subset=["lat", "lon"]).copy() if filtered_df is not None else pd.DataFrame()
     if df.empty:
         raise ValueError("No GPS data to plot for handover map")
 
@@ -963,17 +1278,19 @@ def generate_handover_map(filtered_df, events, output_html, polygon_wkt=None):
     # Draw dense route points only (no polylines).
     # This prevents line-like rendering and keeps handover focus on events.
     if "session_id" in df.columns:
-        sessions = sorted(df["session_id"].dropna().unique())
+        df["__session_sort"] = df["session_id"].apply(_safe_sort_value)
+        sessions = sorted(df["__session_sort"].dropna().unique())
         if "timestamp" in df.columns:
-            df_route = df.sort_values(["session_id", "timestamp"]).copy()
+            df["__timestamp_sort"] = df["timestamp"].apply(_safe_sort_value)
+            df_route = df.sort_values(["__session_sort", "__timestamp_sort"]).copy()
         else:
-            df_route = df.sort_values(["session_id"]).copy()
+            df_route = df.sort_values(["__session_sort"]).copy()
 
         colors = generate_distinct_colors(len(sessions)) if sessions else ["#2b8cbe"]
 
         # Draw each session
         for i, sid in enumerate(sessions):
-            seg = df_route[df_route["session_id"] == sid]
+            seg = df_route[df_route["__session_sort"] == sid]
             if seg.empty:
                 continue
             # overlay filled points for solid appearance
@@ -984,7 +1301,8 @@ def generate_handover_map(filtered_df, events, output_html, polygon_wkt=None):
     else:
         # Fallback: draw a single route backbone (pre-existing behavior)
         if "timestamp" in df.columns:
-            df_route = df.sort_values(["timestamp"])
+            df["__timestamp_sort"] = df["timestamp"].apply(_safe_sort_value)
+            df_route = df.sort_values(["__timestamp_sort"])
         else:
             df_route = df
 
@@ -999,12 +1317,37 @@ def generate_handover_map(filtered_df, events, output_html, polygon_wkt=None):
         '<path fill="{color}" stroke="#222" stroke-width="0.6" d="M13 2 L3 14 H12 L11 22 L21 10 H12 L13 2 Z"/>'
         '</svg></div>'
     )
-    spark_color = "#ff9933"
+    event_colors = {
+        "technology": "#22c55e",
+        "band": "#3b82f6",
+        "pci": "#a855f7",
+    }
     for ev in events:
-        html = spark_svg.format(color=spark_color)
+        event_type = str(ev.get("type") or "handover").lower()
+        html = spark_svg.format(color=event_colors.get(event_type, "#ff9933"))
         icon = folium.DivIcon(html=html, icon_size=(28, 28), icon_anchor=(14, 14))
-        tooltip = f"{ev.get('from_provider')} -> {ev.get('to_provider')} (Session {ev.get('session_id')})"
+        if ev.get("from_value") is not None and ev.get("to_value") is not None:
+            tooltip = (
+                f"{event_type.title()}: {ev.get('from_value')} -> {ev.get('to_value')} "
+                f"(Session {ev.get('session_id')})"
+            )
+        else:
+            tooltip = f"{ev.get('from_provider')} -> {ev.get('to_provider')} (Session {ev.get('session_id')})"
         folium.Marker(location=(ev["lat"], ev["lon"]), icon=icon, tooltip=tooltip).add_to(m)
+
+    if events:
+        counts = {}
+        for ev in events:
+            event_type = str(ev.get("type") or "handover").lower()
+            counts[event_type] = counts.get(event_type, 0) + 1
+        add_legend(
+            m,
+            "Handover Events",
+            [
+                (event_type.title(), event_colors.get(event_type, "#ff9933"), count)
+                for event_type, count in counts.items()
+            ],
+        )
 
     # Polygon boundary
     if polygon_wkt:

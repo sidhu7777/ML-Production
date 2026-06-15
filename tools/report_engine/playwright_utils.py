@@ -5,6 +5,13 @@ import os
 from playwright.sync_api import sync_playwright
 
 
+def _env_int(name, default):
+    try:
+        return int(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+
+
 def _candidate_browser_paths():
     env_path = os.getenv("REPORT_CHROMIUM_PATH") or os.getenv("PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH")
     if env_path:
@@ -60,117 +67,148 @@ def html_to_png(
 ):
     html_path = os.path.abspath(html_path)
     html_url = "file:///" + html_path.replace("\\", "/")
+    render_timeout_ms = _env_int("REPORT_RENDER_TIMEOUT_MS", 120000)
+    navigation_attempts = max(1, _env_int("REPORT_RENDER_NAV_ATTEMPTS", 2))
 
     with sync_playwright() as p:
         browser = _launch_chromium(p)
-        context = browser.new_context(
-            viewport={"width": width, "height": height},
-            device_scale_factor=device_scale_factor,
-        )
-        page = context.new_page()
+        context = None
+        try:
+            context = browser.new_context(
+                viewport={"width": width, "height": height},
+                device_scale_factor=device_scale_factor,
+            )
+            context.set_default_timeout(render_timeout_ms)
+            context.set_default_navigation_timeout(render_timeout_ms)
+            page = context.new_page()
+            page.set_default_timeout(render_timeout_ms)
+            page.set_default_navigation_timeout(render_timeout_ms)
 
-        # Load the page and wait for DOM ready
-        page.goto(html_url, wait_until="domcontentloaded")
+            # Large Folium files can take more than Playwright's default 30s to
+            # parse. Retry once before failing the report.
+            last_nav_error = None
+            for attempt in range(navigation_attempts):
+                try:
+                    page.goto(
+                        html_url,
+                        wait_until="domcontentloaded",
+                        timeout=render_timeout_ms,
+                    )
+                    last_nav_error = None
+                    break
+                except Exception as exc:
+                    last_nav_error = exc
+                    if attempt + 1 < navigation_attempts:
+                        print(
+                            f"Warning: map navigation timed out, retrying "
+                            f"({attempt + 1}/{navigation_attempts}) for {html_path}: {exc}"
+                        )
+                        page.close()
+                        page = context.new_page()
+                        page.set_default_timeout(render_timeout_ms)
+                        page.set_default_navigation_timeout(render_timeout_ms)
+            if last_nav_error is not None:
+                raise last_nav_error
         
-        # Wait for the map container to be present
-        page.wait_for_selector(".folium-map, .leaflet-container", timeout=30000)
+            # Wait for the map container to be present
+            page.wait_for_selector(".folium-map, .leaflet-container", timeout=render_timeout_ms)
 
-        # Wait for Folium/Leaflet when possible, but do not fail the report if
-        # offline tiles/scripts prevent Leaflet from setting its internal flag.
-        try:
-            page.wait_for_function(
-                """() => {
-                    const el = document.querySelector('.folium-map');
-                    const map = el && el.id && window[el.id];
-                    return !!(map && map._loaded);
-                }""",
-                timeout=15000,
-            )
-        except Exception as e:
-            print(f"Warning: Leaflet map load check timed out, continuing screenshot: {e}")
-
-        # Invalidate map size to ensure proper rendering
-        try:
-            page.evaluate(
-                """() => {
-                    const el = document.querySelector('.folium-map');
-                    const map = el && el.id && window[el.id];
-                    if (map && typeof map.invalidateSize === 'function') {
-                        map.invalidateSize(true);
-                    }
-                }"""
-            )
-        except Exception as e:
-            print(f"Warning: Map invalidateSize failed, continuing screenshot: {e}")
-
-        # Wait for tiles to load - flexible approach
-        # Check multiple times to ensure tiles are actually loaded
-        for attempt in range(3):
+            # Wait for Folium/Leaflet when possible, but do not fail the report if
+            # offline tiles/scripts prevent Leaflet from setting its internal flag.
             try:
                 page.wait_for_function(
                     """() => {
-                        const loaded = document.querySelectorAll('.leaflet-tile-loaded').length;
-                        const loading = document.querySelectorAll('.leaflet-tile-loading').length;
-                        // More flexible: require at least some tiles loaded and no loading tiles
-                        return loaded >= 10 && loading === 0;
+                        const el = document.querySelector('.folium-map');
+                        const map = el && el.id && window[el.id];
+                        return !!(map && map._loaded);
                     }""",
-                    timeout=15000,
+                    timeout=min(render_timeout_ms, 30000),
                 )
-                # If successful, break the loop
-                break
             except Exception as e:
-                if attempt < 2:
-                    # Wait a bit and retry
-                    page.wait_for_timeout(2000)
-                else:
-                    # Last attempt failed, but continue anyway
-                    print(f"Warning: Tile loading check failed after 3 attempts: {e}")
+                print(f"Warning: Leaflet map load check timed out, continuing screenshot: {e}")
 
-        # Additional wait for network to be idle (all tile requests complete)
-        try:
-            page.wait_for_load_state("networkidle", timeout=8000)
-        except Exception as e:
-            # Network idle not critical, continue anyway
-            pass
+            # Invalidate map size to ensure proper rendering
+            try:
+                page.evaluate(
+                    """() => {
+                        const el = document.querySelector('.folium-map');
+                        const map = el && el.id && window[el.id];
+                        if (map && typeof map.invalidateSize === 'function') {
+                            map.invalidateSize(true);
+                        }
+                    }"""
+                )
+            except Exception as e:
+                print(f"Warning: Map invalidateSize failed, continuing screenshot: {e}")
 
-        # Final settling delay to ensure all rendering is complete
-        page.wait_for_timeout(2000)
-
-        # Force one more map refresh
-        try:
-            page.evaluate(
-                """() => {
-                    const el = document.querySelector('.folium-map');
-                    const map = el && el.id && window[el.id];
-                    if (map && typeof map.invalidateSize === 'function') {
-                        map.invalidateSize(true);
-                    }
-                }"""
-            )
-        except Exception as e:
-            print(f"Warning: Final map refresh failed, continuing screenshot: {e}")
-
-        # Small delay after final refresh
-        page.wait_for_timeout(500)
-
-        if clip_to_map:
-            map_el = page.query_selector(".folium-map") or page.query_selector(".leaflet-container")
-            if map_el:
-                box = map_el.bounding_box()
-                if box:
-                    page.screenshot(
-                        path=png_path,
-                        clip={
-                            "x": box["x"],
-                            "y": box["y"],
-                            "width": box["width"],
-                            "height": box["height"],
-                        },
+            # Wait for tiles to load - flexible approach
+            # Check multiple times to ensure tiles are actually loaded
+            for attempt in range(3):
+                try:
+                    page.wait_for_function(
+                        """() => {
+                            const loaded = document.querySelectorAll('.leaflet-tile-loaded').length;
+                            const loading = document.querySelectorAll('.leaflet-tile-loading').length;
+                            // More flexible: require at least some tiles loaded and no loading tiles
+                            return loaded >= 10 && loading === 0;
+                        }""",
+                        timeout=min(render_timeout_ms, 20000),
                     )
-                    context.close()
-                    browser.close()
-                    return
+                    # If successful, break the loop
+                    break
+                except Exception as e:
+                    if attempt < 2:
+                        # Wait a bit and retry
+                        page.wait_for_timeout(2000)
+                    else:
+                        # Last attempt failed, but continue anyway
+                        print(f"Warning: Tile loading check failed after 3 attempts: {e}")
 
-        page.screenshot(path=png_path, full_page=True)
-        context.close()
-        browser.close()
+            # Additional wait for network to be idle (all tile requests complete)
+            try:
+                page.wait_for_load_state("networkidle", timeout=min(render_timeout_ms, 10000))
+            except Exception as e:
+                # Network idle not critical, continue anyway
+                pass
+
+            # Final settling delay to ensure all rendering is complete
+            page.wait_for_timeout(2000)
+
+            # Force one more map refresh
+            try:
+                page.evaluate(
+                    """() => {
+                        const el = document.querySelector('.folium-map');
+                        const map = el && el.id && window[el.id];
+                        if (map && typeof map.invalidateSize === 'function') {
+                            map.invalidateSize(true);
+                        }
+                    }"""
+                )
+            except Exception as e:
+                print(f"Warning: Final map refresh failed, continuing screenshot: {e}")
+
+            # Small delay after final refresh
+            page.wait_for_timeout(500)
+
+            if clip_to_map:
+                map_el = page.query_selector(".folium-map") or page.query_selector(".leaflet-container")
+                if map_el:
+                    box = map_el.bounding_box()
+                    if box:
+                        page.screenshot(
+                            path=png_path,
+                            clip={
+                                "x": box["x"],
+                                "y": box["y"],
+                                "width": box["width"],
+                                "height": box["height"],
+                            },
+                        )
+                        return
+
+            page.screenshot(path=png_path, full_page=True)
+        finally:
+            if context is not None:
+                context.close()
+            browser.close()

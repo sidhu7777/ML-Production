@@ -283,6 +283,35 @@ class PDFReportGenerator:
         self.story.append(img)
         self.story.append(Spacer(1, 6))  # Small spacing between images
 
+    def has_image(self, filename, subdir="kpi_maps"):
+        return os.path.exists(os.path.join(self.images_dir, subdir, filename))
+
+    def has_text(self, text):
+        return isinstance(text, str) and text.strip() and text.strip().lower() != "not available."
+
+    def has_any_image(self, images):
+        return any(self.has_image(**img) for img in images)
+
+    def add_image_section(self, title, key, images, page_break=False, cond_break=False):
+        if not self.has_any_image(images):
+            return False
+        if page_break:
+            self.story.append(PageBreak())
+        elif cond_break:
+            self.story.append(CondPageBreak(3 * inch))
+        self.add_toc_heading(title, self.styles["Section"], 0, key)
+        for img in images:
+            self.add_image(**img)
+        return True
+
+    def add_image_subsection(self, title, key, images, toc_text=None):
+        if not self.has_any_image(images):
+            return False
+        self.add_toc_heading(title, self.styles["SubSection"], 1, key, toc_text or title)
+        for img in images:
+            self.add_image(**img)
+        return True
+
     # --------------------------------------------------
     # COVER
     # --------------------------------------------------
@@ -345,38 +374,59 @@ class PDFReportGenerator:
             self.story.append(Paragraph(report_text["Introduction"], self.styles["Body"]))
         
         # 2. Area Summary
-        self.story.append(CondPageBreak(3 * inch))
-        self.add_toc_heading('2. Area Summary', self.styles["Section"], 0, "sec2")
-        self.render_section(None, report_text.get("Area Summary", ""))
-        self.add_image("base_route_map.png")
+        area_summary = report_text.get("Area Summary", "")
+        if area_summary or self.has_image("base_route_map.png"):
+            self.story.append(CondPageBreak(3 * inch))
+            self.add_toc_heading('2. Area Summary', self.styles["Section"], 0, "sec2")
+            self.render_section(None, area_summary)
+            self.add_image("base_route_map.png")
         
         # 3. Drive Summary
-        self.story.append(PageBreak())
-        self.add_toc_heading('3. Drive Summary', self.styles["Section"], 0, "sec3")
-        if report_text.get("Drive Summary"):
-            self.story.append(Paragraph(report_text["Drive Summary"], self.styles["Body"]))
-        self.add_image("drive_summary.png", subdir="kpi_analysis")
+        drive_text = report_text.get("Drive Summary")
+        if self.has_text(drive_text) or self.has_image("drive_summary.png", subdir="kpi_analysis"):
+            self.story.append(PageBreak())
+            self.add_toc_heading('3. Drive Summary', self.styles["Section"], 0, "sec3")
+            if self.has_text(drive_text):
+                self.story.append(Paragraph(drive_text, self.styles["Body"]))
+            self.add_image("drive_summary.png", subdir="kpi_analysis")
 
         # 4. KPI Summary
-        self.story.append(CondPageBreak(3 * inch))
-        self.add_toc_heading('4. KPI Summary', self.styles["Section"], 0, "sec4")
+        kpi_summary_images = [
+            {"filename": "kpi_summary.png", "subdir": "kpi_analysis"},
+            {"filename": "session_table.png", "subdir": "kpi_analysis"},
+        ]
         kpi_text = report_text.get("KPI Summary")
         if not kpi_text or not isinstance(kpi_text, str) or not kpi_text.strip():
             kpi_text = (
                 "A concise executive summary of overall KPI performance across the drive, "
                 "highlighting overall network health and any major issues observed."
             )
-        self.story.append(Paragraph(kpi_text, self.styles["Body"]))
-        self.add_image("kpi_summary.png", subdir="kpi_analysis")
-        self.add_image("session_table.png", subdir="kpi_analysis")
+        if self.has_text(kpi_text) or self.has_any_image(kpi_summary_images):
+            self.story.append(CondPageBreak(3 * inch))
+            self.add_toc_heading('4. KPI Summary', self.styles["Section"], 0, "sec4")
+            if self.has_text(kpi_text):
+                self.story.append(Paragraph(kpi_text, self.styles["Body"]))
+            for img in kpi_summary_images:
+                self.add_image(**img)
 
         # 5. MAP VIEW
-        self.story.append(PageBreak())
-        self.add_toc_heading('5. Map View', self.styles["Section"], 0, "sec5")
+        map_view_started = False
+
+        def ensure_map_view():
+            nonlocal map_view_started
+            if not map_view_started:
+                self.story.append(PageBreak())
+                self.add_toc_heading('5. Map View', self.styles["Section"], 0, "sec5")
+                map_view_started = True
 
         def kpi_sub(label, anchor, toc_label, text, imgs):
+            has_text = self.has_text(text)
+            has_any_image = any(self.has_image(**img) for img in imgs)
+            if not has_text and not has_any_image:
+                return
+            ensure_map_view()
             self.add_toc_heading(label, self.styles["SubSection"], 1, anchor, toc_label)
-            if text:
+            if has_text:
                 self.story.append(Paragraph(text, self.styles["Body"]))
                 self.story.append(Spacer(1, 6))
             for img in imgs:
@@ -434,55 +484,61 @@ class PDFReportGenerator:
         ])
 
         # 6. PCI Summary
-        self.story.append(PageBreak())
-        self.add_toc_heading('6. PCI Summary', self.styles["Section"], 0, "sec6")
-        if report_text.get("PCI Summary"):
-            self.story.append(Paragraph(report_text["PCI Summary"], self.styles["Body"]))
-
-        self.add_image("pci_map.png")
-        self.add_image("pci_distribution.png", subdir="kpi_analysis")
-        self.add_image("cdf_pci.png", subdir="kpi_analysis")
-
-        self.add_toc_heading('a) Top 30 PCI Values', self.styles["SubSection"], 1, "sec6a")
-        self.add_image("pci_table.png", subdir="kpi_analysis")
-
-        self.add_toc_heading('b) PCI with Poor RSRP', self.styles["SubSection"], 1, "sec6b")
-        self.add_image("pci_poor_rsrp.png", subdir="kpi_analysis")
-
-        self.add_toc_heading('c) PCI with Poor RSRQ', self.styles["SubSection"], 1, "sec6c")
-        self.add_image("pci_poor_rsrq.png", subdir="kpi_analysis")
+        pci_main_images = [
+            {"filename": "pci_map.png"},
+            {"filename": "pci_distribution.png", "subdir": "kpi_analysis"},
+            {"filename": "cdf_pci.png", "subdir": "kpi_analysis"},
+        ]
+        pci_subsections = [
+            ('a) Top 30 PCI Values', "sec6a", [{"filename": "pci_table.png", "subdir": "kpi_analysis"}]),
+            ('b) PCI with Poor RSRP', "sec6b", [{"filename": "pci_poor_rsrp.png", "subdir": "kpi_analysis"}]),
+            ('c) PCI with Poor RSRQ', "sec6c", [{"filename": "pci_poor_rsrq.png", "subdir": "kpi_analysis"}]),
+        ]
+        pci_text = report_text.get("PCI Summary")
+        has_pci_content = (
+            self.has_text(pci_text)
+            or self.has_any_image(pci_main_images)
+            or any(self.has_any_image(images) for _, _, images in pci_subsections)
+        )
+        if has_pci_content:
+            self.story.append(PageBreak())
+            self.add_toc_heading('6. PCI Summary', self.styles["Section"], 0, "sec6")
+            if self.has_text(pci_text):
+                self.story.append(Paragraph(pci_text, self.styles["Body"]))
+            for img in pci_main_images:
+                self.add_image(**img)
+            for title, key, images in pci_subsections:
+                self.add_image_subsection(title, key, images)
 
         # 7. App Analytics
-        self.story.append(CondPageBreak(3 * inch))
-        self.add_toc_heading('7. App Analytics', self.styles["Section"], 0, "sec7")
-        self.add_image("app_analytics_part1.png", subdir="kpi_analysis")
-        self.add_image("app_analytics_part2.png", subdir="kpi_analysis")
+        self.add_image_section('7. App Analytics', "sec7", [
+            {"filename": "app_analytics_part1.png", "subdir": "kpi_analysis"},
+            {"filename": "app_analytics_part2.png", "subdir": "kpi_analysis"},
+        ], cond_break=True)
 
         # 8. Indoor/Outdoor Summary
-        self.story.append(CondPageBreak(3 * inch))
-        self.add_toc_heading('8. Indoor/Outdoor Summary', self.styles["Section"], 0, "sec8")
-        self.add_image("indoor_outdoor_stats.png", subdir="kpi_analysis")
+        self.add_image_section('8. Indoor/Outdoor Summary', "sec8", [
+            {"filename": "indoor_outdoor_stats.png", "subdir": "kpi_analysis"},
+        ], cond_break=True)
 
         # 9. Performance Summary
-        self.story.append(CondPageBreak(3 * inch))
-        self.add_toc_heading('9. Performance Summary', self.styles["Section"], 0, "sec9")
-
-        self.add_toc_heading('a) Network Quality Metrics', self.styles["SubSection"], 1, "sec9a")
-        self.add_image("network_quality_summary.png", subdir="kpi_analysis")
-
-        self.add_toc_heading('b) Speed Metrics', self.styles["SubSection"], 1, "sec9b")
-        self.add_image("speed_hist.png", subdir="kpi_analysis")
-
-        self.add_toc_heading('c) Latency Distribution', self.styles["SubSection"], 1, "sec9c")
-        self.add_image("latency_hist.png", subdir="kpi_analysis")
-
-        self.add_toc_heading('d) Jitter Distribution', self.styles["SubSection"], 1, "sec9d")
-        self.add_image("jitter_hist.png", subdir="kpi_analysis")
+        performance_subsections = [
+            ('a) Network Quality Metrics', "sec9a", [{"filename": "network_quality_summary.png", "subdir": "kpi_analysis"}]),
+            ('b) Speed Metrics', "sec9b", [{"filename": "speed_hist.png", "subdir": "kpi_analysis"}]),
+            ('c) Latency Distribution', "sec9c", [{"filename": "latency_hist.png", "subdir": "kpi_analysis"}]),
+            ('d) Jitter Distribution', "sec9d", [{"filename": "jitter_hist.png", "subdir": "kpi_analysis"}]),
+        ]
+        if any(self.has_any_image(images) for _, _, images in performance_subsections):
+            self.story.append(CondPageBreak(3 * inch))
+            self.add_toc_heading('9. Performance Summary', self.styles["Section"], 0, "sec9")
+            for title, key, images in performance_subsections:
+                self.add_image_subsection(title, key, images)
 
         # 10. Handover Analysis
-        self.story.append(PageBreak())
-        self.add_toc_heading('10. Handover Analysis', self.styles["Section"], 0, "sec10")
-        self.add_image("handover_map.png")
+        if self.has_image("handover_map.png"):
+            self.story.append(PageBreak())
+            self.add_toc_heading('10. Handover Analysis', self.styles["Section"], 0, "sec10")
+            self.add_image("handover_map.png")
 
         # Build with multiple passes for TOC and page numbers
         self.doc.multiBuild(self.story, canvasmaker=PageNumCanvas)

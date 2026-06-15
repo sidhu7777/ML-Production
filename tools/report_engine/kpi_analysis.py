@@ -706,24 +706,13 @@ def format_duration(seconds):
 
 def get_session_data_for_drive_summary(session_ids: list):
     """Fetch session data from database"""
-    from .db import get_engine
-    from sqlalchemy import text, bindparam
+    from .db import get_sessions_by_ids
     
     if not session_ids:
         return None
     
     try:
-        engine = get_engine()
-        query = text("""
-        SELECT id, start_time, end_time, distance
-        FROM defaultdb.tbl_session
-        WHERE id IN :session_ids
-        ORDER BY start_time
-        """).bindparams(bindparam("session_ids", expanding=True))
-
-        with engine.connect() as conn:
-            df = pd.read_sql(query, conn, params={"session_ids": session_ids})
-        return df
+        return get_sessions_by_ids(session_ids)
     except Exception as e:
         print(f"ERROR: Failed to fetch session data: {e}")
         return None
@@ -746,13 +735,26 @@ def _build_session_df_from_network_logs(network_df: pd.DataFrame) -> pd.DataFram
     return grouped
 
 
+def _normalize_session_times(session_df: pd.DataFrame | None) -> pd.DataFrame | None:
+    if session_df is None or session_df.empty:
+        return None
+
+    normalized = session_df.copy()
+    normalized["start_time"] = pd.to_datetime(normalized["start_time"], errors="coerce")
+    normalized["end_time"] = pd.to_datetime(normalized["end_time"], errors="coerce")
+    normalized = normalized.dropna(subset=["start_time", "end_time"])
+    if normalized.empty:
+        return None
+    return normalized
+
+
 def generate_drive_summary_images(session_ids: list, total_samples: int, network_df: pd.DataFrame | None = None):
     """Generate drive summary and session table images"""
     
     # Prefer network log timestamps when available (more reliable than tbl_session)
-    session_df = _build_session_df_from_network_logs(network_df)
+    session_df = _normalize_session_times(_build_session_df_from_network_logs(network_df))
     if session_df is None:
-        session_df = get_session_data_for_drive_summary(session_ids)
+        session_df = _normalize_session_times(get_session_data_for_drive_summary(session_ids))
     
     if session_df is None or session_df.empty:
         print("WARNING: No session data available for drive summary")
@@ -760,16 +762,7 @@ def generate_drive_summary_images(session_ids: list, total_samples: int, network
     
     # Create a copy to avoid SettingWithCopyWarning
     session_df = session_df.copy()
-    
-    # Convert to datetime and filter valid records
-    session_df["start_time"] = pd.to_datetime(session_df["start_time"], errors='coerce')
-    session_df["end_time"] = pd.to_datetime(session_df["end_time"], errors='coerce')
-    session_df = session_df.dropna(subset=["start_time", "end_time"])
-    
-    if session_df.empty:
-        print("WARNING: No valid session timestamps found")
-        return None
-    
+
     # Calculate statistics
     # Ensure distance comes from tbl_session if missing in network logs
     if "distance" not in session_df.columns or session_df["distance"].isna().all():

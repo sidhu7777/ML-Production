@@ -2,6 +2,7 @@
 
 import os
 import json
+import time
 from typing import Dict
 from groq import Groq
 from dotenv import load_dotenv
@@ -77,12 +78,45 @@ If any required KPI fields are missing in METADATA, return a concise paragraph
 stating which metrics were unavailable, but do not invent values.
 """
 
+
+def _json_safe_llm(value):
+    if value is None:
+        return None
+    try:
+        if value is json.loads("null"):
+            return None
+    except Exception:
+        pass
+    if isinstance(value, dict):
+        return {k: _json_safe_llm(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_json_safe_llm(v) for v in value]
+    if isinstance(value, tuple):
+        return [_json_safe_llm(v) for v in value]
+    if hasattr(value, "isoformat") and not isinstance(value, str):
+        try:
+            return value.isoformat()
+        except Exception:
+            pass
+    if hasattr(value, "item"):
+        try:
+            return _json_safe_llm(value.item())
+        except Exception:
+            pass
+    try:
+        if value != value:
+            return None
+    except Exception:
+        pass
+    return value
+
 def generate_report_text(
     metadata: Dict,
     output_path: str = "data/processed/report_text.json",
     model: str = "llama-3.1-8b-instant",
     temperature: float = 0.0,
     max_tokens: int = 2500,
+    max_retries: int = 3,
     verbose: bool = False,
 ) -> Dict:
 
@@ -91,8 +125,31 @@ def generate_report_text(
     # Use Area Summary directly from metadata (LLM just repeats it anyway)
     report = {"Area Summary": metadata.get("area_summary", {})}
     
-    # Remove area_summary from metadata sent to LLM to reduce prompt size
-    llm_metadata = {k: v for k, v in metadata.items() if k != "area_summary"}
+    # Keep the prompt intact but send only the narrative-critical fields.
+    drive_summary = metadata.get("drive_summary", {}) if isinstance(metadata, dict) else {}
+    if isinstance(drive_summary, dict):
+        drive_summary = {
+            k: drive_summary.get(k)
+            for k in [
+                "distance_covered",
+                "total_samples",
+                "total_sessions",
+                "number_of_days",
+                "start_date",
+                "end_date",
+            ]
+            if k in drive_summary
+        }
+
+    llm_metadata = {
+        "location": metadata.get("location", {}),
+        "introduction": metadata.get("introduction"),
+        "drive_summary": drive_summary,
+        "kpi_summary": metadata.get("kpi_summary", {}),
+        "band_summary": metadata.get("band_summary", []),
+        "pci_summary": metadata.get("pci_summary", {}),
+    }
+    llm_metadata = _json_safe_llm(llm_metadata)
     
     prompt = f"""
 Generate a telecom drive-test report using the metadata below.
@@ -139,15 +196,34 @@ Return JSON with EXACT keys:
     if verbose:
         print("Calling LLM to generate report text...")
 
-    response = client.chat.completions.create(
-        model=model,
-        messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": prompt},
-        ],
-        temperature=temperature,
-        max_tokens=max_tokens,
-    )
+    response = None
+    last_error = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            response = client.chat.completions.create(
+                model=model,
+                messages=[
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": prompt},
+                ],
+                temperature=temperature,
+                max_tokens=max_tokens,
+            )
+            break
+        except Exception as e:
+            last_error = e
+            if verbose:
+                print(f"LLM request failed on attempt {attempt}/{max_retries}: {e}")
+            if attempt < max_retries:
+                time.sleep(min(attempt, 2))
+
+    if response is None:
+        if verbose:
+            print("LLM request failed after retries, synthesizing fallbacks from metadata.")
+        report = _fill_missing_sections_from_metadata(report, metadata)
+        with open(output_path, "w", encoding="utf-8") as f:
+            json.dump(report, f, indent=2, ensure_ascii=False)
+        return report
 
     try:
         source_map = {"Area Summary": "metadata"}
@@ -194,10 +270,9 @@ Return JSON with EXACT keys:
         # Fill any missing sections from synthesis and report sources
         missing = [k for k in REQUIRED_KEYS if k not in report]
         if missing:
-            synth = _synthesize_missing_sections(metadata, missing)
+            report = _fill_missing_sections_from_metadata(report, metadata, missing_keys=missing)
             for k in missing:
-                if k in synth:
-                    report[k] = synth[k]
+                if k in report:
                     source_map[k] = "synth"
         for k in REQUIRED_KEYS:
             if k in llm_output:
@@ -222,20 +297,7 @@ Return JSON with EXACT keys:
             print(f" LLM raw response: {response.choices[0].message.content[:500]}...")
         source_map = {k: "synth" for k in REQUIRED_KEYS}
         source_map["Area Summary"] = "metadata"
-        synth = _synthesize_missing_sections(metadata, REQUIRED_KEYS)
-        for k in REQUIRED_KEYS:
-            if k not in report:  # Area Summary already set from metadata
-                if k in synth and isinstance(synth[k], str) and synth[k].strip():
-                    report[k] = synth[k]
-                else:
-                    # Provide conservative defaults; KPI Summary uses fixed executive line
-                    if k == "KPI Summary":
-                        report[k] = (
-                            "Network KPI metrics including coverage, quality, and throughput were analyzed across the drive route. "
-                            "Detailed performance analysis is provided in the Map View sections below."
-                        )
-                    else:
-                        report[k] = synth.get(k) or "Not available."
+        report = _fill_missing_sections_from_metadata(report, metadata)
         if verbose:
             print("Section sources:")
             for k in REQUIRED_KEYS:
@@ -261,6 +323,29 @@ Return JSON with EXACT keys:
     with open(output_path, "w", encoding="utf-8") as f:
         json.dump(report, f, indent=2, ensure_ascii=False)
 
+    return report
+
+
+def _fill_missing_sections_from_metadata(report: Dict, metadata: Dict, missing_keys=None) -> Dict:
+    if missing_keys is None:
+        missing_keys = [k for k in REQUIRED_KEYS if k not in report or report.get(k) in (None, "")]
+
+    synth = _synthesize_missing_sections(metadata, missing_keys)
+    for k in missing_keys:
+        if k in report and report.get(k) not in (None, ""):
+            continue
+        if k == "Area Summary":
+            report[k] = metadata.get("area_summary") or synth.get(k) or {"Overview": "Area summary not available."}
+            continue
+        if k in synth and isinstance(synth[k], str) and synth[k].strip():
+            report[k] = synth[k]
+        elif k == "KPI Summary":
+            report[k] = (
+                "Network KPI metrics including coverage, quality, and throughput were analyzed across the drive route. "
+                "Detailed performance analysis is provided in the Map View sections below."
+            )
+        else:
+            report[k] = "Not available."
     return report
 
 

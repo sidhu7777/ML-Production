@@ -1,10 +1,15 @@
 import json
 from pathlib import Path
 
+import numpy as np
+import pandas as pd
 import pytest
 
 from tools.report_engine.llm_integration import generate_report_text, parse_and_validate_llm_output
+from tools.report_engine.metadata_generator import write_metadata_file
+from tools.report_engine.kpi_analysis import generate_drive_summary_images
 from tools.report_engine.pdf_generator import PDFReportGenerator
+from tools.report_engine.map_generator import detect_handover_events, generate_handover_map
 
 
 def _build_metadata(include_rsrp: bool = True):
@@ -269,10 +274,6 @@ def test_generate_report_text_hybrid_path_merges_llm_and_supported_synthesized_s
     assert report["PCI Summary"].startswith("The drive test observed")
 
 
-@pytest.mark.xfail(
-    reason="Current generate_report_text() does not backfill KPI Summary when the LLM returns valid JSON but omits that key.",
-    strict=True,
-)
 def test_generate_report_text_should_backfill_kpi_summary_after_partial_llm_success(monkeypatch, tmp_path):
     metadata = _build_metadata(include_rsrp=False)
     output_path = tmp_path / "report_text.json"
@@ -297,10 +298,6 @@ def test_generate_report_text_should_backfill_kpi_summary_after_partial_llm_succ
     assert report["KPI Summary"]
 
 
-@pytest.mark.xfail(
-    reason="Current generate_report_text() does not backfill a missing Map View KPI section when valid LLM JSON omits it and metadata has no matching KPI entry.",
-    strict=True,
-)
 def test_generate_report_text_should_backfill_missing_absent_kpi_section_after_partial_llm_success(monkeypatch, tmp_path):
     metadata = _build_metadata(include_rsrp=False)
     output_path = tmp_path / "report_text.json"
@@ -326,7 +323,7 @@ def test_generate_report_text_should_backfill_missing_absent_kpi_section_after_p
     assert report["Map View - RSRP"] == "Not available."
 
 
-def test_pdf_generator_currently_keeps_empty_kpi_headings(tmp_path, monkeypatch):
+def test_pdf_generator_skips_empty_kpi_headings(tmp_path, monkeypatch):
     output_path = tmp_path / "report.pdf"
     gen = PDFReportGenerator(output_path=str(output_path), images_dir=str(tmp_path))
     monkeypatch.setattr(gen.doc, "multiBuild", lambda story, canvasmaker=None: None)
@@ -335,9 +332,9 @@ def test_pdf_generator_currently_keeps_empty_kpi_headings(tmp_path, monkeypatch)
 
     texts = _paragraph_texts(gen.story)
 
-    assert "5. Map View" in texts
-    assert "b) RSRP" in texts
-    assert "g) MOS" in texts
+    assert "5. Map View" not in texts
+    assert "b) RSRP" not in texts
+    assert "g) MOS" not in texts
 
 
 def test_hybrid_report_text_can_feed_pdf_builder_without_error(monkeypatch, tmp_path):
@@ -449,10 +446,6 @@ def test_debug_write_report_engine_output_artifacts(monkeypatch):
     assert parse_fallback_report["PCI Summary"]
 
 
-@pytest.mark.xfail(
-    reason="Current PDF generator always adds hardcoded KPI subsection headings even when text and images are absent.",
-    strict=True,
-)
 def test_pdf_generator_should_skip_kpi_heading_when_no_text_and_no_images(tmp_path, monkeypatch):
     output_path = tmp_path / "report.pdf"
     gen = PDFReportGenerator(output_path=str(output_path), images_dir=str(tmp_path))
@@ -465,10 +458,6 @@ def test_pdf_generator_should_skip_kpi_heading_when_no_text_and_no_images(tmp_pa
     assert "b) RSRP" not in texts
 
 
-@pytest.mark.xfail(
-    reason="Current generate_report_text() raises if the Groq request fails before a response object exists.",
-    strict=True,
-)
 def test_generate_report_text_should_fallback_after_request_failures(monkeypatch, tmp_path):
     from tools.report_engine import llm_integration
 
@@ -486,10 +475,6 @@ def test_generate_report_text_should_fallback_after_request_failures(monkeypatch
     assert report["Map View - RSRP"]
 
 
-@pytest.mark.xfail(
-    reason="Current generate_report_text() has no retry loop around the Groq request.",
-    strict=True,
-)
 def test_generate_report_text_should_retry_three_times_before_fallback(monkeypatch, tmp_path):
     from tools.report_engine import llm_integration
 
@@ -520,10 +505,6 @@ def test_generate_report_text_should_retry_three_times_before_fallback(monkeypat
     assert attempts["count"] == 3
 
 
-@pytest.mark.xfail(
-    reason="Current generate_report_text() cannot produce fallback report_text.json after a request-level Groq failure, so the downstream PDF path cannot be exercised.",
-    strict=True,
-)
 def test_request_failure_fallback_output_should_feed_pdf_builder(monkeypatch, tmp_path):
     from tools.report_engine import llm_integration
 
@@ -545,3 +526,122 @@ def test_request_failure_fallback_output_should_feed_pdf_builder(monkeypatch, tm
     texts = _paragraph_texts(gen.story)
     assert report_text_path.exists()
     assert "1. Introduction" in texts
+
+
+def test_write_metadata_file_serializes_numpy_scalars(tmp_path):
+    output_path = tmp_path / "report_metadata.json"
+    metadata = {
+        "drive_summary": {
+            "total_sessions": np.int64(3),
+            "number_of_days": np.int64(1),
+            "distance_covered": np.float64(0.0),
+        },
+        "kpi_summary": {
+            "RSRP": {
+                "poor_count": np.int64(266),
+                "poor_percentage": np.float64(26.47),
+            }
+        },
+    }
+
+    write_metadata_file(metadata, str(output_path))
+
+    loaded = json.loads(output_path.read_text(encoding="utf-8"))
+    assert loaded["drive_summary"]["total_sessions"] == 3
+    assert loaded["drive_summary"]["number_of_days"] == 1
+    assert loaded["kpi_summary"]["RSRP"]["poor_count"] == 266
+
+
+def test_generate_report_text_serializes_numpy_scalars_in_llm_payload(monkeypatch, tmp_path):
+    metadata = _build_metadata()
+    metadata["drive_summary"]["total_sessions"] = np.int64(4)
+    metadata["pci_summary"]["total_unique_pci"] = np.int64(18)
+
+    output_path = tmp_path / "report_text.json"
+    _install_failing_groq(monkeypatch, lambda: RuntimeError("forced failure after prompt build"))
+
+    report = generate_report_text(
+        metadata=metadata,
+        output_path=str(output_path),
+        verbose=False,
+    )
+
+    assert output_path.exists()
+    assert report["Introduction"]
+
+
+def test_drive_summary_falls_back_to_session_rows_when_network_timestamps_invalid(tmp_path, monkeypatch):
+    network_df = pd.DataFrame(
+        [
+            {"session_id": 4178, "timestamp": None},
+            {"session_id": 4180, "timestamp": None},
+        ]
+    )
+
+    session_df = pd.DataFrame(
+        [
+            {"id": 4178, "start_time": "2026-03-25 18:29:00", "end_time": "2026-03-25 19:31:00", "distance": 0.0},
+            {"id": 4180, "start_time": "2026-03-25 18:30:00", "end_time": "2026-03-25 19:25:00", "distance": 0.0},
+        ]
+    )
+
+    monkeypatch.setattr("tools.report_engine.kpi_analysis.IMAGE_DIR", str(tmp_path))
+    monkeypatch.setattr("tools.report_engine.kpi_analysis.get_session_data_for_drive_summary", lambda session_ids: session_df)
+
+    summary = generate_drive_summary_images([4178, 4180], total_samples=6331, network_df=network_df)
+
+    assert summary is not None
+    assert summary["total_sessions"] == 2
+    assert summary["start_date"] == "2026-03-25"
+
+
+def test_handover_handles_bridge_dict_timestamps(tmp_path):
+    timestamp_1 = {
+        "IsValidDateTime": True,
+        "Year": 2026,
+        "Month": 6,
+        "Day": 8,
+        "Hour": 13,
+        "Minute": 42,
+        "Second": 1,
+    }
+    timestamp_2 = {
+        "IsValidDateTime": True,
+        "Year": 2026,
+        "Month": 6,
+        "Day": 8,
+        "Hour": 13,
+        "Minute": 42,
+        "Second": 2,
+    }
+    df = pd.DataFrame(
+        [
+            {
+                "session_id": 4763,
+                "timestamp": timestamp_1,
+                "lat": 7.3876,
+                "lon": 3.8787,
+                "network": "4G",
+                "band": "B3",
+                "pci": 101,
+                "m_alpha_long": "MTN NIGERIA",
+            },
+            {
+                "session_id": 4763,
+                "timestamp": timestamp_2,
+                "lat": 7.3877,
+                "lon": 3.8788,
+                "network": "5G",
+                "band": "n78",
+                "pci": 102,
+                "m_alpha_long": "MTN NIGERIA",
+            },
+        ]
+    )
+
+    events = detect_handover_events(df, use_global_detection=True, min_run_length=10)
+    assert events
+
+    output_html = tmp_path / "handover.html"
+    generate_handover_map(df, events, str(output_html))
+    assert output_html.exists()

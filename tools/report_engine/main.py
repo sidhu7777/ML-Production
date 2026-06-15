@@ -196,6 +196,7 @@ def main(
         handover_png = f"{kpi_maps_dir}/handover_map.png"
         # Use stable run length to avoid noisy events (use 10 as tuned in test)
         events = detect_handover_events(filtered_df, use_global_detection=True, min_run_length=10)
+        print(f"Handover events selected for map: {len(events)}")
         generate_handover_map(filtered_df, events, handover_html, polygon_wkt=polygon_wkt)
         html_to_png(handover_html, handover_png)
         print("Generated handover map")

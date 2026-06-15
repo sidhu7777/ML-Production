@@ -31,6 +31,24 @@ def _headers() -> dict[str, str]:
     return headers
 
 
+def _mapview_headers() -> dict[str, str]:
+    headers = {"Accept": "application/json"}
+    authorization = os.getenv("MAPVIEW_API_AUTHORIZATION")
+    cookie = os.getenv("MAPVIEW_API_COOKIE")
+    if authorization:
+        headers["Authorization"] = authorization
+    if cookie:
+        headers["Cookie"] = cookie
+    return headers
+
+
+def _service_root_url() -> str:
+    base = (os.getenv("BASE_URL") or _base_url() or "").rstrip("/")
+    if base.lower().endswith("/api/pythonbridge"):
+        return base[: -len("/api/PythonBridge")]
+    return base
+
+
 def _json_safe(value: Any) -> Any:
     if value is None:
         return None
@@ -168,6 +186,96 @@ class PythonBridgeClient:
                 break
             offset += page_limit
         return pd.DataFrame(rows)
+
+    def get_project(self, project_id: int) -> dict[str, Any] | None:
+        payload = self._request("GET", "GetProject", params={"projectId": int(project_id)})
+        return payload.get("Data")
+
+    def get_project_regions(self, project_id: int) -> list[dict[str, Any]]:
+        payload = self._request("GET", "GetProjectRegions", params={"projectId": int(project_id)})
+        return payload.get("Data") or []
+
+    def get_report_network_logs(
+        self,
+        session_ids: Iterable[int],
+        limit: int = 50000,
+        project_id: int | None = None,
+        provider: str | None = None,
+        start_date: str | None = None,
+        end_date: str | None = None,
+    ) -> pd.DataFrame:
+        session_ids = [int(v) for v in session_ids if int(v) > 0]
+        if os.getenv("REPORT_USE_MAPVIEW_NETWORKLOG_API", "0") == "1":
+            try:
+                return self.get_mapview_network_logs(session_ids, limit=limit, project_id=project_id)
+            except PythonBridgeError:
+                pass
+        return self.post_rows(
+            "GetReportNetworkLogs",
+            {
+                "SessionIds": session_ids,
+                "ProjectId": int(project_id) if project_id is not None else None,
+                "Provider": provider,
+                "StartDate": start_date,
+                "EndDate": end_date,
+                "Limit": int(limit),
+            },
+            limit=limit,
+        )
+
+    def get_mapview_network_logs(
+        self,
+        session_ids: Iterable[int],
+        limit: int = 50000,
+        project_id: int | None = None,
+    ) -> pd.DataFrame:
+        session_ids = [int(v) for v in session_ids if int(v) > 0]
+        if not session_ids:
+            return pd.DataFrame()
+
+        service_root = _service_root_url()
+        if not service_root:
+            raise PythonBridgeError("BASE_URL is not configured for MapView network-log access")
+
+        url = f"{service_root}/api/MapView/GetNetworkLog"
+        params: dict[str, Any] = {
+            "session_ids": ",".join(str(v) for v in session_ids),
+            "limit": int(limit),
+            "page": 1,
+        }
+        if project_id is not None:
+            params["project_id"] = int(project_id)
+
+        payload = self._request_url(
+            "GET",
+            url,
+            params=params,
+            headers=_mapview_headers(),
+        )
+        rows = payload.get("data") or payload.get("Data") or []
+        return pd.DataFrame(rows)
+
+    def get_sessions(self, session_ids: Iterable[int]) -> pd.DataFrame:
+        session_ids = [int(v) for v in session_ids if int(v) > 0]
+        payload = self._request("POST", "GetSessions", json={"SessionIds": session_ids})
+        rows = payload.get("Data") or []
+        return pd.DataFrame(rows)
+
+    def get_user(self, user_id: int) -> dict[str, Any] | None:
+        payload = self._request("GET", "GetUser", params={"userId": int(user_id)})
+        return payload.get("Data")
+
+    def get_user_thresholds(self, user_id: int) -> dict[str, Any] | None:
+        payload = self._request("GET", "GetUserThresholds", params={"userId": int(user_id)})
+        return payload.get("Data")
+
+    def update_project_download_path(self, project_id: int, download_path: str) -> bool:
+        payload = self._request(
+            "POST",
+            "UpdateProjectDownloadPath",
+            json={"ProjectId": int(project_id), "DownloadPath": str(download_path)},
+        )
+        return bool(payload.get("Updated", False) or payload.get("Status") == 1)
 
     def save_dataframe(
         self,
