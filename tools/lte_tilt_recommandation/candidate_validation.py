@@ -13,6 +13,12 @@ import pandas as pd
 
 from tools.lte_prediction_optimised import ml_engine as opt_ml
 from tools.lte_tilt_recommandation.cell_identity import canonical_cell_id
+from tools.lte_tilt_recommandation.geo_logic import (
+    MIN_BEARING_SAMPLE_COUNT,
+    _normalize_azimuth,
+    _signed_azimuth_delta,
+    compute_dominant_bearing_summary,
+)
 
 
 SEVERE_CONSTRAINT_PENALTY = 100000.0
@@ -48,6 +54,8 @@ class CandidateValidationConfig:
     min_safe_etilt: float = 2.0
     max_safe_etilt: float = 12.0
     max_good_area_loss_pct: float = 15.0
+    enable_azimuth_fallback: bool = True
+    azimuth_fallback_steps_deg: tuple[float, ...] = (5.0, 10.0, 15.0)
     rf_debug_log_path: Optional[str] = None
     constraint_map: Optional[Dict[str, Dict[str, object]]] = None
 
@@ -114,6 +122,24 @@ def _format_etilt_updates(updates: list[Dict[str, object]]) -> str:
         parts.append(
             "{cell}: {current:.1f}->{target:.1f} ({delta:+.1f})".format(
                 cell=_clean_id(update.get("cell_id")),
+                current=_safe_float(update.get("current_value"), np.nan),
+                target=_safe_float(update.get("target_value"), np.nan),
+                delta=_safe_float(update.get("actual_delta"), np.nan),
+            )
+        )
+    return "[" + "; ".join(parts) + "]"
+
+
+def _format_updates(updates: list[Dict[str, object]]) -> str:
+    if not updates:
+        return "[]"
+    parts = []
+    for update in updates:
+        parameter = str(update.get("parameter", "") or "").strip() or "Update"
+        parts.append(
+            "{cell} {parameter}: {current:.1f}->{target:.1f} ({delta:+.1f})".format(
+                cell=_clean_id(update.get("cell_id")),
+                parameter=parameter,
                 current=_safe_float(update.get("current_value"), np.nan),
                 target=_safe_float(update.get("target_value"), np.nan),
                 delta=_safe_float(update.get("actual_delta"), np.nan),
@@ -919,6 +945,122 @@ def _make_etilt_update(
     }
 
 
+def _azimuth_in_range(value: float, min_az: float, max_az: float) -> bool:
+    value_norm = float(value) % 360.0
+    min_norm = float(min_az) % 360.0
+    max_norm = float(max_az) % 360.0
+    if min_norm <= max_norm:
+        return min_norm <= value_norm <= max_norm
+    return value_norm >= min_norm or value_norm <= max_norm
+
+
+def _clamp_azimuth_to_range(value: float, min_az: float, max_az: float) -> float:
+    value_norm = float(value) % 360.0
+    if _azimuth_in_range(value_norm, min_az, max_az):
+        return value_norm
+    min_norm = float(min_az) % 360.0
+    max_norm = float(max_az) % 360.0
+    dist_to_min = abs(((value_norm - min_norm + 180.0) % 360.0) - 180.0)
+    dist_to_max = abs(((value_norm - max_norm + 180.0) % 360.0) - 180.0)
+    return min_norm if dist_to_min <= dist_to_max else max_norm
+
+
+def _bearing_context_map(
+    baseline_df: pd.DataFrame,
+    antenna_df: pd.DataFrame,
+    thresholds: Dict[str, float],
+) -> Dict[str, Dict[str, object]]:
+    try:
+        bearing_df = compute_dominant_bearing_summary(
+            baseline_df,
+            antenna_df,
+            float(thresholds.get("rsrp", -105.0)),
+            float(thresholds.get("rsrq", -15.0)),
+            float(thresholds.get("sinr", 0.0)),
+        )
+    except Exception as exc:
+        print(f"[TILT_AZIMUTH_FALLBACK] bearing_context_failed reason={exc}")
+        return {}
+    if bearing_df.empty or "Cell ID" not in bearing_df.columns:
+        return {}
+    work = bearing_df.copy()
+    work["_cell_key"] = work["Cell ID"].map(canonical_cell_id)
+    return {
+        str(row["_cell_key"]): row.drop(labels=["_cell_key"]).to_dict()
+        for _, row in work.iterrows()
+        if str(row.get("_cell_key", "")).strip()
+    }
+
+
+def _make_azimuth_update(
+    antenna_df: pd.DataFrame,
+    cell_id: str,
+    step_deg: float,
+    config: CandidateValidationConfig,
+    bearing_map: Dict[str, Dict[str, object]],
+    antenna_work_df: Optional[pd.DataFrame] = None,
+) -> Optional[Dict[str, object]]:
+    if antenna_work_df is not None and not antenna_work_df.empty:
+        ant = antenna_work_df
+    else:
+        ant = opt_ml._normalize_site_df(_prepare_optimizer_site_df(antenna_df), log_stage="TILT_COORDINATE_AZIMUTH_UPDATE")
+    cell_key = str(cell_id).strip()
+    row = ant.loc[ant["Node_Cell_ID"].astype(str).str.strip() == cell_key]
+    if row.empty:
+        suffix = cell_key.split("_")[-1]
+        row = ant.loc[ant.get("cell_id", pd.Series("", index=ant.index)).map(_clean_id) == suffix]
+    if row.empty:
+        return None
+
+    current = pd.to_numeric(pd.Series([row.iloc[0].get("azimuth")]), errors="coerce").iloc[0]
+    if pd.isna(current):
+        return None
+    current = _normalize_azimuth(float(current))
+    if pd.isna(current):
+        return None
+
+    context = bearing_map.get(canonical_cell_id(cell_key)) or bearing_map.get(cell_key) or {}
+    dominant_bearing = pd.to_numeric(pd.Series([context.get("dominant_bearing_deg")]), errors="coerce").iloc[0]
+    bearing_samples = pd.to_numeric(pd.Series([context.get("bearing_sample_count")]), errors="coerce").fillna(0).iloc[0]
+    if pd.isna(dominant_bearing) or int(bearing_samples) < int(MIN_BEARING_SAMPLE_COUNT):
+        return None
+
+    signed_delta = _signed_azimuth_delta(float(dominant_bearing), float(current))
+    if pd.isna(signed_delta) or abs(float(signed_delta)) < 5.0:
+        return None
+    direction = 1.0 if float(signed_delta) > 0 else -1.0
+    requested_delta = direction * abs(float(step_deg))
+    if abs(requested_delta) > abs(float(signed_delta)):
+        requested_delta = float(signed_delta)
+    target = _normalize_azimuth(float(current) + float(requested_delta))
+
+    constraint = (config.constraint_map or {}).get(_threshold_cell_id(cell_key))
+    if constraint and bool(constraint.get("optimised")):
+        min_allowed = pd.to_numeric(pd.Series([constraint.get("min_azimuth")]), errors="coerce").iloc[0]
+        max_allowed = pd.to_numeric(pd.Series([constraint.get("max_azimuth")]), errors="coerce").iloc[0]
+        if pd.notna(min_allowed) and pd.notna(max_allowed):
+            target = _clamp_azimuth_to_range(float(target), float(min_allowed), float(max_allowed))
+
+    actual_delta = _signed_azimuth_delta(float(target), float(current))
+    if pd.isna(actual_delta) or abs(float(actual_delta)) < 0.5:
+        return None
+
+    return {
+        "cell_id": cell_key,
+        "parameter": "Azimuth",
+        "current_value": float(current),
+        "target_value": float(target),
+        "requested_delta": float(requested_delta),
+        "actual_delta": float(actual_delta),
+        "dominant_bearing_deg": float(dominant_bearing),
+        "bearing_sample_count": int(bearing_samples),
+        "bearing_mismatch_deg": _safe_float(context.get("bearing_mismatch_deg"), np.nan),
+        "bearing_peak_share": _safe_float(context.get("bearing_peak_share"), np.nan),
+        "bearing_spread_deg": _safe_float(context.get("bearing_spread_deg"), np.nan),
+        "bearing_directional_contrast": _safe_float(context.get("bearing_directional_contrast"), np.nan),
+    }
+
+
 def _evaluate_update_set(
     *,
     updates: list[Dict[str, object]],
@@ -1052,7 +1194,7 @@ def _evaluate_update_set(
     )
     print(
         "[TILT_CANDIDATE_RESULT] "
-        f"updates={len(updates)} etilt={_format_etilt_updates(updates)} "
+        f"updates={len(updates)} changes={_format_updates(updates)} "
         f"score={float(metrics.get('score', -99999.0)):.4f} "
         f"net={float(metrics.get('net_bad_reduction', 0.0)):.0f} "
         f"before_bad={float(metrics.get('baseline_bad_grid_count', metrics.get('baseline_bad_count', 0.0))):.0f} "
@@ -1133,6 +1275,7 @@ def coordinate_search_recommendations(
         _prepare_optimizer_site_df(antenna_df),
         log_stage="TILT_COORDINATE_RF_ANTENNA_PREPARED",
     )
+    bearing_map = _bearing_context_map(baseline_df, antenna_df, thresholds) if bool(config.enable_azimuth_fallback) else {}
     evaluation_lock = threading.Lock()
     seen_coordinate_keys: set[tuple] = {tuple()}
     evaluation_rows: list[Dict[str, object]] = []
@@ -1184,8 +1327,19 @@ def coordinate_search_recommendations(
         delta: float,
         state: Dict[str, Dict[str, object]],
         stage_name: str,
+        parameter: str = "ETilt",
     ) -> Optional[tuple[Dict[str, Dict[str, object]], Dict[str, object], pd.DataFrame]]:
-        update = _make_etilt_update(antenna_df, cell_id, delta, config, antenna_work_df=prepared_antenna_work)
+        if str(parameter).strip().lower() == "azimuth":
+            update = _make_azimuth_update(
+                antenna_df,
+                cell_id,
+                delta,
+                config,
+                bearing_map,
+                antenna_work_df=prepared_antenna_work,
+            )
+        else:
+            update = _make_etilt_update(antenna_df, cell_id, delta, config, antenna_work_df=prepared_antenna_work)
         if update is None:
             return None
         trial_state = dict(state)
@@ -1215,10 +1369,10 @@ def coordinate_search_recommendations(
             metrics, after_df = {
                 "score": -99999.0,
                 "constraints_passed": 0.0,
-                "candidate_name": f"coordinate_{stage_name}_error_{cell_id}_{delta}",
+                "candidate_name": f"coordinate_{stage_name}_{parameter}_error_{cell_id}_{delta}",
                 "error": str(exc),
             }, pd.DataFrame()
-        metrics["candidate_name"] = f"coord_pass_{pass_idx}_cell_{cell_id}_delta_{delta:+.1f}_active_{len(trial_updates)}"
+        metrics["candidate_name"] = f"coord_pass_{pass_idx}_{parameter.lower()}_cell_{cell_id}_delta_{delta:+.1f}_active_{len(trial_updates)}"
         return trial_state, metrics, after_df
 
     def evaluate_delta_stage(
@@ -1228,6 +1382,7 @@ def coordinate_search_recommendations(
         deltas: list[float],
         state: Dict[str, Dict[str, object]],
         stage_name: str,
+        parameter: str = "ETilt",
     ) -> list[tuple[float, Dict[str, Dict[str, object]], Dict[str, object], pd.DataFrame]]:
         valid_deltas = [float(delta) for delta in deltas]
         if not valid_deltas:
@@ -1235,12 +1390,19 @@ def coordinate_search_recommendations(
         candidate_workers = max(1, int(config.candidate_workers or 1))
         print(
             f"[TILT_COORDINATE_STAGE] pass={pass_idx} cell={cell_id} stage={stage_name} "
-            f"deltas={valid_deltas} candidate_workers={min(candidate_workers, len(valid_deltas))}"
+            f"parameter={parameter} deltas={valid_deltas} candidate_workers={min(candidate_workers, len(valid_deltas))}"
         )
         stage_results: list[tuple[float, Dict[str, Dict[str, object]], Dict[str, object], pd.DataFrame]] = []
         if candidate_workers <= 1 or len(valid_deltas) == 1:
             for delta in valid_deltas:
-                evaluated = evaluate_trial(pass_idx=pass_idx, cell_id=cell_id, delta=delta, state=state, stage_name=stage_name)
+                evaluated = evaluate_trial(
+                    pass_idx=pass_idx,
+                    cell_id=cell_id,
+                    delta=delta,
+                    state=state,
+                    stage_name=stage_name,
+                    parameter=parameter,
+                )
                 if evaluated is None:
                     continue
                 trial_state, metrics, after_df = evaluated
@@ -1249,7 +1411,17 @@ def coordinate_search_recommendations(
             return stage_results
         process_jobs: list[tuple[float, Dict[str, Dict[str, object]], list[Dict[str, object]], str]] = []
         for delta in valid_deltas:
-            update = _make_etilt_update(antenna_df, cell_id, delta, config, antenna_work_df=prepared_antenna_work)
+            if str(parameter).strip().lower() == "azimuth":
+                update = _make_azimuth_update(
+                    antenna_df,
+                    cell_id,
+                    delta,
+                    config,
+                    bearing_map,
+                    antenna_work_df=prepared_antenna_work,
+                )
+            else:
+                update = _make_etilt_update(antenna_df, cell_id, delta, config, antenna_work_df=prepared_antenna_work)
             if update is None:
                 continue
             trial_state = dict(state)
@@ -1260,7 +1432,7 @@ def coordinate_search_recommendations(
                 if key in seen_coordinate_keys:
                     continue
                 seen_coordinate_keys.add(key)
-            candidate_name = f"coord_pass_{pass_idx}_cell_{cell_id}_delta_{delta:+.1f}_active_{len(trial_updates)}"
+            candidate_name = f"coord_pass_{pass_idx}_{parameter.lower()}_cell_{cell_id}_delta_{delta:+.1f}_active_{len(trial_updates)}"
             process_jobs.append((delta, trial_state, trial_updates, candidate_name))
         if not process_jobs:
             return []
@@ -1268,7 +1440,7 @@ def coordinate_search_recommendations(
         max_workers = min(candidate_workers, len(process_jobs))
         print(
             f"[TILT_COORDINATE_PROCESS_POOL] pass={pass_idx} cell={cell_id} stage={stage_name} "
-            f"process_workers={max_workers} rf_workers_per_candidate={rf_workers_per_candidate}"
+            f"parameter={parameter} process_workers={max_workers} rf_workers_per_candidate={rf_workers_per_candidate}"
         )
         with ProcessPoolExecutor(max_workers=max_workers) as executor:
             future_to_job = {
@@ -1299,7 +1471,7 @@ def coordinate_search_recommendations(
                     metrics, after_df = {
                         "score": -99999.0,
                         "constraints_passed": 0.0,
-                        "candidate_name": f"coordinate_{stage_name}_error_{cell_id}_{delta}",
+                        "candidate_name": f"coordinate_{stage_name}_{parameter}_error_{cell_id}_{delta}",
                         "error": str(exc),
                     }, pd.DataFrame()
                 metrics["candidate_name"] = candidate_name
@@ -1368,6 +1540,55 @@ def coordinate_search_recommendations(
             print(f"[TILT_COORDINATE_STOP] pass={pass_idx} reason=no_improvement")
             break
 
+    if bool(config.enable_azimuth_fallback) and bearing_map:
+        remaining_cells = [cell_id for cell_id in target_cells if cell_id not in current_updates]
+        azimuth_steps = [abs(float(step)) for step in config.azimuth_fallback_steps_deg if abs(float(step)) > 0.0]
+        print(
+            f"[TILT_AZIMUTH_FALLBACK_START] remaining_cells={len(remaining_cells)} "
+            f"steps={azimuth_steps} active_etilt_updates={len(current_updates)}"
+        )
+        for cell_idx, cell_id in enumerate(remaining_cells, start=1):
+            print(
+                f"[TILT_AZIMUTH_FALLBACK_PROGRESS] cell_index={cell_idx}/{len(remaining_cells)} "
+                f"cell={cell_id} active_updates={len(current_updates)}"
+            )
+            best_updates = dict(current_updates)
+            best_metrics = current_metrics
+            best_after = current_after
+            fallback_results = evaluate_delta_stage(
+                pass_idx=max(1, int(config.coordinate_passes)) + 1,
+                cell_id=cell_id,
+                deltas=azimuth_steps,
+                state=current_updates,
+                stage_name="azimuth_directional_fallback",
+                parameter="Azimuth",
+            )
+            for _, trial_updates, metrics, after_df in sorted(
+                fallback_results,
+                key=lambda item: rank(item[2]),
+                reverse=True,
+            ):
+                if rank(metrics) > rank(best_metrics):
+                    best_updates = trial_updates
+                    best_metrics = metrics
+                    best_after = after_df
+                    break
+            if rank(best_metrics) > rank(current_metrics):
+                current_updates = best_updates
+                current_metrics = best_metrics
+                current_after = best_after
+                accepted = current_updates.get(cell_id, {})
+                print(
+                    f"[TILT_AZIMUTH_FALLBACK_KEEP] cell={cell_id} "
+                    f"azimuth={_safe_float(accepted.get('current_value'), np.nan):.1f}->"
+                    f"{_safe_float(accepted.get('target_value'), np.nan):.1f} "
+                    f"score={float(current_metrics.get('score', 0.0)):.4f} "
+                    f"net={float(current_metrics.get('net_bad_reduction', 0.0)):.0f}"
+                )
+        print(f"[TILT_AZIMUTH_FALLBACK_DONE] active_updates={len(current_updates)}")
+    elif bool(config.enable_azimuth_fallback):
+        print("[TILT_AZIMUTH_FALLBACK_SKIP] reason=no_bearing_context")
+
     evaluation_df = pd.DataFrame(evaluation_rows)
     actionable = (
         current_updates
@@ -1393,21 +1614,34 @@ def coordinate_search_recommendations(
         cell_id = canonical_cell_id(rf_cell_id)
         ant_row = ant.loc[ant["Node_Cell_ID"].astype(str) == rf_cell_id]
         tech = ant_row.iloc[0].get("Technology", "4G") if not ant_row.empty else "4G"
+        parameter = str(update.get("parameter", "ETilt") or "ETilt").strip()
+        if parameter.lower() == "azimuth":
+            reason = (
+                "Directional azimuth fallback selected this update after ETilt candidate passes did not produce a validated improvement "
+                "for this cell. The azimuth candidate was evaluated with RF before/after validation. "
+                f"dominant_bearing={_safe_float(update.get('dominant_bearing_deg'), np.nan):.1f}, "
+                f"score={float(current_metrics.get('score', 0.0)):.4f}, "
+                f"net_bad_grid_reduction={float(current_metrics.get('net_bad_reduction', 0.0)):.0f}."
+            )
+            root_cause = "directional_azimuth_fallback_validated"
+        else:
+            reason = (
+                "Global combined weighted bad-grid coordinate search selected this ETilt update after RF before/after validation. "
+                f"score={float(current_metrics.get('score', 0.0)):.4f}, "
+                f"net_bad_grid_reduction={float(current_metrics.get('net_bad_reduction', 0.0)):.0f}."
+            )
+            root_cause = "global_bad_grid_combined_weighted"
         rows.append(
             {
                 "Cell ID": cell_id,
                 "Technology": tech,
-                "Parameter": "ETilt",
+                "Parameter": parameter,
                 "Current Value": float(update["current_value"]),
                 "Recommended Value": float(update["target_value"]),
-                "Reason": (
-                    "Global combined weighted bad-grid coordinate search selected this ETilt update after RF before/after validation. "
-                    f"score={float(current_metrics.get('score', 0.0)):.4f}, "
-                    f"net_bad_grid_reduction={float(current_metrics.get('net_bad_reduction', 0.0)):.0f}."
-                ),
+                "Reason": reason,
                 "Swap Sector Detected": "No",
                 "Bad Sample Count": int(float(current_metrics.get("baseline_bad_grid_count", 0.0))),
-                "Root Cause Category": "global_bad_grid_combined_weighted",
+                "Root Cause Category": root_cause,
                 "Recommendation Status": "action_change_validated",
                 "Recommendation Confidence": "High" if float(current_metrics.get("score", 0.0)) > 10 else "Medium",
                 "Confidence Score": float(np.clip(float(current_metrics.get("score", 0.0)) * 4.0 + 15.0, 0.0, 100.0)),
