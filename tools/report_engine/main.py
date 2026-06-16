@@ -194,8 +194,8 @@ def main(
     try:
         handover_html = f"{html_dir}/handover_map.html"
         handover_png = f"{kpi_maps_dir}/handover_map.png"
-        # Use stable run length to avoid noisy events (use 10 as tuned in test)
-        events = detect_handover_events(filtered_df, use_global_detection=True, min_run_length=10)
+        # Report handover map uses frontend-style band transitions only.
+        events = detect_handover_events(filtered_df)
         print(f"Handover events selected for map: {len(events)}")
         generate_handover_map(filtered_df, events, handover_html, polygon_wkt=polygon_wkt)
         html_to_png(handover_html, handover_png)

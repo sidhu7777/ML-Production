@@ -2,9 +2,21 @@ from flask import Flask, jsonify
 from flask_cors import CORS
 import os
 import logging
+import sys
+import multiprocessing
 from werkzeug.exceptions import HTTPException
 
+if getattr(sys, "frozen", False):
+    multiprocessing.freeze_support()
+
 os.environ.setdefault("LOKY_MAX_CPU_COUNT", str(os.cpu_count() or 1))
+for _stream_name in ("stdout", "stderr"):
+    _stream = getattr(sys, _stream_name, None)
+    if _stream and hasattr(_stream, "reconfigure"):
+        try:
+            _stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
 print(f"[PYTHON_BOOT] lte_patch=2026-06-10-latlon-trace loky_max_cpu_count={os.environ.get('LOKY_MAX_CPU_COUNT')}", flush=True)
 
 # Import config, blueprints, and db

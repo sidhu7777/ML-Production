@@ -20,20 +20,42 @@ from tools.lte_tilt_recommandation.cell_identity import (
 # =========================
 # Config (Dynamic Input with Defaults)
 # =========================
-if len(sys.argv) >= 3:
-    INPUT_LOG = sys.argv[1]
-    INPUT_PHYSICAL_DB = sys.argv[2]
-    INPUT_GEO = sys.argv[6] if len(sys.argv) >= 7 else ""
-    
-    # Dynamic thresholds with fallbacks
-    RSRP_THRESH = float(sys.argv[3]) if len(sys.argv) >= 4 else -105.0
-    RSRQ_THRESH = float(sys.argv[4]) if len(sys.argv) >= 5 else -15.0
-    SINR_THRESH = float(sys.argv[5]) if len(sys.argv) >= 6 else 0.0
-else:
-    print("Error: Missing Log and DB CSV paths.")
-    sys.exit(1)
+INPUT_LOG = ""
+INPUT_PHYSICAL_DB = ""
+INPUT_GEO = ""
+RSRP_THRESH = -105.0
+RSRQ_THRESH = -15.0
+SINR_THRESH = 0.0
 
-OUTPUT_PATH = os.path.join(os.path.dirname(os.path.abspath(INPUT_LOG)), "RF_Optimization_Report.xlsx")
+OUTPUT_PATH = (
+    os.path.join(os.path.dirname(os.path.abspath(INPUT_LOG)), "RF_Optimization_Report.xlsx")
+    if INPUT_LOG
+    else ""
+)
+
+
+def configure_cli_inputs(argv: List[str]) -> None:
+    global INPUT_LOG, INPUT_PHYSICAL_DB, INPUT_GEO
+    global RSRP_THRESH, RSRQ_THRESH, SINR_THRESH, OUTPUT_PATH
+
+    if len(argv) < 3:
+        return
+
+    INPUT_LOG = argv[1]
+    INPUT_PHYSICAL_DB = argv[2]
+    INPUT_GEO = argv[6] if len(argv) >= 7 else ""
+
+    # Dynamic thresholds with fallbacks. Keep this behind __main__ so importing
+    # the module inside PyInstaller does not parse bootloader args like pipe_handle.
+    RSRP_THRESH = float(argv[3]) if len(argv) >= 4 else -105.0
+    RSRQ_THRESH = float(argv[4]) if len(argv) >= 5 else -15.0
+    SINR_THRESH = float(argv[5]) if len(argv) >= 6 else 0.0
+
+    OUTPUT_PATH = (
+        os.path.join(os.path.dirname(os.path.abspath(INPUT_LOG)), "RF_Optimization_Report.xlsx")
+        if INPUT_LOG
+        else ""
+    )
 PROJECT_ROOT = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
@@ -1406,6 +1428,9 @@ def export_to_excel(
     return output_path
 
 def main():
+    if not INPUT_LOG or not INPUT_PHYSICAL_DB:
+        print("Error: Missing Log and DB CSV paths.")
+        sys.exit(1)
     try:
         print("Loading input files...")
         log_df = pd.read_csv(INPUT_LOG)
@@ -1474,4 +1499,5 @@ def main():
 
 
 if __name__ == "__main__":
+    configure_cli_inputs(sys.argv)
     main()

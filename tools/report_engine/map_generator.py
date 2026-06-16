@@ -717,156 +717,14 @@ def _select_non_overlapping_regions(candidates, min_distance_meters, top_regions
 
 def detect_handover_events(df: pd.DataFrame, use_global_detection=True, min_run_length=3):
     """
-    Detect provider/technology handover events from a dataframe with columns:
-    ['timestamp','lat','lon','m_alpha_long','session_id', ...]
-    Returns list of events with keys: session_id,timestamp,lat,lon,from_provider,to_provider,from_network,to_network
+    Detect report handover events.
+
+    The PDF report handover image intentionally follows the frontend's band
+    handover logic only. Technology and PCI transitions are available in the
+    frontend UI, but they should not be mixed into this report map.
     """
     frontend_events = _detect_frontend_style_handover_events(df)
-    if frontend_events:
-        return frontend_events
-
-    events = []
-    if df is None or df.empty:
-        return events
-
-    df = df.rename(columns={c: c.lower() for c in df.columns})
-
-    tech_col = None
-    for cand in ("network", "technology", "tech"):
-        if cand in df.columns:
-            tech_col = cand
-            break
-
-    required = {"timestamp", "lat", "lon", "m_alpha_long"}
-    if tech_col:
-        required.add(tech_col)
-    if not required.issubset(set(df.columns)):
-        return events
-
-    df = df.dropna(subset=["lat", "lon", "m_alpha_long"] + ([tech_col] if tech_col else []))
-
-    MIN_RUN_LENGTH = min_run_length
-
-    # per-session detection
-    if "session_id" in df.columns:
-        df_s = df.sort_values(["session_id", "timestamp"]) 
-        for sid, group in df_s.groupby("session_id"):
-            runs = []
-            prev = None
-            count = 0
-            first_row = None
-            for _, row in group.iterrows():
-                prov = str(row["m_alpha_long"]).strip()
-                tech = str(row[tech_col]).strip() if tech_col else None
-                key = (prov, tech)
-                if prev is None:
-                    prev = key
-                    count = 1
-                    first_row = row
-                    continue
-                if key == prev:
-                    count += 1
-                else:
-                    runs.append((prev, first_row, count))
-                    prev = key
-                    count = 1
-                    first_row = row
-            if prev is not None:
-                runs.append((prev, first_row, count))
-
-            for i in range(len(runs) - 1):
-                (cur_prov, cur_tech), cur_row, cur_cnt = runs[i]
-                (next_prov, next_tech), next_row, next_cnt = runs[i + 1]
-                if (next_prov != cur_prov or next_tech != cur_tech) and next_cnt >= MIN_RUN_LENGTH:
-                    events.append({
-                        "session_id": int(sid),
-                        "timestamp": next_row["timestamp"],
-                        "lat": float(next_row["lat"]),
-                        "lon": float(next_row["lon"]),
-                        "from_provider": cur_prov,
-                        "to_provider": next_prov,
-                        "from_network": cur_tech,
-                        "to_network": next_tech,
-                    })
-
-        # relaxed detection (min_run=1) if none found
-        if not events:
-            events_relaxed = []
-            for sid, group in df_s.groupby("session_id"):
-                prev = None
-                for _, row in group.iterrows():
-                    prov = str(row["m_alpha_long"]).strip()
-                    tech = str(row[tech_col]).strip() if tech_col else None
-                    key = (prov, tech)
-                    if prev is None:
-                        prev = key
-                        continue
-                    if key != prev:
-                        events_relaxed.append({
-                            "session_id": int(sid),
-                            "timestamp": row["timestamp"],
-                            "lat": float(row["lat"]),
-                            "lon": float(row["lon"]),
-                            "from_provider": prev[0],
-                            "to_provider": prov,
-                            "from_network": prev[1],
-                            "to_network": tech,
-                        })
-                        prev = key
-            events = events_relaxed
-
-    # if global detection requested or no session_id
-    if use_global_detection or "session_id" not in df.columns:
-        df_g = df.sort_values(["timestamp"])  # time-ordered
-        runs = []
-        prev = None
-        count = 0
-        first_row = None
-        for _, row in df_g.iterrows():
-            prov = str(row["m_alpha_long"]).strip()
-            tech = str(row[tech_col]).strip() if tech_col else None
-            key = (prov, tech)
-            if prev is None:
-                prev = key
-                count = 1
-                first_row = row
-                continue
-            if key == prev:
-                count += 1
-            else:
-                runs.append((prev, first_row, count))
-                prev = key
-                count = 1
-                first_row = row
-        if prev is not None:
-            runs.append((prev, first_row, count))
-
-        for i in range(len(runs) - 1):
-            (cur_prov, cur_tech), cur_row, cur_cnt = runs[i]
-            (next_prov, next_tech), next_row, next_cnt = runs[i + 1]
-            if (next_prov != cur_prov or next_tech != cur_tech) and next_cnt >= MIN_RUN_LENGTH:
-                events.append({
-                    "session_id": int(next_row.get("session_id")) if next_row.get("session_id") is not None else None,
-                    "timestamp": next_row["timestamp"],
-                    "lat": float(next_row["lat"]),
-                    "lon": float(next_row["lon"]),
-                    "from_provider": cur_prov,
-                    "to_provider": next_prov,
-                    "from_network": cur_tech,
-                    "to_network": next_tech,
-                })
-
-    # deduplicate
-    unique = []
-    seen = set()
-    for ev in events:
-        k = (str(ev.get('timestamp')), round(float(ev.get('lat')), 6), round(float(ev.get('lon')), 6), ev.get('from_provider'), ev.get('to_provider'))
-        if k in seen:
-            continue
-        seen.add(k)
-        unique.append(ev)
-
-    return unique
+    return frontend_events
 
 
 def _first_present(row, candidates):
@@ -923,8 +781,8 @@ def _safe_session_id(value):
 
 def _detect_frontend_style_handover_events(df: pd.DataFrame):
     """
-    Detect the same practical handover families shown by the frontend:
-    technology, band, and PCI transitions, per session in timestamp/order.
+    Detect band handover transitions using the same practical value
+    normalization/order rules used by the frontend handover experience.
     """
     if df is None or df.empty:
         return []
@@ -959,55 +817,42 @@ def _detect_frontend_style_handover_events(df: pd.DataFrame):
     groups = data.groupby("__session_group", dropna=False) if session_col else [(None, data)]
     events = []
 
-    value_resolvers = {
-        "technology": lambda r: normalize_tech_name(
-            _first_present(r, ("network", "technology", "networktype", "tech")),
-            _first_present(r, ("band", "neighbourband", "neighborband", "neighbour_band")),
-        ),
-        "band": lambda r: normalize_band_name(
-            _first_present(r, ("band", "neighbourband", "neighborband", "neighbour_band"))
-        ),
-        "pci": lambda r: _clean_transition_value(
-            _first_present(r, ("pci", "best_pci", "physical_cell_id", "cell_id"))
-        ),
-    }
+    value_resolver = lambda r: normalize_band_name(
+        _first_present(r, ("band", "neighbourband", "neighborband", "neighbour_band"))
+    )
 
     for sid, group in groups:
-        previous_by_type = {}
-        previous_row_by_type = {}
+        previous = None
+        previous_row = None
 
         for _, row in group.iterrows():
-            for event_type, resolver in value_resolvers.items():
-                current = _clean_transition_value(resolver(row))
-                if current is None:
-                    continue
+            current = _clean_transition_value(value_resolver(row))
+            if current is None:
+                continue
 
-                previous = previous_by_type.get(event_type)
-                previous_row = previous_row_by_type.get(event_type)
+            if previous is not None and previous != current and previous_row is not None:
+                events.append({
+                    "type": "band",
+                    "session_id": _safe_session_id(sid),
+                    "timestamp": row.get("timestamp"),
+                    "lat": float(row["lat"]),
+                    "lon": float(row["lon"]),
+                    "from_value": previous,
+                    "to_value": current,
+                    "from_lat": float(previous_row["lat"]),
+                    "from_lon": float(previous_row["lon"]),
+                    "from_provider": _clean_transition_value(
+                        _first_present(previous_row, ("m_alpha_long", "provider", "operator"))
+                    ),
+                    "to_provider": _clean_transition_value(
+                        _first_present(row, ("m_alpha_long", "provider", "operator"))
+                    ),
+                    "from_network": None,
+                    "to_network": None,
+                })
 
-                if previous is not None and previous != current and previous_row is not None:
-                    events.append({
-                        "type": event_type,
-                        "session_id": _safe_session_id(sid),
-                        "timestamp": row.get("timestamp"),
-                        "lat": float(row["lat"]),
-                        "lon": float(row["lon"]),
-                        "from_value": previous,
-                        "to_value": current,
-                        "from_lat": float(previous_row["lat"]),
-                        "from_lon": float(previous_row["lon"]),
-                        "from_provider": _clean_transition_value(
-                            _first_present(previous_row, ("m_alpha_long", "provider", "operator"))
-                        ),
-                        "to_provider": _clean_transition_value(
-                            _first_present(row, ("m_alpha_long", "provider", "operator"))
-                        ),
-                        "from_network": previous if event_type == "technology" else None,
-                        "to_network": current if event_type == "technology" else None,
-                    })
-
-                previous_by_type[event_type] = current
-                previous_row_by_type[event_type] = row
+            previous = current
+            previous_row = row
 
     unique = []
     seen = set()
@@ -1025,7 +870,7 @@ def _detect_frontend_style_handover_events(df: pd.DataFrame):
         seen.add(key)
         unique.append(ev)
 
-    return unique[:500]
+    return unique
 
 
 def _build_region_candidates(poor_df, grid_size):
@@ -1271,6 +1116,10 @@ def generate_handover_map(filtered_df, events, output_html, polygon_wkt=None):
     df = filtered_df.dropna(subset=["lat", "lon"]).copy() if filtered_df is not None else pd.DataFrame()
     if df.empty:
         raise ValueError("No GPS data to plot for handover map")
+    events = [
+        ev for ev in (events or [])
+        if str(ev.get("type") or "").lower() == "band"
+    ]
 
     m = folium.Map(tiles="CartoDB positron", zoom_control=True, control_scale=False, prefer_canvas=True)
     add_fullscreen_css(m)
@@ -1318,9 +1167,7 @@ def generate_handover_map(filtered_df, events, output_html, polygon_wkt=None):
         '</svg></div>'
     )
     event_colors = {
-        "technology": "#22c55e",
         "band": "#3b82f6",
-        "pci": "#a855f7",
     }
     for ev in events:
         event_type = str(ev.get("type") or "handover").lower()
@@ -1342,7 +1189,7 @@ def generate_handover_map(filtered_df, events, output_html, polygon_wkt=None):
             counts[event_type] = counts.get(event_type, 0) + 1
         add_legend(
             m,
-            "Handover Events",
+            "Band Handover Events",
             [
                 (event_type.title(), event_colors.get(event_type, "#ff9933"), count)
                 for event_type, count in counts.items()

@@ -606,7 +606,7 @@ def main(args):
     sys.stdout   = DualLogger(log_filename)
 
     print("\n============================================================")
-    print(" LTE PREDICTOR — 3GPP 3D ANTENNA + INTER-CELL INTERFERENCE")
+    print(" LTE PREDICTOR - 3GPP 3D ANTENNA + INTER-CELL INTERFERENCE")
     print(f" Cores: {args.n_workers}   Frequency: {args.frequency} MHz   BW: {args.bandwidth} MHz")
     print("============================================================\n")
 
@@ -683,7 +683,7 @@ def main(args):
 
     for cid in unique_cells:
         print("----------------------------------------------------")
-        print(f"Processing Cell → {cid}")
+        print(f"Processing Cell -> {cid}")
         print("----------------------------------------------------")
 
         site_rows = site_df[site_df["Node_Cell_ID"] == cid].copy()
@@ -761,7 +761,7 @@ def main(args):
         final_list.append(pts)
 
     # ── 7. COMBINE & CLIP TO AREA ───────────────────────────────
-    print("\nCombining all sector predictions…")
+    print("\nCombining all sector predictions...")
     final_df = pd.concat(final_list, ignore_index=True)
 
     if area_polygon is not None:

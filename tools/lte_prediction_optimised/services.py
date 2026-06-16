@@ -1207,7 +1207,7 @@ class LTEPredictionService_optimised:
     def _update(self, job_id, status, msg):
         JOBS[job_id]["status"] = status
         JOBS[job_id]["progress"] = msg
-        print(f"[{job_id[:6]}] {msg}")
+        print(f"[{job_id[:6]}] {msg}", flush=True)
 
     def _get_next_project_scenario_id(self, project_id, current_engine):
         query = text("""

@@ -1,6 +1,8 @@
 import os
 from numpy import around
 import pandas as pd
+import matplotlib
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 
@@ -19,6 +21,16 @@ def has_valid_series(df, column):
 
 def has_non_empty_df(df):
     return df is not None and not df.empty
+
+
+def _join_unique_non_empty(values):
+    cleaned = (
+        values.dropna()
+        .astype(str)
+        .str.strip()
+    )
+    cleaned = cleaned[cleaned.ne("") & cleaned.str.lower().ne("none")]
+    return ",".join(sorted(set(cleaned)))
 
 
 # =====================================================
@@ -323,8 +335,8 @@ def generate_pci_poor_rsrp(df):
     grouped = df.groupby("pci").agg(
         sample_count=("rsrp", "count"),
         avg_rsrp=("rsrp", "mean"),
-        bands=("band", lambda x: ",".join(sorted(set(x)))),
-        cell_ids=("cell_id", lambda x: ",".join(sorted(set(map(str, x)))))
+        bands=("band", _join_unique_non_empty),
+        cell_ids=("cell_id", _join_unique_non_empty)
     ).reset_index()
 
     poor = grouped.loc[grouped["avg_rsrp"] < -100].copy()
@@ -345,8 +357,8 @@ def generate_pci_poor_rsrq(df):
     grouped = df.groupby("pci").agg(
         sample_count=("rsrq", "count"),
         avg_rsrq=("rsrq", "mean"),
-        bands=("band", lambda x: ",".join(sorted(set(x)))),
-        cell_ids=("cell_id", lambda x: ",".join(sorted(set(map(str, x)))))
+        bands=("band", _join_unique_non_empty),
+        cell_ids=("cell_id", _join_unique_non_empty)
     ).reset_index()
 
     poor = grouped.loc[grouped["avg_rsrq"] < -15].copy()

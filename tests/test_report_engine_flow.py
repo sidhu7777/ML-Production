@@ -7,7 +7,11 @@ import pytest
 
 from tools.report_engine.llm_integration import generate_report_text, parse_and_validate_llm_output
 from tools.report_engine.metadata_generator import write_metadata_file
-from tools.report_engine.kpi_analysis import generate_drive_summary_images
+from tools.report_engine.kpi_analysis import (
+    generate_drive_summary_images,
+    generate_pci_poor_rsrp,
+    generate_pci_poor_rsrq,
+)
 from tools.report_engine.pdf_generator import PDFReportGenerator
 from tools.report_engine.map_generator import detect_handover_events, generate_handover_map
 
@@ -595,6 +599,24 @@ def test_drive_summary_falls_back_to_session_rows_when_network_timestamps_invali
     assert summary["start_date"] == "2026-03-25"
 
 
+def test_pci_poor_tables_ignore_empty_band_values(tmp_path, monkeypatch):
+    monkeypatch.setattr("tools.report_engine.kpi_analysis.IMAGE_DIR", str(tmp_path))
+
+    df = pd.DataFrame(
+        [
+            {"pci": 101, "rsrp": -110, "rsrq": -18, "band": "B3", "cell_id": "A"},
+            {"pci": 101, "rsrp": -108, "rsrq": -17, "band": None, "cell_id": None},
+            {"pci": 101, "rsrp": -109, "rsrq": -16, "band": "B40", "cell_id": "B"},
+        ]
+    )
+
+    generate_pci_poor_rsrp(df)
+    generate_pci_poor_rsrq(df)
+
+    assert (tmp_path / "pci_poor_rsrp.png").exists()
+    assert (tmp_path / "pci_poor_rsrq.png").exists()
+
+
 def test_handover_handles_bridge_dict_timestamps(tmp_path):
     timestamp_1 = {
         "IsValidDateTime": True,
@@ -645,3 +667,77 @@ def test_handover_handles_bridge_dict_timestamps(tmp_path):
     output_html = tmp_path / "handover.html"
     generate_handover_map(df, events, str(output_html))
     assert output_html.exists()
+
+
+def test_report_handover_detects_only_band_transitions():
+    df = pd.DataFrame(
+        [
+            {
+                "session_id": 1,
+                "timestamp": "2026-06-08T13:42:01",
+                "lat": 7.3876,
+                "lon": 3.8787,
+                "network": "4G",
+                "band": "B3",
+                "pci": 101,
+            },
+            {
+                "session_id": 1,
+                "timestamp": "2026-06-08T13:42:02",
+                "lat": 7.3877,
+                "lon": 3.8788,
+                "network": "5G",
+                "band": "B3",
+                "pci": 102,
+            },
+        ]
+    )
+
+    events = detect_handover_events(df)
+
+    assert events == []
+
+
+def test_report_handover_band_transitions_are_not_limited_to_500():
+    rows = []
+    for idx in range(601):
+        rows.append(
+            {
+                "session_id": 1,
+                "timestamp": f"2026-06-08T13:{idx // 60:02d}:{idx % 60:02d}",
+                "lat": 7.3 + (idx * 0.00001),
+                "lon": 3.8 + (idx * 0.00001),
+                "network": "4G",
+                "band": "B3" if idx % 2 == 0 else "B40",
+                "pci": 100 + idx,
+            }
+        )
+
+    events = detect_handover_events(pd.DataFrame(rows))
+
+    assert len(events) == 600
+    assert {event["type"] for event in events} == {"band"}
+
+
+def test_report_handover_map_renders_band_events_only(tmp_path):
+    df = pd.DataFrame(
+        [
+            {"session_id": 1, "timestamp": "2026-06-08T13:42:01", "lat": 7.3876, "lon": 3.8787},
+            {"session_id": 1, "timestamp": "2026-06-08T13:42:02", "lat": 7.3877, "lon": 3.8788},
+            {"session_id": 1, "timestamp": "2026-06-08T13:42:03", "lat": 7.3878, "lon": 3.8789},
+        ]
+    )
+    events = [
+        {"type": "technology", "session_id": 1, "lat": 7.3876, "lon": 3.8787, "from_value": "4G", "to_value": "5G"},
+        {"type": "band", "session_id": 1, "lat": 7.3877, "lon": 3.8788, "from_value": "B3", "to_value": "B40"},
+        {"type": "pci", "session_id": 1, "lat": 7.3878, "lon": 3.8789, "from_value": "101", "to_value": "102"},
+    ]
+
+    output_html = tmp_path / "handover.html"
+    generate_handover_map(df, events, str(output_html))
+    html = output_html.read_text(encoding="utf-8")
+
+    assert "Band Handover Events" in html
+    assert "Band: B3 -> B40" in html
+    assert "Technology: 4G -> 5G" not in html
+    assert "Pci: 101 -> 102" not in html

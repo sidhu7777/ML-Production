@@ -241,6 +241,7 @@ class LTEPredictionService:
                     "dt_replace_radius_m": cfg.get("dt_replace_radius_m", 20),
                     "dt_blend_sigma_m": cfg.get("dt_blend_sigma_m", 60),
                     "dt_blend_radius_m": cfg.get("dt_blend_radius_m", 140),
+                    "enable_osm_enrichment": cfg.get("enable_osm_enrichment"),
                 },
             )
             _job_df_summary("DISPLAY_OUTPUT_DF", final_df)
@@ -287,7 +288,7 @@ class LTEPredictionService:
     def _update(self, job_id, status, msg):
         JOBS[job_id]["status"] = status
         JOBS[job_id]["progress"] = msg
-        print(f"[{job_id[:6]}] {msg}")
+        print(f"[{job_id[:6]}] {msg}", flush=True)
 
     def _resolve_dem_path(self, project_id, region, site_df, requested_path=None):
         try:

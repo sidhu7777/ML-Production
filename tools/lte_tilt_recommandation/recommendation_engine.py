@@ -1,8 +1,5 @@
 from __future__ import annotations
 
-import importlib.util
-import os
-import sys
 from dataclasses import dataclass
 from typing import Dict, Optional
 
@@ -13,6 +10,7 @@ from tools.lte_tilt_recommandation.candidate_validation import (
     CandidateValidationConfig,
     coordinate_search_recommendations,
 )
+from tools.lte_tilt_recommandation import etilt_optimizer_cd2 as TILT_SRC
 
 
 DISABLED_THRESHOLD = -999999.0
@@ -46,26 +44,6 @@ class TiltEngineConfig:
     max_neighbors_per_update_cell: int = 2
     rf_debug_log_path: Optional[str] = None
     constraint_map: Optional[Dict[str, Dict[str, object]]] = None
-
-
-def _load_tilt_source():
-    module_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "etilt_optimizer_cd2.py")
-    module_name = "tools.lte_tilt_recommandation._runtime_etilt_optimizer_cd2"
-    old_argv = sys.argv[:]
-    try:
-        sys.argv = [module_path, "dummy_log.csv", "dummy_antenna.csv", "-105", "-15", "0"]
-        spec = importlib.util.spec_from_file_location(module_name, module_path)
-        if spec is None or spec.loader is None:
-            raise ImportError(f"Unable to load tilt optimizer from {module_path}")
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
-        return module
-    finally:
-        sys.argv = old_argv
-
-
-TILT_SRC = _load_tilt_source()
-
 
 def _normalise_mode(mode: object) -> str:
     text = str(mode or "combined_weighted").strip().lower().replace("-", "_").replace(" ", "_")

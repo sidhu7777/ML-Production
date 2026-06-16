@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import ast
 import math
+import os
+import time
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
 
@@ -32,6 +34,7 @@ except Exception:  # pragma: no cover - optional dependency
 
 DEFAULT_TILE_SIZE_M = 100.0
 DEFAULT_CLUSTER_COUNT = 5
+DEFAULT_ENABLE_OSM_ENRICHMENT = False
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 OPTIMIZER_ROOT = PROJECT_ROOT / "tests" / "output"
 DEFAULT_GEO_WEIGHTS = {
@@ -184,6 +187,25 @@ def _safe_numeric(df: pd.DataFrame, col: str) -> pd.Series:
     if col in df.columns:
         return pd.to_numeric(df[col], errors="coerce").fillna(0.0)
     return pd.Series(0.0, index=df.index, dtype=float)
+
+
+def _truthy(value: object) -> bool:
+    return str(value).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _osm_enrichment_enabled(params: Optional[Dict[str, object]] = None) -> bool:
+    params = params or {}
+    if params.get("enable_osm_enrichment") is not None:
+        return _truthy(params.get("enable_osm_enrichment"))
+    if "LTE_PREDICTION_ENABLE_OSM" in os.environ:
+        return _truthy(os.getenv("LTE_PREDICTION_ENABLE_OSM"))
+    return DEFAULT_ENABLE_OSM_ENRICHMENT
+
+
+def _log_geo_stage(stage: str, started_at: float, **details):
+    elapsed = time.perf_counter() - started_at
+    suffix = " ".join(f"{key}={value}" for key, value in details.items())
+    print(f"[LTE][GEO_STAGE] stage={stage} elapsed_sec={elapsed:.2f} {suffix}".rstrip(), flush=True)
 
 
 def _metric_bundle(y_true: pd.Series, y_pred: pd.Series, metric_key: Optional[str] = None) -> Dict[str, float]:
@@ -781,11 +803,19 @@ def _fetch_osm_features(mask_gdf: gpd.GeoDataFrame, tags: Dict[str, object]) -> 
         return gpd.GeoDataFrame({"geometry": []}, geometry="geometry", crs="EPSG:4326")
 
 
-def _attach_osm_context_features(grid_gdf: gpd.GeoDataFrame, mask_gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
+def _attach_osm_context_features(
+    grid_gdf: gpd.GeoDataFrame,
+    mask_gdf: gpd.GeoDataFrame,
+    enabled: bool = DEFAULT_ENABLE_OSM_ENRICHMENT,
+) -> gpd.GeoDataFrame:
     out = grid_gdf.copy()
     for col in ["road_length_m", "green_ratio", "water_ratio"]:
         if col not in out.columns:
             out[col] = 0.0
+
+    if not enabled:
+        print(f"[LTE][OSM_CONTEXT] skipped=True reason=disabled grid_rows={len(out)}", flush=True)
+        return out
 
     if mask_gdf.empty:
         return out
@@ -847,8 +877,15 @@ def _attach_osm_context_features(grid_gdf: gpd.GeoDataFrame, mask_gdf: gpd.GeoDa
     return out
 
 
-def _enrich_buildings_with_osm_heights(building_gdf: gpd.GeoDataFrame, mask_gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
+def _enrich_buildings_with_osm_heights(
+    building_gdf: gpd.GeoDataFrame,
+    mask_gdf: gpd.GeoDataFrame,
+    enabled: bool = DEFAULT_ENABLE_OSM_ENRICHMENT,
+) -> gpd.GeoDataFrame:
     out = _normalize_building_height_gdf(building_gdf)
+    if not enabled:
+        print(f"[LTE][OSM_BUILDING_HEIGHT] skipped=True reason=disabled local_rows={len(out)}", flush=True)
+        return out
     if mask_gdf.empty or ox is None:
         return out
 
@@ -2211,14 +2248,22 @@ def apply_full_display_correction(
     params: Optional[Dict[str, object]] = None,
 ) -> tuple[pd.DataFrame, Dict[str, object]]:
     params = params or {}
+    correction_started_at = time.perf_counter()
     if pred_df.empty:
         return pred_df.copy(), {"enabled": False, "reason": "empty_prediction"}
 
+    print(
+        f"[LTE][GEO_START] pred_rows={len(pred_df)} drive_rows={len(drive_df)} "
+        f"site_rows={len(site_df)} building_rows={len(building_df)} "
+        f"osm_enabled={_osm_enrichment_enabled(params)}",
+        flush=True,
+    )
     site_norm = normalize_site_for_geo(site_df)
     weights, weights_summary = load_geo_weights(
         project_id=params.get("project_id"),
         weights_path=params.get("optimizer_weights_path"),
     )
+    _log_geo_stage("normalize_site_and_weights", correction_started_at, site_rows=len(site_norm))
     polygon_list = list(polygon_geoms)
     if polygon_list:
         polygon_gdf = gpd.GeoDataFrame({"geometry": polygon_list}, crs="EPSG:4326")
@@ -2226,9 +2271,14 @@ def apply_full_display_correction(
     else:
         polygon_gdf = _fallback_polygon_from_points(pred_df if not pred_df.empty else site_norm)
         polygon_alignment = "fallback_from_points"
+    _log_geo_stage("polygon_alignment", correction_started_at, polygon_rows=len(polygon_gdf), alignment=polygon_alignment)
+
+    osm_enabled = _osm_enrichment_enabled(params)
     building_gdf = building_df_to_gdf(building_df)
     building_gdf, building_alignment = align_building_geometries_to_project(building_gdf, polygon_gdf)
-    building_gdf = _enrich_buildings_with_osm_heights(building_gdf, polygon_gdf)
+    _log_geo_stage("building_alignment", correction_started_at, building_rows=len(building_gdf), alignment=building_alignment)
+    building_gdf = _enrich_buildings_with_osm_heights(building_gdf, polygon_gdf, enabled=osm_enabled)
+    _log_geo_stage("building_height_enrichment", correction_started_at, building_rows=len(building_gdf), osm_enabled=osm_enabled)
 
     tile_size_m = float(params.get("tile_size_m") or max(float(params.get("grid", 25.0)), DEFAULT_TILE_SIZE_M))
     cluster_count = int(params.get("cluster_count", 5))
@@ -2236,11 +2286,15 @@ def apply_full_display_correction(
     if polygon_gdf.empty:
         pred_work = pred_df.copy()
         pred_work = attach_site_context_features(pred_work, site_norm)
+        _log_geo_stage("fallback_site_context", correction_started_at, pred_rows=len(pred_work))
         pred_work = _attach_building_path_features(pred_work, building_gdf)
+        _log_geo_stage("fallback_building_path", correction_started_at, pred_rows=len(pred_work))
         pred_work, dem_status = _attach_dem_features(pred_work, dem_raster_path)
+        _log_geo_stage("fallback_dem", correction_started_at, sampled=dem_status.get("sampled"), reason=dem_status.get("reason"))
         pred_work = _refine_experimental_forward_features(pred_work)
         pred_work = attach_fixed_serving_sinr_rsrq_proxy(pred_work, site_norm)
         pred_work, geo_summary = apply_experimental_geo_adjustments(pred_work, weights=weights)
+        _log_geo_stage("fallback_geo_adjustment", correction_started_at, pred_rows=len(pred_work))
         drive_train_df, drive_holdout_df, split_summary = split_drive_train_holdout(
             drive_df,
             validation_fraction=float(params.get("dt_validation_fraction", 0.25)),
@@ -2250,6 +2304,7 @@ def apply_full_display_correction(
         pred_work = apply_dt_holdout_calibration(pred_work, dt_calibration_models)
         pred_work = preserve_calibrated_kpis(pred_work)
         _, baseline_metrics, geo_metrics = evaluate_geo_against_dt(drive_holdout_df, pred_work)
+        _log_geo_stage("fallback_dt_calibration", correction_started_at, train_rows=len(drive_train_df), holdout_rows=len(drive_holdout_df))
         pred_work, demo_summary = apply_demo_dt_overlay(
             pred_work,
             drive_df,
@@ -2260,6 +2315,7 @@ def apply_full_display_correction(
         pred_work["pred_rsrp"] = pd.to_numeric(pred_work.get("pred_rsrp_demo", pred_work.get("pred_rsrp_geo", pred_work["pred_rsrp"])), errors="coerce").clip(-140, -44)
         pred_work["pred_rsrq"] = pd.to_numeric(pred_work.get("pred_rsrq_demo", pred_work.get("pred_rsrq_geo", pred_work["pred_rsrq"])), errors="coerce").clip(-20, -3)
         pred_work["pred_sinr"] = pd.to_numeric(pred_work.get("pred_sinr_demo", pred_work.get("pred_sinr_geo", pred_work["pred_sinr"])), errors="coerce").clip(-10, 30)
+        _log_geo_stage("fallback_done", correction_started_at, pred_rows=len(pred_work))
         return pred_work, {
             "enabled": True,
             "polygon_alignment": polygon_alignment,
@@ -2280,18 +2336,25 @@ def apply_full_display_correction(
         }
 
     grid_gdf = create_analysis_grid(polygon_gdf, tile_size_m)
+    _log_geo_stage("create_analysis_grid", correction_started_at, grid_rows=len(grid_gdf), tile_size_m=tile_size_m)
     grid_gdf = attach_building_features(grid_gdf, building_gdf)
-    grid_gdf = _attach_osm_context_features(grid_gdf, polygon_gdf)
+    _log_geo_stage("attach_building_features", correction_started_at, grid_rows=len(grid_gdf))
+    grid_gdf = _attach_osm_context_features(grid_gdf, polygon_gdf, enabled=osm_enabled)
+    _log_geo_stage("attach_osm_context", correction_started_at, grid_rows=len(grid_gdf), osm_enabled=osm_enabled)
     grid_df, _ = build_grid_feature_frame(grid_gdf, site_norm, cluster_count)
+    _log_geo_stage("build_grid_feature_frame", correction_started_at, grid_rows=len(grid_df))
     grid_df, geo_status = augment_grid_with_advanced_geo_features(grid_df, building_gdf, site_norm, dem_raster_path=dem_raster_path)
+    _log_geo_stage("advanced_geo_features", correction_started_at, grid_rows=len(grid_df))
     grid_gdf = grid_gdf.merge(grid_df[["grid_id", "clutter_class", "morphology_cluster"]], on="grid_id", how="left")
 
     pred_work = pred_df.copy()
     pred_work = assign_points_to_tiles(pred_work, grid_gdf)
+    _log_geo_stage("assign_points_to_tiles", correction_started_at, pred_rows=len(pred_work))
     pred_work = _attach_missing_grid_features_by_grid_id(pred_work, grid_df)
     if "Node_Cell_ID" not in pred_work.columns and "node_cell_id" in pred_work.columns:
         pred_work["Node_Cell_ID"] = pred_work["node_cell_id"].astype(str)
     pred_work = attach_fixed_serving_sinr_rsrq_proxy(pred_work, site_norm)
+    _log_geo_stage("serving_sinr_rsrq_proxy", correction_started_at, pred_rows=len(pred_work))
     pred_work, geo_summary = apply_experimental_geo_adjustments(pred_work, weights=weights)
     drive_train_df, drive_holdout_df, split_summary = split_drive_train_holdout(
         drive_df,
@@ -2302,6 +2365,7 @@ def apply_full_display_correction(
     pred_work = apply_dt_holdout_calibration(pred_work, dt_calibration_models)
     pred_work = preserve_calibrated_kpis(pred_work)
     _, baseline_metrics, geo_metrics = evaluate_geo_against_dt(drive_holdout_df, pred_work)
+    _log_geo_stage("dt_calibration", correction_started_at, train_rows=len(drive_train_df), holdout_rows=len(drive_holdout_df))
     pred_work, demo_summary = apply_demo_dt_overlay(
         pred_work,
         drive_df,
@@ -2325,6 +2389,7 @@ def apply_full_display_correction(
     pred_work["pred_rsrp"] = pred_work["pred_rsrp"].clip(-140, -44)
     pred_work["pred_rsrq"] = pred_work["pred_rsrq"].clip(-20, -3)
     pred_work["pred_sinr"] = pred_work["pred_sinr"].clip(-10, 30)
+    _log_geo_stage("done", correction_started_at, pred_rows=len(pred_work))
 
     return pred_work, {
         "enabled": True,
