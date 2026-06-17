@@ -47,8 +47,8 @@ decorator==5.2.1
 defusedxml==0.7.1
 distro==1.9.0
 dnspython==2.8.0
-eli5==0.16.0
 email-validator==2.3.0
+evidently==0.4.30
 et_xmlfile==2.0.0
 executing==2.2.0
 fastapi==0.115.8
@@ -198,13 +198,15 @@ rich-toolkit==0.15.1
 rignore==0.7.6
 rpds-py==0.22.3
 s3transfer==0.16.0
-scikit-learn==1.6.1
+scikit-learn==1.5.2
 scipy==1.15.1
 seaborn==0.13.2
 Send2Trash==1.8.3
 sentry-sdk==2.44.0
 setuptools==79.0.1
 shapely==2.0.6
+shap==0.45.0
+
 shellingham==1.5.4
 simplejson==3.20.2
 six==1.16.0

@@ -57,6 +57,7 @@ cache/
 uploads/
 outputs/
 data/
+models/
 data/reports/
 tests/output/
 tests/output/project_*/
@@ -87,6 +88,9 @@ commands.*.local.txt
 *.xls
 *.geojson
 *.zip
+
+# ML experiment scratch artifacts
+_tmp_evidently*.html
 
 # Curated fixture data exceptions
 !tests/fixtures/project_196_rsrp_tilt/*.csv
