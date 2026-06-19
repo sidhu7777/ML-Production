@@ -64,6 +64,13 @@ REDUCED_COVERAGE_GREEN_TAGS = {
     "natural": ["grassland"],
 }
 COVERAGE_CLUTTER_FORMULA_VERSION = "v3_park_open_driven_suburban_split"
+TOPOLOGY_SELECTION_VERSION = "v2_site_cell_sector_growth_db_topology"
+BAND_DIVERSITY_VERSION = "v1_bucket_band_mix"
+BAND_MIX_PLAN = {
+    "PART_1": {900: 0.15, 1800: 0.69, 850: 0.15, 2300: 0.01},
+    "PART_2": {900: 0.11, 1800: 0.76, 850: 0.10, 2300: 0.03},
+    "PART_3": {900: 0.08, 1800: 0.80, 850: 0.07, 2300: 0.05},
+}
 
 
 @dataclass
@@ -77,8 +84,12 @@ class CoverageTestConfig:
     grid_size_m: float = 50.0
     baseline_radius_m: float = 500.0
     baseline_workers: int = 3
+    max_interference_sites: int = 50
     geo_cache_mode: str = "prebuilt"
     geo_base_run_dir: Optional[str] = None
+    topology_operator: Optional[str] = "Airtel"
+    use_frontend_grid_sampling: bool = True
+    grid_analytics_scenario_id: Optional[int] = None
     output_root: Path = OUTPUT_ROOT
 
 
@@ -93,6 +104,14 @@ def _config_fingerprint(config: CoverageTestConfig) -> Dict[str, object]:
         "grid_size_m": float(config.grid_size_m),
         "baseline_radius_m": float(config.baseline_radius_m),
         "baseline_workers": int(config.baseline_workers),
+        "max_interference_sites": int(config.max_interference_sites),
+        "topology_operator": str(config.topology_operator or ""),
+        "use_frontend_grid_sampling": bool(config.use_frontend_grid_sampling),
+        "grid_analytics_scenario_id": (
+            int(config.grid_analytics_scenario_id) if config.grid_analytics_scenario_id is not None else None
+        ),
+        "topology_plan": _default_topology_plan(),
+        "band_mix_plan": BAND_MIX_PLAN,
     }
 
 
@@ -144,6 +163,35 @@ def _read_cache_df(path_base: Path) -> Optional[pd.DataFrame]:
     if pickle_path.exists():
         return pd.read_pickle(pickle_path)
     return None
+
+
+def _load_bucket_summary_from_run_dir(run_dir: Optional[Path]) -> Optional[pd.DataFrame]:
+    if run_dir is None:
+        return None
+    path = run_dir / "bucket_summary.csv"
+    if not path.exists():
+        return None
+    try:
+        df = pd.read_csv(path)
+    except Exception:
+        return None
+    print(f"[COVERAGE_TEST][RUN_REUSE] artifact=bucket_summary.csv rows={len(df)} path={path}")
+    return df
+
+
+def _load_coverage_rows_from_run_dir(run_dir: Optional[Path]) -> Optional[pd.DataFrame]:
+    if run_dir is None:
+        return None
+    path = run_dir / "coverage_rows.csv"
+    if not path.exists():
+        return None
+    try:
+        df = pd.read_csv(path)
+    except Exception:
+        return None
+    df = _coerce_numeric_columns(df)
+    print(f"[COVERAGE_TEST][RUN_REUSE] artifact=coverage_rows.csv rows={len(df)} path={path}")
+    return df
 
 
 def _resolve_engine(region: str):
@@ -1292,6 +1340,337 @@ def _fetch_project_sites_raw(project_id: int, region: str) -> pd.DataFrame:
     return site_df.copy()
 
 
+def _default_topology_plan() -> Dict[str, Dict[str, int]]:
+    return {
+        "PART_1": {"site_count": 56, "cell_count": 166, "cell_sector_count": 340},
+        "PART_2": {"site_count": 59, "cell_count": 176, "cell_sector_count": 360},
+    }
+
+
+def _normalize_site_operator_series(df: pd.DataFrame) -> pd.Series:
+    if "network" in df.columns:
+        return df["network"].apply(_normalize_operator_label)
+    if "operator" in df.columns:
+        return df["operator"].apply(_normalize_operator_label)
+    if "cluster" in df.columns:
+        return df["cluster"].apply(_normalize_operator_label)
+    return pd.Series(["Unknown"] * len(df), index=df.index, dtype="object")
+
+
+def _filter_rows_to_operator(df: pd.DataFrame, operator_name: Optional[str]) -> pd.DataFrame:
+    if df.empty or not operator_name:
+        return df.copy()
+    normalized_target = _normalize_operator_label(operator_name)
+    if "m_alpha_long" in df.columns or "m_alpha_short" in df.columns:
+        long_match = (
+            df.get("m_alpha_long", pd.Series([""] * len(df), index=df.index))
+            .apply(_normalize_operator_label)
+            .eq(normalized_target)
+        )
+        short_match = (
+            df.get("m_alpha_short", pd.Series([""] * len(df), index=df.index))
+            .apply(_normalize_operator_label)
+            .eq(normalized_target)
+        )
+        filtered = df.loc[long_match | short_match].copy()
+        print(
+            f"[COVERAGE_TEST][OPERATOR_FILTER] target={normalized_target} "
+            f"source=drive_rows before={len(df)} after={len(filtered)}"
+        )
+        return filtered
+
+    if {"network", "operator", "cluster"}.intersection(df.columns):
+        op_series = _normalize_site_operator_series(df)
+        filtered = df.loc[op_series.eq(normalized_target)].copy()
+        print(
+            f"[COVERAGE_TEST][OPERATOR_FILTER] target={normalized_target} "
+            f"source=site_rows before={len(df)} after={len(filtered)}"
+        )
+        return filtered
+    return df.copy()
+
+
+def _derive_topology_keys(site_df: pd.DataFrame) -> pd.DataFrame:
+    out = site_df.copy()
+    site_key_col = next((col for col in ["Site ID", "site_id", "site", "site_name", "nodeb_id"] if col in out.columns), None)
+    cell_source_col = "cell_id" if "cell_id" in out.columns else None
+    if site_key_col is None:
+        raise ValueError("Cannot derive site topology keys: missing raw site identifier column")
+    if cell_source_col is None:
+        raise ValueError("Cannot derive site topology keys: missing raw cell identifier column")
+
+    sector_series = (
+        out["sector"].astype("string").str.strip()
+        if "sector" in out.columns
+        else pd.Series(pd.NA, index=out.index, dtype="string")
+    )
+    sector_series = sector_series.mask(sector_series.isin(["", "nan", "NaN", "None", "<NA>"]))
+    out["_topo_site_key"] = out[site_key_col].astype(str).str.strip().values
+    out["_topo_cell_key"] = (
+        out[site_key_col].astype(str).str.strip()
+        + "|"
+        + out[cell_source_col].astype(str).str.strip()
+    ).values
+    out["_topo_cell_sector_key"] = (
+        out[site_key_col].astype(str).str.strip()
+        + "|"
+        + out[cell_source_col].astype(str).str.strip()
+        + "|"
+        + sector_series.fillna("__NULL__").astype(str).str.strip()
+    ).values
+    return out
+
+
+def _select_topology_subset(
+    sector_catalog: pd.DataFrame,
+    prior_sector_keys: List[str],
+    target_site_count: int,
+    target_cell_count: int,
+    target_sector_count: int,
+) -> List[str]:
+    selected: List[str] = []
+    selected_set = set()
+    selected_sites = set()
+    selected_cells = set()
+
+    sector_lookup = sector_catalog.set_index("_topo_cell_sector_key")[["_topo_site_key", "_topo_cell_key"]].to_dict("index")
+
+    for key in prior_sector_keys:
+        if key not in sector_lookup or key in selected_set:
+            continue
+        selected.append(key)
+        selected_set.add(key)
+        selected_sites.add(sector_lookup[key]["_topo_site_key"])
+        selected_cells.add(sector_lookup[key]["_topo_cell_key"])
+
+    if (
+        len(selected_sites) > target_site_count
+        or len(selected_cells) > target_cell_count
+        or len(selected) > target_sector_count
+    ):
+        raise ValueError("Previous bucket topology already exceeds target counts")
+
+    def _try_add(key: str) -> bool:
+        if key in selected_set:
+            return False
+        meta = sector_lookup.get(key)
+        if meta is None:
+            return False
+        new_site = 0 if meta["_topo_site_key"] in selected_sites else 1
+        new_cell = 0 if meta["_topo_cell_key"] in selected_cells else 1
+        if len(selected) + 1 > target_sector_count:
+            return False
+        if len(selected_sites) + new_site > target_site_count:
+            return False
+        if len(selected_cells) + new_cell > target_cell_count:
+            return False
+        selected.append(key)
+        selected_set.add(key)
+        selected_sites.add(meta["_topo_site_key"])
+        selected_cells.add(meta["_topo_cell_key"])
+        return True
+
+    ordered_site_keys = sector_catalog["_topo_site_key"].drop_duplicates().tolist()
+    for site_key in ordered_site_keys:
+        if len(selected_sites) >= target_site_count:
+            break
+        selected_sites.add(site_key)
+
+    candidate_catalog = sector_catalog.loc[sector_catalog["_topo_site_key"].isin(selected_sites)].copy()
+
+    per_site_first = candidate_catalog.drop_duplicates(subset=["_topo_site_key"], keep="first")
+    for row in per_site_first.to_dict("records"):
+        _try_add(str(row["_topo_cell_sector_key"]))
+
+    per_cell_first = candidate_catalog.drop_duplicates(subset=["_topo_cell_key"], keep="first")
+    for row in per_cell_first.to_dict("records"):
+        if len(selected_cells) >= target_cell_count:
+            break
+        _try_add(str(row["_topo_cell_sector_key"]))
+
+    preference_masks = [
+        (candidate_catalog["_topo_cell_key"].isin(selected_cells)),
+        pd.Series([True] * len(candidate_catalog), index=candidate_catalog.index),
+    ]
+    for mask in preference_masks:
+        for row in candidate_catalog.loc[mask].to_dict("records"):
+            if len(selected) >= target_sector_count:
+                break
+            _try_add(str(row["_topo_cell_sector_key"]))
+        if len(selected) >= target_sector_count:
+            break
+
+    if len(selected_sites) != target_site_count or len(selected_cells) != target_cell_count or len(selected) != target_sector_count:
+        raise ValueError(
+            f"Unable to build requested topology subset exactly: "
+            f"sites={len(selected_sites)}/{target_site_count} "
+            f"cells={len(selected_cells)}/{target_cell_count} "
+            f"cell_sector={len(selected)}/{target_sector_count}"
+        )
+    return selected
+
+
+def _select_topology_subset_relaxed(
+    sector_catalog: pd.DataFrame,
+    prior_sector_keys: List[str],
+    target_site_count: int,
+    target_cell_count: int,
+    target_sector_count: int,
+) -> tuple[List[str], int]:
+    last_error: Optional[Exception] = None
+    for relaxed_cell_count in range(int(target_cell_count), 0, -1):
+        try:
+            selected = _select_topology_subset(
+                sector_catalog=sector_catalog,
+                prior_sector_keys=prior_sector_keys,
+                target_site_count=target_site_count,
+                target_cell_count=relaxed_cell_count,
+                target_sector_count=target_sector_count,
+            )
+            if relaxed_cell_count != int(target_cell_count):
+                print(
+                    f"[COVERAGE_TEST][TOPOLOGY_RELAX] "
+                    f"sites={target_site_count} sectors={target_sector_count} "
+                    f"cell_target={target_cell_count} relaxed_cell_target={relaxed_cell_count}"
+                )
+            return selected, int(relaxed_cell_count)
+        except ValueError as exc:
+            last_error = exc
+            continue
+    if last_error is not None:
+        raise last_error
+    raise ValueError("Unable to build requested topology subset")
+
+
+def _assign_band_mix_to_bucket(bucket_df: pd.DataFrame, bucket_label: str) -> tuple[pd.DataFrame, Dict[str, int]]:
+    out = bucket_df.copy()
+    band_plan = BAND_MIX_PLAN.get(str(bucket_label), BAND_MIX_PLAN.get("PART_3", {1800: 1.0}))
+    if out.empty or "_topo_cell_sector_key" not in out.columns:
+        return out, {}
+
+    unique_keys = (
+        out["_topo_cell_sector_key"]
+        .astype(str)
+        .drop_duplicates()
+        .sort_values(
+            key=lambda s: s.map(lambda value: hashlib.sha1(f"{bucket_label}|{value}".encode("utf-8")).hexdigest())
+        )
+        .tolist()
+    )
+    total_keys = len(unique_keys)
+    if total_keys <= 0:
+        return out, {}
+
+    bands = list(band_plan.keys())
+    raw_counts = [float(band_plan[band]) * float(total_keys) for band in bands]
+    base_counts = [int(np.floor(value)) for value in raw_counts]
+    remainder = total_keys - int(sum(base_counts))
+    fractional_order = sorted(
+        range(len(bands)),
+        key=lambda idx: (raw_counts[idx] - base_counts[idx], -int(bands[idx])),
+        reverse=True,
+    )
+    for idx in fractional_order[:remainder]:
+        base_counts[idx] += 1
+
+    assignments: Dict[str, int] = {}
+    cursor = 0
+    for band_value, band_count in zip(bands, base_counts):
+        for key in unique_keys[cursor:cursor + int(band_count)]:
+            assignments[str(key)] = int(band_value)
+        cursor += int(band_count)
+
+    if cursor < total_keys:
+        fallback_band = int(max(band_plan.items(), key=lambda item: item[1])[0])
+        for key in unique_keys[cursor:]:
+            assignments[str(key)] = fallback_band
+
+    assigned_band = out["_topo_cell_sector_key"].astype(str).map(assignments).astype(int)
+    out["band"] = assigned_band.astype(float)
+    out["frequency_mhz"] = assigned_band.astype(float)
+    if "frequency" in out.columns:
+        out["frequency"] = assigned_band.astype(float)
+    if "downlink_frequency" in out.columns:
+        out["downlink_frequency"] = assigned_band.astype(float)
+    if "uplink_center_frequency" in out.columns:
+        out["uplink_center_frequency"] = assigned_band.astype(float)
+
+    band_counts = {str(int(band)): int(count) for band, count in zip(bands, base_counts)}
+    return out, band_counts
+
+
+def _build_bucket_site_topologies(
+    site_df: pd.DataFrame,
+    buckets: Sequence[Tuple[str, str, str]],
+    operator_name: Optional[str],
+) -> Tuple[Dict[str, pd.DataFrame], pd.DataFrame]:
+    if site_df.empty:
+        return {}, pd.DataFrame()
+
+    filtered = _filter_rows_to_operator(site_df, operator_name)
+    if filtered.empty:
+        raise ValueError(f"No site rows found for operator={operator_name}")
+    filtered = _derive_topology_keys(filtered)
+    filtered = filtered.sort_values(["_topo_site_key", "_topo_cell_key", "_topo_cell_sector_key", "lat", "lon"]).reset_index(drop=True)
+
+    sector_catalog = (
+        filtered[["_topo_site_key", "_topo_cell_key", "_topo_cell_sector_key"]]
+        .drop_duplicates(subset=["_topo_cell_sector_key"], keep="first")
+        .sort_values(["_topo_site_key", "_topo_cell_key", "_topo_cell_sector_key"])
+        .reset_index(drop=True)
+    )
+
+    full_site_count = int(filtered["_topo_site_key"].nunique())
+    full_cell_count = int(filtered["_topo_cell_key"].nunique())
+    full_sector_count = int(filtered["_topo_cell_sector_key"].nunique())
+    plan = _default_topology_plan()
+
+    bucket_frames: Dict[str, pd.DataFrame] = {}
+    summary_rows: List[Dict[str, object]] = []
+    previous_sector_keys: List[str] = []
+    for idx, (label, _, _) in enumerate(buckets):
+        bucket_plan = dict(plan.get(str(label), {}))
+        site_target = int(bucket_plan.get("site_count", full_site_count if idx == len(buckets) - 1 else full_site_count))
+        cell_target = int(bucket_plan.get("cell_count", full_cell_count if idx == len(buckets) - 1 else full_cell_count))
+        sector_target = int(bucket_plan.get("cell_sector_count", full_sector_count if idx == len(buckets) - 1 else full_sector_count))
+        if idx == len(buckets) - 1:
+            site_target = full_site_count
+            cell_target = full_cell_count
+            sector_target = full_sector_count
+
+        selected_sector_keys, effective_cell_target = _select_topology_subset_relaxed(
+            sector_catalog=sector_catalog,
+            prior_sector_keys=previous_sector_keys,
+            target_site_count=site_target,
+            target_cell_count=cell_target,
+            target_sector_count=sector_target,
+        )
+        bucket_df = filtered.loc[filtered["_topo_cell_sector_key"].isin(selected_sector_keys)].copy()
+        bucket_df, band_counts = _assign_band_mix_to_bucket(bucket_df, str(label))
+        actual_site_count = int(bucket_df["_topo_site_key"].nunique())
+        actual_cell_count = int(bucket_df["_topo_cell_key"].nunique())
+        actual_sector_count = int(bucket_df["_topo_cell_sector_key"].nunique())
+        bucket_df = bucket_df.drop(columns=["_topo_site_key", "_topo_cell_key", "_topo_cell_sector_key"], errors="ignore")
+        bucket_frames[str(label)] = bucket_df.reset_index(drop=True)
+        previous_sector_keys = selected_sector_keys
+        summary_rows.append(
+            {
+                "time_bucket": str(label),
+                "operator": _normalize_operator_label(operator_name),
+                "site_count": actual_site_count,
+                "cell_count": actual_cell_count,
+                "cell_sector_count": actual_sector_count,
+                "requested_cell_count": int(cell_target),
+                "effective_cell_count_target": int(effective_cell_target),
+                "band_mix_version": BAND_DIVERSITY_VERSION,
+                "band_counts_json": json.dumps(band_counts, sort_keys=True),
+                "site_rows": int(len(bucket_df)),
+            }
+        )
+
+    return bucket_frames, pd.DataFrame(summary_rows)
+
+
 def _run_project_baseline_prediction(
     project_id: int,
     region: str,
@@ -1301,7 +1680,10 @@ def _run_project_baseline_prediction(
     baseline_radius_m: float,
     grid_size_m: float,
     workers: int,
+    max_interference_sites: int,
     polygon_wkt: Optional[str] = None,
+    use_frontend_grid_sampling: bool = True,
+    grid_analytics_scenario_id: Optional[int] = None,
 ) -> pd.DataFrame:
     if site_df.empty:
         return pd.DataFrame()
@@ -1316,7 +1698,11 @@ def _run_project_baseline_prediction(
             "radius": float(baseline_radius_m),
             "grid": float(grid_size_m),
             "workers": int(workers),
-            "max_interference_sites": 50,
+            "max_interference_sites": int(max_interference_sites),
+            "use_frontend_grid_sampling": bool(use_frontend_grid_sampling),
+            "grid_analytics_scenario_id": (
+                int(grid_analytics_scenario_id) if grid_analytics_scenario_id is not None else None
+            ),
         },
     )
     if pred_df.empty:
@@ -1330,18 +1716,22 @@ def _run_project_baseline_prediction(
 
 def _run_bucket_baseline_predictions(
     detail_df: pd.DataFrame,
-    site_df: pd.DataFrame,
+    site_df_by_bucket: Dict[str, pd.DataFrame],
     building_df: pd.DataFrame,
     project_id: int,
     region: str,
     baseline_radius_m: float,
     grid_size_m: float,
     workers: int,
+    max_interference_sites: int,
     buckets: Sequence[Tuple[str, str, str]],
     polygon_wkt: Optional[str] = None,
+    use_frontend_grid_sampling: bool = True,
+    grid_analytics_scenario_id: Optional[int] = None,
 ) -> pd.DataFrame:
     out_rows: List[pd.DataFrame] = []
     for label, _, _ in buckets:
+        bucket_site_df = site_df_by_bucket.get(str(label), pd.DataFrame())
         bucket_dt_df = (
             detail_df.loc[detail_df["time_bucket"].astype(str) == str(label)].copy()
             if (not detail_df.empty and "time_bucket" in detail_df.columns)
@@ -1350,13 +1740,16 @@ def _run_bucket_baseline_predictions(
         baseline_df = _run_project_baseline_prediction(
             project_id=project_id,
             region=region,
-            site_df=site_df,
+            site_df=bucket_site_df,
             drive_df=bucket_dt_df,
             building_df=building_df,
             baseline_radius_m=baseline_radius_m,
             grid_size_m=grid_size_m,
             workers=workers,
+            max_interference_sites=max_interference_sites,
             polygon_wkt=polygon_wkt,
+            use_frontend_grid_sampling=use_frontend_grid_sampling,
+            grid_analytics_scenario_id=grid_analytics_scenario_id,
         )
         if baseline_df.empty:
             continue
@@ -1369,7 +1762,7 @@ def _run_bucket_baseline_predictions(
 def _run_bucket_corrected_predictions(
     baseline_pred_df: pd.DataFrame,
     detail_df: pd.DataFrame,
-    site_df: pd.DataFrame,
+    site_df_by_bucket: Dict[str, pd.DataFrame],
     building_df: pd.DataFrame,
     project_id: int,
     region: str,
@@ -1381,6 +1774,7 @@ def _run_bucket_corrected_predictions(
         return pd.DataFrame()
     out_rows: List[pd.DataFrame] = []
     for label, _, _ in buckets:
+        bucket_site_df = site_df_by_bucket.get(str(label), pd.DataFrame())
         bucket_baseline_df = (
             baseline_pred_df.loc[baseline_pred_df["time_bucket"].astype(str) == str(label)].copy()
             if "time_bucket" in baseline_pred_df.columns
@@ -1392,7 +1786,7 @@ def _run_bucket_corrected_predictions(
         corrected_df = base_ml.run_ml_fast(
             pred_df=bucket_baseline_df,
             drive_df=bucket_dt_df,
-            site_df=site_df,
+            site_df=bucket_site_df,
             building_df=building_df,
             params={
                 "project_id": int(project_id),
@@ -1419,19 +1813,53 @@ def _build_corrected_grid_surface(pred_df: pd.DataFrame) -> pd.DataFrame:
     work = pred_df.loc[pred_df["grid_id"].notna()].copy()
     if work.empty:
         return pd.DataFrame()
+
+    # Match production baseline persistence: keep calibrated pre-smoothing KPI
+    # values as the main baseline surface, while preserving display/demo values
+    # separately for audit.
+    def _resolve_metric_series(group_df: pd.DataFrame, metric: str) -> pd.Series:
+        candidates = [
+            f"pred_{metric}_calibrated",
+            f"pred_{metric}_geo",
+            f"pred_{metric}",
+        ]
+        for col in candidates:
+            if col in group_df.columns:
+                return pd.to_numeric(group_df[col], errors="coerce")
+        return pd.Series(np.nan, index=group_df.index, dtype="float64")
+
+    def _resolve_display_series(group_df: pd.DataFrame, metric: str) -> pd.Series:
+        candidates = [
+            f"pred_{metric}_demo",
+            f"pred_{metric}",
+        ]
+        for col in candidates:
+            if col in group_df.columns:
+                return pd.to_numeric(group_df[col], errors="coerce")
+        return pd.Series(np.nan, index=group_df.index, dtype="float64")
+
     group_cols = ["time_bucket", "grid_id", "grid_row", "grid_col", "grid_centroid_lat", "grid_centroid_lon"]
     for keys, group_df in work.groupby(group_cols, dropna=False):
         row = dict(zip(group_cols, keys if isinstance(keys, tuple) else (keys,)))
+        rsrp_series = _resolve_metric_series(group_df, "rsrp")
+        rsrq_series = _resolve_metric_series(group_df, "rsrq")
+        sinr_series = _resolve_metric_series(group_df, "sinr")
+        rsrp_display_series = _resolve_display_series(group_df, "rsrp")
+        rsrq_display_series = _resolve_display_series(group_df, "rsrq")
+        sinr_display_series = _resolve_display_series(group_df, "sinr")
         row.update(
             {
                 "prediction_point_count": int(len(group_df)),
-                "corrected_rsrp_mean": float(pd.to_numeric(group_df["pred_rsrp"], errors="coerce").dropna().mean()) if "pred_rsrp" in group_df.columns and pd.to_numeric(group_df["pred_rsrp"], errors="coerce").dropna().size else np.nan,
-                "corrected_rsrq_mean": float(pd.to_numeric(group_df["pred_rsrq"], errors="coerce").dropna().mean()) if "pred_rsrq" in group_df.columns and pd.to_numeric(group_df["pred_rsrq"], errors="coerce").dropna().size else np.nan,
-                "corrected_sinr_mean": float(pd.to_numeric(group_df["pred_sinr"], errors="coerce").dropna().mean()) if "pred_sinr" in group_df.columns and pd.to_numeric(group_df["pred_sinr"], errors="coerce").dropna().size else np.nan,
+                "corrected_rsrp_mean": float(rsrp_series.dropna().mean()) if rsrp_series.dropna().size else np.nan,
+                "corrected_rsrq_mean": float(rsrq_series.dropna().mean()) if rsrq_series.dropna().size else np.nan,
+                "corrected_sinr_mean": float(sinr_series.dropna().mean()) if sinr_series.dropna().size else np.nan,
+                "display_rsrp_mean": float(rsrp_display_series.dropna().mean()) if rsrp_display_series.dropna().size else np.nan,
+                "display_rsrq_mean": float(rsrq_display_series.dropna().mean()) if rsrq_display_series.dropna().size else np.nan,
+                "display_sinr_mean": float(sinr_display_series.dropna().mean()) if sinr_display_series.dropna().size else np.nan,
                 "corrected_dominant_pci": _mode_or_na(pd.to_numeric(group_df["pci"], errors="coerce")) if "pci" in group_df.columns else pd.NA,
                 "corrected_dominant_earfcn": _mode_or_na(pd.to_numeric(group_df["earfcn"], errors="coerce")) if "earfcn" in group_df.columns else pd.NA,
                 "corrected_bandwidth_mhz_est": _estimate_bandwidth_mhz(group_df["band"]) if "band" in group_df.columns else 10.0,
-                "correction_source": _mode_or_na(group_df["demo_source"]) if "demo_source" in group_df.columns else pd.NA,
+                "correction_source": _mode_or_na(group_df["demo_visual_source"]) if "demo_visual_source" in group_df.columns else pd.NA,
             }
         )
         rows.append(row)
@@ -1522,7 +1950,9 @@ def _build_grid_kpi_timeseries(
         for col in [
             "sample_count", "dt_rsrp_mean", "dt_rsrq_mean", "dt_sinr_mean", "rssi_mean", "dl_tpt_mean", "ul_tpt_mean",
             "dt_cqi_mean", "dt_estimated_prb_mean", "dt_bandwidth_mhz_est",
-            "corrected_rsrp_mean", "corrected_rsrq_mean", "corrected_sinr_mean", "corrected_bandwidth_mhz_est",
+            "corrected_rsrp_mean", "corrected_rsrq_mean", "corrected_sinr_mean",
+            "display_rsrp_mean", "display_rsrq_mean", "display_sinr_mean",
+            "corrected_bandwidth_mhz_est",
             "prediction_point_count",
         ]:
             if col not in bucket_base.columns:
@@ -1558,6 +1988,7 @@ def _build_grid_kpi_timeseries(
         "sample_count", "rsrp_mean", "rsrq_mean", "sinr_mean", "rssi_mean", "dl_tpt_mean", "ul_tpt_mean",
         "cqi_mean", "estimated_prb_mean", "dominant_pci", "dominant_earfcn", "bandwidth_mhz_est",
         "cqi_source", "kpi_source", "corrected_rsrp_mean", "corrected_rsrq_mean", "corrected_sinr_mean",
+        "display_rsrp_mean", "display_rsrq_mean", "display_sinr_mean",
         "prediction_point_count",
     ]
     return out[[col for col in keep_cols if col in out.columns]].copy()
@@ -1610,9 +2041,12 @@ def run_coverage_test(config: CoverageTestConfig) -> Path:
     site_project_id = int(config.site_project_id if config.site_project_id is not None else config.project_id)
     run_dir = _ensure_dir(config.output_root / f"project_{config.project_id}" / f"coverage_{_timestamp()}")
     stable_cache_dir = _cache_root_for_project(config.project_id)
+    base_run_dir = Path(str(config.geo_base_run_dir)) if config.geo_base_run_dir else None
     engine = _resolve_engine(config.region)
     config_fp = _config_fingerprint(config)
     timings: Dict[str, float] = {}
+    reused_summary_df = _load_bucket_summary_from_run_dir(base_run_dir)
+    reused_detail_df = _load_coverage_rows_from_run_dir(base_run_dir)
     print(
         f"[COVERAGE_TEST][START] project_id={config.project_id} region={config.region} "
         f"site_project_id={site_project_id} "
@@ -1627,7 +2061,7 @@ def run_coverage_test(config: CoverageTestConfig) -> Path:
             stable_cache_dir,
             "bucket_summary",
             {"stage": "bucket_summary", **config_fp},
-            lambda: _fetch_bucket_summary(engine, config.polygon_wkt, config.buckets),
+            lambda: reused_summary_df.copy() if reused_summary_df is not None else _fetch_bucket_summary(engine, config.polygon_wkt, config.buckets),
         ),
     )
     raw_detail_df = _time_step(
@@ -1637,7 +2071,9 @@ def run_coverage_test(config: CoverageTestConfig) -> Path:
             stable_cache_dir,
             "coverage_rows_raw",
             {"stage": "coverage_rows_raw", **config_fp},
-            lambda: _coerce_numeric_columns(
+            lambda: reused_detail_df.copy()
+            if reused_detail_df is not None
+            else _coerce_numeric_columns(
                 _fetch_detail_rows_chunked(engine, config.polygon_wkt, config.buckets, config.chunk_size)
             ),
         ),
@@ -1663,7 +2099,9 @@ def run_coverage_test(config: CoverageTestConfig) -> Path:
                 **config_fp,
                 "grid_key": {"polygon_wkt": config_fp["polygon_wkt"], "grid_size_m": config_fp["grid_size_m"]},
             },
-            lambda: _assign_points_to_grid(
+            lambda: raw_detail_df.copy()
+            if ("grid_id" in raw_detail_df.columns and raw_detail_df["grid_id"].notna().any())
+            else _assign_points_to_grid(
                 detail_df=raw_detail_df,
                 grid_size_m=config.grid_size_m,
                 utm_crs=utm_crs,
@@ -1672,16 +2110,27 @@ def run_coverage_test(config: CoverageTestConfig) -> Path:
             ),
         ),
     )
+    detail_df = _filter_rows_to_operator(detail_df, config.topology_operator)
     project_sites_raw_df = _time_step(
         timings,
         "project_sites_raw",
-        lambda: _load_or_build_df(
-            stable_cache_dir,
-            "project_sites_raw",
-            {"stage": "project_sites_raw", "site_project_id": site_project_id, "region": config.region},
-            lambda: _fetch_project_sites_raw(site_project_id, config.region),
+        lambda: _fetch_project_sites_raw(site_project_id, config.region),
+    )
+    bucket_site_df_map, bucket_topology_summary_df = _time_step(
+        timings,
+        "bucket_site_topology",
+        lambda: _build_bucket_site_topologies(
+            site_df=project_sites_raw_df,
+            buckets=config.buckets,
+            operator_name=config.topology_operator,
         ),
     )
+    bucket_topology_key = {
+        "topology_selection_version": TOPOLOGY_SELECTION_VERSION,
+        "band_diversity_version": BAND_DIVERSITY_VERSION,
+        "band_mix_plan": BAND_MIX_PLAN,
+        "bucket_topology_summary": bucket_topology_summary_df.to_dict(orient="records"),
+    }
     building_df = _time_step(
         timings,
         "building_rows",
@@ -1706,22 +2155,30 @@ def run_coverage_test(config: CoverageTestConfig) -> Path:
                 "grid_size_m": config.grid_size_m,
                 "baseline_radius_m": config.baseline_radius_m,
                 "baseline_workers": config.baseline_workers,
+                "max_interference_sites": config.max_interference_sites,
                 "polygon_wkt": config.polygon_wkt,
+                "topology_operator": config.topology_operator,
+                "use_frontend_grid_sampling": config.use_frontend_grid_sampling,
+                "grid_analytics_scenario_id": config.grid_analytics_scenario_id,
                 "buckets": [[str(label), str(start_ts), str(end_ts)] for label, start_ts, end_ts in config.buckets],
                 "baseline_mode": "per_bucket_dt",
+                "bucket_topology_key": bucket_topology_key,
             },
             lambda: _assign_points_to_grid(
                 detail_df=_run_bucket_baseline_predictions(
                     detail_df=detail_df,
-                    site_df=project_sites_raw_df,
+                    site_df_by_bucket=bucket_site_df_map,
                     building_df=building_df,
                     project_id=config.project_id,
                     region=config.region,
                     baseline_radius_m=config.baseline_radius_m,
                     grid_size_m=config.grid_size_m,
                     workers=config.baseline_workers,
+                    max_interference_sites=config.max_interference_sites,
                     buckets=config.buckets,
                     polygon_wkt=config.polygon_wkt,
+                    use_frontend_grid_sampling=config.use_frontend_grid_sampling,
+                    grid_analytics_scenario_id=config.grid_analytics_scenario_id,
                 ),
                 grid_size_m=config.grid_size_m,
                 utm_crs=utm_crs,
@@ -1743,13 +2200,15 @@ def run_coverage_test(config: CoverageTestConfig) -> Path:
                     "grid_size_m": config.grid_size_m,
                     "baseline_radius_m": config.baseline_radius_m,
                     "baseline_workers": config.baseline_workers,
+                    "max_interference_sites": config.max_interference_sites,
                 },
+                "bucket_topology_key": bucket_topology_key,
             },
             lambda: _assign_points_to_grid(
                 detail_df=_run_bucket_corrected_predictions(
                     baseline_pred_df=baseline_pred_df,
                     detail_df=detail_df,
-                    site_df=project_sites_raw_df,
+                    site_df_by_bucket=bucket_site_df_map,
                     building_df=building_df,
                     project_id=config.project_id,
                     region=config.region,
@@ -1775,12 +2234,7 @@ def run_coverage_test(config: CoverageTestConfig) -> Path:
     project_sites_df = _time_step(
         timings,
         "project_sites",
-        lambda: _load_or_build_df(
-            stable_cache_dir,
-            "project_sites",
-            {"stage": "project_sites", "site_project_id": site_project_id, "region": config.region},
-            lambda: _fetch_project_sites(site_project_id, config.region),
-        ),
+        lambda: _filter_rows_to_operator(_fetch_project_sites(site_project_id, config.region), config.topology_operator),
     )
     project_site_summary_df = _time_step(timings, "project_site_summary", lambda: _build_project_site_summary(project_sites_df))
 
@@ -1788,6 +2242,11 @@ def run_coverage_test(config: CoverageTestConfig) -> Path:
     def _geo_bundle_builder():
         if str(config.geo_cache_mode).lower() == "prebuilt":
             cached = _load_precomputed_geo_bundle(stable_cache_dir, geo_bundle_key)
+            if cached is None and config.geo_base_run_dir:
+                cached = _load_geo_bundle_from_run_dir(Path(str(config.geo_base_run_dir)))
+                if cached is not None:
+                    print(f"[COVERAGE_TEST][GEO_PREBUILT] reused_from_base_run=True rows={len(cached)}")
+                    return cached
             if cached is None:
                 raise FileNotFoundError(
                     "Prebuilt yearly geo bundle not found. Run once with --geo-cache-mode build to create it."
@@ -1795,20 +2254,12 @@ def run_coverage_test(config: CoverageTestConfig) -> Path:
             print(f"[COVERAGE_TEST][GEO_PREBUILT] reused=True rows={len(cached)}")
             return cached
         if str(config.geo_cache_mode).lower() == "build":
-            base_bundle = None
             if config.geo_base_run_dir:
                 base_bundle = _load_geo_bundle_from_run_dir(Path(str(config.geo_base_run_dir)))
                 if base_bundle is not None:
-                    print("[COVERAGE_TEST][GEO_PREBUILD] cache_hit=False forcing_building_refresh_from_base_run=True")
-                    updated = _rebuild_geo_bundle_from_base_with_buildings(
-                        base_bundle_df=base_bundle,
-                        grid_cells_df=grid_cells_df,
-                        polygon_wkt=config.polygon_wkt,
-                        cache_dir=stable_cache_dir,
-                        buckets=config.buckets,
-                    )
-                    _write_cache_df(_precomputed_geo_bundle_path(stable_cache_dir, geo_bundle_key), updated)
-                    return updated
+                    print(f"[COVERAGE_TEST][GEO_REUSE] base_run_dir={config.geo_base_run_dir} rows={len(base_bundle)}")
+                    return base_bundle
+            base_bundle = None
             current = _load_precomputed_geo_bundle(stable_cache_dir, geo_bundle_key)
             if current is not None:
                 print(f"[COVERAGE_TEST][GEO_PREBUILD] cache_hit=True rows={len(current)}")
@@ -1860,6 +2311,7 @@ def run_coverage_test(config: CoverageTestConfig) -> Path:
     corrected_grid_df.to_csv(run_dir / "corrected_grid_surface.csv", index=False)
     project_sites_df.to_csv(run_dir / "project_sites.csv", index=False)
     project_site_summary_df.to_csv(run_dir / "project_site_summary.csv", index=False)
+    bucket_topology_summary_df.to_csv(run_dir / "bucket_topology_summary.csv", index=False)
     grid_geo_features_df.to_csv(run_dir / "grid_geo_features.csv", index=False)
     bucket_grid_geo_features_df.to_csv(run_dir / "bucket_grid_geo_features.csv", index=False)
     grid_cells_df.to_csv(run_dir / "coverage_grid_cells.csv", index=False)
@@ -1886,6 +2338,7 @@ def run_coverage_test(config: CoverageTestConfig) -> Path:
         "chunk_size": int(config.chunk_size),
         "baseline_radius_m": float(config.baseline_radius_m),
         "baseline_workers": int(config.baseline_workers),
+        "max_interference_sites": int(config.max_interference_sites),
         "bucket_row_counts": {
             str(row["time_bucket"]): int(row["total_rows"])
             for _, row in summary_df.iterrows()
@@ -1900,8 +2353,14 @@ def run_coverage_test(config: CoverageTestConfig) -> Path:
         "bucket_corrected_prediction_rows": int(len(corrected_pred_df)),
         "corrected_grid_surface_rows": int(len(corrected_grid_df)),
         "project_site_rows": int(len(project_sites_df)),
+        "bucket_topology_summary_rows": int(len(bucket_topology_summary_df)),
         "grid_geo_features_rows": int(len(grid_geo_features_df)),
         "bucket_grid_geo_features_rows": int(len(bucket_grid_geo_features_df)),
+        "topology_operator": str(config.topology_operator or ""),
+        "use_frontend_grid_sampling": bool(config.use_frontend_grid_sampling),
+        "grid_analytics_scenario_id": (
+            int(config.grid_analytics_scenario_id) if config.grid_analytics_scenario_id is not None else None
+        ),
         "geo_snapshot_strategy": "per_bucket_osm_overpass_attic_custom_snapshot_ts",
         "geo_snapshot_timestamps": DEFAULT_GEO_SNAPSHOT_TS_BY_BUCKET,
         "geo_cache_mode": str(config.geo_cache_mode),
@@ -1916,6 +2375,7 @@ def run_coverage_test(config: CoverageTestConfig) -> Path:
             "corrected_grid_surface_csv": "corrected_grid_surface.csv",
             "project_sites_csv": "project_sites.csv",
             "project_site_summary_csv": "project_site_summary.csv",
+            "bucket_topology_summary_csv": "bucket_topology_summary.csv",
             "grid_geo_features_csv": "grid_geo_features.csv",
             "bucket_grid_geo_features_csv": "bucket_grid_geo_features.csv",
             "coverage_grid_cells_csv": "coverage_grid_cells.csv",
@@ -1940,8 +2400,12 @@ def _parse_args() -> CoverageTestConfig:
     parser.add_argument("--grid-size-m", type=float, default=50.0)
     parser.add_argument("--baseline-radius-m", type=float, default=500.0)
     parser.add_argument("--baseline-workers", type=int, default=3)
+    parser.add_argument("--max-interference-sites", type=int, default=50)
     parser.add_argument("--geo-cache-mode", type=str, default="prebuilt", choices=["prebuilt", "build", "auto"])
     parser.add_argument("--geo-base-run-dir", type=str, default=None)
+    parser.add_argument("--topology-operator", type=str, default="Airtel")
+    parser.add_argument("--use-frontend-grid-sampling", type=int, default=1)
+    parser.add_argument("--grid-analytics-scenario-id", type=int, default=None)
     args = parser.parse_args()
     return CoverageTestConfig(
         project_id=int(args.project_id),
@@ -1953,8 +2417,12 @@ def _parse_args() -> CoverageTestConfig:
         grid_size_m=max(5.0, float(args.grid_size_m)),
         baseline_radius_m=max(100.0, float(args.baseline_radius_m)),
         baseline_workers=max(1, int(args.baseline_workers)),
+        max_interference_sites=max(1, int(args.max_interference_sites)),
         geo_cache_mode=str(args.geo_cache_mode).lower(),
         geo_base_run_dir=str(args.geo_base_run_dir) if args.geo_base_run_dir else None,
+        topology_operator=str(args.topology_operator).strip() or None,
+        use_frontend_grid_sampling=bool(int(args.use_frontend_grid_sampling)),
+        grid_analytics_scenario_id=(int(args.grid_analytics_scenario_id) if args.grid_analytics_scenario_id is not None else None),
         output_root=OUTPUT_ROOT,
     )
 

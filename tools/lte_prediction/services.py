@@ -100,8 +100,59 @@ def _job_df_summary(stage, df):
 
 
 def _clean_text_series(series):
-    cleaned = series.astype(str).str.strip()
-    return cleaned.replace({"": pd.NA, "nan": pd.NA, "None": pd.NA, "none": pd.NA})
+    cleaned = series.astype("string").str.strip()
+    invalid = ["", "nan", "NaN", "None", "none", "<NA>"]
+    return cleaned.mask(cleaned.isin(invalid))
+
+
+def _strip_decimal_suffix_series(series):
+    cleaned = _clean_text_series(series)
+    return cleaned.astype("string").str.replace(r"\.0+$", "", regex=True)
+
+
+def _normalize_site_selector_series(series):
+    stripped = _strip_decimal_suffix_series(series)
+    text = stripped.astype("string")
+    already_selector = text.str.lower().str.startswith("s-", na=False)
+    normalized = text.where(already_selector, "s-" + text)
+    return normalized.mask(text.isna())
+
+
+def _normalize_optional_site_selector_series(series, fallback=None):
+    stripped = _strip_decimal_suffix_series(series)
+    text = stripped.astype("string")
+    already_selector = text.str.lower().str.startswith("s-", na=False)
+    numeric_like = text.str.fullmatch(r"\d+", na=False)
+
+    normalized = pd.Series(pd.NA, index=text.index, dtype="string")
+    normalized = normalized.mask(already_selector, text)
+    normalized = normalized.mask(numeric_like, "s-" + text)
+    normalized = normalized.mask((~already_selector) & (~numeric_like) & text.notna(), text)
+
+    if fallback is not None:
+        fallback_norm = _normalize_site_selector_series(fallback)
+        normalized = normalized.where(normalized.notna(), fallback_norm)
+    return normalized
+
+
+def _derive_nodeb_cell_from_identity_series(series):
+    text = _clean_text_series(series).astype("string")
+    node_part = pd.Series(pd.NA, index=text.index, dtype="string")
+    cell_part = pd.Series(pd.NA, index=text.index, dtype="string")
+
+    pipe_mask = text.str.contains(r"\|", na=False)
+    if pipe_mask.any():
+        pipe_split = text.loc[pipe_mask].str.split("|", n=1, expand=True)
+        node_part.loc[pipe_mask] = _clean_text_series(pipe_split[0])
+        cell_part.loc[pipe_mask] = _strip_decimal_suffix_series(pipe_split[1])
+
+    underscore_mask = (~pipe_mask) & text.str.contains(r"_", na=False)
+    if underscore_mask.any():
+        underscore_split = text.loc[underscore_mask].str.split("_", n=1, expand=True)
+        node_part.loc[underscore_mask] = _clean_text_series(underscore_split[0])
+        cell_part.loc[underscore_mask] = _strip_decimal_suffix_series(underscore_split[1])
+
+    return node_part, cell_part
 
 
 def _pick_first_present(df, candidates):
@@ -891,6 +942,9 @@ class LTEPredictionService:
                 rename_map = {}
                 if "nodeb_id" in site_meta.columns:
                     rename_map["nodeb_id"] = "site_nodeb_id"
+                selector_col = _pick_first_present(site_meta, ["site_id_selector", "site_selector"])
+                if selector_col:
+                    rename_map[selector_col] = "site_selector_id"
                 if site_id_col:
                     rename_map[site_id_col] = "site_site_id"
                 if operator_col:
@@ -898,19 +952,15 @@ class LTEPredictionService:
 
                 site_meta = site_meta.rename(columns=rename_map)
                 keep_cols = ["node_cell_id"] + [
-                    col for col in ["site_nodeb_id", "site_site_id", "site_operator"] if col in site_meta.columns
+                    col for col in ["site_nodeb_id", "site_selector_id", "site_site_id", "site_operator"] if col in site_meta.columns
                 ]
                 site_meta = site_meta[keep_cols].drop_duplicates(subset=["node_cell_id"], keep="first")
                 out = out.merge(site_meta, on="node_cell_id", how="left")
 
         if "node_cell_id" in out.columns:
-            split_cols = out["node_cell_id"].astype(str).str.split("_", n=1, expand=True)
-            if split_cols.shape[1] >= 2:
-                out["derived_nodeb_id"] = _clean_text_series(split_cols[0])
-                out["derived_cell_id"] = _clean_text_series(split_cols[1])
-            else:
-                out["derived_nodeb_id"] = pd.NA
-                out["derived_cell_id"] = pd.NA
+            derived_nodeb_id, derived_cell_id = _derive_nodeb_cell_from_identity_series(out["node_cell_id"])
+            out["derived_nodeb_id"] = derived_nodeb_id
+            out["derived_cell_id"] = derived_cell_id
         else:
             out["derived_nodeb_id"] = pd.NA
             out["derived_cell_id"] = pd.NA
@@ -919,13 +969,17 @@ class LTEPredictionService:
         out["job_id"] = job_id
         out["created_at"] = datetime.now()
 
-        out = _coalesce_columns(out, "node_b_id", ["node_b_id", "nodeb_id", "site_nodeb_id", "derived_nodeb_id"])
+        out = _coalesce_columns(out, "node_b_id", ["site_selector_id", "node_b_id", "nodeb_id", "site_nodeb_id", "derived_nodeb_id"])
         out = _coalesce_columns(out, "cell_id", ["original_cell_id", "derived_cell_id", "cell_id"])
         out = _coalesce_columns(out, "operator", ["operator", "site_operator"], default=operator)
-        out = _coalesce_columns(out, "site_id", ["site_id", "site_site_id", "node_b_id"])
+        out = _coalesce_columns(out, "site_id", ["site_selector_id", "site_id", "site_site_id", "node_b_id"])
 
         for col in ["node_b_id", "cell_id", "operator", "site_id"]:
             out[col] = _clean_text_series(out[col])
+
+        out["node_b_id"] = _normalize_site_selector_series(out["node_b_id"])
+        out["site_id"] = _normalize_optional_site_selector_series(out["site_id"], fallback=out["node_b_id"])
+        out["cell_id"] = _strip_decimal_suffix_series(out["cell_id"])
 
         legacy_nodeb_cell_id = np.where(
             out["node_b_id"].notna() & out["cell_id"].notna(),
