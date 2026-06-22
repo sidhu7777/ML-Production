@@ -12,6 +12,7 @@ from .ml_engine import (
     fetch_baseline,
     fetch_site_data,
     fetch_optimized_sites,
+    resolve_site_prediction_scenario_operator,
     compute_k1k2_for_cells,
     _compute_affected_cells,
     _normalize_site_df,
@@ -63,22 +64,30 @@ def _resolve_engine(region="india"):
     return engine.get(str(region).lower(), engine["india"])
 
 
-def _latest_baseline_job_id(project_id, region="india"):
+def _latest_baseline_job_id(project_id, region="india", operator=None):
     bridge = get_bridge_client()
     if bridge:
-        payload = bridge._request("GET", "GetLatestLteBaselineJobId", params={"projectId": int(project_id)})
+        params = {"projectId": int(project_id), "region": region}
+        if operator and str(operator).strip().lower() != "all":
+            params["operator"] = str(operator).strip()
+        payload = bridge._request("GET", "GetLatestLteBaselineJobId", params=params)
         job_id = payload.get("JobId") or payload.get("jobId")
         return str(job_id) if job_id is not None else None
     current_engine = _resolve_engine(region)
-    query = text("""
+    where_parts = ["project_id = :project_id"]
+    params = {"project_id": int(project_id)}
+    if operator and str(operator).strip().lower() != "all":
+        where_parts.append("LOWER(TRIM(operator)) = :operator")
+        params["operator"] = str(operator).strip().lower()
+    query = text(f"""
         SELECT job_id
         FROM lte_prediction_baseline_results
-        WHERE project_id = :project_id
+        WHERE {" AND ".join(where_parts)}
         ORDER BY created_at DESC
         LIMIT 1
     """)
     with current_engine.connect() as conn:
-        row = conn.execute(query, {"project_id": int(project_id)}).fetchone()
+        row = conn.execute(query, params).fetchone()
     return str(row[0]) if row and row[0] is not None else None
 
 
@@ -722,6 +731,9 @@ class LTEPredictionService_optimised:
             "scenario_row_id": scenario_row_id,
             "scenario_id": scenario_id,
             "project_id": int(cfg["project_id"]),
+            "region": region,
+            "operator": cfg.get("operator"),
+            "baseline_job_id": cfg.get("baseline_job_id"),
         }
 
         threading.Thread(
@@ -762,6 +774,9 @@ class LTEPredictionService_optimised:
             "scenario_id": scenario_id,
             "recommendation_scenario_id": int(recommendation_scenario_id),
             "project_id": int(cfg["project_id"]),
+            "region": region,
+            "operator": operator,
+            "baseline_job_id": cfg.get("baseline_job_id"),
         }
 
         threading.Thread(
@@ -787,7 +802,7 @@ class LTEPredictionService_optimised:
         try:
             print(
                 f"[LTE_OPT][JOB_START] job_id={job_id} project_id={cfg['project_id']} "
-                f"region={str(cfg.get('region', 'india')).lower()} operator={cfg.get('operator', 'Airtel')} "
+                f"region={str(cfg.get('region', 'india')).lower()} operator={cfg.get('operator') or 'all'} "
                 f"radius={cfg.get('radius', 500)} grid_resolution={cfg.get('grid_resolution', 10)} "
                 f"n_workers={cfg.get('n_workers')}"
             )
@@ -796,15 +811,39 @@ class LTEPredictionService_optimised:
             self._update(job_id, "running", "Loading baseline")
 
             project_id = cfg["project_id"]
-            operator = cfg.get("operator", "Airtel")
+            operator = cfg.get("operator")
             polygon_ids = cfg.get("polygon_ids") or cfg.get("polygonIds")
             site_prediction_scenario_id = (
                 cfg.get("site_prediction_scenario_id")
                 or cfg.get("sitePredictionScenarioId")
                 or cfg.get("scenario")
             )
+            scenario_operator = resolve_site_prediction_scenario_operator(
+                project_id,
+                site_prediction_scenario_id,
+                region=region,
+            ) if site_prediction_scenario_id else None
+            if scenario_operator:
+                if operator and str(operator).strip().lower() != str(scenario_operator).strip().lower():
+                    print(
+                        f"[LTE_OPT][OPERATOR_RESOLVE] source=scenario_override "
+                        f"requested_operator={operator} scenario_operator={scenario_operator} "
+                        f"scenario={site_prediction_scenario_id}"
+                    )
+                elif not operator:
+                    print(
+                        f"[LTE_OPT][OPERATOR_RESOLVE] source=scenario "
+                        f"operator={scenario_operator} scenario={site_prediction_scenario_id}"
+                    )
+                operator = scenario_operator
+                cfg["operator"] = scenario_operator
 
-            baseline_df = fetch_baseline(project_id, region=region, operator=operator)
+            baseline_df = fetch_baseline(
+                project_id,
+                region=region,
+                operator=operator,
+                baseline_job_id=cfg.get("baseline_job_id"),
+            )
             _df_summary("BASELINE_DF", baseline_df)
             baseline_job_id = None
             if "job_id" in baseline_df.columns and not baseline_df["job_id"].dropna().empty:
@@ -940,7 +979,12 @@ class LTEPredictionService_optimised:
             _df_summary("RECOMMENDATION_ACTIONABLE_ROWS", actionable_df)
 
             self._update(job_id, "running", "Loading baseline")
-            baseline_df = fetch_baseline(project_id, region=region, operator=operator)
+            baseline_df = fetch_baseline(
+                project_id,
+                region=region,
+                operator=operator,
+                baseline_job_id=cfg.get("baseline_job_id"),
+            )
             _df_summary("BASELINE_DF", baseline_df)
             baseline_job_id = None
             if "job_id" in baseline_df.columns and not baseline_df["job_id"].dropna().empty:
@@ -1179,7 +1223,25 @@ class LTEPredictionService_optimised:
         df["Technology"] = "4G"
         df["Operator"] = operator  
         df["created_at"] = datetime.datetime.now()
-        df["site_id"] = df["node_b_id"]
+        if "site_id" in df.columns:
+            site_id_series = df["site_id"].astype("string").str.strip()
+            site_id_series = site_id_series.mask(site_id_series.isin(["", "nan", "NaN", "None", "<NA>"]))
+        else:
+            site_id_series = pd.Series(pd.NA, index=df.index, dtype="string")
+
+        fallback_site_series = None
+        for candidate in ["dashboard_site_id", "site", "nodeb_id_raw"]:
+            if candidate in df.columns:
+                fallback_site_series = df[candidate].astype("string").str.strip()
+                fallback_site_series = fallback_site_series.mask(
+                    fallback_site_series.isin(["", "nan", "NaN", "None", "<NA>"])
+                )
+                break
+
+        if fallback_site_series is None:
+            fallback_site_series = df["node_b_id"].astype("string").str.strip()
+
+        df["site_id"] = site_id_series.fillna(fallback_site_series)
         df["scenario_id"] = scenario_id
         df["public_scenario_id"] = public_scenario_id
 
@@ -1286,7 +1348,10 @@ class LTEPredictionService_optimised:
     def _create_scenario(self, cfg, job_id, region):
         bridge = get_bridge_client()
         if bridge:
-            baseline_job_id = cfg.get("baseline_job_id") or _latest_baseline_job_id(cfg["project_id"], region=region)
+            baseline_job_id = cfg.get("baseline_job_id") or _latest_baseline_job_id(
+                cfg["project_id"], region=region, operator=cfg.get("operator")
+            )
+            cfg["baseline_job_id"] = baseline_job_id
             payload = {
                 "ProjectId": int(cfg["project_id"]),
                 "ScenarioId": int(cfg["requested_public_scenario_id"]) if cfg.get("requested_public_scenario_id") else None,
@@ -1294,7 +1359,7 @@ class LTEPredictionService_optimised:
                 "ScenarioName": _build_scenario_name(cfg),
                 "ScenarioDescription": _build_scenario_description(cfg),
                 "Region": region,
-                "Operator": str(cfg.get("operator", "Airtel")),
+                "Operator": cfg.get("operator"),
                 "TargetType": str(cfg.get("target_type", "")).strip() or None,
                 "TargetId": str(cfg.get("target_id", "")).strip() or None,
                 "ImpactRadiusM": float(cfg.get("impact_radius_m", cfg.get("radius", 500)) or 500),
@@ -1316,7 +1381,10 @@ class LTEPredictionService_optimised:
             print(f"[LTE_OPT][SCENARIO_CREATE] source=python_bridge row_id={scenario_row_id} scenario_id={public_scenario_id} job_id={job_id}")
             return scenario_row_id, public_scenario_id
         current_engine = _resolve_engine(region)
-        baseline_job_id = cfg.get("baseline_job_id") or _latest_baseline_job_id(cfg["project_id"], region=region)
+        baseline_job_id = cfg.get("baseline_job_id") or _latest_baseline_job_id(
+            cfg["project_id"], region=region, operator=cfg.get("operator")
+        )
+        cfg["baseline_job_id"] = baseline_job_id
         self._prune_oldest_project_scenario_if_needed(cfg["project_id"], current_engine, max_scenarios=6)
         requested_public_scenario_id = cfg.get("requested_public_scenario_id")
         if requested_public_scenario_id is not None:
@@ -1331,7 +1399,7 @@ class LTEPredictionService_optimised:
             "scenario_name": _build_scenario_name(cfg),
             "scenario_description": _build_scenario_description(cfg),
             "region": region,
-            "operator": str(cfg.get("operator", "Airtel")),
+            "operator": cfg.get("operator"),
             "target_type": str(cfg.get("target_type", "")).strip() or None,
             "target_id": str(cfg.get("target_id", "")).strip() or None,
             "impact_radius_m": float(cfg.get("impact_radius_m", cfg.get("radius", 500)) or 500),
@@ -1376,7 +1444,11 @@ class LTEPredictionService_optimised:
         if bridge:
             baseline_job_id = None
             try:
-                baseline_job_id = _latest_baseline_job_id(JOBS.get(job_id, {}).get("project_id"), region) if job_id and JOBS.get(job_id, {}).get("project_id") else None
+                baseline_job_id = _latest_baseline_job_id(
+                    JOBS.get(job_id, {}).get("project_id"),
+                    region,
+                    operator=JOBS.get(job_id, {}).get("operator"),
+                ) if job_id and JOBS.get(job_id, {}).get("project_id") else None
             except Exception:
                 baseline_job_id = None
             bridge._request(
@@ -1396,7 +1468,11 @@ class LTEPredictionService_optimised:
         """)
         baseline_job_id = None
         try:
-            baseline_job_id = _latest_baseline_job_id(JOBS.get(job_id, {}).get("project_id"), region) if job_id and JOBS.get(job_id, {}).get("project_id") else None
+            baseline_job_id = _latest_baseline_job_id(
+                JOBS.get(job_id, {}).get("project_id"),
+                region,
+                operator=JOBS.get(job_id, {}).get("operator"),
+            ) if job_id and JOBS.get(job_id, {}).get("project_id") else None
         except Exception:
             baseline_job_id = None
         with current_engine.begin() as conn:

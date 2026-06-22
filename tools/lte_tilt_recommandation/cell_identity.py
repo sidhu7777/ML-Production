@@ -50,6 +50,34 @@ def canonical_pair(nodeb: object, cell: object) -> str:
     return canonical_cell_id(f"{nodeb_text}_{cell_text}")
 
 
+def _join_identity_parts(*parts: object) -> str:
+    cleaned = [clean_cell_token(part).replace("|", "_").replace("p0", "") for part in parts]
+    if any(not part for part in cleaned):
+        return ""
+    return "_".join(cleaned)
+
+
+def build_rf_identity(site: object = None, cell_id: object = None, sector: object = None, band: object = None, fallback: object = None) -> str:
+    """Return the carrier-level RF identity: site_cell_sector_band, with legacy fallback."""
+    identity = _join_identity_parts(site, cell_id, sector, band)
+    if identity:
+        return identity
+    return canonical_cell_id(fallback)
+
+
+def build_sector_identity(site: object = None, cell_id: object = None, sector: object = None, fallback: object = None) -> str:
+    """Return the sector-level identity: site_cell_sector, with legacy fallback."""
+    identity = _join_identity_parts(site, cell_id, sector)
+    if identity:
+        return identity
+    return canonical_cell_id(fallback)
+
+
+def build_site_sector_band_identity(site: object = None, sector: object = None, band: object = None) -> str:
+    """Return a stable match key for optimized rows where cell_id changed."""
+    return _join_identity_parts(site, sector, band)
+
+
 def canonical_cell_series(series: pd.Series) -> pd.Series:
     if series is None:
         return pd.Series(dtype="string")

@@ -67,6 +67,24 @@ def _safe_minmax(df, col):
     return f"{series.min():.4f}..{series.max():.4f}"
 
 
+def _normalize_operator_label(value):
+    if pd.isna(value):
+        return pd.NA
+    text = str(value).strip()
+    if text == "":
+        return pd.NA
+    key = text.lower()
+    aliases = {
+        "airtel": "Airtel",
+        "bsnl": "BSNL",
+        "jio": "Jio",
+        "chingau": "Chingau",
+    }
+    if key in aliases:
+        return aliases[key]
+    return text[:1].upper() + text[1:].lower() if len(text) > 1 else text.upper()
+
+
 def _copy_first_present(df, target, candidates):
     if target in df.columns:
         return
@@ -316,7 +334,7 @@ def _resolve_operator(df):
             series = df[col].dropna().astype(str).str.strip()
             series = series[series != ""]
             if not series.empty:
-                operator = series.mode().iloc[0]
+                operator = _normalize_operator_label(series.mode().iloc[0])
                 print(f"[LTE][SITE_FETCH] resolved_operator_from={col} value={operator}")
                 return operator
     raise ValueError("Unable to resolve operator from site_prediction data")
@@ -447,6 +465,13 @@ def fetch_site_data(project_id, region="india", polygon_ids=None, operator=None)
     if "Node_Cell_ID" not in df.columns and "cell_id" in df.columns:
         df["Node_Cell_ID"] = df["cell_id"].astype(str).str.strip()
 
+    if "network" in df.columns:
+        df["network"] = df["network"].map(_normalize_operator_label)
+    if "cluster" in df.columns:
+        df["cluster"] = df["cluster"].map(_normalize_operator_label)
+    if "operator" in df.columns:
+        df["operator"] = df["operator"].map(_normalize_operator_label)
+
     df = df.dropna(subset=["lat", "lon"])
 
     requested_operator = str(operator or "").strip()
@@ -478,7 +503,9 @@ def fetch_site_data(project_id, region="india", polygon_ids=None, operator=None)
 
     print("[LTE][SITE_FETCH_READY] converted_to_prediction_engine_format=True")
     _print_df_profile("SITE_FETCH_READY", df)
-    return df, requested_operator if requested_operator and requested_operator.lower() not in {"all", "auto"} else _resolve_operator(df)
+    if requested_operator and requested_operator.lower() not in {"all", "auto"}:
+        return df, requested_operator
+    return df, None
 
 
 def fetch_drive_data(

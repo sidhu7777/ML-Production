@@ -22,6 +22,12 @@ from .ml_engine import (
 from .dem_utils import ensure_project_dem
 
 from extensions import db
+from tools.lte_tilt_recommandation.cell_identity import (
+    build_rf_identity,
+    build_sector_identity,
+    build_site_sector_band_identity,
+)
+from .geo_correction_pipeline import prepare_site_df_for_source_rf_export
 from utils.python_bridge import get_bridge_client
 
 load_dotenv()
@@ -37,6 +43,12 @@ BASELINE_SMOOTHED_COLUMNS = {
     "pred_rsrp_smoothed": "DOUBLE NULL",
     "pred_rsrq_smoothed": "DOUBLE NULL",
     "pred_sinr_smoothed": "DOUBLE NULL",
+    "legacy_nodeb_id_cell_id": "VARCHAR(255) NULL",
+    "sector": "VARCHAR(100) NULL",
+    "band": "VARCHAR(100) NULL",
+    "rf_identity_key": "VARCHAR(255) NULL",
+    "sector_identity_key": "VARCHAR(255) NULL",
+    "site_sector_band_key": "VARCHAR(255) NULL",
 }
 
 
@@ -103,6 +115,24 @@ def _clean_text_series(series):
     cleaned = series.astype("string").str.strip()
     invalid = ["", "nan", "NaN", "None", "none", "<NA>"]
     return cleaned.mask(cleaned.isin(invalid))
+
+
+def _normalize_operator_label(value):
+    if pd.isna(value):
+        return pd.NA
+    text = str(value).strip()
+    if text == "":
+        return pd.NA
+    key = text.lower()
+    aliases = {
+        "airtel": "Airtel",
+        "bsnl": "BSNL",
+        "jio": "Jio",
+        "chingau": "Chingau",
+    }
+    if key in aliases:
+        return aliases[key]
+    return text[:1].upper() + text[1:].lower() if len(text) > 1 else text.upper()
 
 
 def _strip_decimal_suffix_series(series):
@@ -399,6 +429,12 @@ class LTEPredictionService:
                     cell_id,
                     operator,
                     site_id,
+                    legacy_nodeb_id_cell_id,
+                    sector,
+                    band,
+                    rf_identity_key,
+                    sector_identity_key,
+                    site_sector_band_key,
                     Technology
                 FROM lte_prediction_baseline_results
                 WHERE project_id = :project_id
@@ -423,6 +459,12 @@ class LTEPredictionService:
             "cell_id",
             "operator",
             "site_id",
+            "legacy_nodeb_id_cell_id",
+            "sector",
+            "band",
+            "rf_identity_key",
+            "sector_identity_key",
+            "site_sector_band_key",
             "Technology",
         ]
         numeric_tolerances = {
@@ -507,14 +549,18 @@ class LTEPredictionService:
                     pred_rsrp, pred_rsrq, pred_sinr,
                     pred_rsrp_smoothed, pred_rsrq_smoothed, pred_sinr_smoothed,
                     node_b_id, cell_id,
-                    operator, created_at, site_id, nodeb_id_cell_id, Technology
+                    operator, created_at, site_id, nodeb_id_cell_id,
+                    legacy_nodeb_id_cell_id, sector, band,
+                    rf_identity_key, sector_identity_key, site_sector_band_key, Technology
                 )
                 SELECT
                     id, project_id, job_id, lat, lat_6dp, lon, lon_6dp,
                     pred_rsrp, pred_rsrq, pred_sinr,
                     pred_rsrp_smoothed, pred_rsrq_smoothed, pred_sinr_smoothed,
                     node_b_id, cell_id,
-                    operator, created_at, site_id, nodeb_id_cell_id, Technology
+                    operator, created_at, site_id, nodeb_id_cell_id,
+                    legacy_nodeb_id_cell_id, sector, band,
+                    rf_identity_key, sector_identity_key, site_sector_band_key, Technology
                 FROM {staging_table}
                 ON DUPLICATE KEY UPDATE
                     job_id = VALUES(job_id),
@@ -530,6 +576,12 @@ class LTEPredictionService:
                     created_at = VALUES(created_at),
                     site_id = VALUES(site_id),
                     nodeb_id_cell_id = VALUES(nodeb_id_cell_id),
+                    legacy_nodeb_id_cell_id = VALUES(legacy_nodeb_id_cell_id),
+                    sector = VALUES(sector),
+                    band = VALUES(band),
+                    rf_identity_key = VALUES(rf_identity_key),
+                    sector_identity_key = VALUES(sector_identity_key),
+                    site_sector_band_key = VALUES(site_sector_band_key),
                     Technology = VALUES(Technology),
                     lat = VALUES(lat),
                     lon = VALUES(lon),
@@ -929,15 +981,20 @@ class LTEPredictionService:
 
         if site_df is not None and not site_df.empty:
             site_meta = site_df.copy()
+            site_operator_col = _pick_first_present(site_meta, ["network", "cluster", "operator", "Technology"])
+            site_operator_series = None
+            if site_operator_col:
+                site_operator_series = _clean_text_series(site_meta[site_operator_col]).map(_normalize_operator_label)
+
+            site_meta = prepare_site_df_for_source_rf_export(site_meta)
             if "Node_Cell_ID" in site_meta.columns and "node_cell_id" not in site_meta.columns:
                 site_meta["node_cell_id"] = site_meta["Node_Cell_ID"]
-            elif "cell_id" in site_meta.columns:
+            elif "cell_id" in site_meta.columns and "node_cell_id" not in site_meta.columns:
                 site_meta["node_cell_id"] = site_meta["cell_id"]
 
             if "node_cell_id" in site_meta.columns:
                 site_meta["node_cell_id"] = _clean_text_series(site_meta["node_cell_id"])
                 site_id_col = _pick_first_present(site_meta, ["site_id", "Site ID", "site"])
-                operator_col = _pick_first_present(site_meta, ["operator", "network", "cluster", "Technology"])
 
                 rename_map = {}
                 if "nodeb_id" in site_meta.columns:
@@ -947,12 +1004,41 @@ class LTEPredictionService:
                     rename_map[selector_col] = "site_selector_id"
                 if site_id_col:
                     rename_map[site_id_col] = "site_site_id"
-                if operator_col:
-                    rename_map[operator_col] = "site_operator"
+                for src_col, dst_col in [
+                    ("sector", "site_sector"),
+                    ("band", "site_band"),
+                    ("frequency_mhz", "site_frequency_mhz"),
+                    ("frequency", "site_frequency"),
+                    ("rf_identity_key", "site_rf_identity_key"),
+                    ("sector_identity_key", "site_sector_identity_key"),
+                    ("site_sector_band_key", "site_site_sector_band_key"),
+                    ("legacy_nodeb_id_cell_id", "site_legacy_nodeb_id_cell_id"),
+                    ("original_node_cell_id", "site_original_node_cell_id"),
+                    ("original_cell_id", "site_original_cell_id"),
+                ]:
+                    if src_col in site_meta.columns and src_col not in rename_map:
+                        rename_map[src_col] = dst_col
 
                 site_meta = site_meta.rename(columns=rename_map)
+                if site_operator_series is not None:
+                    site_meta["site_operator"] = site_operator_series.reindex(site_meta.index)
                 keep_cols = ["node_cell_id"] + [
-                    col for col in ["site_nodeb_id", "site_selector_id", "site_site_id", "site_operator"] if col in site_meta.columns
+                    col for col in [
+                        "site_nodeb_id",
+                        "site_selector_id",
+                        "site_site_id",
+                        "site_operator",
+                        "site_sector",
+                        "site_band",
+                        "site_frequency_mhz",
+                        "site_frequency",
+                        "site_rf_identity_key",
+                        "site_sector_identity_key",
+                        "site_site_sector_band_key",
+                        "site_legacy_nodeb_id_cell_id",
+                        "site_original_node_cell_id",
+                        "site_original_cell_id",
+                    ] if col in site_meta.columns
                 ]
                 site_meta = site_meta[keep_cols].drop_duplicates(subset=["node_cell_id"], keep="first")
                 out = out.merge(site_meta, on="node_cell_id", how="left")
@@ -971,15 +1057,23 @@ class LTEPredictionService:
 
         out = _coalesce_columns(out, "node_b_id", ["site_selector_id", "node_b_id", "nodeb_id", "site_nodeb_id", "derived_nodeb_id"])
         out = _coalesce_columns(out, "cell_id", ["original_cell_id", "derived_cell_id", "cell_id"])
-        out = _coalesce_columns(out, "operator", ["operator", "site_operator"], default=operator)
+        out = _coalesce_columns(out, "operator", ["site_operator", "operator"], default=operator)
         out = _coalesce_columns(out, "site_id", ["site_selector_id", "site_id", "site_site_id", "node_b_id"])
 
         for col in ["node_b_id", "cell_id", "operator", "site_id"]:
             out[col] = _clean_text_series(out[col])
 
+        out["operator"] = out["operator"].map(_normalize_operator_label)
+        if "site_operator" in out.columns:
+            out["site_operator"] = out["site_operator"].map(_normalize_operator_label)
+
         out["node_b_id"] = _normalize_site_selector_series(out["node_b_id"])
         out["site_id"] = _normalize_optional_site_selector_series(out["site_id"], fallback=out["node_b_id"])
         out["cell_id"] = _strip_decimal_suffix_series(out["cell_id"])
+        out = _coalesce_columns(out, "sector", ["sector", "site_sector"])
+        out = _coalesce_columns(out, "band", ["band", "site_band", "site_frequency_mhz", "site_frequency", "serving_frequency_mhz"])
+        out["sector"] = _strip_decimal_suffix_series(out["sector"])
+        out["band"] = _strip_decimal_suffix_series(out["band"])
 
         legacy_nodeb_cell_id = np.where(
             out["node_b_id"].notna() & out["cell_id"].notna(),
@@ -987,10 +1081,49 @@ class LTEPredictionService:
             out.get("node_cell_id")
         )
         out["legacy_nodeb_id_cell_id"] = _clean_text_series(pd.Series(legacy_nodeb_cell_id, index=out.index))
-        if "frontend_site_sector_key" in out.columns:
-            out["nodeb_id_cell_id"] = _clean_text_series(out["frontend_site_sector_key"]).fillna(out["legacy_nodeb_id_cell_id"])
-        else:
-            out["nodeb_id_cell_id"] = out["legacy_nodeb_id_cell_id"]
+        out = _coalesce_columns(out, "rf_identity_key", ["rf_identity_key", "site_rf_identity_key"])
+        out = _coalesce_columns(out, "sector_identity_key", ["sector_identity_key", "site_sector_identity_key"])
+        out = _coalesce_columns(out, "site_sector_band_key", ["site_sector_band_key", "site_site_sector_band_key"])
+
+        identity_site = _coalesce_columns(out.copy(), "_identity_site", ["site", "Site ID", "site_site_id", "site_nodeb_id", "node_b_id"])["_identity_site"]
+        identity_site = _clean_text_series(identity_site).astype("string").str.replace(r"^s-", "", regex=True, case=False)
+        out["rf_identity_key"] = _clean_text_series(out["rf_identity_key"]).fillna(pd.Series(
+            [
+                build_rf_identity(site, cell, sector, band, fallback=fallback)
+                for site, cell, sector, band, fallback in zip(
+                    identity_site,
+                    out["cell_id"],
+                    out["sector"],
+                    out["band"],
+                    out["legacy_nodeb_id_cell_id"],
+                )
+            ],
+            index=out.index,
+            dtype="object",
+        ))
+        out["sector_identity_key"] = _clean_text_series(out["sector_identity_key"]).fillna(pd.Series(
+            [
+                build_sector_identity(site, cell, sector, fallback=fallback)
+                for site, cell, sector, fallback in zip(
+                    identity_site,
+                    out["cell_id"],
+                    out["sector"],
+                    out["legacy_nodeb_id_cell_id"],
+                )
+            ],
+            index=out.index,
+            dtype="object",
+        ))
+        out["site_sector_band_key"] = _clean_text_series(out["site_sector_band_key"]).fillna(pd.Series(
+            [
+                build_site_sector_band_identity(site, sector, band)
+                for site, sector, band in zip(identity_site, out["sector"], out["band"])
+            ],
+            index=out.index,
+            dtype="object",
+        ))
+
+        out["nodeb_id_cell_id"] = _clean_text_series(out["rf_identity_key"]).fillna(out["legacy_nodeb_id_cell_id"])
         out["nodeb_id_cell_id"] = _clean_text_series(out["nodeb_id_cell_id"])
 
         self._save_geo_features(
@@ -1023,6 +1156,12 @@ class LTEPredictionService:
             "created_at",
             "site_id",
             "nodeb_id_cell_id",
+            "legacy_nodeb_id_cell_id",
+            "sector",
+            "band",
+            "rf_identity_key",
+            "sector_identity_key",
+            "site_sector_band_key",
             "Technology",
         ]
 
@@ -1094,7 +1233,11 @@ class LTEPredictionService:
         geo_out["region"] = str(region).lower()
         geo_out["operator"] = _clean_text_series(
             geo_out["operator"] if "operator" in geo_out.columns else pd.Series([operator] * len(geo_out), index=geo_out.index)
-        ).fillna(str(operator) if operator else None)
+        )
+        operator_fallback = _normalize_operator_label(operator)
+        if operator_fallback is not None and not pd.isna(operator_fallback):
+            geo_out["operator"] = geo_out["operator"].fillna(operator_fallback)
+        geo_out["operator"] = geo_out["operator"].map(_normalize_operator_label)
 
         if "proxy_site_id" not in geo_out.columns and "_proxy_site_id" in geo_out.columns:
             geo_out["proxy_site_id"] = geo_out["_proxy_site_id"]
@@ -1210,6 +1353,7 @@ class LTEPredictionService:
                 project_id=int(project_id),
                 job_id=str(baseline_job_id),
                 region=str(region).lower(),
+                chunk_size=int(os.getenv("PYTHON_BRIDGE_GEO_SAVE_CHUNK_SIZE", "50000")),
                 replace_existing=True,
             )
             print("[LTE][GEO_DB_WRITE] source=python_bridge")

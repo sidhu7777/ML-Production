@@ -139,6 +139,15 @@ def load_project_data(project_id: int):
             end_date=project.get("to_date"),
         )
 
+        valid_geo_rows = 0
+        if {"lat", "lon"}.issubset(raw_df.columns):
+            valid_geo_rows = int((raw_df["lat"].notna() & raw_df["lon"].notna()).sum())
+        print(
+            "[ReportLogs] load_project_data received raw logs "
+            f"project_id={project_id} sessions={session_ids} rows={len(raw_df)} "
+            f"valid_lat_lon_rows={valid_geo_rows} columns={list(raw_df.columns)}"
+        )
+
         
 
         # 3 Regions / polygons
@@ -147,6 +156,11 @@ def load_project_data(project_id: int):
 
         # 4 Spatial filtering
         filtered_df = _filter_df_by_polygons(raw_df, polygons)
+        print(
+            "[ReportLogs] polygon filter result "
+            f"project_id={project_id} polygons={len(polygons)} rows_before={len(raw_df)} "
+            f"rows_after={len(filtered_df)}"
+        )
         used_polygons = polygons
         used_region_wkts = None
 
@@ -155,6 +169,10 @@ def load_project_data(project_id: int):
             print("WARNING: Polygon filter returned 0 rows, retrying with swapped polygon coordinates.")
             swapped_polygons = _swap_polygon_coords(polygons)
             filtered_df = _filter_df_by_polygons(raw_df, swapped_polygons)
+            print(
+                "[ReportLogs] swapped polygon filter result "
+                f"project_id={project_id} rows_after={len(filtered_df)}"
+            )
             if not filtered_df.empty:
                 used_polygons = swapped_polygons
                 used_region_wkts = _polygons_to_wkt(swapped_polygons)

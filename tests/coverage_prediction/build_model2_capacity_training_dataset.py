@@ -14,6 +14,7 @@ import pandas as pd
 REQUIRED_ARCHIVE_MEMBERS = (
     "grid_kpi_timeseries.csv",
     "bucket_grid_geo_features.csv",
+    "bucket_corrected_prediction_grid.csv",
     "summary.json",
 )
 
@@ -28,8 +29,19 @@ CLUTTER_DEMAND_WEIGHT = {
     "Water": 0.04,
 }
 
+CLUTTER_TRANSITION_LEVEL = {
+    "Water": 0,
+    "Vegetation": 0,
+    "Rural/Open": 0,
+    "Suburban": 1,
+    "Urban": 2,
+    "Dense Urban": 3,
+}
+
 PRB_PRESSURE_CAP = 40.0
 PRB_OUTLIER_THRESHOLD = 100.0
+
+BAND_CLASS_LABELS = ("LOW_BAND", "MID_BAND", "HIGH_BAND")
 
 
 def _safe_numeric(df: pd.DataFrame, col: str, default: float = 0.0) -> pd.Series:
@@ -100,6 +112,104 @@ def _derive_growth_rate(df: pd.DataFrame) -> pd.Series:
     return growth.reindex(work.index).sort_index()
 
 
+def _classify_band(freq_value: object) -> str:
+    try:
+        freq = float(freq_value)
+    except (TypeError, ValueError):
+        return "UNKNOWN"
+    if not math.isfinite(freq) or freq <= 0:
+        return "UNKNOWN"
+    if freq <= 1000:
+        return "LOW_BAND"
+    if freq <= 2000:
+        return "MID_BAND"
+    return "HIGH_BAND"
+
+
+def _derive_band_features(pred_df: pd.DataFrame) -> pd.DataFrame:
+    if pred_df.empty or "grid_id" not in pred_df.columns or "time_bucket" not in pred_df.columns:
+        return pd.DataFrame(columns=["grid_id", "time_bucket", "low_band_ratio", "mid_band_ratio", "high_band_ratio", "dominant_band_class", "carrier_count"])
+
+    work = pred_df.copy()
+    work["grid_id"] = pd.to_numeric(work["grid_id"], errors="coerce").astype("Int64")
+    work["time_bucket"] = work["time_bucket"].astype(str)
+    band_source = None
+    for candidate in ["band", "frequency", "earfcn"]:
+        if candidate in work.columns:
+            band_source = candidate
+            break
+    if band_source is None:
+        out = work[["grid_id", "time_bucket"]].drop_duplicates().copy()
+        out["low_band_ratio"] = 0.0
+        out["mid_band_ratio"] = 0.0
+        out["high_band_ratio"] = 0.0
+        out["dominant_band_class"] = "UNKNOWN"
+        out["carrier_count"] = 0
+        return out
+
+    work["band_class"] = work[band_source].map(_classify_band)
+    work = work.dropna(subset=["grid_id"])
+
+    counts = (
+        work.groupby(["grid_id", "time_bucket", "band_class"], dropna=False)
+        .size()
+        .rename("row_count")
+        .reset_index()
+    )
+    pivot = counts.pivot_table(
+        index=["grid_id", "time_bucket"],
+        columns="band_class",
+        values="row_count",
+        aggfunc="sum",
+        fill_value=0.0,
+    ).reset_index()
+    pivot.columns.name = None
+    for label in BAND_CLASS_LABELS:
+        if label not in pivot.columns:
+            pivot[label] = 0.0
+
+    total = pivot[list(BAND_CLASS_LABELS)].sum(axis=1).replace(0, np.nan)
+    pivot["low_band_ratio"] = (pivot["LOW_BAND"] / total).fillna(0.0)
+    pivot["mid_band_ratio"] = (pivot["MID_BAND"] / total).fillna(0.0)
+    pivot["high_band_ratio"] = (pivot["HIGH_BAND"] / total).fillna(0.0)
+
+    def _dominant_label(row: pd.Series) -> str:
+        ratios = {
+            "LOW_BAND": float(row["low_band_ratio"]),
+            "MID_BAND": float(row["mid_band_ratio"]),
+            "HIGH_BAND": float(row["high_band_ratio"]),
+        }
+        best_label = max(ratios, key=ratios.get)
+        return best_label if ratios[best_label] > 0 else "UNKNOWN"
+
+    pivot["dominant_band_class"] = pivot.apply(_dominant_label, axis=1)
+    pivot["carrier_count"] = ((pivot["LOW_BAND"] > 0).astype(int) + (pivot["MID_BAND"] > 0).astype(int) + (pivot["HIGH_BAND"] > 0).astype(int))
+
+    keep = [
+        "grid_id",
+        "time_bucket",
+        "low_band_ratio",
+        "mid_band_ratio",
+        "high_band_ratio",
+        "dominant_band_class",
+        "carrier_count",
+    ]
+    return pivot[keep]
+
+
+def _ratio_vs_first_bucket(df: pd.DataFrame, value_col: str) -> pd.Series:
+    work = df.sort_values(["grid_id", "bucket_seq"]).copy()
+    current = pd.to_numeric(work[value_col], errors="coerce")
+    baseline = work.groupby("grid_id", sort=False)[value_col].transform("first")
+    baseline = pd.to_numeric(baseline, errors="coerce")
+    denom = baseline.abs().replace(0, np.nan)
+    ratio = (current - baseline) / denom
+    cold_start = baseline.fillna(0.0).eq(0.0) & current.fillna(0.0).gt(0.0)
+    ratio = ratio.where(~cold_start, 1.0)
+    ratio = ratio.replace([np.inf, -np.inf], np.nan).fillna(0.0).clip(-1.0, 5.0)
+    return ratio.reindex(work.index).sort_index()
+
+
 def _add_model2_features(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
     out["bucket_seq"] = out["time_bucket"].astype(str).map(BUCKET_ORDER).fillna(0).astype(int)
@@ -130,6 +240,10 @@ def _add_model2_features(df: pd.DataFrame) -> pd.DataFrame:
         if col not in out.columns:
             out[col] = np.nan
         out[col] = pd.to_numeric(out[col], errors="coerce")
+
+    for col in ["low_band_ratio", "mid_band_ratio", "high_band_ratio", "carrier_count"]:
+        out[col] = _safe_numeric(out, col, default=0.0)
+    out["dominant_band_class"] = out.get("dominant_band_class", pd.Series("UNKNOWN", index=out.index)).fillna("UNKNOWN").astype(str)
 
     raw_prb = out["estimated_prb_mean"]
     out["prb_pressure_est"] = raw_prb.clip(lower=0.0, upper=PRB_PRESSURE_CAP).fillna(0.0).round(6)
@@ -186,7 +300,80 @@ def _add_model2_features(df: pd.DataFrame) -> pd.DataFrame:
 
     out["geo_demand_score"] = (geo_demand_score * 100.0).round(3)
     out["kpi_demand_score"] = (kpi_demand_score * 100.0).round(3)
-    out["demand_index"] = (((0.40 * geo_demand_score) + (0.48 * kpi_demand_score) + (0.12 * growth_signal)) * 100.0).round(3)
+    activity_anchor_score = (
+        ((out["mall_presence"] > 0).astype(float) * 0.45)
+        + ((out["metro_presence"] > 0).astype(float) * 0.35)
+        + ((road_norm >= 0.60).astype(float) * 0.20)
+    ).clip(0.0, 1.0)
+
+    development_pressure_score = (
+        (0.24 * building_count_norm)
+        + (0.26 * building_area_norm)
+        + (0.16 * road_norm)
+        + (0.14 * activity_anchor_score)
+        + (0.20 * growth_signal)
+    ).clip(0.0, 1.0)
+
+    clutter_level = (
+        out.get("clutter_class", pd.Series("", index=out.index))
+        .fillna("")
+        .astype(str)
+        .map(CLUTTER_TRANSITION_LEVEL)
+        .fillna(0)
+        .astype(int)
+    )
+    baseline_clutter_level = (
+        out.assign(_clutter_level=clutter_level)
+        .sort_values(["grid_id", "bucket_seq"])
+        .groupby("grid_id", sort=False)["_clutter_level"]
+        .transform("first")
+        .reindex(out.index)
+        .fillna(0)
+        .astype(int)
+    )
+    out["clutter_transition_flag"] = clutter_level.ne(baseline_clutter_level).astype(int)
+    out["clutter_upgrade_score"] = np.where(clutter_level > baseline_clutter_level, clutter_level, 0).astype(float)
+
+    out["building_growth_ratio"] = _ratio_vs_first_bucket(out, "building_area_ratio").round(6)
+    out["road_growth_ratio"] = _ratio_vs_first_bucket(out, "road_density").round(6)
+
+    bandwidth_norm = _robust_norm(out["bandwidth_mhz_est"].replace(0, np.nan).fillna(10.0))
+    low_band_ratio = out["low_band_ratio"].clip(0.0, 1.0)
+    mid_band_ratio = out["mid_band_ratio"].clip(0.0, 1.0)
+    high_band_ratio = out["high_band_ratio"].clip(0.0, 1.0)
+    carrier_count_norm = _robust_norm(out["carrier_count"])
+    spare_capacity_signal = (1.0 - prb_norm).clip(0.0, 1.0)
+    capacity_context_score = (
+        (0.22 * bandwidth_norm)
+        + (0.18 * spare_capacity_signal)
+        + (0.12 * throughput_norm)
+        + (0.08 * (1.0 - sinr_pressure))
+        + (0.14 * low_band_ratio)
+        + (0.16 * mid_band_ratio)
+        + (0.18 * high_band_ratio)
+        + (0.10 * carrier_count_norm)
+    ).clip(0.0, 1.0)
+
+    growth_zone_score = (
+        (0.38 * geo_demand_score)
+        + (0.32 * development_pressure_score)
+        + (0.30 * kpi_demand_score)
+    ).clip(0.0, 1.0)
+
+    out["development_pressure_score"] = (development_pressure_score * 100.0).round(3)
+    out["growth_zone_score"] = (growth_zone_score * 100.0).round(3)
+    out["activity_anchor_score"] = (activity_anchor_score * 100.0).round(3)
+    out["capacity_context_score"] = (capacity_context_score * 100.0).round(3)
+
+    out["demand_index"] = (
+        (
+            (0.35 * geo_demand_score)
+            + (0.40 * kpi_demand_score)
+            + (0.15 * growth_signal)
+            + (0.10 * capacity_context_score)
+        )
+        * 100.0
+    ).round(3)
 
     area_factor = _robust_norm(out.get("grid_area_m2", pd.Series(2500.0, index=out.index))).replace(0, 0.35)
     users_base = 2.0 + (out["demand_index"] / 100.0) * 42.0
@@ -194,15 +381,31 @@ def _add_model2_features(df: pd.DataFrame) -> pd.DataFrame:
     out["active_users_est"] = (users_base * (0.70 + 0.60 * area_factor) + observed_boost).clip(lower=0.0).round(3)
 
     traffic_from_tpt = out["dl_tpt_mean"].fillna(0.0).clip(lower=0.0)
-    traffic_proxy = (out["demand_index"] / 100.0) * (out["bandwidth_mhz_est"].replace(0, np.nan).fillna(10.0)) * 2.2
+    capacity_gap_score = (
+        (0.44 * (out["demand_index"] / 100.0).clip(0.0, 1.5))
+        + (0.26 * prb_norm)
+        + (0.12 * sinr_pressure)
+        + (0.08 * (out["clutter_upgrade_score"] / 3.0).clip(0.0, 1.0))
+        + (0.10 * np.clip(out["building_growth_ratio"], 0.0, 1.0))
+        - (0.25 * capacity_context_score)
+    ).clip(0.0, 1.5)
+    traffic_proxy = (
+        (out["demand_index"] / 100.0)
+        * (out["bandwidth_mhz_est"].replace(0, np.nan).fillna(10.0))
+        * (1.0 + 0.35 * capacity_gap_score)
+        * 2.2
+    )
     out["traffic_demand_est"] = (
-        (0.62 * traffic_from_tpt)
-        + (0.25 * out["active_users_est"])
-        + (0.13 * traffic_proxy)
+        (0.40 * traffic_from_tpt)
+        + (0.22 * out["active_users_est"])
+        + (0.18 * traffic_proxy)
+        + (0.12 * out["prb_pressure_est"])
+        + (0.08 * out["capacity_context_score"])
     ).clip(lower=0.0).round(3)
 
+    out["capacity_gap_score"] = (capacity_gap_score * 100.0).round(3)
     out["growth_rate"] = out["growth_rate"].round(6)
-    out["demand_feature_source"] = "geo_plus_kpi_bucket_trend"
+    out["demand_feature_source"] = "geo_kpi_growth_capacity_context"
     return out
 
 
@@ -210,10 +413,12 @@ def build_dataset(archive_path: Path, output_csv: Path, work_dir: Path) -> Tuple
     extracted_root = _extract_required_members(archive_path, work_dir)
     kpi_path = extracted_root / "grid_kpi_timeseries.csv"
     geo_path = extracted_root / "bucket_grid_geo_features.csv"
+    pred_path = extracted_root / "bucket_corrected_prediction_grid.csv"
     summary_path = extracted_root / "summary.json"
 
     kpi_df = pd.read_csv(kpi_path)
     geo_df = pd.read_csv(geo_path)
+    pred_df = pd.read_csv(pred_path)
     with summary_path.open("r", encoding="utf-8") as handle:
         source_summary = json.load(handle)
 
@@ -251,7 +456,9 @@ def build_dataset(archive_path: Path, output_csv: Path, work_dir: Path) -> Tuple
         ]
         if col in geo_df.columns
     ]
+    band_features_df = _derive_band_features(pred_df)
     merged = kpi_df.merge(geo_df[geo_keep], on=join_keys, how="left", validate="one_to_one")
+    merged = merged.merge(band_features_df, on=join_keys, how="left", validate="one_to_one")
     enriched = _add_model2_features(merged)
 
     preferred_cols = [
@@ -281,10 +488,27 @@ def build_dataset(archive_path: Path, output_csv: Path, work_dir: Path) -> Tuple
         "sinr_mean",
         "rsrp_mean",
         "rsrq_mean",
+        "corrected_rsrp_mean",
+        "corrected_rsrq_mean",
+        "corrected_sinr_mean",
         "bandwidth_mhz_est",
+        "low_band_ratio",
+        "mid_band_ratio",
+        "high_band_ratio",
+        "dominant_band_class",
+        "carrier_count",
         "geo_demand_score",
         "kpi_demand_score",
         "growth_rate",
+        "development_pressure_score",
+        "growth_zone_score",
+        "clutter_transition_flag",
+        "clutter_upgrade_score",
+        "building_growth_ratio",
+        "road_growth_ratio",
+        "activity_anchor_score",
+        "capacity_context_score",
+        "capacity_gap_score",
         "demand_index",
         "active_users_est",
         "traffic_demand_est",
@@ -320,9 +544,13 @@ def build_dataset(archive_path: Path, output_csv: Path, work_dir: Path) -> Tuple
         "prb_pressure_est_max": float(prb_pressure.max()) if prb_pressure.notna().any() else None,
         "prb_outlier_threshold": PRB_OUTLIER_THRESHOLD,
         "prb_outlier_rows": int(enriched["prb_outlier_flag"].sum()) if "prb_outlier_flag" in enriched.columns else 0,
+        "dominant_band_class_counts": {
+            str(k): int(v) for k, v in enriched.get("dominant_band_class", pd.Series(dtype="object")).value_counts(dropna=False).items()
+        },
         "notes": [
             "Built from existing coverage artifacts only; coverage pipeline was not rerun.",
-            "Demand features use both geo context and KPI bucket history.",
+            "Demand features use geo context, KPI bucket history, and added development/capacity context features.",
+            "Band-family ratios and dominant band class are derived from saved corrected prediction grid rows.",
             "estimated_prb_mean is retained as the raw unbounded proxy for audit only.",
             "Model 2 training should use prb_pressure_est, capped at 40, instead of raw estimated_prb_mean.",
             "active_users_est is an estimated proxy because real subscriber counters are not present in the source data.",

@@ -21,6 +21,12 @@ from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from sklearn.neighbors import BallTree
 from sklearn.preprocessing import StandardScaler
 
+from tools.lte_tilt_recommandation.cell_identity import (
+    build_rf_identity,
+    build_sector_identity,
+    build_site_sector_band_identity,
+)
+
 try:
     import rasterio
 except Exception:  # pragma: no cover - optional dependency
@@ -415,16 +421,30 @@ def add_sector_identity_columns(site_df: pd.DataFrame, use_as_node_cell_id: bool
     sector_key = _clean_identity_part(out["sector"]) if "sector" in out.columns else pd.Series(pd.NA, index=out.index, dtype="string")
     cell_key = _clean_identity_part(out["cell_id"]) if "cell_id" in out.columns else out["original_node_cell_id"]
     sector_or_cell = sector_key.fillna(cell_key)
+    band_col = next((col for col in ["band", "Band", "carrier", "frequency_mhz", "frequency"] if col in out.columns), None)
+    band_key = _clean_identity_part(out[band_col]) if band_col else pd.Series(pd.NA, index=out.index, dtype="string")
 
     out["site_identity_key"] = site_key
     out["sector_identity"] = sector_or_cell
     out["frontend_site_sector_key"] = site_key.astype(str) + "|" + sector_or_cell.astype(str)
     out["node_cell_sector_key"] = out["original_node_cell_id"].astype(str) + "|" + sector_or_cell.astype(str)
     out["canonical_sector_id"] = _canonical_sector_ids(site_key, sector_or_cell, out["original_cell_id"])
+    out["sector_identity_key"] = [
+        build_sector_identity(site, cell, sector, fallback=fallback)
+        for site, cell, sector, fallback in zip(site_key, cell_key, sector_key, out["original_node_cell_id"])
+    ]
+    out["site_sector_band_key"] = [
+        build_site_sector_band_identity(site, sector, band)
+        for site, sector, band in zip(site_key, sector_key, band_key)
+    ]
+    out["rf_identity_key"] = [
+        build_rf_identity(site, cell, sector, band, fallback=fallback)
+        for site, cell, sector, band, fallback in zip(site_key, cell_key, sector_key, band_key, out["original_node_cell_id"])
+    ]
     out.loc[sector_or_cell.isna(), ["frontend_site_sector_key", "node_cell_sector_key"]] = pd.NA
 
     if use_as_node_cell_id:
-        out["Node_Cell_ID"] = out["frontend_site_sector_key"]
+        out["Node_Cell_ID"] = out["rf_identity_key"].where(out["rf_identity_key"].astype("string").str.strip().ne(""), out["frontend_site_sector_key"])
     return out
 
 
@@ -484,9 +504,13 @@ def attach_site_identity_to_predictions(pred_df: pd.DataFrame, site_df: pd.DataF
             "sector_identity",
             "frontend_site_sector_key",
             "node_cell_sector_key",
+            "sector_identity_key",
+            "site_sector_band_key",
+            "rf_identity_key",
             "site",
             "Site ID",
             "sector",
+            "band",
             "nodeb_id",
             "pci",
             "PCI",

@@ -83,17 +83,34 @@ NUMERIC_FEATURES = [
     "rsrp_mean",
     "rsrq_mean",
     "sinr_mean",
+    "corrected_rsrp_mean",
+    "corrected_rsrq_mean",
+    "corrected_sinr_mean",
     "cqi_mean",
     "dl_tpt_mean",
     "ul_tpt_mean",
     "sample_count",
+    "bandwidth_mhz_est",
+    "low_band_ratio",
+    "mid_band_ratio",
+    "high_band_ratio",
+    "carrier_count",
     "prb_pressure_est",
     "prb_outlier_flag",
     "growth_rate",
     "geo_demand_score",
     "kpi_demand_score",
+    "development_pressure_score",
+    "growth_zone_score",
+    "clutter_transition_flag",
+    "clutter_upgrade_score",
+    "building_growth_ratio",
+    "road_growth_ratio",
+    "activity_anchor_score",
+    "capacity_context_score",
+    "capacity_gap_score",
 ]
-CATEGORICAL_FEATURES = ["time_bucket", "clutter_class"]
+CATEGORICAL_FEATURES = ["time_bucket", "clutter_class", "dominant_band_class"]
 ALL_FEATURES = NUMERIC_FEATURES + CATEGORICAL_FEATURES
 
 DEFAULT_OPTUNA_TRIALS = 50
@@ -135,11 +152,32 @@ def rmse(y_true: np.ndarray, y_pred: np.ndarray) -> float:
     return float(np.sqrt(mean_squared_error(y_true, y_pred)))
 
 
+def mape(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+    y_true = np.asarray(y_true, dtype=float)
+    y_pred = np.asarray(y_pred, dtype=float)
+    denom = np.abs(y_true)
+    mask = denom > 1e-9
+    if not np.any(mask):
+        return float("nan")
+    return float(np.mean(np.abs((y_true[mask] - y_pred[mask]) / denom[mask])) * 100.0)
+
+
+def wape(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+    y_true = np.asarray(y_true, dtype=float)
+    y_pred = np.asarray(y_pred, dtype=float)
+    denom = np.abs(y_true).sum()
+    if denom <= 1e-9:
+        return float("nan")
+    return float(np.abs(y_true - y_pred).sum() / denom * 100.0)
+
+
 def compute_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> dict[str, float]:
     return {
         "mae": float(mean_absolute_error(y_true, y_pred)),
         "rmse": rmse(y_true, y_pred),
         "r2": float(r2_score(y_true, y_pred)),
+        "mape_pct": mape(y_true, y_pred),
+        "wape_pct": wape(y_true, y_pred),
     }
 
 
@@ -191,6 +229,34 @@ def temporal_split(df: pd.DataFrame, valid_fraction_of_part3: float = 0.60) -> t
 
     log.info("Temporal split -> TRAIN:%d | VALID:%d | TEST:%d", len(train_df), len(valid_df), len(test_df))
     return train_df, valid_df, test_df
+
+
+def limited_walk_forward_splits(df: pd.DataFrame) -> list[dict[str, object]]:
+    part1 = df[df["time_bucket"] == "PART_1"].copy()
+    part2 = df[df["time_bucket"] == "PART_2"].copy()
+    part3 = df[df["time_bucket"] == "PART_3"].copy()
+    splits: list[dict[str, object]] = []
+    if not part1.empty and not part2.empty:
+        splits.append(
+            {
+                "name": "PART1_to_PART2",
+                "train_label": "PART_1",
+                "eval_label": "PART_2",
+                "train_df": part1,
+                "eval_df": part2,
+            }
+        )
+    if not part1.empty and not part2.empty and not part3.empty:
+        splits.append(
+            {
+                "name": "PART1PART2_to_PART3",
+                "train_label": "PART_1 + PART_2",
+                "eval_label": "PART_3",
+                "train_df": pd.concat([part1, part2], ignore_index=True),
+                "eval_df": part3,
+            }
+        )
+    return splits
 
 
 def build_preprocessor() -> ColumnTransformer:
@@ -308,6 +374,101 @@ def evaluate(
     results["residual_std"] = round(float(np.std(residuals)), 4)
     save_json(results, out_dir / "metrics.json")
     return results
+
+
+def run_walk_forward_validation(
+    df: pd.DataFrame,
+    target_key: str,
+    best_params: dict,
+    out_dir: Path,
+) -> dict[str, object]:
+    target = TARGET_CONFIG[target_key]["target"]
+    folds: list[dict[str, object]] = []
+    for split in limited_walk_forward_splits(df):
+        train_df = split["train_df"]
+        eval_df = split["eval_df"]
+        pipeline = fit_pipeline(train_df[ALL_FEATURES], train_df[target], best_params)
+        pred = pipeline.predict(eval_df[ALL_FEATURES])
+        metrics = compute_metrics(eval_df[target].to_numpy(dtype=float), pred)
+        folds.append(
+            {
+                "name": split["name"],
+                "train": split["train_label"],
+                "eval": split["eval_label"],
+                "train_rows": int(len(train_df)),
+                "eval_rows": int(len(eval_df)),
+                "metrics": metrics,
+            }
+        )
+    summary = {
+        "target": target,
+        "fold_count": len(folds),
+        "folds": folds,
+    }
+    save_json(summary, out_dir / "walk_forward_validation.json")
+    return summary
+
+
+def run_clutter_transition_validation(
+    pipeline: Pipeline,
+    df_test: pd.DataFrame,
+    target: str,
+    target_key: str,
+    out_dir: Path,
+) -> dict[str, object]:
+    log.info("[%s] Evaluating clutter-transition behaviour", target_key)
+    work = df_test.copy()
+    work["prediction"] = pipeline.predict(df_test[ALL_FEATURES])
+
+    segments = {
+        "all_test": work,
+        "clutter_changed": work[work.get("clutter_transition_flag", 0) > 0],
+        "clutter_static": work[work.get("clutter_transition_flag", 0) <= 0],
+        "clutter_upgraded": work[work.get("clutter_upgrade_score", 0) > 0],
+    }
+    segment_metrics: dict[str, object] = {}
+    for name, segment in segments.items():
+        if segment.empty:
+            segment_metrics[name] = {"rows": 0}
+            continue
+        metrics = compute_metrics(
+            segment[target].to_numpy(dtype=float),
+            segment["prediction"].to_numpy(dtype=float),
+        )
+        metrics["rows"] = int(len(segment))
+        metrics["unique_grids"] = int(segment["grid_id"].nunique()) if "grid_id" in segment.columns else 0
+        metrics["mean_actual"] = round(float(segment[target].mean()), 4)
+        metrics["mean_prediction"] = round(float(segment["prediction"].mean()), 4)
+        segment_metrics[name] = metrics
+
+    by_clutter = (
+        work.groupby("clutter_class", dropna=False, as_index=False)
+        .apply(
+            lambda part: pd.Series(
+                {
+                    "rows": int(len(part)),
+                    "unique_grids": int(part["grid_id"].nunique()) if "grid_id" in part.columns else 0,
+                    "mae": compute_metrics(
+                        part[target].to_numpy(dtype=float),
+                        part["prediction"].to_numpy(dtype=float),
+                    )["mae"],
+                    "wape_pct": compute_metrics(
+                        part[target].to_numpy(dtype=float),
+                        part["prediction"].to_numpy(dtype=float),
+                    )["wape_pct"],
+                }
+            )
+        )
+        .reset_index(drop=True)
+    )
+    by_clutter.to_csv(out_dir / "clutter_transition_metrics.csv", index=False)
+    summary = {
+        "target": target,
+        "segments": segment_metrics,
+        "artifact_csv": "clutter_transition_metrics.csv",
+    }
+    save_json(summary, out_dir / "clutter_transition_validation.json")
+    return summary
 
 
 def run_shap(pipeline: Pipeline, X_test: pd.DataFrame, target_key: str, out_dir: Path) -> None:
@@ -440,6 +601,15 @@ def save_prediction_outputs(
         "traffic_demand_est",
         "prb_pressure_est",
         "growth_rate",
+        "development_pressure_score",
+        "growth_zone_score",
+        "clutter_transition_flag",
+        "clutter_upgrade_score",
+        "building_growth_ratio",
+        "road_growth_ratio",
+        "activity_anchor_score",
+        "capacity_context_score",
+        "capacity_gap_score",
     ]
     keep_cols = [col for col in keep_cols if col in pred_df.columns]
     pred_df[keep_cols].to_csv(out_dir / "test_predictions.csv", index=False)
@@ -551,6 +721,8 @@ def save_model(
     out_dir: Path,
     trials: int,
     timeout: int,
+    walk_forward_summary: dict[str, object],
+    clutter_validation_summary: dict[str, object],
 ) -> None:
     cfg = TARGET_CONFIG[target_key]
     target = cfg["target"]
@@ -582,7 +754,10 @@ def save_model(
             "valid": "first 60% of PART_3 in stable timestamp/grid order",
             "test": "last 40% of PART_3 in stable timestamp/grid order",
             "leakage_rule": "No PART_3 rows are used for training.",
+            "walk_forward_reference": "PART_1 -> PART_2, then PART_1 + PART_2 -> PART_3",
         },
+        "walk_forward_validation": walk_forward_summary,
+        "clutter_transition_validation": clutter_validation_summary,
         "artifacts": [
             cfg["model_file"],
             "metrics.json",
@@ -594,6 +769,9 @@ def save_model(
             "yb_prediction_error.png",
             "evidently_report.html",
             "test_predictions.csv",
+            "walk_forward_validation.json",
+            "clutter_transition_validation.json",
+            "clutter_transition_metrics.csv",
         ],
         "random_seed": RANDOM_SEED,
         "optuna_trials": trials,
@@ -603,6 +781,7 @@ def save_model(
 
 
 def train_target(
+    df_full: pd.DataFrame,
     df_train: pd.DataFrame,
     df_valid: pd.DataFrame,
     df_test: pd.DataFrame,
@@ -622,11 +801,23 @@ def train_target(
     best_params = run_optuna(X_train, y_train, X_valid, y_valid, target_key, out_dir, trials, timeout)
     pipeline = fit_pipeline(X_train, y_train, best_params)
     metrics = evaluate(pipeline, X_train, y_train, X_valid, y_valid, X_test, y_test, target_key, out_dir)
+    walk_forward_summary = run_walk_forward_validation(df_full, target_key, best_params, out_dir)
+    clutter_validation_summary = run_clutter_transition_validation(pipeline, df_test, target, target_key, out_dir)
     run_shap(pipeline, X_test, target_key, out_dir)
     run_yellowbrick(pipeline, X_train, y_train, X_test, y_test, target_key, out_dir)
     run_evidently(pipeline, df_train, df_test, target, target_key, out_dir)
     pred_df = save_prediction_outputs(pipeline, df_test, target, target_key, out_dir)
-    save_model(pipeline, target_key, metrics, best_params, out_dir, trials, timeout)
+    save_model(
+        pipeline,
+        target_key,
+        metrics,
+        best_params,
+        out_dir,
+        trials,
+        timeout,
+        walk_forward_summary,
+        clutter_validation_summary,
+    )
     return pred_df
 
 
@@ -665,7 +856,7 @@ def main() -> None:
         log.info("=" * 70)
         log.info("TARGET: %s (%s)", target_key, TARGET_CONFIG[target_key]["target"])
         log.info("=" * 70)
-        all_test_predictions[target_key] = train_target(train_df, valid_df, test_df, target_key, args.trials, args.timeout)
+        all_test_predictions[target_key] = train_target(df, train_df, valid_df, test_df, target_key, args.trials, args.timeout)
         metrics_path = MODEL_ROOT / target_key / "metrics.json"
         if metrics_path.exists():
             all_metrics[target_key] = json.loads(metrics_path.read_text(encoding="utf-8"))

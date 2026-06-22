@@ -3,6 +3,7 @@ from __future__ import annotations
 import math
 import os
 import re
+import json
 from datetime import date, datetime
 from typing import Any, Iterable
 
@@ -70,10 +71,13 @@ def _records(df: pd.DataFrame) -> list[dict[str, Any]]:
     safe_df = df.copy()
     safe_df = safe_df.replace({pd.NA: None})
     safe_df = safe_df.where(pd.notna(safe_df), None)
-    return [
-        {key: _json_safe(value) for key, value in row.items()}
-        for row in safe_df.to_dict(orient="records")
-    ]
+    try:
+        return json.loads(safe_df.to_json(orient="records", date_format="iso", date_unit="s"))
+    except Exception:
+        return [
+            {key: _json_safe(value) for key, value in row.items()}
+            for row in safe_df.to_dict(orient="records")
+        ]
 
 
 class PythonBridgeClient:
@@ -205,12 +209,19 @@ class PythonBridgeClient:
         end_date: str | None = None,
     ) -> pd.DataFrame:
         session_ids = [int(v) for v in session_ids if int(v) > 0]
+        print(
+            "[ReportLogs] requesting logs via PythonBridge "
+            f"sessions={len(session_ids)} project_id={project_id} "
+            f"provider={provider!r} start_date={start_date} end_date={end_date} limit={limit}"
+        )
         if os.getenv("REPORT_USE_MAPVIEW_NETWORKLOG_API", "0") == "1":
             try:
-                return self.get_mapview_network_logs(session_ids, limit=limit, project_id=project_id)
-            except PythonBridgeError:
-                pass
-        return self.post_rows(
+                df = self.get_mapview_network_logs(session_ids, limit=limit, project_id=project_id)
+                print(f"[ReportLogs] received rows from MapView/GetNetworkLog: {len(df)}")
+                return df
+            except PythonBridgeError as exc:
+                print(f"[ReportLogs] MapView/GetNetworkLog failed, falling back to PythonBridge: {exc}")
+        df = self.post_rows(
             "GetReportNetworkLogs",
             {
                 "SessionIds": session_ids,
@@ -222,6 +233,8 @@ class PythonBridgeClient:
             },
             limit=limit,
         )
+        print(f"[ReportLogs] received rows from PythonBridge/GetReportNetworkLogs: {len(df)}")
+        return df
 
     def get_mapview_network_logs(
         self,
@@ -288,7 +301,9 @@ class PythonBridgeClient:
         replace_existing: bool = False,
     ) -> int:
         total = 0
+        progress_enabled = os.getenv("PYTHON_BRIDGE_SAVE_PROGRESS", "1") != "0"
         for start in range(0, len(df), chunk_size):
+            chunk_started = datetime.now()
             chunk = df.iloc[start:start + chunk_size]
             payload = {
                 "ProjectId": int(project_id),
@@ -298,7 +313,16 @@ class PythonBridgeClient:
                 "Rows": _records(chunk),
             }
             result = self._request("POST", endpoint, json=payload)
-            total += int(result.get("Inserted") or result.get("Deleted") or 0)
+            written = int(result.get("Inserted") or result.get("Deleted") or 0)
+            total += written
+            if progress_enabled:
+                elapsed = (datetime.now() - chunk_started).total_seconds()
+                print(
+                    f"[PYTHON_BRIDGE_SAVE] endpoint={endpoint} offset={start} "
+                    f"rows={len(chunk)} written={written} total={total}/{len(df)} "
+                    f"elapsed_sec={elapsed:.2f}",
+                    flush=True,
+                )
         return total
 
     def get_grid_analytics(

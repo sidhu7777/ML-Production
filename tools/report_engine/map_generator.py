@@ -8,6 +8,10 @@ import math
 import os
 import re
 
+REPORT_MAP_MAX_ZOOM = 22
+REPORT_MAP_PADDING_PX = 90
+REPORT_MAP_LEGEND_RIGHT_PADDING_PX = 420
+
 # Helper function to add legend to folium map
 
 def add_fullscreen_css(m):
@@ -15,9 +19,25 @@ def add_fullscreen_css(m):
     <style>
         html, body { width: 100%; height: 100%; margin: 0; padding: 0; }
         .folium-map { width: 100% !important; height: 100% !important; position: relative; }
+        .leaflet-control-container { display: none !important; }
     </style>
     """
     m.get_root().header.add_child(folium.Element(css))
+
+
+def fit_report_bounds(m, bounds, reserve_legend_space=False):
+    """Fit report map content tightly with a print-friendly margin."""
+    right_padding = (
+        REPORT_MAP_LEGEND_RIGHT_PADDING_PX
+        if reserve_legend_space
+        else REPORT_MAP_PADDING_PX
+    )
+    m.fit_bounds(
+        bounds,
+        padding_top_left=(REPORT_MAP_PADDING_PX, REPORT_MAP_PADDING_PX),
+        padding_bottom_right=(right_padding, REPORT_MAP_PADDING_PX),
+        max_zoom=REPORT_MAP_MAX_ZOOM,
+    )
 
 
 def add_legend(m, title, items):
@@ -271,7 +291,8 @@ def generate_debug_map(df, polygon_wkt, output_path, sample_points=50):
         tiles="CartoDB positron",  # cleaner than OSM
         zoom_control=True,
         control_scale=False,
-        prefer_canvas=True
+        prefer_canvas=True,
+        max_zoom=REPORT_MAP_MAX_ZOOM
     )
 
     add_fullscreen_css(m)
@@ -323,7 +344,7 @@ def generate_debug_map(df, polygon_wkt, output_path, sample_points=50):
     # Fit view to polygon + route with minimal padding
     bounds = merge_bounds(get_df_bounds(df), get_polygon_bounds(polygon_wkt))
     bounds = expand_bounds(bounds, expand_factor=0.02)
-    m.fit_bounds(bounds, max_zoom=18)
+    fit_report_bounds(m, bounds)
 
     m.save(output_path)
 
@@ -341,7 +362,8 @@ def generate_kpi_map(df, kpi_column, color_func,ranges, output_html, polygon_wkt
         tiles="CartoDB positron",  # cleaner than OSM
         zoom_control=True,
         control_scale=False,
-        prefer_canvas=True
+        prefer_canvas=True,
+        max_zoom=REPORT_MAP_MAX_ZOOM
     )
 
     add_fullscreen_css(m)
@@ -400,13 +422,7 @@ def generate_kpi_map(df, kpi_column, color_func,ranges, output_html, polygon_wkt
     # Minimal expansion - only 2% to avoid clipping
     bounds = expand_bounds(bounds, expand_factor=0.02)
     
-    # Tight padding: small left/top, room for legend on right
-    m.fit_bounds(
-        bounds,
-        padding_top_left=(20, 20),
-        padding_bottom_right=(320, 20),
-        max_zoom=18
-    )
+    fit_report_bounds(m, bounds, reserve_legend_space=True)
     
     m.save(output_html)
 
@@ -579,7 +595,8 @@ def generate_categorical_kpi_map(df, kpi_column, output_html, polygon_wkt=None):
         tiles="CartoDB positron",  # cleaner than OSM
         zoom_control=True,
         control_scale=False,
-        prefer_canvas=True
+        prefer_canvas=True,
+        max_zoom=REPORT_MAP_MAX_ZOOM
     )
 
     add_fullscreen_css(m)
@@ -674,13 +691,7 @@ def generate_categorical_kpi_map(df, kpi_column, output_html, polygon_wkt=None):
     # Minimal expansion - only 2% to avoid clipping
     bounds = expand_bounds(bounds, expand_factor=0.02)
     
-    # Tight padding: small left/top, room for legend on right
-    m.fit_bounds(
-        bounds,
-        padding_top_left=(20, 20),
-        padding_bottom_right=(320, 20),
-        max_zoom=18
-    )
+    fit_report_bounds(m, bounds, reserve_legend_space=True)
     
     m.save(output_html)
 
@@ -942,7 +953,8 @@ def generate_poor_region_map(
         tiles="CartoDB positron",
         zoom_control=True,
         control_scale=False,
-        prefer_canvas=True
+        prefer_canvas=True,
+        max_zoom=REPORT_MAP_MAX_ZOOM
     )
 
     add_fullscreen_css(fmap)
@@ -999,12 +1011,7 @@ def generate_poor_region_map(
 
     bounds = expand_bounds(bounds, expand_factor=0.02)
 
-    fmap.fit_bounds(
-        bounds,
-        padding_top_left=(20, 20),
-        padding_bottom_right=(320, 20),
-        max_zoom=18
-    )
+    fit_report_bounds(fmap, bounds, reserve_legend_space=True)
 
     fmap.save(tmp_html)
 
@@ -1040,7 +1047,8 @@ def generate_base_route_map(df, polygon_wkt, output_html):
         tiles="CartoDB positron",
         zoom_control=True,
         control_scale=False,
-        prefer_canvas=True
+        prefer_canvas=True,
+        max_zoom=REPORT_MAP_MAX_ZOOM
     )
 
     add_fullscreen_css(m)
@@ -1076,7 +1084,7 @@ def generate_base_route_map(df, polygon_wkt, output_html):
         bounds = merge_bounds(bounds, get_polygon_bounds(polygon_wkt))
 
     bounds = expand_bounds(bounds, expand_factor=0.02)
-    m.fit_bounds(bounds, max_zoom=18)
+    fit_report_bounds(m, bounds)
 
     m.save(output_html)
 
@@ -1121,7 +1129,13 @@ def generate_handover_map(filtered_df, events, output_html, polygon_wkt=None):
         if str(ev.get("type") or "").lower() == "band"
     ]
 
-    m = folium.Map(tiles="CartoDB positron", zoom_control=True, control_scale=False, prefer_canvas=True)
+    m = folium.Map(
+        tiles="CartoDB positron",
+        zoom_control=True,
+        control_scale=False,
+        prefer_canvas=True,
+        max_zoom=REPORT_MAP_MAX_ZOOM
+    )
     add_fullscreen_css(m)
 
     # Draw dense route points only (no polylines).
@@ -1206,6 +1220,6 @@ def generate_handover_map(filtered_df, events, output_html, polygon_wkt=None):
     if polygon_wkt:
         bounds = merge_bounds(bounds, get_polygon_bounds(polygon_wkt))
     bounds = expand_bounds(bounds, expand_factor=0.02)
-    m.fit_bounds(bounds, max_zoom=18)
+    fit_report_bounds(m, bounds, reserve_legend_space=bool(events))
 
     m.save(output_html)
