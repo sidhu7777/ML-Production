@@ -288,8 +288,8 @@ def _fetch_baseline_log_df(current_engine, project_id: int, operator_input, is_a
     filters = ["project_id = :pid", "job_id = :job_id"]
     params = {"pid": int(project_id), "job_id": baseline_job_id}
     if not is_all_operators and "operator" in select_cols:
-        filters.append("operator = :op")
-        params["op"] = operator_input
+        filters.append("LOWER(TRIM(operator)) = :op")
+        params["op"] = str(operator_input).strip().lower()
 
     query = text(
         f"""
@@ -368,8 +368,14 @@ def _fetch_grid_analytics_df(current_engine, project_id: int, operator_input, is
     return grid_df
 
 
-def _bridge_latest_baseline_job_id(bridge, project_id: int) -> str:
-    payload = bridge._request("GET", "GetLatestLteBaselineJobId", params={"projectId": int(project_id)})
+def _bridge_latest_baseline_job_id(bridge, project_id: int, region: str, operator_input, is_all_operators: bool) -> str:
+    params = {
+        "projectId": int(project_id),
+        "region": region,
+    }
+    if not is_all_operators:
+        params["operator"] = operator_input
+    payload = bridge._request("GET", "GetLatestLteBaselineJobId", params=params)
     job_id = payload.get("JobId") or payload.get("jobId")
     if not job_id:
         raise ValueError(f"No baseline results found for project {project_id}")
@@ -377,7 +383,7 @@ def _bridge_latest_baseline_job_id(bridge, project_id: int) -> str:
 
 
 def _bridge_fetch_baseline_log_df(bridge, project_id: int, region: str, operator_input, is_all_operators: bool) -> tuple[pd.DataFrame, str]:
-    baseline_job_id = _bridge_latest_baseline_job_id(bridge, int(project_id))
+    baseline_job_id = _bridge_latest_baseline_job_id(bridge, int(project_id), region, operator_input, is_all_operators)
     params = {
         "projectId": int(project_id),
         "region": region,
@@ -397,7 +403,8 @@ def _bridge_fetch_baseline_log_df(bridge, project_id: int, region: str, operator
     if "job_id" in log_df.columns:
         log_df = log_df.loc[log_df["job_id"].astype(str) == baseline_job_id].copy()
     if not is_all_operators and "operator" in log_df.columns:
-        log_df = log_df.loc[log_df["operator"].astype(str).str.strip() == str(operator_input).strip()].copy()
+        requested_operator = str(operator_input).strip().lower()
+        log_df = log_df.loc[log_df["operator"].astype(str).str.strip().str.lower() == requested_operator].copy()
     if log_df.empty:
         raise ValueError(f"No baseline rows found for project {project_id} job_id={baseline_job_id}")
     print(f"[TILT][BASELINE_FETCH] source=python_bridge rows={len(log_df)} baseline_job_id={baseline_job_id}")

@@ -102,6 +102,29 @@ def _filter_df_by_polygons_swapped(df: pd.DataFrame, polygons: list) -> pd.DataF
     return df.loc[mask].reset_index(drop=True)
 
 
+def _filter_primary_rows(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Keep only primary-serving rows.
+
+    The frontend uses the registered-cell marker inside `primary_cell_info_1`
+    (mRegistered=YES). Some datasets also expose an explicit `primary` column,
+    so support both forms here.
+    """
+    if df.empty:
+        return df
+
+    if "primary_cell_info_1" in df.columns:
+        primary_info = df["primary_cell_info_1"].fillna("").astype(str)
+        primary_mask = primary_info.str.contains("mRegistered=YES", case=False, na=False)
+    elif "primary" in df.columns:
+        primary_values = df["primary"].fillna("").astype(str).str.strip().str.lower()
+        primary_mask = primary_values.isin({"yes", "y", "true", "1"})
+    else:
+        return df
+
+    return df.loc[primary_mask].reset_index(drop=True)
+
+
 # -----------------------------------------------------
 # MAIN LOADER (THIS IS WHAT YOU IMPORT)
 # -----------------------------------------------------
@@ -150,15 +173,18 @@ def load_project_data(project_id: int):
 
         
 
-        # 3 Regions / polygons
+        # 3 Primary row filtering
+        primary_df = _filter_primary_rows(raw_df)
+
+        # 4 Regions / polygons
         region_rows = get_project_regions(project_id, conn)
         polygons = _parse_polygons(region_rows)
 
-        # 4 Spatial filtering
-        filtered_df = _filter_df_by_polygons(raw_df, polygons)
+        # 5 Spatial filtering
+        filtered_df = _filter_df_by_polygons(primary_df, polygons)
         print(
             "[ReportLogs] polygon filter result "
-            f"project_id={project_id} polygons={len(polygons)} rows_before={len(raw_df)} "
+            f"project_id={project_id} polygons={len(polygons)} rows_before={len(primary_df)} "
             f"rows_after={len(filtered_df)}"
         )
         used_polygons = polygons
@@ -168,7 +194,7 @@ def load_project_data(project_id: int):
         if filtered_df.empty and polygons:
             print("WARNING: Polygon filter returned 0 rows, retrying with swapped polygon coordinates.")
             swapped_polygons = _swap_polygon_coords(polygons)
-            filtered_df = _filter_df_by_polygons(raw_df, swapped_polygons)
+            filtered_df = _filter_df_by_polygons(primary_df, swapped_polygons)
             print(
                 "[ReportLogs] swapped polygon filter result "
                 f"project_id={project_id} rows_after={len(filtered_df)}"
@@ -177,7 +203,7 @@ def load_project_data(project_id: int):
                 used_polygons = swapped_polygons
                 used_region_wkts = _polygons_to_wkt(swapped_polygons)
 
-        # 5 Add region WKT to project metadata for map generation
+        # 6 Add region WKT to project metadata for map generation
         if used_region_wkts:
             project["region"] = used_region_wkts[0]
         elif region_rows and len(region_rows) > 0:

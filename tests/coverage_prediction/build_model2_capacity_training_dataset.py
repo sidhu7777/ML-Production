@@ -42,6 +42,20 @@ PRB_PRESSURE_CAP = 40.0
 PRB_OUTLIER_THRESHOLD = 100.0
 
 BAND_CLASS_LABELS = ("LOW_BAND", "MID_BAND", "HIGH_BAND")
+BAND_FEATURE_COLUMNS = [
+    "grid_id",
+    "time_bucket",
+    "low_band_ratio",
+    "mid_band_ratio",
+    "high_band_ratio",
+    "dominant_band_class",
+    "carrier_count",
+]
+DEFAULT_BUCKET_BAND_MIX_PLAN = {
+    "PART_1": {900: 0.15, 1800: 0.69, 850: 0.15, 2300: 0.01},
+    "PART_2": {900: 0.11, 1800: 0.76, 850: 0.10, 2300: 0.03},
+    "PART_3": {900: 0.08, 1800: 0.80, 850: 0.07, 2300: 0.05},
+}
 
 
 def _safe_numeric(df: pd.DataFrame, col: str, default: float = 0.0) -> pd.Series:
@@ -112,7 +126,11 @@ def _derive_growth_rate(df: pd.DataFrame) -> pd.Series:
     return growth.reindex(work.index).sort_index()
 
 
-def _classify_band(freq_value: object) -> str:
+def _empty_band_features() -> pd.DataFrame:
+    return pd.DataFrame(columns=BAND_FEATURE_COLUMNS)
+
+
+def _classify_mhz(freq_value: object) -> str:
     try:
         freq = float(freq_value)
     except (TypeError, ValueError):
@@ -126,18 +144,68 @@ def _classify_band(freq_value: object) -> str:
     return "HIGH_BAND"
 
 
-def _derive_band_features(pred_df: pd.DataFrame) -> pd.DataFrame:
-    if pred_df.empty or "grid_id" not in pred_df.columns or "time_bucket" not in pred_df.columns:
-        return pd.DataFrame(columns=["grid_id", "time_bucket", "low_band_ratio", "mid_band_ratio", "high_band_ratio", "dominant_band_class", "carrier_count"])
+def _classify_lte_earfcn(earfcn_value: object) -> str:
+    try:
+        earfcn = float(earfcn_value)
+    except (TypeError, ValueError):
+        return "UNKNOWN"
+    if not math.isfinite(earfcn) or earfcn <= 0:
+        return "UNKNOWN"
 
-    work = pred_df.copy()
+    # Common LTE/NR ARFCN ranges seen in Indian planning exports.
+    # We classify by approximate downlink carrier family, not by bandwidth.
+    if 2400 <= earfcn <= 2649:  # LTE band 5, ~850 MHz
+        return "LOW_BAND"
+    if 3450 <= earfcn <= 3799:  # LTE band 8, ~900 MHz
+        return "LOW_BAND"
+    if 1200 <= earfcn <= 1949:  # LTE band 3, ~1800 MHz
+        return "MID_BAND"
+    if 0 <= earfcn <= 599:  # LTE band 1, ~2100 MHz
+        return "HIGH_BAND"
+    if 38650 <= earfcn <= 39649:  # LTE band 40, ~2300 MHz
+        return "HIGH_BAND"
+    if 39650 <= earfcn <= 41589:  # LTE band 41, ~2500 MHz
+        return "HIGH_BAND"
+    if earfcn >= 600000:  # NR ARFCN, usually capacity/high-band in these exports
+        return "HIGH_BAND"
+
+    # Some sources store MHz in an EARFCN-named column.
+    if 600 <= earfcn <= 6000:
+        return _classify_mhz(earfcn)
+    return "UNKNOWN"
+
+
+def _classify_band_value(value: object, source_col: str) -> str:
+    source = str(source_col).lower()
+    if "earfcn" in source:
+        return _classify_lte_earfcn(value)
+    return _classify_mhz(value)
+
+
+def _band_source_column(df: pd.DataFrame) -> str | None:
+    for candidate in [
+        "band",
+        "frequency_mhz",
+        "frequency",
+        "downlink_frequency",
+        "uplink_center_frequency",
+        "earfcn",
+        "dominant_earfcn",
+        "corrected_dominant_earfcn",
+    ]:
+        if candidate in df.columns:
+            return candidate
+    return None
+
+
+def _derive_band_features_from_rows(source_df: pd.DataFrame) -> pd.DataFrame:
+    if source_df.empty or "grid_id" not in source_df.columns or "time_bucket" not in source_df.columns:
+        return _empty_band_features()
+
+    work = source_df.copy()
     work["grid_id"] = pd.to_numeric(work["grid_id"], errors="coerce").astype("Int64")
     work["time_bucket"] = work["time_bucket"].astype(str)
-    band_source = None
-    for candidate in ["band", "frequency", "earfcn"]:
-        if candidate in work.columns:
-            band_source = candidate
-            break
+    band_source = _band_source_column(work)
     if band_source is None:
         out = work[["grid_id", "time_bucket"]].drop_duplicates().copy()
         out["low_band_ratio"] = 0.0
@@ -147,7 +215,7 @@ def _derive_band_features(pred_df: pd.DataFrame) -> pd.DataFrame:
         out["carrier_count"] = 0
         return out
 
-    work["band_class"] = work[band_source].map(_classify_band)
+    work["band_class"] = work[band_source].map(lambda value: _classify_band_value(value, band_source))
     work = work.dropna(subset=["grid_id"])
 
     counts = (
@@ -195,6 +263,90 @@ def _derive_band_features(pred_df: pd.DataFrame) -> pd.DataFrame:
         "carrier_count",
     ]
     return pivot[keep]
+
+
+def _derive_band_features(pred_df: pd.DataFrame, kpi_df: pd.DataFrame) -> Tuple[pd.DataFrame, str]:
+    pred_band_features = _derive_band_features_from_rows(pred_df)
+    if not pred_band_features.empty and (pred_band_features[["low_band_ratio", "mid_band_ratio", "high_band_ratio"]].sum(axis=1) > 0).any():
+        return pred_band_features, "prediction_grid"
+
+    kpi_band_features = _derive_band_features_from_rows(kpi_df)
+    if not kpi_band_features.empty and (kpi_band_features[["low_band_ratio", "mid_band_ratio", "high_band_ratio"]].sum(axis=1) > 0).any():
+        return kpi_band_features, "grid_kpi_timeseries"
+
+    if not pred_band_features.empty:
+        return pred_band_features, "prediction_grid_empty"
+    if not kpi_band_features.empty:
+        return kpi_band_features, "grid_kpi_timeseries_empty"
+    return _empty_band_features(), "missing"
+
+
+def _normalise_band_mix_plan(raw_plan: object) -> Dict[str, Dict[float, float]]:
+    if not isinstance(raw_plan, dict):
+        raw_plan = DEFAULT_BUCKET_BAND_MIX_PLAN
+    out: Dict[str, Dict[float, float]] = {}
+    for bucket, plan in raw_plan.items():
+        if not isinstance(plan, dict):
+            continue
+        bucket_plan: Dict[float, float] = {}
+        for band, ratio in plan.items():
+            try:
+                band_value = float(band)
+                ratio_value = float(ratio)
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(band_value) and math.isfinite(ratio_value) and ratio_value > 0:
+                bucket_plan[band_value] = ratio_value
+        if bucket_plan:
+            out[str(bucket)] = bucket_plan
+    return out or _normalise_band_mix_plan(DEFAULT_BUCKET_BAND_MIX_PLAN)
+
+
+def _bucket_mix_ratios(bucket_label: object, band_mix_plan: Dict[str, Dict[float, float]]) -> Dict[str, float]:
+    plan = band_mix_plan.get(str(bucket_label), {})
+    totals = {label: 0.0 for label in BAND_CLASS_LABELS}
+    for band, ratio in plan.items():
+        band_class = _classify_mhz(band)
+        if band_class in totals:
+            totals[band_class] += float(ratio)
+    total = sum(totals.values())
+    if total <= 0:
+        return {label: 0.0 for label in BAND_CLASS_LABELS}
+    return {label: totals[label] / total for label in BAND_CLASS_LABELS}
+
+
+def _apply_bucket_band_mix_fallback(
+    df: pd.DataFrame,
+    source_summary: Dict[str, object],
+) -> Tuple[pd.DataFrame, int, str]:
+    out = df.copy()
+    raw_plan = source_summary.get("band_mix_plan") or source_summary.get("topology_plan", {}).get("band_mix_plan")
+    plan = _normalise_band_mix_plan(raw_plan)
+    source = "source_summary_band_mix_plan" if raw_plan else "default_current_bucket_band_mix_plan"
+
+    ratio_sum = (
+        pd.to_numeric(out.get("low_band_ratio"), errors="coerce").fillna(0.0)
+        + pd.to_numeric(out.get("mid_band_ratio"), errors="coerce").fillna(0.0)
+        + pd.to_numeric(out.get("high_band_ratio"), errors="coerce").fillna(0.0)
+    )
+    missing_mask = ratio_sum.le(0.0)
+    if not missing_mask.any():
+        return out, 0, source
+
+    filled = 0
+    for bucket_label, bucket_idx in out.loc[missing_mask].groupby(out.loc[missing_mask, "time_bucket"].astype(str)).groups.items():
+        ratios = _bucket_mix_ratios(bucket_label, plan)
+        if sum(ratios.values()) <= 0:
+            continue
+        idx = list(bucket_idx)
+        out.loc[idx, "low_band_ratio"] = ratios["LOW_BAND"]
+        out.loc[idx, "mid_band_ratio"] = ratios["MID_BAND"]
+        out.loc[idx, "high_band_ratio"] = ratios["HIGH_BAND"]
+        best_label = max(ratios, key=ratios.get)
+        out.loc[idx, "dominant_band_class"] = best_label if ratios[best_label] > 0 else "UNKNOWN"
+        out.loc[idx, "carrier_count"] = int(sum(1 for value in ratios.values() if value > 0))
+        filled += len(idx)
+    return out, int(filled), source
 
 
 def _ratio_vs_first_bucket(df: pd.DataFrame, value_col: str) -> pd.Series:
@@ -456,10 +608,11 @@ def build_dataset(archive_path: Path, output_csv: Path, work_dir: Path) -> Tuple
         ]
         if col in geo_df.columns
     ]
-    band_features_df = _derive_band_features(pred_df)
+    band_features_df, band_feature_source = _derive_band_features(pred_df, kpi_df)
     merged = kpi_df.merge(geo_df[geo_keep], on=join_keys, how="left", validate="one_to_one")
     merged = merged.merge(band_features_df, on=join_keys, how="left", validate="one_to_one")
     enriched = _add_model2_features(merged)
+    enriched, band_mix_fallback_rows, band_mix_fallback_source = _apply_bucket_band_mix_fallback(enriched, source_summary)
 
     preferred_cols = [
         "time_bucket",
@@ -547,10 +700,20 @@ def build_dataset(archive_path: Path, output_csv: Path, work_dir: Path) -> Tuple
         "dominant_band_class_counts": {
             str(k): int(v) for k, v in enriched.get("dominant_band_class", pd.Series(dtype="object")).value_counts(dropna=False).items()
         },
+        "band_feature_source": band_feature_source,
+        "band_mix_fallback_source": band_mix_fallback_source,
+        "band_mix_fallback_rows": band_mix_fallback_rows,
+        "band_ratio_nonzero_rows": int(
+            (
+                pd.to_numeric(enriched.get("low_band_ratio"), errors="coerce").fillna(0.0)
+                + pd.to_numeric(enriched.get("mid_band_ratio"), errors="coerce").fillna(0.0)
+                + pd.to_numeric(enriched.get("high_band_ratio"), errors="coerce").fillna(0.0)
+            ).gt(0.0).sum()
+        ),
         "notes": [
             "Built from existing coverage artifacts only; coverage pipeline was not rerun.",
             "Demand features use geo context, KPI bucket history, and added development/capacity context features.",
-            "Band-family ratios and dominant band class are derived from saved corrected prediction grid rows.",
+            "Band-family ratios and dominant band class are derived from prediction-grid band columns when available, otherwise from grid_kpi_timeseries dominant EARFCN.",
             "estimated_prb_mean is retained as the raw unbounded proxy for audit only.",
             "Model 2 training should use prb_pressure_est, capped at 40, instead of raw estimated_prb_mean.",
             "active_users_est is an estimated proxy because real subscriber counters are not present in the source data.",

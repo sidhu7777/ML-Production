@@ -69,6 +69,12 @@ TARGET_CONFIG = {
 }
 TARGETS = [cfg["target"] for cfg in TARGET_CONFIG.values()]
 
+SHAP_DISPLAY_LABELS = {
+    "model2a_demand": "Model 2a Demand",
+    "model2b_users": "Model 2b Users",
+    "model2c_traffic": "Model 2c Traffic",
+}
+
 NUMERIC_FEATURES = [
     "bucket_seq",
     "building_count",
@@ -497,6 +503,8 @@ def run_shap(pipeline: Pipeline, X_test: pd.DataFrame, target_key: str, out_dir:
 
         plt.figure(figsize=(10, 7))
         shap.summary_plot(shap_vals, X_t, feature_names=feature_names, show=False, max_display=20)
+        fig = plt.gcf()
+        fig.suptitle(f"{SHAP_DISPLAY_LABELS.get(target_key, target_key)} - SHAP Summary", fontsize=16, y=0.98)
         plt.tight_layout()
         plt.savefig(out_dir / "shap_summary.png", dpi=150, bbox_inches="tight")
         plt.close("all")

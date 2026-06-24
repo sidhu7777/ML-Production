@@ -161,6 +161,36 @@ def _ensure_node_cell(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+_MATCH_ALIAS_COLS = [
+    "Node_Cell_ID",
+    "rf_identity_key",
+    "sector_identity_key",
+    "site_sector_band_key",
+    "legacy_nodeb_id_cell_id",
+    "frontend_site_sector_key",
+    "nodeb_id_cell_id",
+    "canonical_cell_id",
+    "cell_id",
+    "local_cell_id",
+]
+
+
+def _identity_match_mask(df: pd.DataFrame, cell_id: object) -> pd.Series:
+    target = _clean_id(cell_id)
+    if df.empty or not target:
+        return pd.Series(False, index=df.index)
+    target_aliases = {target, canonical_cell_id(target)}
+    for col in [c for c in _MATCH_ALIAS_COLS if c in df.columns]:
+        values = df[col].map(_clean_id)
+        mask = values.isin(target_aliases)
+        if bool(mask.any()):
+            return mask
+        canonical_mask = values.map(canonical_cell_id).isin(target_aliases)
+        if bool(canonical_mask.any()):
+            return canonical_mask
+    return pd.Series(False, index=df.index)
+
+
 def _prepare_optimizer_site_df(antenna_df: pd.DataFrame) -> pd.DataFrame:
     out = _ensure_node_cell(antenna_df)
     if "cell_id" in out.columns and "local_cell_id" not in out.columns:
@@ -211,7 +241,7 @@ def _apply_updates_to_site_df(
         target = pd.to_numeric(pd.Series([update.get("target_value")]), errors="coerce").iloc[0]
         if not cell_id or site_col is None or pd.isna(target):
             continue
-        mask = site_df["Node_Cell_ID"].astype(str).str.strip() == cell_id
+        mask = _identity_match_mask(site_df, cell_id)
         if not mask.any():
             suffix = cell_id.split("_")[-1]
             mask = site_df.get("cell_id", pd.Series("", index=site_df.index)).map(_clean_id) == suffix
@@ -892,7 +922,10 @@ def _build_recompute_cells(
         ant = opt_ml._normalize_site_df(_prepare_optimizer_site_df(antenna_df), log_stage="TILT_COORDINATE_RECOMPUTE")
     recompute = set(update_set)
     if {"Node_Cell_ID", "dashboard_site_id"}.issubset(ant.columns):
-        sites = set(ant.loc[ant["Node_Cell_ID"].astype(str).isin(update_set), "dashboard_site_id"].astype(str).tolist())
+        update_mask = pd.Series(False, index=ant.index)
+        for cell in update_set:
+            update_mask = update_mask | _identity_match_mask(ant, cell)
+        sites = set(ant.loc[update_mask, "dashboard_site_id"].astype(str).tolist())
         recompute.update(ant.loc[ant["dashboard_site_id"].astype(str).isin(sites), "Node_Cell_ID"].astype(str).tolist())
     topology_cols = [col for col in ["best_interferer_cell_id", "neighbor_1_cell_id", "neighbor_2_cell_id"] if col in baseline_df.columns]
     neighbor_counts: Dict[str, int] = {}
@@ -905,8 +938,7 @@ def _build_recompute_cells(
                     neighbor_counts[cell] = neighbor_counts.get(cell, 0) + 1
     max_neighbors = max(0, int(max_neighbors_per_update_cell)) * max(1, len(update_set))
     recompute.update([cell for cell, _ in sorted(neighbor_counts.items(), key=lambda item: (-item[1], item[0]))[:max_neighbors]])
-    available = set(ant["Node_Cell_ID"].astype(str).tolist()) if "Node_Cell_ID" in ant.columns else set()
-    return sorted(cell for cell in recompute if cell in available)
+    return sorted(cell for cell in recompute if bool(_identity_match_mask(ant, cell).any()))
 
 
 def _make_etilt_update(
@@ -920,7 +952,7 @@ def _make_etilt_update(
         ant = antenna_work_df
     else:
         ant = opt_ml._normalize_site_df(_prepare_optimizer_site_df(antenna_df), log_stage="TILT_COORDINATE_UPDATE")
-    row = ant.loc[ant["Node_Cell_ID"].astype(str).str.strip() == str(cell_id).strip()]
+    row = ant.loc[_identity_match_mask(ant, cell_id)]
     if row.empty:
         return None
     current = pd.to_numeric(pd.Series([row.iloc[0].get("electrical_tilt")]), errors="coerce").iloc[0]
@@ -1005,7 +1037,7 @@ def _make_azimuth_update(
     else:
         ant = opt_ml._normalize_site_df(_prepare_optimizer_site_df(antenna_df), log_stage="TILT_COORDINATE_AZIMUTH_UPDATE")
     cell_key = str(cell_id).strip()
-    row = ant.loc[ant["Node_Cell_ID"].astype(str).str.strip() == cell_key]
+    row = ant.loc[_identity_match_mask(ant, cell_key)]
     if row.empty:
         suffix = cell_key.split("_")[-1]
         row = ant.loc[ant.get("cell_id", pd.Series("", index=ant.index)).map(_clean_id) == suffix]

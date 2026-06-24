@@ -14,6 +14,7 @@ from __future__ import annotations
 import io
 import json
 import logging
+import math
 import subprocess
 import sys
 import warnings
@@ -49,6 +50,12 @@ LOG_PATH = MODEL_ROOT / "training.log"
 
 TARGETS = ["pred_rsrp", "pred_rsrq", "pred_sinr"]
 
+DEFAULT_BUCKET_BAND_MIX_PLAN = {
+    "PART_1": {900: 0.15, 1800: 0.69, 850: 0.15, 2300: 0.01},
+    "PART_2": {900: 0.11, 1800: 0.76, 850: 0.10, 2300: 0.03},
+    "PART_3": {900: 0.08, 1800: 0.80, 850: 0.07, 2300: 0.05},
+}
+
 NUMERIC_FEATURES = [
     "grid_centroid_lat",
     "grid_centroid_lon",
@@ -78,6 +85,20 @@ NUMERIC_FEATURES = [
     "site_count_250m",
     "site_count_500m",
     "azimuth_delta_deg",
+    "bandwidth_mhz_est",
+    "low_band_ratio",
+    "mid_band_ratio",
+    "high_band_ratio",
+    "carrier_count",
+    "clutter_transition_flag",
+    "clutter_upgrade_score",
+    "morphology_cluster",
+    "interference_gap_db",
+    "interference_ratio_linear",
+    "terrain_elevation_m",
+    "terrain_slope_deg",
+    "los_blocked_ratio",
+    "nlos_flag",
     "prev_obs_rsrp",
     "prev_obs_rsrq",
     "prev_obs_sinr",
@@ -89,7 +110,7 @@ NUMERIC_FEATURES = [
     "prev_trend_sinr",
 ]
 
-CATEGORICAL_FEATURES = ["clutter_class"]
+CATEGORICAL_FEATURES = ["clutter_class", "dominant_band_class"]
 ALL_FEATURES = NUMERIC_FEATURES + CATEGORICAL_FEATURES
 
 OPTUNA_TRIALS = 50
@@ -263,19 +284,188 @@ def _add_temporal_history_features(df: pd.DataFrame) -> pd.DataFrame:
     return work
 
 
+def _classify_mhz(freq_value: object) -> str:
+    try:
+        freq = float(freq_value)
+    except (TypeError, ValueError):
+        return "UNKNOWN"
+    if not math.isfinite(freq) or freq <= 0:
+        return "UNKNOWN"
+    if freq <= 1000:
+        return "LOW_BAND"
+    if freq <= 2000:
+        return "MID_BAND"
+    return "HIGH_BAND"
+
+
+def _classify_lte_earfcn(earfcn_value: object) -> str:
+    try:
+        earfcn = float(earfcn_value)
+    except (TypeError, ValueError):
+        return "UNKNOWN"
+    if not math.isfinite(earfcn) or earfcn <= 0:
+        return "UNKNOWN"
+    if 2400 <= earfcn <= 2649:
+        return "LOW_BAND"
+    if 3450 <= earfcn <= 3799:
+        return "LOW_BAND"
+    if 1200 <= earfcn <= 1949:
+        return "MID_BAND"
+    if 0 <= earfcn <= 599:
+        return "HIGH_BAND"
+    if 38650 <= earfcn <= 39649:
+        return "HIGH_BAND"
+    if 39650 <= earfcn <= 41589:
+        return "HIGH_BAND"
+    if earfcn >= 600000:
+        return "HIGH_BAND"
+    if 600 <= earfcn <= 6000:
+        return _classify_mhz(earfcn)
+    return "UNKNOWN"
+
+
+def _bucket_band_mix_ratios(bucket_label: object) -> dict[str, float]:
+    plan = DEFAULT_BUCKET_BAND_MIX_PLAN.get(str(bucket_label), DEFAULT_BUCKET_BAND_MIX_PLAN["PART_3"])
+    totals = {"LOW_BAND": 0.0, "MID_BAND": 0.0, "HIGH_BAND": 0.0}
+    for band, ratio in plan.items():
+        totals[_classify_mhz(band)] += float(ratio)
+    total = sum(totals.values())
+    if total <= 0:
+        return {key: 0.0 for key in totals}
+    return {key: value / total for key, value in totals.items()}
+
+
+def _derive_band_features_from_kpi(kpi_df: pd.DataFrame) -> pd.DataFrame:
+    if kpi_df.empty:
+        return pd.DataFrame(
+            columns=[
+                "grid_id",
+                "grid_row",
+                "grid_col",
+                "grid_centroid_lat",
+                "grid_centroid_lon",
+                "time_bucket",
+                "bandwidth_mhz_est",
+                "low_band_ratio",
+                "mid_band_ratio",
+                "high_band_ratio",
+                "dominant_band_class",
+                "carrier_count",
+            ]
+        )
+    work = kpi_df.copy()
+    work["dominant_band_class"] = work.get("dominant_earfcn", pd.Series(index=work.index, dtype=float)).map(_classify_lte_earfcn)
+    work["bandwidth_mhz_est"] = pd.to_numeric(work.get("bandwidth_mhz_est"), errors="coerce")
+    ratios = work["time_bucket"].astype(str).map(_bucket_band_mix_ratios)
+    work["low_band_ratio"] = ratios.map(lambda item: item["LOW_BAND"] if isinstance(item, dict) else 0.0)
+    work["mid_band_ratio"] = ratios.map(lambda item: item["MID_BAND"] if isinstance(item, dict) else 0.0)
+    work["high_band_ratio"] = ratios.map(lambda item: item["HIGH_BAND"] if isinstance(item, dict) else 0.0)
+    missing_band_mask = work["dominant_band_class"].eq("UNKNOWN")
+    work.loc[missing_band_mask, "dominant_band_class"] = np.where(
+        work.loc[missing_band_mask, "mid_band_ratio"] >= work.loc[missing_band_mask, ["low_band_ratio", "high_band_ratio"]].max(axis=1),
+        "MID_BAND",
+        np.where(
+            work.loc[missing_band_mask, "high_band_ratio"] >= work.loc[missing_band_mask, "low_band_ratio"],
+            "HIGH_BAND",
+            "LOW_BAND",
+        ),
+    )
+    work["carrier_count"] = np.where(
+        work.get("dominant_earfcn").notna(),
+        1.0,
+        (
+            (work["low_band_ratio"] > 0).astype(int)
+            + (work["mid_band_ratio"] > 0).astype(int)
+            + (work["high_band_ratio"] > 0).astype(int)
+        ).astype(float),
+    )
+    return work[
+        [
+            "grid_id",
+            "grid_row",
+            "grid_col",
+            "grid_centroid_lat",
+            "grid_centroid_lon",
+            "time_bucket",
+            "bandwidth_mhz_est",
+            "low_band_ratio",
+            "mid_band_ratio",
+            "high_band_ratio",
+            "dominant_band_class",
+            "carrier_count",
+        ]
+    ].copy()
+
+
+def _derive_corrected_surface_features(corrected_pred_df: pd.DataFrame) -> pd.DataFrame:
+    if corrected_pred_df.empty:
+        return pd.DataFrame()
+    work = corrected_pred_df.copy()
+    group_cols = ["grid_id", "grid_row", "grid_col", "grid_centroid_lat", "grid_centroid_lon", "time_bucket"]
+    feature_df = (
+        work.groupby(group_cols, as_index=False)
+        .agg(
+            morphology_cluster=("morphology_cluster", "median"),
+            interference_gap_db=("interference_gap_db", "mean"),
+            interference_ratio_linear=("interference_ratio_linear", "mean"),
+            terrain_elevation_m=("terrain_elevation_m", "mean"),
+            terrain_slope_deg=("terrain_slope_deg", "mean"),
+            los_blocked_ratio=("los_blocked_ratio", "mean"),
+            nlos_flag=("nlos_flag", "mean"),
+        )
+    )
+    return feature_df
+
+
+def _add_clutter_evolution_features(df: pd.DataFrame) -> pd.DataFrame:
+    clutter_levels = {
+        "Water": 0,
+        "Vegetation": 0,
+        "Rural/Open": 0,
+        "Suburban": 1,
+        "Urban": 2,
+        "Dense Urban": 3,
+    }
+    work = df.copy()
+    clutter_level = (
+        work.get("clutter_class", pd.Series("", index=work.index))
+        .fillna("")
+        .astype(str)
+        .map(clutter_levels)
+        .fillna(0)
+        .astype(int)
+    )
+    baseline_level = (
+        work.assign(_clutter_level=clutter_level)
+        .sort_values(["grid_id", "bucket_seq"])
+        .groupby("grid_id", sort=False)["_clutter_level"]
+        .transform("first")
+        .reindex(work.index)
+        .fillna(0)
+        .astype(int)
+    )
+    work["clutter_transition_flag"] = clutter_level.ne(baseline_level).astype(float)
+    work["clutter_upgrade_score"] = np.where(clutter_level > baseline_level, clutter_level, 0).astype(float)
+    return work
+
+
 def build_dataset() -> pd.DataFrame:
     log.info("Loading coverage archive: %s", COVERAGE_ARCHIVE)
     if not COVERAGE_ARCHIVE.exists():
         raise FileNotFoundError(f"Missing archive: {COVERAGE_ARCHIVE}")
 
     pred_df = _read_csv_from_archive(COVERAGE_ARCHIVE, "baseline_prediction_grid.csv")
+    corrected_pred_df = _read_csv_from_archive(COVERAGE_ARCHIVE, "bucket_corrected_prediction_grid.csv")
+    kpi_df = _read_csv_from_archive(COVERAGE_ARCHIVE, "grid_kpi_timeseries.csv")
     geo_df = _read_csv_from_archive(COVERAGE_ARCHIVE, "bucket_grid_geo_features.csv")
     site_df = _read_csv_from_archive(COVERAGE_ARCHIVE, "project_sites.csv")
     coverage_rows_df = _read_csv_from_archive(COVERAGE_ARCHIVE, "coverage_rows.csv")
 
     log.info(
-        "Archive inputs loaded: baseline=%s geo=%s sites=%s coverage_rows=%s",
+        "Archive inputs loaded: baseline=%s corrected=%s kpi=%s geo=%s sites=%s coverage_rows=%s",
         pred_df.shape,
+        corrected_pred_df.shape,
+        kpi_df.shape,
         geo_df.shape,
         site_df.shape,
         coverage_rows_df.shape,
@@ -343,6 +533,24 @@ def build_dataset() -> pd.DataFrame:
         validate="one_to_one",
     )
 
+    corrected_feature_df = _derive_corrected_surface_features(corrected_pred_df)
+    if not corrected_feature_df.empty:
+        agg_df = agg_df.merge(
+            corrected_feature_df,
+            on=["grid_id", "grid_row", "grid_col", "grid_centroid_lat", "grid_centroid_lon", "time_bucket"],
+            how="left",
+            validate="one_to_one",
+        )
+
+    band_feature_df = _derive_band_features_from_kpi(kpi_df)
+    if not band_feature_df.empty:
+        agg_df = agg_df.merge(
+            band_feature_df,
+            on=["grid_id", "grid_row", "grid_col", "grid_centroid_lat", "grid_centroid_lon", "time_bucket"],
+            how="left",
+            validate="one_to_one",
+        )
+
     geo_df = geo_df.drop(columns=["centroid_lat", "centroid_lon"], errors="ignore")
     geo_df = geo_df.drop(
         columns=[
@@ -379,6 +587,7 @@ def build_dataset() -> pd.DataFrame:
         log.info("Dropped %d rows with missing observed targets; remaining rows=%d", before_drop - len(df), len(df))
 
     df = _add_temporal_history_features(df)
+    df = _add_clutter_evolution_features(df)
     feature_nulls = df[ALL_FEATURES].isnull().sum()
     bad_feature_nulls = feature_nulls[feature_nulls > 0]
     if not bad_feature_nulls.empty:
@@ -422,6 +631,25 @@ def build_dataset() -> pd.DataFrame:
             "site_count_250m",
             "site_count_500m",
             "azimuth_delta_deg",
+            "bandwidth_mhz_est",
+            "low_band_ratio",
+            "mid_band_ratio",
+            "high_band_ratio",
+            "dominant_band_class",
+            "carrier_count",
+        ],
+        "corrected_surface_features_added": [
+            "morphology_cluster",
+            "interference_gap_db",
+            "interference_ratio_linear",
+            "terrain_elevation_m",
+            "terrain_slope_deg",
+            "los_blocked_ratio",
+            "nlos_flag",
+        ],
+        "clutter_evolution_features_added": [
+            "clutter_transition_flag",
+            "clutter_upgrade_score",
         ],
         "temporal_features_added": [
             "bucket_seq",
@@ -715,6 +943,8 @@ def run_shap(pipeline: Pipeline, X_test: pd.DataFrame, target: str, out_dir: Pat
 
         plt.figure(figsize=(10, 7))
         shap.summary_plot(shap_vals, X_t, feature_names=feature_names, show=False, max_display=20)
+        fig = plt.gcf()
+        fig.suptitle(f"Model 1 - {target} SHAP Summary", fontsize=16, y=0.98)
         plt.tight_layout()
         plt.savefig(out_dir / "shap_summary.png", dpi=150, bbox_inches="tight")
         plt.close("all")

@@ -184,7 +184,10 @@ def _sort_site_rows(df: pd.DataFrame, sort_cols: list[str]) -> pd.DataFrame:
 def _ensure_canonical_identity(df):
     work = df.copy()
     if "rf_identity_key" in work.columns:
-        work["Node_Cell_ID"] = work["rf_identity_key"].map(_rf_cell_id)
+        rf_identity = _clean_identity_series(work["rf_identity_key"])
+        fallback_col = _pick_col(work, ["Node_Cell_ID", "nodeb_id_cell_id", "legacy_nodeb_id_cell_id", "node_cell_id", "cell_id"])
+        fallback = _clean_identity_series(work[fallback_col]) if fallback_col else pd.Series(pd.NA, index=work.index, dtype="object")
+        work["Node_Cell_ID"] = rf_identity.fillna(fallback).fillna("")
         work["canonical_cell_id"] = work["Node_Cell_ID"].map(canonical_cell_id)
         return work
     elif "Node_Cell_ID" in work.columns:
@@ -226,6 +229,51 @@ def _shared_identity_column(*dataframes: pd.DataFrame) -> str:
         if all(isinstance(df, pd.DataFrame) and col in df.columns for df in dataframes):
             return col
     return "Node_Cell_ID"
+
+
+_IDENTITY_ALIAS_COLS = [
+    "Node_Cell_ID",
+    "rf_identity_key",
+    "sector_identity_key",
+    "site_sector_band_key",
+    "legacy_nodeb_id_cell_id",
+    "frontend_site_sector_key",
+    "nodeb_id_cell_id",
+    "canonical_cell_id",
+    "cell_id",
+    "local_cell_id",
+]
+
+
+def _row_identity_aliases(row) -> set[str]:
+    aliases = {_rf_cell_id(row.get(col)) for col in _IDENTITY_ALIAS_COLS}
+    aliases.update(
+        {
+            _site_prefixed_cell_id(row.get("site"), row.get("cell_id")),
+            _site_prefixed_cell_id(row.get("site"), row.get("local_cell_id")),
+            _site_prefixed_cell_id(row.get("site"), row.get("sector")),
+            _site_prefixed_cell_id(row.get("dashboard_site_id"), row.get("sector")),
+            _site_prefixed_cell_id(row.get("site_id"), row.get("sector")),
+        }
+    )
+    aliases.update({canonical_cell_id(alias) for alias in list(aliases) if alias})
+    return {alias for alias in aliases if alias}
+
+
+def _identity_match_mask(df: pd.DataFrame, identity: object) -> pd.Series:
+    target = _rf_cell_id(identity)
+    if df.empty or not target:
+        return pd.Series(False, index=df.index)
+    target_aliases = {target, canonical_cell_id(target)}
+    for col in [c for c in _IDENTITY_ALIAS_COLS if c in df.columns]:
+        values = df[col].map(_rf_cell_id)
+        mask = values.isin(target_aliases)
+        if bool(mask.any()):
+            return mask
+        canonical_mask = values.map(canonical_cell_id).isin(target_aliases)
+        if bool(canonical_mask.any()):
+            return canonical_mask
+    return df.apply(lambda row: bool(_row_identity_aliases(row) & target_aliases), axis=1)
 
 
 def _normalize_site_df(site_df, log_stage="SITE_INPUT"):
@@ -617,6 +665,7 @@ def _apply_saved_geo_correction(pts_df, site_df, project_id=None):
 
 def _expand_site_rows_to_allowed_cells(df: pd.DataFrame, allowed_cells) -> pd.DataFrame:
     allowed = {_rf_cell_id(cell) for cell in allowed_cells if _rf_cell_id(cell)}
+    allowed.update({canonical_cell_id(cell) for cell in list(allowed) if cell})
     if not allowed or df.empty:
         return df.iloc[0:0].copy() if allowed_cells is not None else df
 
@@ -727,7 +776,14 @@ def fetch_site_data(project_id, region="india", operator=None, allowed_cells=Non
         if allowed_cells is not None:
             before_rows = len(df)
             before_cells = _safe_nunique(df, "Node_Cell_ID")
+            unfiltered_df = df.copy()
             df = _expand_site_rows_to_allowed_cells(df, allowed_cells)
+            if df.empty and not unfiltered_df.empty:
+                print(
+                    "[LTE_OPT][SITE_FETCH] baseline_population_filter_empty=True "
+                    "fallback=unfiltered_site_rows_for_recommendation_matching"
+                )
+                df = unfiltered_df
             print(
                 f"[LTE_OPT][SITE_FETCH] baseline_population_filter=True rows_before={before_rows} rows_after={len(df)} "
                 f"cells_before={before_cells} cells_after={_safe_nunique(df, 'Node_Cell_ID')}"
@@ -757,7 +813,14 @@ def fetch_site_data(project_id, region="india", operator=None, allowed_cells=Non
     if allowed_cells is not None:
         before_rows = len(df)
         before_cells = _safe_nunique(df, "Node_Cell_ID")
+        unfiltered_df = df.copy()
         df = _expand_site_rows_to_allowed_cells(df, allowed_cells)
+        if df.empty and not unfiltered_df.empty:
+            print(
+                "[LTE_OPT][SITE_FETCH] baseline_population_filter_empty=True "
+                "fallback=unfiltered_site_rows_for_recommendation_matching"
+            )
+            df = unfiltered_df
         print(
             f"[LTE_OPT][SITE_FETCH] baseline_population_filter=True "
             f"rows_before={before_rows} rows_after={len(df)} "
@@ -1192,9 +1255,13 @@ def compute_k1k2_for_cells(baseline_df, site_df, target_cells):
     site_work = _ensure_canonical_identity(site_df)
     identity_col = _shared_identity_column(baseline_work, site_work)
     for cid in sorted({str(x) for x in target_cells}):
-        site_rows = site_work[site_work[identity_col].astype(str) == str(cid)].copy()
+        site_rows = site_work.loc[_identity_match_mask(site_work, cid)].copy()
         dt_rows = pd.DataFrame()
         match_col = identity_col
+        site_aliases = set()
+        for _, site_row in site_rows.iterrows():
+            site_aliases.update(_row_identity_aliases(site_row))
+        site_aliases.update({_rf_cell_id(cid), canonical_cell_id(cid)})
         for candidate_col in [
             "site_sector_band_key",
             "sector_identity_key",
@@ -1203,23 +1270,28 @@ def compute_k1k2_for_cells(baseline_df, site_df, target_cells):
             identity_col,
             "Node_Cell_ID",
         ]:
-            if site_rows.empty or candidate_col not in site_rows.columns or candidate_col not in baseline_work.columns:
+            if site_rows.empty or candidate_col not in baseline_work.columns:
                 continue
-            candidate_values = {
-                _rf_cell_id(value)
-                for value in site_rows[candidate_col].dropna().astype(str).tolist()
-                if _rf_cell_id(value)
-            }
+            candidate_values = set(site_aliases)
+            if candidate_col in site_rows.columns:
+                candidate_values.update(
+                    _rf_cell_id(value)
+                    for value in site_rows[candidate_col].dropna().astype(str).tolist()
+                    if _rf_cell_id(value)
+                )
             if not candidate_values:
                 continue
             baseline_values = baseline_work[candidate_col].map(_rf_cell_id)
-            candidate_dt = baseline_work.loc[baseline_values.isin(candidate_values)].copy()
+            candidate_dt = baseline_work.loc[
+                baseline_values.isin(candidate_values)
+                | baseline_values.map(canonical_cell_id).isin(candidate_values)
+            ].copy()
             if not candidate_dt.empty:
                 dt_rows = candidate_dt
                 match_col = candidate_col
                 break
         if dt_rows.empty:
-            dt_rows = baseline_work[baseline_work[identity_col].astype(str) == str(cid)].copy()
+            dt_rows = baseline_work.loc[_identity_match_mask(baseline_work, cid)].copy()
         print(
             f"[LTE_OPT][K1K2_LOCAL] cell={cid} site_rows={len(site_rows)} "
             f"baseline_rows={len(dt_rows)} match_col={match_col}"
@@ -1425,12 +1497,14 @@ def run_prediction_only_optimized(opt_sites, k1k2_map, params):
 
     if explicit_recompute_cells is not None:
         affected_cells = sorted({str(cell).strip() for cell in explicit_recompute_cells if str(cell).strip()})
-        available_cell_ids = set(work_df["Node_Cell_ID"].astype(str).tolist())
         affected_cells = [
             cell for cell in affected_cells
-            if cell in available_cell_ids
+            if bool(_identity_match_mask(work_df, cell).any())
         ]
-        affected_rows = work_df.loc[work_df["Node_Cell_ID"].astype(str).isin(affected_cells)].copy()
+        affected_mask = pd.Series(False, index=work_df.index)
+        for cell in affected_cells:
+            affected_mask = affected_mask | _identity_match_mask(work_df, cell)
+        affected_rows = work_df.loc[affected_mask].copy()
         affected_sites = sorted(affected_rows["dashboard_site_id"].astype(str).dropna().unique().tolist())
         changed_rows = work_df.loc[_build_change_mask(work_df)].copy()
         print(
@@ -1454,6 +1528,9 @@ def run_prediction_only_optimized(opt_sites, k1k2_map, params):
 
     final_list = []
     print(f"[LTE_OPT][RUN] total_cells_to_process={len(affected_cells)}")
+    progress_callback = params.get("progress_callback")
+    progress_label = str(params.get("progress_label") or "optimized prediction")
+    total_cells = len(affected_cells)
     geo_features_df = params.get("geo_features_df")
     if isinstance(geo_features_df, pd.DataFrame) and not geo_features_df.empty:
         geo_features_df = geo_features_df.copy()
@@ -1477,10 +1554,14 @@ def run_prediction_only_optimized(opt_sites, k1k2_map, params):
             print(f"[LTE_OPT][GEO_FETCH] enabled=False reason={exc}")
             geo_features_df = pd.DataFrame()
 
-    for cid in affected_cells:
+    for cell_index, cid in enumerate(affected_cells, start=1):
+        if callable(progress_callback):
+            progress_callback(progress_label, cell_index, total_cells, cid, "start", None, None)
         print(f"[LTE_OPT][RUN] cell_start={cid}")
-        site_rows = work_df[work_df["Node_Cell_ID"].astype(str) == str(cid)].copy()
+        site_rows = work_df.loc[_identity_match_mask(work_df, cid)].copy()
         if site_rows.empty:
+            if callable(progress_callback):
+                progress_callback(progress_label, cell_index, total_cells, cid, "skipped", None, 0)
             continue
         k1, k2 = k1k2_map.get(str(cid), (0.0, 0.0))
         local_interference_records = _build_local_interference_records(
@@ -1522,7 +1603,7 @@ def run_prediction_only_optimized(opt_sites, k1k2_map, params):
             ]
             pts = (
                 prediction_points_df.loc[
-                    prediction_points_df["Node_Cell_ID"].astype(str) == str(cid),
+                    _identity_match_mask(prediction_points_df, cid),
                     point_cols,
                 ]
                 .dropna(subset=["lat", "lon"])
@@ -1542,7 +1623,7 @@ def run_prediction_only_optimized(opt_sites, k1k2_map, params):
                 cell_params["grid_resolution"]
             )
             point_source = "generated_grid"
-        cell_geo = geo_features_df[geo_features_df["Node_Cell_ID"].astype(str) == str(cid)].copy() if not geo_features_df.empty else pd.DataFrame()
+        cell_geo = geo_features_df.loc[_identity_match_mask(geo_features_df, cid)].copy() if not geo_features_df.empty else pd.DataFrame()
         if point_source == "generated_grid" and not cell_geo.empty and not pts.empty:
             geo_mask = (
                 cell_geo.loc[:, ["lat", "lon"]]
@@ -1631,8 +1712,12 @@ def run_prediction_only_optimized(opt_sites, k1k2_map, params):
             f"pred_rsrq_range={_safe_minmax(pts, 'pred_rsrq')} "
             f"pred_sinr_range={_safe_minmax(pts, 'pred_sinr')}"
         )
+        if callable(progress_callback):
+            progress_callback(progress_label, cell_index, total_cells, cid, "done", elapsed, len(pts))
         final_list.append(pts)
 
+    if not final_list:
+        return pd.DataFrame(columns=["lat", "lon", "pred_rsrp", "pred_rsrq", "pred_sinr", "Node_Cell_ID"])
     final_df = pd.concat(final_list, ignore_index=True)
     _print_fetch_summary(
         "OPTIMIZED_RF_OUTPUT",

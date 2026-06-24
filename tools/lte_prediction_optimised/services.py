@@ -1,5 +1,6 @@
 import uuid
 import threading
+from functools import partial
 import pandas as pd
 import numpy as np
 import os
@@ -25,6 +26,35 @@ from utils.python_bridge import PythonBridgeError, get_bridge_client
 
 # Global dictionary to track job status
 JOBS = {}
+
+
+def _update_job_progress(job_id, status, msg):
+    JOBS[job_id]["status"] = status
+    JOBS[job_id]["progress"] = msg
+    JOBS[job_id]["updated_at"] = datetime.datetime.now().isoformat()
+    print(f"[{job_id[:6]}] {msg}", flush=True)
+
+
+def _prediction_progress_callback(job_id, label, current, total, cell_id, state, elapsed_sec, point_count):
+    if state == "done":
+        msg = (
+            f"{label}: cell {current}/{total} completed "
+            f"({cell_id}, points={point_count}, {elapsed_sec}s)"
+        )
+    elif state == "skipped":
+        msg = f"{label}: cell {current}/{total} skipped ({cell_id}, no site rows)"
+    else:
+        msg = f"{label}: cell {current}/{total} running ({cell_id})"
+    _update_job_progress(job_id, "running", msg)
+    JOBS[job_id]["prediction_progress"] = {
+        "label": label,
+        "current": int(current),
+        "total": int(total),
+        "cell_id": str(cell_id),
+        "state": state,
+        "elapsed_sec": elapsed_sec,
+        "point_count": point_count,
+    }
 
 
 def _metric_range(df, col):
@@ -910,6 +940,8 @@ class LTEPredictionService_optimised:
                 "max_neighbors_per_update_cell": cfg.get("max_neighbors_per_update_cell", cfg.get("neighbor_site_count", 2) or 2),
                 "baseline_df": baseline_df,
                 "recompute_cells": affected_cells,
+                "progress_label": "optimized prediction",
+                "progress_callback": partial(_prediction_progress_callback, job_id),
             }
 
             self._update(job_id, "running", "Running prediction")
@@ -1056,9 +1088,21 @@ class LTEPredictionService_optimised:
                 "recompute_cells": affected_cells,
             }
 
-            self._update(job_id, "running", "Running recommendation optimized prediction")
-            baseline_rf_df = run_prediction_only_optimized(site_df, k1k2_map, params)
-            optimized_df = run_prediction_only_optimized(modified_site_df, k1k2_map, params)
+            self._update(job_id, "running", "Running recommendation baseline RF prediction")
+            baseline_params = params.copy()
+            baseline_params.update({
+                "progress_label": "recommendation baseline RF",
+                "progress_callback": partial(_prediction_progress_callback, job_id),
+            })
+            baseline_rf_df = run_prediction_only_optimized(site_df, k1k2_map, baseline_params)
+
+            self._update(job_id, "running", "Running recommendation optimized RF prediction")
+            optimized_params = params.copy()
+            optimized_params.update({
+                "progress_label": "recommendation optimized RF",
+                "progress_callback": partial(_prediction_progress_callback, job_id),
+            })
+            optimized_df = run_prediction_only_optimized(modified_site_df, k1k2_map, optimized_params)
             if optimized_df.empty:
                 raise RuntimeError("Recommendation optimization produced no prediction rows")
             merged_df, rf_delta_metrics = _apply_recommendation_rf_delta(
@@ -1207,15 +1251,49 @@ class LTEPredictionService_optimised:
             else:
                 raise ValueError("Missing Node_Cell_ID/nodeb_id_cell_id in optimized output")
 
-        raw_node_cell = df["nodeb_id_cell_id"].astype(str) if "nodeb_id_cell_id" in df.columns else df["Node_Cell_ID"].astype(str)
-        canonical = df["canonical_cell_id"].astype(str) if "canonical_cell_id" in df.columns else df["Node_Cell_ID"].map(_clean_id)
+        raw_node_cell = (
+            df["nodeb_id_cell_id"].map(_clean_id)
+            if "nodeb_id_cell_id" in df.columns
+            else df["Node_Cell_ID"].map(_clean_id)
+        )
+        canonical = (
+            df["canonical_cell_id"].map(_clean_id)
+            if "canonical_cell_id" in df.columns
+            else pd.Series(pd.NA, index=df.index, dtype="object")
+        )
+        if canonical.isna().all() or not canonical.astype(str).str.strip().ne("").any():
+            canonical = raw_node_cell
+        canonical = canonical.where(canonical.astype(str).str.strip().ne(""), pd.NA)
+        if canonical.isna().all() or not canonical.astype(str).str.contains("_", na=False).any():
+            fallback_canonical = None
+            if {"node_b_id", "cell_id"}.issubset(df.columns):
+                fallback_canonical = (
+                    df["node_b_id"].map(_clean_id).astype(str).str.strip()
+                    + "_"
+                    + df["cell_id"].map(_clean_id).astype(str).str.strip()
+                )
+                fallback_canonical = fallback_canonical.mask(fallback_canonical.str.contains("^_$|^_+$|^+$", regex=True))
+            if fallback_canonical is not None:
+                canonical = canonical.fillna(fallback_canonical)
+        canonical = canonical.fillna(raw_node_cell.map(_clean_id))
         split_cols = canonical.astype(str).str.split("_", expand=True)
         if split_cols.shape[1] < 2:
             raise ValueError("Invalid canonical cell identity format")
 
-        df["node_b_id"] = df["node_b_id"].astype(str) if "node_b_id" in df.columns else split_cols[0].astype(str)
-        df["cell_id"] = df["cell_id"].astype(str) if "cell_id" in df.columns else canonical
+        node_b_series = (
+            df["node_b_id"].map(_clean_id)
+            if "node_b_id" in df.columns
+            else pd.Series(pd.NA, index=df.index, dtype="object")
+        )
+        cell_series = (
+            df["cell_id"].map(_clean_id)
+            if "cell_id" in df.columns
+            else pd.Series(pd.NA, index=df.index, dtype="object")
+        )
+        df["node_b_id"] = node_b_series.where(node_b_series.astype(str).str.strip().ne(""), split_cols[0].astype(str))
+        df["cell_id"] = cell_series.where(cell_series.astype(str).str.strip().ne(""), split_cols[1].astype(str))
         df["nodeb_id_cell_id"] = raw_node_cell.astype(str)
+        df["canonical_cell_id"] = canonical.astype(str)
 
         df["project_id"] = project_id
         df["job_id"] = job_id
@@ -1267,9 +1345,7 @@ class LTEPredictionService_optimised:
         return final_df
 
     def _update(self, job_id, status, msg):
-        JOBS[job_id]["status"] = status
-        JOBS[job_id]["progress"] = msg
-        print(f"[{job_id[:6]}] {msg}", flush=True)
+        _update_job_progress(job_id, status, msg)
 
     def _get_next_project_scenario_id(self, project_id, current_engine):
         query = text("""
