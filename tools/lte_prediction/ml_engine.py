@@ -1,5 +1,6 @@
 import os
 import time
+import hashlib
 
 import pandas as pd
 from sqlalchemy import create_engine
@@ -132,6 +133,15 @@ def _normalize_drive_dataframe(df):
 
 def _empty_drive_dataframe():
     return _normalize_drive_dataframe(pd.DataFrame())
+
+
+def _drive_cache_path(project_id, operator, region, session_ids):
+    session_key = ",".join(map(str, session_ids))
+    raw_key = f"{project_id}|{region}|{operator}|{session_key}"
+    digest = hashlib.sha1(raw_key.encode("utf-8")).hexdigest()[:12]
+    safe_operator = "".join(ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in str(operator or "all"))
+    safe_region = "".join(ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in str(region or "india"))
+    return f"cache/drive_{project_id}_{safe_region}_{safe_operator}_{digest}.parquet"
 
 
 def _print_fetch_summary(stage, table_name, filters, df, extra=None):
@@ -517,8 +527,7 @@ def fetch_drive_data(
     frontend_drive_rows_source=None,
 ):
     session_str = ",".join(map(str, session_ids))
-    key = f"{project_id}_{operator}_{session_str}"
-    path = f"cache/drive_{key}.parquet"
+    path = _drive_cache_path(project_id, operator, region, session_ids)
     required_drive_cols = {"lat", "lon", "cell_id", "nodeb_id"}
     current_engine = engine.get(region.lower(), engine["india"])
 
