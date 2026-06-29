@@ -1,4 +1,5 @@
 import os
+import math
 from numpy import around
 import pandas as pd
 import matplotlib
@@ -8,8 +9,12 @@ import matplotlib.pyplot as plt
 
 from .kpi_config import KPI_CONFIG
 from .threshold_resolver import resolve_kpi_ranges
+from .map_generator import normalize_band_name
 
 IMAGE_DIR = "data/images/kpi_analysis"
+
+# Poor-PCI tables can include 100+ PCIs; cap the visible rows for the PDF.
+POOR_PCI_LIMIT = 15
 
 
 # =====================================================
@@ -31,6 +36,21 @@ def _join_unique_non_empty(values):
     )
     cleaned = cleaned[cleaned.ne("") & cleaned.str.lower().ne("none")]
     return ",".join(sorted(set(cleaned)))
+
+
+def _nice_tick_step(min_value, max_value, max_ticks=10):
+    span = max_value - min_value
+    if span <= 0:
+        return 1
+
+    raw_step = span / max(1, max_ticks)
+    magnitude = 10 ** math.floor(math.log10(raw_step))
+    normalized = raw_step / magnitude
+
+    for candidate in (1, 2, 5, 10):
+        if normalized <= candidate:
+            return candidate * magnitude
+    return 10 * magnitude
 
 
 # =====================================================
@@ -154,17 +174,27 @@ def generate_kpi_summary(df):
 # 2. BAND SUMMARY
 # =====================================================
 def generate_band_summary(df):
+    """
+    Band distribution table + pie.
+
+    Raw band values are normalized and the "Unknown" bucket is dropped, so the
+    denominator is the count of *known* bands — this keeps the table, the pie
+    and the LLM-facing metadata band % identical.  Returns the band summary
+    list (band/sample_count/sample_percentage) for injection into metadata.
+    """
     if not has_valid_series(df, "band"):
-        return
+        return None
 
-    total = len(df)
-    band_df = df["band"].value_counts().reset_index()
+    normalized = df["band"].apply(normalize_band_name)
+    known = normalized[normalized != "Unknown"]
+    if known.empty:
+        return None
+
+    total = int(len(known))
+    band_df = known.value_counts().reset_index()
     band_df.columns = ["band", "Sample Count"]
-
-    if band_df.empty:
-        return
-
     band_df["% Samples"] = round((band_df["Sample Count"] / total) * 100, 2)
+
     save_table_image(band_df, "Band Distribution", "band_table.png")
 
     plt.figure(figsize=(6, 6))
@@ -173,6 +203,15 @@ def generate_band_summary(df):
     plt.tight_layout()
     plt.savefig(os.path.join(IMAGE_DIR, "band_pie.png"), dpi=200)
     plt.close()
+
+    return [
+        {
+            "band": row["band"],
+            "sample_count": int(row["Sample Count"]),
+            "sample_percentage": float(row["% Samples"]),
+        }
+        for _, row in band_df.iterrows()
+    ]
 
 
 # =====================================================
@@ -285,17 +324,21 @@ def generate_pci_distribution(df):
     if not has_valid_series(df, "pci"):
         return
 
-    # Count only existing PCI values
-    pci_counts = df["pci"].value_counts()
+    pci_series = pd.to_numeric(df["pci"], errors="coerce").dropna()
+    if pci_series.empty:
+        return
+
+    # Count only existing PCI values. Plot on the actual PCI numeric axis so
+    # hundreds of PCIs can be shown without writing every label.
+    pci_counts = pci_series.astype(int).value_counts()
     if pci_counts.empty:
         return
 
     # Sort by PCI numeric value for visual continuity
     pci_counts = pci_counts.sort_index()
 
-    x = range(len(pci_counts))            # positional index
-    y = pci_counts.values                 # sample counts
-    labels = pci_counts.index.astype(str)
+    x = pci_counts.index.to_numpy()
+    y = pci_counts.values
 
     plt.figure(figsize=(14, 4))
 
@@ -305,14 +348,22 @@ def generate_pci_distribution(df):
     # Points on curve
     plt.scatter(x, y, color="red", s=30)
 
-    plt.xticks(x, labels, rotation=90)
+    min_pci = int(pci_counts.index.min())
+    max_pci = int(pci_counts.index.max())
+    step = int(max(1, _nice_tick_step(min_pci, max_pci, max_ticks=10)))
+    tick_start = int(math.floor(min_pci / step) * step)
+    tick_end = int(math.ceil(max_pci / step) * step)
+    ticks = list(range(tick_start, tick_end + step, step))
+
+    plt.xticks(ticks, [str(t) for t in ticks], rotation=0)
+    plt.xlim(tick_start, tick_end)
     plt.title("PCI Distribution")
     plt.xlabel("PCI")
     plt.ylabel("Sample Count")
-    plt.grid(True, axis="y", linestyle="--", alpha=0.4)
+    plt.grid(True, axis="both", linestyle="--", alpha=0.35)
 
     plt.tight_layout()
-    plt.savefig(os.path.join(IMAGE_DIR, "pci_distribution.png"), dpi=200)
+    plt.savefig(os.path.join(IMAGE_DIR, "pci_distribution.png"), dpi=300)
     plt.close()
 
     # Top 30 table (separate and correct)
@@ -326,47 +377,387 @@ def generate_pci_distribution(df):
     )
 
 # =====================================================
-# 5. PCI – POOR RSRP
+# 5/6. PCI – POOR RSRP / RSRQ  (per-sample, matches frontend)
 # =====================================================
+def build_poor_pci_table(df, metric_column, threshold, limit=POOR_PCI_LIMIT):
+    """
+    Per-sample poor-PCI table matching the frontend.
+
+    The frontend flags PCIs that have *any* poor sample, not PCIs whose mean is
+    poor.  So we count raw samples below the threshold, group by PCI, sort by
+    poor-sample count and keep the worst `limit` rows (a city can have 100+
+    poor PCIs which won't fit the PDF).  `df.attrs["total_poor_pci"]` carries
+    the full count so the section title can show "Top N of M".
+    """
+    if "pci" not in df.columns or metric_column not in df.columns:
+        return None
+
+    cols = ["pci", metric_column] + (["band"] if "band" in df.columns else [])
+    working = df[cols].copy()
+    working[metric_column] = pd.to_numeric(working[metric_column], errors="coerce")
+    working = working.dropna(subset=["pci", metric_column])
+    working = working.loc[working[metric_column] < threshold]
+    if working.empty:
+        return None
+
+    agg = {
+        "Poor_Samples": (metric_column, "count"),
+        "Avg_Value": (metric_column, "mean"),
+        "Worst_Value": (metric_column, "min"),
+    }
+    if "band" in working.columns:
+        agg["Bands"] = ("band", _join_unique_non_empty)
+
+    grouped = working.groupby("pci").agg(**agg).reset_index()
+    total_poor_pci = int(len(grouped))
+    grouped = grouped.sort_values(
+        by=["Poor_Samples", "Worst_Value", "pci"],
+        ascending=[False, True, True],
+    ).head(limit).copy()
+
+    label = metric_column.upper()
+    grouped = grouped.rename(columns={
+        "pci": "PCI",
+        "Poor_Samples": "Poor Samples",
+        "Avg_Value": f"Avg {label}",
+        "Worst_Value": f"Worst {label}",
+    })
+    grouped[f"Avg {label}"] = grouped[f"Avg {label}"].round(2)
+    grouped[f"Worst {label}"] = grouped[f"Worst {label}"].round(2)
+    grouped.attrs["total_poor_pci"] = total_poor_pci
+    return grouped
+
+
 def generate_pci_poor_rsrp(df):
-    if not has_valid_series(df, "rsrp"):
-        return
-
-    grouped = df.groupby("pci").agg(
-        sample_count=("rsrp", "count"),
-        avg_rsrp=("rsrp", "mean"),
-        bands=("band", _join_unique_non_empty),
-        cell_ids=("cell_id", _join_unique_non_empty)
-    ).reset_index()
-
-    poor = grouped.loc[grouped["avg_rsrp"] < -100].copy()
-    if poor.empty:
-        return
-
-    poor["avg_rsrp"] = poor["avg_rsrp"].round(2)
-    save_table_image(poor, "PCI with Poor RSRP (< -100 dBm)", "pci_poor_rsrp.png")
+    table = build_poor_pci_table(df, "rsrp", -105)
+    if table is None:
+        return None
+    save_table_image(table, "PCI with Poor RSRP (< -105 dBm)", "pci_poor_rsrp.png")
+    return table
 
 
-# =====================================================
-# 6. PCI – POOR RSRQ
-# =====================================================
 def generate_pci_poor_rsrq(df):
-    if not has_valid_series(df, "rsrq"):
-        return
+    table = build_poor_pci_table(df, "rsrq", -14)
+    if table is None:
+        return None
+    save_table_image(table, "PCI with Poor RSRQ (< -14 dB)", "pci_poor_rsrq.png")
+    return table
 
-    grouped = df.groupby("pci").agg(
-        sample_count=("rsrq", "count"),
-        avg_rsrq=("rsrq", "mean"),
-        bands=("band", _join_unique_non_empty),
-        cell_ids=("cell_id", _join_unique_non_empty)
-    ).reset_index()
 
-    poor = grouped.loc[grouped["avg_rsrq"] < -15].copy()
-    if poor.empty:
-        return
+# =====================================================
+# NATIVE TABLE DATA BUILDERS
+# Return DataFrames so the PDF generator can render crisp, selectable,
+# tiny native ReportLab tables instead of embedding blurry matplotlib PNGs.
+# Keyed by the same filenames the PDF layout already references.
+# =====================================================
 
-    poor["avg_rsrq"] = poor["avg_rsrq"].round(2)
-    save_table_image(poor, "PCI with Poor RSRQ (< -15 dB)", "pci_poor_rsrq.png")
+def _format_optional_avg(df, column, decimals=1, suffix=""):
+    if not has_valid_series(df, column):
+        return "N/A"
+    value = round(pd.to_numeric(df[column], errors="coerce").mean(), decimals)
+    return f"{value} {suffix}".strip()
+
+
+def _drop_empty_na_columns(df):
+    """Hide columns that contain no real display value (e.g. all Category=N/A)."""
+    keep = []
+    for col in df.columns:
+        values = df[col].dropna().astype(str).str.strip()
+        values = values[~values.str.lower().isin({"", "n/a", "na", "none", "nan"})]
+        if not values.empty:
+            keep.append(col)
+    return df[keep] if keep else df
+
+
+def build_band_native_table(band_summary):
+    if not band_summary:
+        return {}
+    rows = [
+        {
+            "Band": item.get("band"),
+            "Sample Count": item.get("sample_count"),
+            "% Samples": item.get("sample_percentage"),
+        }
+        for item in band_summary
+    ]
+    return {"band_table.png": pd.DataFrame(rows)}
+
+
+def build_drive_native_tables(drive_summary):
+    if not drive_summary:
+        return {}
+
+    sessions = drive_summary.get("sessions") or []
+    distance_values = [row.get("distance") for row in sessions if row.get("distance") is not None]
+    distance_available = any(float(value or 0) > 0 for value in distance_values)
+    total_distance = drive_summary.get("distance_covered")
+    distance_text = (
+        f"{float(total_distance):.2f} KM"
+        if distance_available and total_distance is not None else "N/A"
+    )
+
+    tables = {
+        "drive_summary.png": pd.DataFrame([
+            {"Metric": "Distance Covered", "Value": distance_text},
+            {"Metric": "Total Samples", "Value": f"{drive_summary.get('total_samples', 0):,}"},
+            {"Metric": "Total Sessions", "Value": drive_summary.get("total_sessions", "N/A")},
+            {"Metric": "Number of Days", "Value": f"{drive_summary.get('number_of_days', 'N/A')} Days"},
+        ])
+    }
+
+    if sessions:
+        rows = []
+        for row in sessions:
+            distance = row.get("distance")
+            distance_display = (
+                f"{float(distance):.6f}"
+                if distance_available and distance is not None else "N/A"
+            )
+            rows.append({
+                "Session": row.get("session_id"),
+                "Date": row.get("date"),
+                "Start": row.get("start_time"),
+                "End": row.get("end_time"),
+                "Duration": row.get("duration"),
+                "Distance": distance_display,
+            })
+        tables["session_table.png"] = pd.DataFrame(rows)
+
+    return tables
+
+
+def build_kpi_range_native_tables(metadata):
+    if not isinstance(metadata, dict):
+        return {}
+
+    kpi_summary = metadata.get("kpi_summary") or metadata.get("kpi_analysis") or {}
+    if not isinstance(kpi_summary, dict):
+        return {}
+
+    filename_by_kpi = {
+        "RSRP": "rsrp_range_table.png",
+        "RSRQ": "rsrq_range_table.png",
+        "SINR": "sinr_range_table.png",
+        "DL": "dl_range_table.png",
+        "DL Throughput": "dl_range_table.png",
+        "UL": "ul_range_table.png",
+        "UL Throughput": "ul_range_table.png",
+        "MOS": "mos_range_table.png",
+    }
+
+    tables = {}
+    for kpi, filename in filename_by_kpi.items():
+        data = kpi_summary.get(kpi)
+        if not isinstance(data, dict):
+            continue
+        distribution = data.get("distribution")
+        if not isinstance(distribution, list) or not distribution:
+            continue
+        rows = []
+        for item in distribution:
+            if not isinstance(item, dict):
+                continue
+            rows.append({
+                "Range": item.get("Range") or item.get("range"),
+                "% Of Samples": item.get("percentage"),
+                "CDF": item.get("cdf"),
+            })
+        if rows:
+            tables[filename] = pd.DataFrame(rows)
+
+    return tables
+
+
+def build_app_analytics_native_tables(df):
+    app_col = None
+    if "apps" in df.columns and not df["apps"].isna().all():
+        app_col = "apps"
+    elif "app_name" in df.columns and not df["app_name"].isna().all():
+        app_col = "app_name"
+    if not app_col:
+        return {}
+
+    category_col = "category" if "category" in df.columns else (
+        "app_category" if "app_category" in df.columns else None
+    )
+
+    numeric_cols = ["rsrp", "rsrq", "sinr", "dl_tpt", "ul_tpt", "mos", "latency", "jitter", "packet_loss"]
+    df_clean = df.copy()
+    for col in numeric_cols:
+        if col in df_clean.columns:
+            df_clean[col] = pd.to_numeric(df_clean[col], errors="coerce")
+
+    part1_rows, part2_rows = [], []
+    for app in df_clean[app_col].dropna().unique():
+        app_df = df_clean[df_clean[app_col] == app].copy()
+        if app_df.empty:
+            continue
+
+        category = "N/A"
+        if category_col and category_col in app_df.columns:
+            cat_vals = app_df[category_col].dropna().astype(str).str.strip()
+            cat_vals = cat_vals[~cat_vals.str.lower().isin({"", "n/a", "na", "none", "nan"})]
+            if not cat_vals.empty:
+                category = cat_vals.iloc[0]
+
+        sessions = app_df["session_id"].nunique() if "session_id" in app_df.columns else "N/A"
+        duration = "N/A"
+        time_col = "timestamp" if "timestamp" in app_df.columns else ("time" if "time" in app_df.columns else None)
+        if time_col:
+            times = pd.to_datetime(app_df[time_col], errors="coerce")
+            if times.notna().any():
+                seconds = int((times.max() - times.min()).total_seconds())
+                duration = f"{seconds // 3600:02d}:{(seconds % 3600) // 60:02d}:{seconds % 60:02d}"
+
+        part1_rows.append({
+            "App Name": app,
+            "Category": category,
+            "Sessions": sessions,
+            "Samples": len(app_df),
+            "Duration": duration,
+            "RSRP Avg": _format_optional_avg(app_df, "rsrp"),
+            "RSRQ Avg": _format_optional_avg(app_df, "rsrq"),
+            "SINR Avg": _format_optional_avg(app_df, "sinr"),
+            "DL Avg": _format_optional_avg(app_df, "dl_tpt", suffix="Mbps"),
+        })
+        part2_rows.append({
+            "App Name": app,
+            "Category": category,
+            "UL Avg": _format_optional_avg(app_df, "ul_tpt", suffix="Mbps"),
+            "MOS Avg": _format_optional_avg(app_df, "mos", decimals=2),
+            "Latency Avg": _format_optional_avg(app_df, "latency", suffix="ms"),
+            "Jitter Avg": _format_optional_avg(app_df, "jitter", suffix="ms"),
+            "Loss Avg": _format_optional_avg(app_df, "packet_loss", decimals=2, suffix="%"),
+        })
+
+    tables = {}
+    if part1_rows:
+        tables["app_analytics_part1.png"] = _drop_empty_na_columns(pd.DataFrame(part1_rows))
+        tables["app_analytics_part2.png"] = _drop_empty_na_columns(pd.DataFrame(part2_rows))
+    return tables
+
+
+def build_misc_native_tables(df):
+    tables = {}
+
+    kpi_rows = []
+    for kpi, cfg in KPI_CONFIG.items():
+        if cfg.get("type") != "range":
+            continue
+        col = cfg["column"]
+        if not has_valid_series(df, col):
+            continue
+        values = pd.to_numeric(df[col], errors="coerce").dropna()
+        if values.empty:
+            continue
+        kpi_rows.append({
+            "KPI": kpi,
+            "Average": round(values.mean(), 2),
+            "Min": round(values.min(), 2),
+            "Max": round(values.max(), 2),
+            "Median": round(values.median(), 2),
+        })
+    if kpi_rows:
+        tables["kpi_summary.png"] = pd.DataFrame(kpi_rows)
+
+    if has_valid_series(df, "pci"):
+        pci_counts = df["pci"].dropna().value_counts().sort_values(ascending=False).head(30)
+        pci_table = pci_counts.reset_index()
+        pci_table.columns = ["PCI", "Sample Count"]
+        tables["pci_table.png"] = pci_table
+
+    quality = {}
+    if has_valid_series(df, "latency"):
+        quality["Avg Latency (ms)"] = round(pd.to_numeric(df["latency"], errors="coerce").mean(), 2)
+    if has_valid_series(df, "jitter"):
+        quality["Avg Jitter (ms)"] = round(pd.to_numeric(df["jitter"], errors="coerce").mean(), 2)
+    if has_valid_series(df, "packet_loss"):
+        quality["Avg Packet Loss (%)"] = round(pd.to_numeric(df["packet_loss"], errors="coerce").mean(), 2)
+    if quality:
+        tables["network_quality_summary.png"] = pd.DataFrame([quality])
+
+    poor_rows = []
+    if has_valid_series(df, "rsrp"):
+        rsrp_values = pd.to_numeric(df["rsrp"], errors="coerce").dropna()
+        poor_count = int((rsrp_values < -105).sum())
+        poor_rows.append({
+            "KPI": "RSRP",
+            "Threshold": "< -105 dBm",
+            "Poor Samples": poor_count,
+            "Total Samples": len(rsrp_values),
+            "Percentage": f"{(poor_count / len(rsrp_values) * 100):.2f}%" if len(rsrp_values) else "0.00%",
+        })
+    if has_valid_series(df, "rsrq"):
+        rsrq_values = pd.to_numeric(df["rsrq"], errors="coerce").dropna()
+        poor_count = int((rsrq_values < -14).sum())
+        poor_rows.append({
+            "KPI": "RSRQ",
+            "Threshold": "< -14 dB",
+            "Poor Samples": poor_count,
+            "Total Samples": len(rsrq_values),
+            "Percentage": f"{(poor_count / len(rsrq_values) * 100):.2f}%" if len(rsrq_values) else "0.00%",
+        })
+    if poor_rows:
+        tables["poor_kpi_stats.png"] = pd.DataFrame(poor_rows)
+
+    for column, filename in [
+        ("speed", "speed_stats.png"),
+        ("latency", "latency_stats.png"),
+        ("jitter", "jitter_stats.png"),
+    ]:
+        if has_valid_series(df, column):
+            values = pd.to_numeric(df[column], errors="coerce").dropna()
+            tables[filename] = pd.DataFrame([{
+                "Average": round(values.mean(), 2),
+                "Min": round(values.min(), 2),
+                "Max": round(values.max(), 2),
+            }])
+
+    if "indoor_outdoor" in df.columns and not df["indoor_outdoor"].isna().all():
+        rows = []
+        numeric_df = df.copy()
+        for col in ["rsrp", "rsrq", "sinr", "mos", "dl_tpt", "ul_tpt"]:
+            if col in numeric_df.columns:
+                numeric_df[col] = pd.to_numeric(numeric_df[col], errors="coerce")
+        for env in ["Indoor", "Outdoor"]:
+            env_df = numeric_df[numeric_df["indoor_outdoor"] == env]
+            if not env_df.empty:
+                rows.append({
+                    "Environment": env,
+                    "Samples": len(env_df),
+                    "Avg RSRP": _format_optional_avg(env_df, "rsrp"),
+                    "Avg RSRQ": _format_optional_avg(env_df, "rsrq"),
+                    "Avg SINR": _format_optional_avg(env_df, "sinr", decimals=2),
+                    "Avg MOS": _format_optional_avg(env_df, "mos", decimals=2),
+                    "Avg DL (Mbps)": _format_optional_avg(env_df, "dl_tpt", decimals=2),
+                    "Avg UL (Mbps)": _format_optional_avg(env_df, "ul_tpt", decimals=2),
+                })
+        if rows:
+            tables["indoor_outdoor_stats.png"] = _drop_empty_na_columns(pd.DataFrame(rows))
+
+    return tables
+
+
+def build_native_table_data(report_df, metadata=None, band_summary=None, drive_summary=None):
+    """
+    Build the full {filename: DataFrame} dict of native tables for the PDF.
+    Tables present here are rendered as crisp native ReportLab tables; anything
+    absent falls back to its matplotlib PNG.
+    """
+    tables = {
+        "pci_poor_rsrp.png": build_poor_pci_table(report_df, "rsrp", -105),
+        "pci_poor_rsrq.png": build_poor_pci_table(report_df, "rsrq", -14),
+    }
+    tables.update(build_band_native_table(band_summary))
+    tables.update(build_drive_native_tables(drive_summary))
+    tables.update(build_app_analytics_native_tables(report_df))
+    tables.update(build_misc_native_tables(report_df))
+    tables.update(build_kpi_range_native_tables(metadata))
+    return {
+        filename: table_df
+        for filename, table_df in tables.items()
+        if table_df is not None and not table_df.empty
+    }
 
 
 # =====================================================

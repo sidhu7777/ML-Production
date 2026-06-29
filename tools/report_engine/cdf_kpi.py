@@ -10,6 +10,7 @@ https://api.stracer.vinfocom.co.in/api/MapView/kpi-distribution?sessionIds=2696,
 
 import os
 import requests
+import numpy as np
 import matplotlib.pyplot as plt
 import pandas as pd
 from .kpi_config import KPI_CONFIG
@@ -280,3 +281,94 @@ def generate_all_cdf_plots(session_ids: list, output_dir: str = OUTPUT_DIR):
         "successful": successful_kpis,
         "failed": failed_kpis
     }
+
+
+# =====================================================
+# LOCAL CDF GENERATION (from the report dataframe)
+# The API returns unfiltered per-session data, which doesn't match the report's
+# primary + polygon + known-band population.  These functions compute the CDF
+# directly from the exact report dataframe so every graph is consistent.
+# =====================================================
+
+def _cdf_filename_for_kpi(kpi_name: str, column: str) -> str:
+    if kpi_name == "DL":
+        return "cdf_dl_tpt.png"
+    if kpi_name == "UL":
+        return "cdf_ul_tpt.png"
+    return f"cdf_{column.lower()}.png"
+
+
+def generate_cdf_plot_from_series(values, title: str, x_label: str, output_path: str):
+    """Render a CDF plot (with P10/P50/P90 markers) from a pandas Series."""
+    values = pd.to_numeric(values, errors="coerce").dropna().sort_values()
+    if values.empty:
+        return None
+
+    y = np.arange(1, len(values) + 1) / len(values) * 100
+    fig, ax = plt.subplots(figsize=(10, 5))
+    ax.step(values.to_numpy(), y, where="post", linewidth=2.0, color="#1f77b4")
+    ax.set_xlabel(x_label, fontsize=11)
+    ax.set_ylabel("Cumulative Probability (%)", fontsize=11)
+    ax.set_title(title, fontsize=13, pad=10)
+    ax.grid(True, linestyle="--", linewidth=0.5, alpha=0.25)
+    ax.set_facecolor("white")
+    fig.patch.set_facecolor("white")
+    ax.set_ylim(0, 100)
+
+    offsets = {10: (18, 14), 50: (18, -24), 90: (-56, 14)}
+    for p in (10, 50, 90):
+        percentile_value = float(np.percentile(values, p))
+        ax.scatter([percentile_value], [p], s=34, color="#d62728",
+                   edgecolor="white", linewidth=0.8, zorder=4)
+        ax.annotate(
+            f"P{p} = {percentile_value:.2f}",
+            xy=(percentile_value, p), xytext=offsets[p],
+            textcoords="offset points", fontsize=8.5, color="#333333",
+            arrowprops={"arrowstyle": "->", "color": "#d62728", "lw": 0.8, "alpha": 0.85},
+            bbox={"boxstyle": "round,pad=0.22", "fc": "white", "ec": "#d0d7de", "alpha": 0.95},
+        )
+
+    ax.tick_params(axis="both", labelsize=9)
+    for spine in ax.spines.values():
+        spine.set_linewidth(0.8)
+        spine.set_color("#444444")
+
+    fig.tight_layout()
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    fig.savefig(output_path, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+    return len(values), float(values.min()), float(values.max())
+
+
+def generate_all_cdf_plots_from_df(report_df: pd.DataFrame, output_dir: str = OUTPUT_DIR):
+    """Generate every CDF from the exact report dataframe (range KPIs + PCI)."""
+    print("\n" + "=" * 80)
+    print("GENERATING CDF DISTRIBUTION GRAPHS FROM REPORT FILTERED DATA")
+    print("=" * 80)
+    print(f"Rows used for CDF: {len(report_df)}")
+    os.makedirs(output_dir, exist_ok=True)
+
+    for kpi_name, cfg in KPI_CONFIG.items():
+        col = cfg.get("column")
+        if cfg.get("type") == "range" and col in report_df.columns:
+            filename = _cdf_filename_for_kpi(kpi_name, col)
+            stats = generate_cdf_plot_from_series(
+                report_df[col],
+                f"CDF Distribution - {kpi_name}",
+                f"{kpi_name} Value",
+                os.path.join(output_dir, filename),
+            )
+            if stats:
+                count, min_value, max_value = stats
+                print(f"  {filename}: rows={count}, min={min_value:.2f}, max={max_value:.2f}")
+
+    if "pci" in report_df.columns:
+        stats = generate_cdf_plot_from_series(
+            report_df["pci"],
+            "CDF Distribution - PCI",
+            "PCI Value",
+            os.path.join(output_dir, "cdf_pci.png"),
+        )
+        if stats:
+            count, min_value, max_value = stats
+            print(f"  cdf_pci.png: rows={count}, min={min_value:.2f}, max={max_value:.2f}")

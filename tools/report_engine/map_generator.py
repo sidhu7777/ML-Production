@@ -12,6 +12,58 @@ REPORT_MAP_MAX_ZOOM = 22
 REPORT_MAP_PADDING_PX = 90
 REPORT_MAP_LEGEND_RIGHT_PADDING_PX = 420
 
+# -----------------------------------------------------
+# REPORT MAP HELPERS — fractional zoom + data-only bounds
+# These give tight, frontend-like maps: the route fills the frame (no big grey
+# margins) because zoomSnap=0 lets fit_bounds use fractional zoom, and the
+# viewport fits the DATA only — the polygon is drawn as an overlay but does NOT
+# expand the view.
+# -----------------------------------------------------
+REPORT_TILE = "CartoDB Voyager"
+REPORT_PAD_LEFT = 30
+REPORT_PAD_VERT = 30
+REPORT_PAD_RIGHT_BASE = 40
+REPORT_PAD_RIGHT_LEGEND = 340
+
+
+def new_report_map():
+    """Folium map with fractional zoom (zoomSnap=0) so the data fills the frame."""
+    return folium.Map(
+        tiles=REPORT_TILE,
+        zoom_control=True,
+        control_scale=False,
+        prefer_canvas=True,
+        max_zoom=REPORT_MAP_MAX_ZOOM,
+        zoomSnap=0,       # continuous fractional zoom (no integer snapping)
+        zoomDelta=0.25,
+    )
+
+
+def fit_data_bounds(m, df, reserve_legend_space=False):
+    """Fit the viewport to the GPS data bounds only (not the polygon)."""
+    bounds = get_df_bounds(df)
+    right = REPORT_PAD_RIGHT_LEGEND if reserve_legend_space else REPORT_PAD_RIGHT_BASE
+    m.fit_bounds(
+        bounds,
+        padding_top_left=(REPORT_PAD_LEFT, REPORT_PAD_VERT),
+        padding_bottom_right=(right, REPORT_PAD_VERT),
+        max_zoom=REPORT_MAP_MAX_ZOOM,
+    )
+
+
+def draw_polygon_overlay(m, polygon_wkt, color="#111827", weight=2,
+                         opacity=0.45, dash_array="6,6"):
+    """Draw the project polygon as an outline that does NOT expand the viewport."""
+    if not polygon_wkt:
+        return
+    geom = loads(polygon_wkt)
+    latlon = [(c[1], c[0]) for c in geom.exterior.coords]
+    folium.Polygon(
+        locations=latlon, color=color, weight=weight, fill=False,
+        opacity=opacity, dash_array=dash_array, tooltip="Polygon Boundary",
+    ).add_to(m)
+
+
 # Helper function to add legend to folium map
 
 def add_fullscreen_css(m):
@@ -358,13 +410,7 @@ def generate_kpi_map(df, kpi_column, color_func,ranges, output_html, polygon_wkt
     if df.empty:
         raise ValueError("No data available for KPI map")
 
-    m = folium.Map(
-        tiles="CartoDB positron",  # cleaner than OSM
-        zoom_control=True,
-        control_scale=False,
-        prefer_canvas=True,
-        max_zoom=REPORT_MAP_MAX_ZOOM
-    )
+    m = new_report_map()
 
     add_fullscreen_css(m)
 
@@ -398,32 +444,13 @@ def generate_kpi_map(df, kpi_column, color_func,ranges, output_html, polygon_wkt
 
     legend_items = build_legend_from_ranges(df, kpi_column, ranges)
     add_legend(m, kpi_column, legend_items)
-    
-    # 5 Add polygon boundary on top for visibility
-    if polygon_wkt:
-        geom = loads(polygon_wkt)
-        # WKT format is (lon, lat), convert to (lat, lon) for folium
-        polygon_latlon = [(coord[1], coord[0]) for coord in geom.exterior.coords]
 
-        folium.Polygon(
-            locations=polygon_latlon,
-            color="#FF0000",  # Bright red
-            weight=5,
-            fill=False,
-            opacity=1.0,
-            tooltip="Polygon Boundary"
-        ).add_to(m)
-    
-    # Fit view tightly to data + polygon with minimal padding
-    bounds = get_df_bounds(df)
-    if polygon_wkt:
-        bounds = merge_bounds(bounds, get_polygon_bounds(polygon_wkt))
-    
-    # Minimal expansion - only 2% to avoid clipping
-    bounds = expand_bounds(bounds, expand_factor=0.02)
-    
-    fit_report_bounds(m, bounds, reserve_legend_space=True)
-    
+    # Polygon drawn as a dashed overlay — it does NOT expand the viewport.
+    draw_polygon_overlay(m, polygon_wkt)
+
+    # Fit the viewport to the data only (fractional zoom keeps it tight).
+    fit_data_bounds(m, df, reserve_legend_space=True)
+
     m.save(output_html)
 
 
@@ -591,31 +618,12 @@ def generate_categorical_kpi_map(df, kpi_column, output_html, polygon_wkt=None):
     if df.empty:
         raise ValueError(f"No data available for categorical KPI: {kpi_column}")
 
-    m = folium.Map(
-        tiles="CartoDB positron",  # cleaner than OSM
-        zoom_control=True,
-        control_scale=False,
-        prefer_canvas=True,
-        max_zoom=REPORT_MAP_MAX_ZOOM
-    )
+    m = new_report_map()
 
     add_fullscreen_css(m)
 
-    # For categorical maps, draw the boundary first and keep it subtle. A thick
-    # red boundary drawn last can visually cover the band colors in the PDF.
-    if polygon_wkt:
-        geom = loads(polygon_wkt)
-        polygon_latlon = [(coord[1], coord[0]) for coord in geom.exterior.coords]
-
-        folium.Polygon(
-            locations=polygon_latlon,
-            color="#111827",
-            weight=2,
-            fill=False,
-            opacity=0.45,
-            dash_array="6,6",
-            tooltip="Polygon Boundary"
-        ).add_to(m)
+    # Polygon drawn as a subtle dashed overlay — does NOT expand the viewport.
+    draw_polygon_overlay(m, polygon_wkt)
 
     is_band_map = kpi_column.lower() == "band"
     category_col = "__report_category"
@@ -623,6 +631,10 @@ def generate_categorical_kpi_map(df, kpi_column, output_html, polygon_wkt=None):
     if is_band_map:
         df = df.copy()
         df[category_col] = df[kpi_column].apply(normalize_band_name)
+        # Exclude Unknown so the band map colours match the corrected band table.
+        df = df[df[category_col] != "Unknown"]
+        if df.empty:
+            raise ValueError("No non-Unknown band data for band map")
         value_counts = df[category_col].value_counts()
         value_color_map = {
             value: get_frontend_band_color(value)
@@ -682,17 +694,10 @@ def generate_categorical_kpi_map(df, kpi_column, output_html, polygon_wkt=None):
     if others > 0:
         legend_items.append(("Others", "#999999", others))
     add_legend(m, kpi_column, legend_items)
-    
-    # Fit view tightly to data + polygon with minimal padding
-    bounds = get_df_bounds(df)
-    if polygon_wkt:
-        bounds = merge_bounds(bounds, get_polygon_bounds(polygon_wkt))
-    
-    # Minimal expansion - only 2% to avoid clipping
-    bounds = expand_bounds(bounds, expand_factor=0.02)
-    
-    fit_report_bounds(m, bounds, reserve_legend_space=True)
-    
+
+    # Fit the viewport to the data only (fractional zoom keeps it tight).
+    fit_data_bounds(m, df, reserve_legend_space=True)
+
     m.save(output_html)
 
 
@@ -922,6 +927,9 @@ def generate_poor_region_map(
     min_distance_meters=400,
     point_radius=2,
     region_opacity=0.25,
+    render_width=1200,
+    render_height=900,
+    device_scale_factor=1,
 ):
     """
     Generate poor region map PNG using ONLY filtered_df.
@@ -942,83 +950,45 @@ def generate_poor_region_map(
         print(f" No poor samples for {value_col}")
         return
 
-    candidates = _build_region_candidates(poor, grid_size)
-    regions = _select_non_overlapping_regions(candidates, min_distance_meters, top_regions)
-
-    if not regions:
-        print(f" No regions found for {value_col}")
-        return
-
-    fmap = folium.Map(
-        tiles="CartoDB positron",
-        zoom_control=True,
-        control_scale=False,
-        prefer_canvas=True,
-        max_zoom=REPORT_MAP_MAX_ZOOM
+    # Draw EVERY individual poor sample (not 5 clustered centroids).  The old
+    # clustering collapsed 17 000 poor points into ~5 blobs; this shows the true
+    # spatial spread.  Subsample only for render speed — the legend keeps the
+    # true count and the dots overlap densely at this zoom anyway.
+    MAX_POOR_DOTS = 8000
+    true_count = len(poor)
+    draw_df = (
+        poor.iloc[:: max(1, true_count // MAX_POOR_DOTS)]
+        if true_count > MAX_POOR_DOTS else poor
     )
 
+    fmap = new_report_map()
     add_fullscreen_css(fmap)
 
-    for idx, region in enumerate(regions, start=1):
-        pts = region["points"]
-        center_lat = float(region["lat"])
-        center_lon = float(region["lon"])
-
-        distances = pts.apply(
-            lambda r: _haversine_m(center_lat, center_lon, r.lat, r.lon),
-            axis=1
-        )
-        radius = min(distances.max(), 350)
-
-        folium.Circle(
-            location=[center_lat, center_lon],
-            radius=radius,
-            color="red",
+    for _, p in draw_df.iterrows():
+        folium.CircleMarker(
+            location=[p["lat"], p["lon"]],
+            radius=4,
+            color="#e31a1c",
             fill=True,
-            fill_opacity=region_opacity,
-            popup=f"{title} | Region {idx} | Samples: {len(pts)}"
+            fill_opacity=0.85,
         ).add_to(fmap)
 
-        for _, p in pts.iterrows():
-            folium.CircleMarker(
-                location=[p.lat, p.lon],
-                radius=point_radius,
-                color="red",
-                fill=True,
-                fill_opacity=0.6
-            ).add_to(fmap)
+    add_legend(fmap, title, [(f"Poor Samples : {true_count}", "#e31a1c", true_count)])
+    draw_polygon_overlay(fmap, polygon_wkt)
 
-    add_legend(fmap, title, [("Poor Samples", "red", len(poor))])
-    
-    # Add polygon boundary on top for visibility
-    if polygon_wkt:
-        geom = loads(polygon_wkt)
-        # WKT format is (lon, lat), convert to (lat, lon) for folium
-        polygon_latlon = [(coord[1], coord[0]) for coord in geom.exterior.coords]
-
-        folium.Polygon(
-            locations=polygon_latlon,
-            color="#FF0000",  # Bright red
-            weight=5,
-            fill=False,
-            opacity=1.0,
-            tooltip="Polygon Boundary"
-        ).add_to(fmap)
-
-    bounds = get_df_bounds(df)
-    if polygon_wkt:
-        bounds = merge_bounds(bounds, get_polygon_bounds(polygon_wkt))
-
-    bounds = expand_bounds(bounds, expand_factor=0.02)
-
-    fit_report_bounds(fmap, bounds, reserve_legend_space=True)
+    # Viewport fits the full route (df) for geographic context.
+    fit_data_bounds(fmap, df, reserve_legend_space=True)
 
     fmap.save(tmp_html)
 
     # Convert saved HTML to PNG using Playwright utility (consistent with other maps)
     try:
         from .playwright_utils import html_to_png
-        html_to_png(tmp_html, output_png)
+        html_to_png(
+            tmp_html, output_png,
+            width=render_width, height=render_height,
+            device_scale_factor=device_scale_factor,
+        )
     except Exception as e:
         print(f" Warning: failed to convert poor region html to png: {e}")
     finally:
@@ -1043,13 +1013,7 @@ def generate_base_route_map(df, polygon_wkt, output_html):
     if df.empty:
         raise ValueError("No GPS data to plot for base route map")
 
-    m = folium.Map(
-        tiles="CartoDB positron",
-        zoom_control=True,
-        control_scale=False,
-        prefer_canvas=True,
-        max_zoom=REPORT_MAP_MAX_ZOOM
-    )
+    m = new_report_map()
 
     add_fullscreen_css(m)
 
@@ -1064,32 +1028,18 @@ def generate_base_route_map(df, polygon_wkt, output_html):
             fill_opacity=0.95,
         ).add_to(m)
 
-    # 2 Polygon boundary (RED)
-    if polygon_wkt:
-        geom = loads(polygon_wkt)
-        polygon_latlon = [(coord[1], coord[0]) for coord in geom.exterior.coords]
+    # 2 Polygon boundary (solid red) — overlay only, does NOT expand the view.
+    draw_polygon_overlay(m, polygon_wkt, color="red", weight=4, opacity=1.0, dash_array="")
 
-        folium.Polygon(
-            locations=polygon_latlon,
-            color="red",
-            weight=4,
-            fill=False,
-            opacity=1.0,
-            tooltip="Polygon Boundary"
-        ).add_to(m)
-
-    # Fit view to route + polygon
-    bounds = get_df_bounds(df)
-    if polygon_wkt:
-        bounds = merge_bounds(bounds, get_polygon_bounds(polygon_wkt))
-
-    bounds = expand_bounds(bounds, expand_factor=0.02)
-    fit_report_bounds(m, bounds)
+    # Fit the viewport to the route only (fractional zoom keeps it tight).
+    fit_data_bounds(m, df, reserve_legend_space=False)
 
     m.save(output_html)
 
 
-def generate_poor_region_maps(filtered_df, output_dir="data/images/maps", tmp_dir="data/tmp", polygon_wkt=None):
+def generate_poor_region_maps(filtered_df, output_dir="data/images/maps", tmp_dir="data/tmp",
+                              polygon_wkt=None, render_width=1200, render_height=900,
+                              device_scale_factor=1):
     """Generate RSRP/RSRQ poor region maps using only filtered_df."""
     import os
     os.makedirs(output_dir, exist_ok=True)
@@ -1102,7 +1052,9 @@ def generate_poor_region_maps(filtered_df, output_dir="data/images/maps", tmp_di
         output_png=os.path.join(output_dir, "rsrp_poor_regions.png"),
         tmp_html=os.path.join(tmp_dir, "rsrp_poor_regions.html"),
         title="RSRP < -105",
-        polygon_wkt=polygon_wkt
+        polygon_wkt=polygon_wkt,
+        render_width=render_width, render_height=render_height,
+        device_scale_factor=device_scale_factor,
     )
     # Also generate RSRQ poor region map
     generate_poor_region_map(
@@ -1112,7 +1064,9 @@ def generate_poor_region_maps(filtered_df, output_dir="data/images/maps", tmp_di
         output_png=os.path.join(output_dir, "rsrq_poor_regions.png"),
         tmp_html=os.path.join(tmp_dir, "rsrq_poor_regions.html"),
         title="RSRQ < -14",
-        polygon_wkt=polygon_wkt
+        polygon_wkt=polygon_wkt,
+        render_width=render_width, render_height=render_height,
+        device_scale_factor=device_scale_factor,
     )
 
 
@@ -1129,14 +1083,11 @@ def generate_handover_map(filtered_df, events, output_html, polygon_wkt=None):
         if str(ev.get("type") or "").lower() == "band"
     ]
 
-    m = folium.Map(
-        tiles="CartoDB positron",
-        zoom_control=True,
-        control_scale=False,
-        prefer_canvas=True,
-        max_zoom=REPORT_MAP_MAX_ZOOM
-    )
+    m = new_report_map()
     add_fullscreen_css(m)
+
+    # Polygon drawn as a dashed overlay — does NOT expand the viewport.
+    draw_polygon_overlay(m, polygon_wkt)
 
     # Draw dense route points only (no polylines).
     # This prevents line-like rendering and keeps handover focus on events.
@@ -1210,16 +1161,7 @@ def generate_handover_map(filtered_df, events, output_html, polygon_wkt=None):
             ],
         )
 
-    # Polygon boundary
-    if polygon_wkt:
-        geom = loads(polygon_wkt)
-        polygon_latlon = [(coord[1], coord[0]) for coord in geom.exterior.coords]
-        folium.Polygon(locations=polygon_latlon, color="#FF0000", weight=5, fill=False, opacity=1.0, tooltip="Polygon Boundary").add_to(m)
-
-    bounds = get_df_bounds(df)
-    if polygon_wkt:
-        bounds = merge_bounds(bounds, get_polygon_bounds(polygon_wkt))
-    bounds = expand_bounds(bounds, expand_factor=0.02)
-    fit_report_bounds(m, bounds, reserve_legend_space=bool(events))
+    # Fit the viewport to the data only (fractional zoom keeps it tight).
+    fit_data_bounds(m, df, reserve_legend_space=bool(events))
 
     m.save(output_html)

@@ -9,6 +9,8 @@ from math import radians, cos, sin, asin, sqrt
 import pandas as pd
 from geopy.geocoders import Nominatim
 
+from .map_generator import normalize_band_name
+
 logger = logging.getLogger(__name__)
 geolocator = Nominatim(user_agent="pdf_report_generator", timeout=3)
 
@@ -180,7 +182,12 @@ def build_band_summary(filtered_df: pd.DataFrame) -> Optional[List[Dict]]:
     if "band" not in filtered_df.columns:
         return None
 
-    band_counts = filtered_df["band"].dropna().value_counts()
+    # Normalize raw band values ("0", "-1", "Unknown", "N/A", …) and drop the
+    # Unknown bucket so the denominator is the count of *known* bands.  This
+    # keeps the LLM-facing band % identical to the band table / pie chart.
+    normalized = filtered_df["band"].apply(normalize_band_name)
+    known = normalized[normalized != "Unknown"]
+    band_counts = known.value_counts()
     if band_counts.empty:
         return None
 

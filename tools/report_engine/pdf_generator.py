@@ -6,7 +6,8 @@ import re
 from datetime import datetime
 from typing import Dict, Any, Optional
 from reportlab.platypus import (
-    SimpleDocTemplate, Paragraph, Spacer, Image, PageBreak, CondPageBreak, Table, TableStyle
+    SimpleDocTemplate, Paragraph, Spacer, Image, PageBreak, CondPageBreak,
+    Table, TableStyle, KeepTogether
 )
 from reportlab.platypus.tableofcontents import TableOfContents
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
@@ -15,6 +16,7 @@ from reportlab.lib.units import inch
 from reportlab.lib import colors
 from reportlab.lib.enums import TA_CENTER, TA_LEFT
 from reportlab.pdfgen import canvas
+from PIL import Image as PILImage
 
 
 class PageNumCanvas(canvas.Canvas):
@@ -58,17 +60,106 @@ class TOCDocTemplate(SimpleDocTemplate):
             self.notify("TOCEntry", (level, text, self.page, key))
 
 
+# =====================================================
+# NATIVE TABLE + IMAGE HANDLING
+# Data tables are rendered as crisp native ReportLab tables (selectable text,
+# tiny size); map screenshots are palette-compressed; charts keep full pixels.
+# =====================================================
+
+# Filenames that are DATA TABLES (full-width, no 4-inch height squeeze).
+TABLE_IMAGE_FILES = {
+    "band_table.png", "pci_table.png", "session_table.png",
+    "kpi_summary.png", "drive_summary.png", "poor_kpi_stats.png",
+    "network_quality_summary.png", "pci_cdf_table.png", "indoor_outdoor_stats.png",
+    "app_analytics_part1.png", "app_analytics_part2.png",
+    "pci_poor_rsrp.png", "pci_poor_rsrq.png",
+    "speed_stats.png", "latency_stats.png", "jitter_stats.png",
+    "rsrp_range_table.png", "rsrq_range_table.png", "sinr_range_table.png",
+    "dl_range_table.png", "ul_range_table.png", "mos_range_table.png",
+}
+
+# Charts: keep original pixels (quantization softens axis/label text).
+CHART_IMAGE_FILES = {
+    "pci_distribution.png", "band_pie.png",
+    "cdf_rsrp.png", "cdf_rsrq.png", "cdf_sinr.png",
+    "cdf_dl_tpt.png", "cdf_ul_tpt.png", "cdf_mos.png", "cdf_pci.png",
+    "speed_hist.png", "latency_hist.png", "jitter_hist.png",
+}
+
+TABLE_MAX_WIDTH = 6.6 * inch    # full usable A4 text width (margins 40+40pt)
+TABLE_MAX_HEIGHT = 8.6 * inch   # nearly full page height (no 4-inch squeeze)
+
+_NATIVE_TABLE_STYLES = getSampleStyleSheet()
+_NATIVE_CELL_STYLE = ParagraphStyle(
+    "NativeTableCell",
+    parent=_NATIVE_TABLE_STYLES["BodyText"],
+    fontName="Helvetica", fontSize=8, leading=9,
+    textColor=colors.HexColor("#1f2937"),
+)
+_NATIVE_HEADER_STYLE = ParagraphStyle(
+    "NativeTableHeader",
+    parent=_NATIVE_CELL_STYLE,
+    fontName="Helvetica-Bold", textColor=colors.white,
+)
+
+
+def make_native_table(df):
+    """Render a compact, crisp native ReportLab table from a DataFrame."""
+    import pandas as pd
+
+    table_data = [[Paragraph(str(col), _NATIVE_HEADER_STYLE) for col in df.columns]]
+    for row in df.itertuples(index=False):
+        table_data.append([
+            Paragraph("" if pd.isna(value) else str(value), _NATIVE_CELL_STYLE)
+            for value in row
+        ])
+
+    col_widths = None
+    if len(df.columns) == 5:
+        col_widths = [0.55 * inch, 0.9 * inch, 0.95 * inch, 0.95 * inch, 3.25 * inch]
+    elif len(df.columns) > 0:
+        col_widths = [TABLE_MAX_WIDTH / len(df.columns)] * len(df.columns)
+
+    table = Table(table_data, repeatRows=1, hAlign="LEFT", colWidths=col_widths)
+    table.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#4472C4")),
+        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+        ("FONTSIZE", (0, 0), (-1, -1), 8),
+        ("LEADING", (0, 0), (-1, -1), 9),
+        ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ("GRID", (0, 0), (-1, -1), 0.35, colors.HexColor("#9aa6b2")),
+        ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.whitesmoke, colors.HexColor("#eef2f7")]),
+        ("LEFTPADDING", (0, 0), (-1, -1), 4),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 4),
+        ("TOPPADDING", (0, 0), (-1, -1), 3),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
+    ]))
+    return table
+
+
 class PDFReportGenerator:
 
     def __init__(
         self,
         output_path="data/processed/drive_test_report.pdf",
         images_dir="data/images",
-        processed_dir="data/processed"
+        processed_dir="data/processed",
+        native_tables=None,
+        scratch_dir=None,
     ):
         self.output_path = output_path
         self.images_dir = images_dir
         self.processed_dir = processed_dir
+        # {filename: DataFrame} rendered as native tables instead of PNGs.
+        self.native_tables = native_tables or {}
+        # Where compressed copies of map PNGs are written.
+        self.scratch_dir = scratch_dir or os.path.join(
+            os.path.dirname(output_path) or ".", "_img_opt"
+        )
+        os.makedirs(self.scratch_dir, exist_ok=True)
+        self._opt_savings = 0
 
         os.makedirs(os.path.dirname(output_path), exist_ok=True)
 
@@ -268,22 +359,69 @@ class PDFReportGenerator:
             self.story.append(Paragraph(str(content), self.styles["Body"]))
             self.story.append(Spacer(1, 4))  # Reduced from 8
 
+    def _append_visual(self, visual):
+        """Bind a heading to the visual that immediately follows it (KeepTogether)."""
+        if self.story and isinstance(self.story[-1], Paragraph) and hasattr(self.story[-1], "toc_level"):
+            heading = self.story.pop()
+            keep = KeepTogether([heading, Spacer(1, 4), visual, Spacer(1, 6)])
+            keep.toc_level = heading.toc_level
+            keep.toc_text = heading.toc_text
+            keep.toc_key = heading.toc_key
+            self.story.append(keep)
+            return
+        self.story.append(visual)
+        self.story.append(Spacer(1, 6))
+
+    def _compress_png(self, path):
+        """Palette-quantize + optimize a map PNG to shrink file size; keep .png."""
+        try:
+            out = os.path.join(self.scratch_dir, os.path.basename(path))
+            with PILImage.open(path) as im:
+                q = im.convert("RGB").quantize(colors=256, method=PILImage.FASTOCTREE)
+                q.save(out, format="PNG", optimize=True)
+            before, after = os.path.getsize(path), os.path.getsize(out)
+            if after < before:
+                self._opt_savings += (before - after)
+                return out
+            return path
+        except Exception as exc:
+            print(f" Warning: image compress failed for {path}: {exc}")
+            return path
+
+    def _place_image(self, path, max_width, max_height):
+        img = Image(path)
+        iw, ih = img.imageWidth, img.imageHeight
+        scale = min(max_width / iw, max_height / ih, 1.0)
+        img.drawWidth = iw * scale
+        img.drawHeight = ih * scale
+        self._append_visual(img)
+
     def add_image(self, filename, subdir="kpi_maps", max_height=4*inch):
+        # Native table takes priority — crisp, selectable, tiny.
+        if filename in self.native_tables:
+            table_df = self.native_tables[filename]
+            if table_df is not None and not table_df.empty:
+                self._append_visual(make_native_table(table_df))
+            return
+
         path = os.path.join(self.images_dir, subdir, filename)
         if not os.path.exists(path):
             print(f" Warning: missing {path}")
             return
 
-        img = Image(path)
-        iw, ih = img.imageWidth, img.imageHeight
-        scale = min((5.8*inch)/iw, max_height/ih, 1.0)
-        img.drawWidth = iw * scale
-        img.drawHeight = ih * scale
-
-        self.story.append(img)
-        self.story.append(Spacer(1, 6))  # Small spacing between images
+        if filename in TABLE_IMAGE_FILES:
+            # Table image fallback: full width, no 4-inch squeeze.
+            self._place_image(path, TABLE_MAX_WIDTH, TABLE_MAX_HEIGHT)
+        elif filename in CHART_IMAGE_FILES:
+            # Charts: full quality (no quantization), full width.
+            self._place_image(path, TABLE_MAX_WIDTH, max_height)
+        else:
+            # Maps: palette-compress to shrink the PDF, then place.
+            self._place_image(self._compress_png(path), 5.8 * inch, max_height)
 
     def has_image(self, filename, subdir="kpi_maps"):
+        if filename in self.native_tables:
+            return True
         return os.path.exists(os.path.join(self.images_dir, subdir, filename))
 
     def has_text(self, text):
@@ -307,6 +445,23 @@ class PDFReportGenerator:
     def add_image_subsection(self, title, key, images, toc_text=None):
         if not self.has_any_image(images):
             return False
+
+        # Native poor-PCI tables: show "Top N of M PCIs" in the heading.
+        if len(images) == 1 and images[0]["filename"] in self.native_tables:
+            filename = images[0]["filename"]
+            table_df = self.native_tables[filename]
+            if table_df is None or table_df.empty:
+                return False
+            display_title = title
+            if filename in {"pci_poor_rsrp.png", "pci_poor_rsrq.png"}:
+                shown = len(table_df)
+                total = int(table_df.attrs.get("total_poor_pci", shown))
+                suffix = f"Top {shown} of {total} PCIs" if total > shown else f"{shown} PCIs"
+                display_title = f"{title} ({suffix})"
+            self.add_toc_heading(display_title, self.styles["SubSection"], 1, key, toc_text or display_title)
+            self.add_image(**images[0])
+            return True
+
         self.add_toc_heading(title, self.styles["SubSection"], 1, key, toc_text or title)
         for img in images:
             self.add_image(**img)
@@ -549,15 +704,22 @@ def generate_pdf_report(
     report_text_path="data/processed/report_text.json",
     output_path="data/processed/drive_test_report.pdf",
     images_dir="data/images",
-    verbose=False
+    verbose=False,
+    native_tables=None,
+    scratch_dir=None,
 ):
     with open(metadata_path) as f:
         metadata = json.load(f)
     with open(report_text_path) as f:
         report_text = json.load(f)
 
-    gen = PDFReportGenerator(output_path, images_dir)
+    gen = PDFReportGenerator(
+        output_path, images_dir,
+        native_tables=native_tables, scratch_dir=scratch_dir,
+    )
     gen.generate_report(report_text, metadata, verbose)
+    if native_tables:
+        print(f" [PDF] image optimization saved ~{gen._opt_savings / (1024 * 1024):.1f} MB")
     return output_path
 
 
