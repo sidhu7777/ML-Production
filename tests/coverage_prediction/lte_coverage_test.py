@@ -22,6 +22,11 @@ from sqlalchemy import text
 from shapely.geometry import box
 from shapely.ops import transform
 from shapely.wkt import loads as load_wkt
+from tools.lte_tilt_recommandation.cell_identity import (
+    build_rf_identity,
+    build_sector_identity,
+    build_site_sector_band_identity,
+)
 
 from tests.lte_rf_debug_lab import DEFAULT_PROJECT_ID, DEFAULT_REGION, _write_json
 from tests.lte_rf_debug_lab import (
@@ -65,12 +70,18 @@ REDUCED_COVERAGE_GREEN_TAGS = {
 }
 COVERAGE_CLUTTER_FORMULA_VERSION = "v3_park_open_driven_suburban_split"
 TOPOLOGY_SELECTION_VERSION = "v2_site_cell_sector_growth_db_topology"
-BAND_DIVERSITY_VERSION = "v1_bucket_band_mix"
+BAND_DIVERSITY_VERSION = "v2_bucket_band_mix_plus_multi_band_sectors"
 BAND_MIX_PLAN = {
     "PART_1": {900: 0.15, 1800: 0.69, 850: 0.15, 2300: 0.01},
     "PART_2": {900: 0.11, 1800: 0.76, 850: 0.10, 2300: 0.03},
     "PART_3": {900: 0.08, 1800: 0.80, 850: 0.07, 2300: 0.05},
 }
+MULTI_BAND_SECTOR_SHARE_PLAN = {
+    "PART_1": 0.05,
+    "PART_2": 0.12,
+    "PART_3": 0.21,
+}
+MULTI_BAND_SECONDARY_BAND_POOL = (700, 850, 900, 2100, 2300)
 
 
 @dataclass
@@ -1599,6 +1610,131 @@ def _assign_band_mix_to_bucket(bucket_df: pd.DataFrame, bucket_label: str) -> tu
     return out, band_counts
 
 
+def _secondary_band_for_sector(bucket_label: str, sector_key: object, primary_band: object) -> int:
+    try:
+        primary = int(float(primary_band))
+    except (TypeError, ValueError):
+        primary = None
+    candidates = [int(band) for band in MULTI_BAND_SECONDARY_BAND_POOL if band != primary]
+    if not candidates:
+        candidates = [int(band) for band in MULTI_BAND_SECONDARY_BAND_POOL]
+    digest = hashlib.sha1(f"{bucket_label}|{sector_key}|{primary}".encode("utf-8")).hexdigest()
+    return int(candidates[int(digest, 16) % len(candidates)])
+
+
+def _expand_multi_band_sectors(bucket_df: pd.DataFrame, bucket_label: str) -> tuple[pd.DataFrame, Dict[str, object]]:
+    out = bucket_df.copy()
+    if out.empty or "_topo_cell_sector_key" not in out.columns:
+        return out, {
+            "multi_band_sector_share_target": 0.0,
+            "multi_band_sector_count": 0,
+            "multi_band_carrier_rows_added": 0,
+            "multi_band_secondary_band_counts_json": json.dumps({}, sort_keys=True),
+        }
+
+    sector_share_target = float(MULTI_BAND_SECTOR_SHARE_PLAN.get(str(bucket_label), 0.0))
+    sector_keys = (
+        out["_topo_cell_sector_key"]
+        .astype(str)
+        .drop_duplicates()
+        .sort_values(
+            key=lambda s: s.map(lambda value: hashlib.sha1(f"{bucket_label}|multi_band|{value}".encode("utf-8")).hexdigest())
+        )
+        .tolist()
+    )
+    sector_target_count = min(len(sector_keys), int(round(len(sector_keys) * sector_share_target)))
+    selected_sector_keys = sector_keys[:sector_target_count]
+    if not selected_sector_keys:
+        out["carrier_variant"] = 1
+        return out, {
+            "multi_band_sector_share_target": sector_share_target,
+            "multi_band_sector_count": 0,
+            "multi_band_carrier_rows_added": 0,
+            "multi_band_secondary_band_counts_json": json.dumps({}, sort_keys=True),
+        }
+
+    selected_mask = out["_topo_cell_sector_key"].astype(str).isin(selected_sector_keys)
+    selected_rows = out.loc[selected_mask].copy()
+    if selected_rows.empty:
+        out["carrier_variant"] = 1
+        return out, {
+            "multi_band_sector_share_target": sector_share_target,
+            "multi_band_sector_count": 0,
+            "multi_band_carrier_rows_added": 0,
+            "multi_band_secondary_band_counts_json": json.dumps({}, sort_keys=True),
+        }
+
+    primary_rows = out.copy()
+    primary_rows["carrier_variant"] = 1
+    duplicate_rows = selected_rows.copy()
+    duplicate_rows["carrier_variant"] = 2
+
+    band_counts: Dict[str, int] = {}
+    node_col = "Node_Cell_ID" if "Node_Cell_ID" in duplicate_rows.columns else ("cell_id" if "cell_id" in duplicate_rows.columns else None)
+    for row_idx, row in duplicate_rows.iterrows():
+        sector_key = row["_topo_cell_sector_key"]
+        secondary_band = _secondary_band_for_sector(str(bucket_label), sector_key, row.get("band"))
+        band_counts[str(secondary_band)] = band_counts.get(str(secondary_band), 0) + 1
+        sector_value = row["sector"] if "sector" in row.index and pd.notna(row["sector"]) and str(row["sector"]).strip() not in {"", "nan", "None"} else str(sector_key).split("|")[-1]
+        base_cell = ""
+        if node_col is not None:
+            base_cell = str(row[node_col]).strip()
+        if not base_cell and "cell_id" in row.index:
+            base_cell = str(row["cell_id"]).strip()
+        if not base_cell:
+            base_cell = f"{row_idx}"
+        synthetic_cell_id = f"{base_cell}__MB{secondary_band}"
+
+        if "Node_Cell_ID" in duplicate_rows.columns:
+            duplicate_rows.at[row_idx, "Node_Cell_ID"] = synthetic_cell_id
+        if "cell_id" in duplicate_rows.columns:
+            duplicate_rows.at[row_idx, "cell_id"] = synthetic_cell_id
+        if "band" in duplicate_rows.columns:
+            duplicate_rows.at[row_idx, "band"] = float(secondary_band)
+        for col in ["frequency_mhz", "frequency", "downlink_frequency", "uplink_center_frequency", "earfcn"]:
+            if col in duplicate_rows.columns:
+                duplicate_rows.at[row_idx, col] = float(secondary_band)
+        if "cell_id_representative" in duplicate_rows.columns:
+            duplicate_rows.at[row_idx, "cell_id_representative"] = synthetic_cell_id
+        if "_topo_site_key" in duplicate_rows.columns and "_topo_cell_key" in duplicate_rows.columns:
+            site_value = row["_topo_site_key"]
+            duplicate_rows.at[row_idx, "_topo_cell_key"] = f"{site_value}|{synthetic_cell_id}"
+            duplicate_rows.at[row_idx, "_topo_cell_sector_key"] = f"{site_value}|{synthetic_cell_id}|{sector_value}"
+            if "rf_identity_key" in duplicate_rows.columns:
+                duplicate_rows.at[row_idx, "rf_identity_key"] = build_rf_identity(
+                    site_value,
+                    synthetic_cell_id,
+                    sector_value,
+                    secondary_band,
+                    fallback=synthetic_cell_id,
+                )
+            if "sector_identity_key" in duplicate_rows.columns:
+                duplicate_rows.at[row_idx, "sector_identity_key"] = build_sector_identity(
+                    site_value,
+                    synthetic_cell_id,
+                    sector_value,
+                    fallback=synthetic_cell_id,
+                )
+            if "site_sector_band_key" in duplicate_rows.columns:
+                duplicate_rows.at[row_idx, "site_sector_band_key"] = build_site_sector_band_identity(
+                    site_value,
+                    sector_value,
+                    secondary_band,
+                )
+
+    out = pd.concat([primary_rows, duplicate_rows], ignore_index=True)
+    sort_cols = [col for col in ["_topo_site_key", "_topo_cell_key", "_topo_cell_sector_key", "carrier_variant", "band", "Node_Cell_ID"] if col in out.columns]
+    if sort_cols:
+        out = out.sort_values(sort_cols).reset_index(drop=True)
+    summary = {
+        "multi_band_sector_share_target": sector_share_target,
+        "multi_band_sector_count": int(len(selected_sector_keys)),
+        "multi_band_carrier_rows_added": int(len(duplicate_rows)),
+        "multi_band_secondary_band_counts_json": json.dumps(band_counts, sort_keys=True),
+    }
+    return out, summary
+
+
 def _build_bucket_site_topologies(
     site_df: pd.DataFrame,
     buckets: Sequence[Tuple[str, str, str]],
@@ -1647,6 +1783,7 @@ def _build_bucket_site_topologies(
         )
         bucket_df = filtered.loc[filtered["_topo_cell_sector_key"].isin(selected_sector_keys)].copy()
         bucket_df, band_counts = _assign_band_mix_to_bucket(bucket_df, str(label))
+        bucket_df, multi_band_summary = _expand_multi_band_sectors(bucket_df, str(label))
         actual_site_count = int(bucket_df["_topo_site_key"].nunique())
         actual_cell_count = int(bucket_df["_topo_cell_key"].nunique())
         actual_sector_count = int(bucket_df["_topo_cell_sector_key"].nunique())
@@ -1664,6 +1801,10 @@ def _build_bucket_site_topologies(
                 "effective_cell_count_target": int(effective_cell_target),
                 "band_mix_version": BAND_DIVERSITY_VERSION,
                 "band_counts_json": json.dumps(band_counts, sort_keys=True),
+                "multi_band_sector_share_target": float(multi_band_summary["multi_band_sector_share_target"]),
+                "multi_band_sector_count": int(multi_band_summary["multi_band_sector_count"]),
+                "multi_band_carrier_rows_added": int(multi_band_summary["multi_band_carrier_rows_added"]),
+                "multi_band_secondary_band_counts_json": str(multi_band_summary["multi_band_secondary_band_counts_json"]),
                 "site_rows": int(len(bucket_df)),
             }
         )

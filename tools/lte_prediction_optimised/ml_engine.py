@@ -1334,10 +1334,37 @@ def _compute_affected_cells(
     selected_cells.update(same_site_rows[identity_col].astype(str).tolist())
 
     available_cells = set(site_work[identity_col].astype(str).tolist())
+
+    # Count changed cells whose location actually moved. A moved cell is searched
+    # around two centers (new + original position), so its neighbour budget must
+    # be doubled — otherwise the closer new-location cells consume the whole cap
+    # and the old-location neighbours are silently dropped.
+    moved_cell_count = 0
+    if {"orig_lat", "orig_lon"}.issubset(changed_rows.columns):
+        new_lat_all = pd.to_numeric(changed_rows["lat"], errors="coerce")
+        new_lon_all = pd.to_numeric(changed_rows["lon"], errors="coerce")
+        orig_lat_all = pd.to_numeric(changed_rows["orig_lat"], errors="coerce")
+        orig_lon_all = pd.to_numeric(changed_rows["orig_lon"], errors="coerce")
+        moved_mask = (
+            orig_lat_all.notna()
+            & orig_lon_all.notna()
+            & new_lat_all.notna()
+            & new_lon_all.notna()
+            & (
+                ~np.isclose(orig_lat_all.fillna(0.0), new_lat_all.fillna(0.0))
+                | ~np.isclose(orig_lon_all.fillna(0.0), new_lon_all.fillna(0.0))
+            )
+        )
+        moved_cell_count = int(
+            changed_rows.loc[moved_mask, identity_col].astype(str).nunique()
+        )
+
+    search_center_count = len(changed_cell_ids) + moved_cell_count
+
     max_neighbors = max_neighbors_per_update_cell
     if max_neighbors is None:
         max_neighbors = neighbor_site_count
-    max_neighbors = max(0, int(max_neighbors or 0)) * max(1, len(changed_cell_ids))
+    max_neighbors = max(0, int(max_neighbors or 0)) * max(1, search_center_count)
 
     neighbor_counts = {}
     topology_cols = []
@@ -1367,22 +1394,43 @@ def _compute_affected_cells(
         candidate_rows["lon"] = pd.to_numeric(candidate_rows["lon"], errors="coerce")
         ranked_parts = []
         for _, row in changed_rows.iterrows():
-            center_lat = pd.to_numeric(pd.Series([row.get("lat")]), errors="coerce").iloc[0]
-            center_lon = pd.to_numeric(pd.Series([row.get("lon")]), errors="coerce").iloc[0]
-            if pd.isna(center_lat) or pd.isna(center_lon) or candidate_rows.empty:
+            if candidate_rows.empty:
                 continue
-            ranked = candidate_rows.copy()
-            ranked["distance_m"] = haversine_vectorized(
-                float(center_lat),
-                float(center_lon),
-                ranked["lat"].to_numpy(dtype=float, copy=False),
-                ranked["lon"].to_numpy(dtype=float, copy=False),
-            )
-            ranked = ranked.loc[ranked["distance_m"] <= float(impact_radius_m)].copy()
-            if ranked.empty:
-                continue
-            ranked = ranked.sort_values(["distance_m", identity_col], ascending=[True, True])
-            ranked_parts.append(ranked)
+            # Search neighbours around BOTH the new location and the original
+            # location. When a site is moved (or removed), the cells surrounding
+            # its *old* position also lose its coverage/interference and must be
+            # recomputed, not only the cells around the new position.
+            new_lat = pd.to_numeric(pd.Series([row.get("lat")]), errors="coerce").iloc[0]
+            new_lon = pd.to_numeric(pd.Series([row.get("lon")]), errors="coerce").iloc[0]
+            orig_lat = pd.to_numeric(pd.Series([row.get("orig_lat")]), errors="coerce").iloc[0]
+            orig_lon = pd.to_numeric(pd.Series([row.get("orig_lon")]), errors="coerce").iloc[0]
+
+            centers = []
+            if not (pd.isna(new_lat) or pd.isna(new_lon)):
+                centers.append((float(new_lat), float(new_lon)))
+            # Only add the original location as a separate center when it is
+            # valid and the site actually moved (otherwise it duplicates the new
+            # center and adds nothing).
+            if not (pd.isna(orig_lat) or pd.isna(orig_lon)) and not (
+                (not pd.isna(new_lat) and not pd.isna(new_lon))
+                and np.isclose(orig_lat, new_lat)
+                and np.isclose(orig_lon, new_lon)
+            ):
+                centers.append((float(orig_lat), float(orig_lon)))
+
+            for center_lat, center_lon in centers:
+                ranked = candidate_rows.copy()
+                ranked["distance_m"] = haversine_vectorized(
+                    center_lat,
+                    center_lon,
+                    ranked["lat"].to_numpy(dtype=float, copy=False),
+                    ranked["lon"].to_numpy(dtype=float, copy=False),
+                )
+                ranked = ranked.loc[ranked["distance_m"] <= float(impact_radius_m)].copy()
+                if ranked.empty:
+                    continue
+                ranked = ranked.sort_values(["distance_m", identity_col], ascending=[True, True])
+                ranked_parts.append(ranked)
         if ranked_parts and max_neighbors > 0:
             ranked_cells = (
                 pd.concat(ranked_parts, ignore_index=True)

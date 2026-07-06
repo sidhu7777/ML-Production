@@ -165,6 +165,10 @@ def _normalize_optional_site_selector_series(series, fallback=None):
     return normalized
 
 
+def _normalize_node_b_id_series(series):
+    return _strip_decimal_suffix_series(series)
+
+
 def _derive_nodeb_cell_from_identity_series(series):
     text = _clean_text_series(series).astype("string")
     node_part = pd.Series(pd.NA, index=text.index, dtype="string")
@@ -203,6 +207,69 @@ def _coalesce_columns(df, target, candidates, default=None):
         out = out.where(out.notna(), series)
     df[target] = out
     return df
+
+
+def _count_baseline_key_overlap(save_engine, out: pd.DataFrame, project_id: int) -> tuple[int, int]:
+    if out.empty:
+        return 0, 0
+
+    key_cols = ["project_id", "nodeb_id_cell_id", "lat_6dp", "lon_6dp"]
+    key_df = out[key_cols].dropna().drop_duplicates().copy()
+    if key_df.empty:
+        return 0, 0
+
+    table_name = "lte_prediction_baseline_results"
+    staging_table = f"tmp_lte_baseline_keys_{uuid_lib.uuid4().hex[:8]}"
+    with save_engine.begin() as conn:
+        existing_rows = int(
+            conn.execute(
+                text(f"SELECT COUNT(*) FROM {table_name} WHERE project_id = :project_id"),
+                {"project_id": int(project_id)},
+            ).scalar()
+            or 0
+        )
+        if existing_rows == 0:
+            return 0, 0
+
+        conn.execute(
+            text(
+                f"""
+                CREATE TEMPORARY TABLE {staging_table} (
+                    project_id BIGINT NOT NULL,
+                    nodeb_id_cell_id VARCHAR(255) NOT NULL,
+                    lat_6dp DOUBLE NOT NULL,
+                    lon_6dp DOUBLE NOT NULL
+                )
+                """
+            )
+        )
+        key_df.to_sql(
+            staging_table,
+            con=conn,
+            if_exists="append",
+            index=False,
+            method="multi",
+            chunksize=10000,
+        )
+        overlap_rows = int(
+            conn.execute(
+                text(
+                    f"""
+                    SELECT COUNT(*)
+                    FROM {table_name} b
+                    INNER JOIN {staging_table} k
+                      ON b.project_id = k.project_id
+                     AND b.nodeb_id_cell_id = k.nodeb_id_cell_id
+                     AND b.lat_6dp = k.lat_6dp
+                     AND b.lon_6dp = k.lon_6dp
+                    WHERE b.project_id = :project_id
+                    """
+                ),
+                {"project_id": int(project_id)},
+            ).scalar()
+            or 0
+        )
+        return existing_rows, overlap_rows
 
 
 def _prefer_columns(df, target, candidates, default=None):
@@ -479,6 +546,21 @@ class LTEPredictionService:
         existing = existing.rename(columns={col: f"{col}__old" for col in compare_cols})
         merged = out.merge(existing, on=key_cols, how="left", indicator=True)
         is_new = merged["_merge"] == "left_only"
+        if bool(is_new.all()):
+            conn.execute(
+                text(
+                    """
+                    DELETE FROM lte_prediction_baseline_results
+                    WHERE project_id = :project_id
+                    """
+                ),
+                {"project_id": int(project_id)},
+            )
+            print(
+                f"[LTE][BASELINE_DELTA] project_id={project_id} existing_rows={len(existing)} "
+                f"overlap_rows=0 action=replace_existing"
+            )
+            return out
         is_changed = pd.Series(False, index=merged.index)
         changed_counts = {}
         for col in compare_cols:
@@ -1055,10 +1137,10 @@ class LTEPredictionService:
         out["job_id"] = job_id
         out["created_at"] = datetime.now()
 
-        out = _coalesce_columns(out, "node_b_id", ["site_selector_id", "node_b_id", "nodeb_id", "site_nodeb_id", "derived_nodeb_id"])
+        out = _coalesce_columns(out, "node_b_id", ["node_b_id", "nodeb_id", "site_nodeb_id", "derived_nodeb_id", "site_selector_id"])
         out = _coalesce_columns(out, "cell_id", ["original_cell_id", "derived_cell_id", "cell_id"])
         out = _coalesce_columns(out, "operator", ["site_operator", "operator"], default=operator)
-        out = _coalesce_columns(out, "site_id", ["site_selector_id", "site_id", "site_site_id", "node_b_id"])
+        out = _coalesce_columns(out, "site_id", ["site_id", "site_site_id", "site_selector_id", "node_b_id"])
 
         for col in ["node_b_id", "cell_id", "operator", "site_id"]:
             out[col] = _clean_text_series(out[col])
@@ -1067,7 +1149,7 @@ class LTEPredictionService:
         if "site_operator" in out.columns:
             out["site_operator"] = out["site_operator"].map(_normalize_operator_label)
 
-        out["node_b_id"] = _normalize_site_selector_series(out["node_b_id"])
+        out["node_b_id"] = _normalize_node_b_id_series(out["node_b_id"])
         out["site_id"] = _normalize_optional_site_selector_series(out["site_id"], fallback=out["node_b_id"])
         out["cell_id"] = _strip_decimal_suffix_series(out["cell_id"])
         out = _coalesce_columns(out, "sector", ["sector", "site_sector"])
@@ -1197,6 +1279,13 @@ class LTEPredictionService:
         baseline_save_started = time.perf_counter()
         bridge = get_bridge_client()
         if bridge:
+            existing_rows, overlap_rows = _count_baseline_key_overlap(save_engine, out, project_id=int(project_id))
+            replace_existing = existing_rows > 0 and overlap_rows == 0
+            print(
+                f"[LTE][BASELINE_DB_REPLACE_CHECK] project_id={project_id} "
+                f"existing_rows={existing_rows} overlap_rows={overlap_rows} "
+                f"replace_existing={replace_existing}"
+            )
             written_rows = bridge.save_dataframe(
                 "SaveLtePredictionBaselineResults",
                 out,
@@ -1204,6 +1293,7 @@ class LTEPredictionService:
                 job_id=str(job_id),
                 region=str(region).lower(),
                 chunk_size=20000,
+                replace_existing=replace_existing,
             )
             print("[LTE][BASELINE_DB_WRITE] source=python_bridge")
         else:
