@@ -45,6 +45,7 @@ np.random.seed(RANDOM_SEED)
 MODEL_ROOT = ML_ROOT / "models" / "model2_hybrid_target_experiment"
 FULL_PREDICTIONS_CSV = MODEL_ROOT / "model2_hybrid_full_predictions.csv"
 SUMMARY_JSON = MODEL_ROOT / "model2_hybrid_training_summary.json"
+DIAGNOSTICS_JSON = MODEL_ROOT / "model2_hybrid_diagnostics_summary.json"
 
 TARGET_CONFIG = {
     "model2a_demand": {
@@ -238,6 +239,174 @@ def fit_pipeline(X_train: pd.DataFrame, y_train: pd.Series, params: dict[str, An
     return pipe
 
 
+def transformed_feature_names(model: Pipeline) -> list[str]:
+    prep = model.named_steps["prep"]
+    try:
+        return list(prep.get_feature_names_out())
+    except Exception:
+        return []
+
+
+def clean_feature_name(feature: str) -> str:
+    name = str(feature)
+    for prefix in ("num__", "cat__"):
+        if name.startswith(prefix):
+            name = name[len(prefix) :]
+    for categorical in CATEGORICAL_FEATURES:
+        if name.startswith(f"{categorical}_"):
+            return categorical
+    return name
+
+
+def run_shap_diagnostics(model: Pipeline, frame: pd.DataFrame, features: list[str], target: str, out_dir: Path) -> dict[str, str]:
+    artifacts: dict[str, str] = {}
+    try:
+        import matplotlib
+        import shap
+
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+
+        sample = frame.sample(n=min(len(frame), 800), random_state=RANDOM_SEED) if len(frame) > 800 else frame
+        transformed = model.named_steps["prep"].transform(sample[features])
+        feature_names = transformed_feature_names(model) or [f"feature_{idx}" for idx in range(transformed.shape[1])]
+        explainer = shap.TreeExplainer(model.named_steps["model"])
+        shap_values = explainer.shap_values(transformed)
+        importance = (
+            pd.DataFrame({"feature": feature_names, "mean_abs_shap": np.abs(shap_values).mean(axis=0)})
+            .sort_values("mean_abs_shap", ascending=False)
+            .reset_index(drop=True)
+        )
+        importance.to_csv(out_dir / "shap_importance.csv", index=False)
+
+        plt.figure(figsize=(10, 7))
+        shap.summary_plot(shap_values, transformed, feature_names=feature_names, show=False, max_display=20)
+        fig = plt.gcf()
+        fig.suptitle(f"Hybrid Model 2 - {target} SHAP Summary", fontsize=16, y=0.98)
+        plt.tight_layout()
+        fig.savefig(out_dir / "shap_summary.png", dpi=160, bbox_inches="tight")
+        plt.close("all")
+        artifacts["shap_importance_csv"] = str(out_dir / "shap_importance.csv")
+        artifacts["shap_summary_png"] = str(out_dir / "shap_summary.png")
+    except Exception as exc:
+        (out_dir / "shap_failed.txt").write_text(str(exc), encoding="utf-8")
+        artifacts["shap_error"] = str(out_dir / "shap_failed.txt")
+    return artifacts
+
+
+def run_prediction_diagnostics(model: Pipeline, train_df: pd.DataFrame, test_df: pd.DataFrame, features: list[str], target: str, out_dir: Path) -> dict[str, str]:
+    artifacts: dict[str, str] = {}
+    try:
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+
+        pred = model.predict(test_df[features])
+        residual = test_df[target].to_numpy(dtype=float) - pred
+
+        fig, ax = plt.subplots(figsize=(8, 6), constrained_layout=True)
+        ax.scatter(test_df[target], pred, s=12, alpha=0.45, color="#2f6f73")
+        lo = float(min(test_df[target].min(), pred.min()))
+        hi = float(max(test_df[target].max(), pred.max()))
+        ax.plot([lo, hi], [lo, hi], color="black", linewidth=1, linestyle="--")
+        ax.set_title(f"{target} Prediction Error", fontsize=14, fontweight="bold")
+        ax.set_xlabel("Actual")
+        ax.set_ylabel("Predicted")
+        ax.grid(alpha=0.25)
+        fig.savefig(out_dir / "yb_prediction_error.png", dpi=160, bbox_inches="tight")
+        plt.close(fig)
+
+        fig, ax = plt.subplots(figsize=(8, 6), constrained_layout=True)
+        ax.scatter(pred, residual, s=12, alpha=0.45, color="#5b5f97")
+        ax.axhline(0, color="black", linewidth=1, linestyle="--")
+        ax.set_title(f"{target} Residuals", fontsize=14, fontweight="bold")
+        ax.set_xlabel("Predicted")
+        ax.set_ylabel("Actual - predicted")
+        ax.grid(alpha=0.25)
+        fig.savefig(out_dir / "yb_residuals.png", dpi=160, bbox_inches="tight")
+        plt.close(fig)
+
+        artifacts["prediction_error_png"] = str(out_dir / "yb_prediction_error.png")
+        artifacts["residuals_png"] = str(out_dir / "yb_residuals.png")
+    except Exception as exc:
+        (out_dir / "prediction_diagnostics_failed.txt").write_text(str(exc), encoding="utf-8")
+        artifacts["prediction_diagnostics_error"] = str(out_dir / "prediction_diagnostics_failed.txt")
+    return artifacts
+
+
+def run_evidently_report(model: Pipeline, train_df: pd.DataFrame, test_df: pd.DataFrame, features: list[str], target: str, out_dir: Path) -> dict[str, str]:
+    artifacts: dict[str, str] = {}
+    try:
+        from evidently import ColumnMapping
+        from evidently.metric_preset import DataDriftPreset, RegressionPreset
+        from evidently.report import Report
+
+        ref = train_df[features + [target]].copy()
+        cur = test_df[features + [target]].copy()
+        ref["prediction"] = model.predict(train_df[features])
+        cur["prediction"] = model.predict(test_df[features])
+        report_features = [feature for feature in features if not ref[feature].isna().all()]
+        numeric_features = [feature for feature in report_features if feature not in CATEGORICAL_FEATURES]
+        categorical_features = [feature for feature in report_features if feature in CATEGORICAL_FEATURES]
+        ref = ref[report_features + [target, "prediction"]]
+        cur = cur[report_features + [target, "prediction"]]
+        mapping = ColumnMapping(
+            target=target,
+            prediction="prediction",
+            numerical_features=numeric_features,
+            categorical_features=categorical_features,
+        )
+        report = Report(metrics=[DataDriftPreset(), RegressionPreset()])
+        report.run(reference_data=ref, current_data=cur, column_mapping=mapping)
+        report.save_html(str(out_dir / "evidently_report.html"))
+        artifacts["evidently_report_html"] = str(out_dir / "evidently_report.html")
+    except Exception as exc:
+        (out_dir / "evidently_failed.txt").write_text(str(exc), encoding="utf-8")
+        artifacts["evidently_error"] = str(out_dir / "evidently_failed.txt")
+    return artifacts
+
+
+def create_combined_shap_image() -> str | None:
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    rows = []
+    for target_key in TARGET_CONFIG:
+        target = TARGET_CONFIG[target_key]["target"]
+        shap_path = MODEL_ROOT / target_key / "shap_importance.csv"
+        if not shap_path.exists():
+            continue
+        shap_df = pd.read_csv(shap_path).head(12).copy()
+        shap_df["target"] = target
+        shap_df["clean_feature"] = shap_df["feature"].map(clean_feature_name)
+        rows.append(shap_df)
+    if not rows:
+        return None
+
+    shap_all = pd.concat(rows, ignore_index=True)
+    fig, axes = plt.subplots(1, len(TARGET_CONFIG), figsize=(18, 8), constrained_layout=True)
+    if len(TARGET_CONFIG) == 1:
+        axes = [axes]
+    for ax, target_key in zip(axes, TARGET_CONFIG):
+        target = TARGET_CONFIG[target_key]["target"]
+        top = shap_all[shap_all["target"] == target].head(12).iloc[::-1].copy()
+        if top.empty:
+            ax.set_axis_off()
+            continue
+        ax.barh(top["clean_feature"], top["mean_abs_shap"], color="#2f6f73")
+        ax.set_title(target.replace("_est", "").upper(), fontsize=14, fontweight="bold")
+        ax.set_xlabel("mean |SHAP|")
+        ax.grid(axis="x", alpha=0.25)
+    output = MODEL_ROOT / "combined_shap_top_features.png"
+    fig.suptitle("Hybrid Model 2 SHAP", fontsize=18, fontweight="bold")
+    fig.savefig(output, dpi=180, bbox_inches="tight")
+    plt.close(fig)
+    return str(output)
+
+
 def train_all(trials: int, timeout: int) -> dict[str, Any]:
     MODEL_ROOT.mkdir(parents=True, exist_ok=True)
     df = load_dataset()
@@ -299,6 +468,10 @@ def train_all(trials: int, timeout: int) -> dict[str, Any]:
         test_pred[f"{target}_pred"] = pipe.predict(X_test)
         test_pred.to_csv(out_dir / "test_predictions.csv", index=False)
         full_predictions[f"{target}_pred"] = pipe.predict(df[ALL_FEATURES])
+        diagnostics: dict[str, str] = {}
+        diagnostics.update(run_shap_diagnostics(pipe, test_df, ALL_FEATURES, target, out_dir))
+        diagnostics.update(run_prediction_diagnostics(pipe, train_df, test_df, ALL_FEATURES, target, out_dir))
+        diagnostics.update(run_evidently_report(pipe, train_df, test_df, ALL_FEATURES, target, out_dir))
 
         target_summary = {
             "target": target,
@@ -306,13 +479,18 @@ def train_all(trials: int, timeout: int) -> dict[str, Any]:
             "root_model_file": str(MODEL_ROOT / cfg["model_file"]),
             "best_params": params,
             "metrics": metrics,
+            "diagnostics": diagnostics,
         }
         save_json(target_summary, out_dir / "metadata.json")
         summary["targets"][target_key] = target_summary
 
     full_predictions.to_csv(FULL_PREDICTIONS_CSV, index=False)
+    summary["combined_shap_image"] = create_combined_shap_image()
+    if summary["combined_shap_image"] is not None:
+        summary["combined_shap_image"] = str(summary["combined_shap_image"])
     summary["full_predictions_csv"] = str(FULL_PREDICTIONS_CSV)
     save_json(summary, SUMMARY_JSON)
+    save_json({"output_root": str(MODEL_ROOT), "diagnostics": {k: v.get("diagnostics", {}) for k, v in summary["targets"].items()}, "combined_shap_image": summary.get("combined_shap_image")}, DIAGNOSTICS_JSON)
     return summary
 
 

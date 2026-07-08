@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import subprocess
 import sys
 import time
 from dataclasses import dataclass
@@ -38,11 +39,13 @@ from tests.lte_rf_debug_lab import (
     _attach_polygon_area_ratio,
     _fetch_osm_layer,
 )
+from tests.coverage_prediction.coverage_artifact_locator import write_latest_coverage_artifact
 from tools.lte_prediction import ml_engine as base_ml
 from tools.lte_prediction_optimised import ml_engine as opt_ml
 
 
 OUTPUT_ROOT = Path("tests/output")
+DATA_ROOT = PROJECT_ROOT / "data"
 DEFAULT_POLYGON_WKT = (
     "POLYGON(("
     "77.3493010211505 28.6451999446618,"
@@ -77,11 +80,36 @@ BAND_MIX_PLAN = {
     "PART_3": {900: 0.08, 1800: 0.80, 850: 0.07, 2300: 0.05},
 }
 MULTI_BAND_SECTOR_SHARE_PLAN = {
-    "PART_1": 0.05,
-    "PART_2": 0.12,
-    "PART_3": 0.21,
+    "PART_1": 0.06,
+    "PART_2": 0.14,
+    "PART_3": 0.18,
 }
-MULTI_BAND_SECONDARY_BAND_POOL = (700, 850, 900, 2100, 2300)
+TRIPLE_BAND_SECTOR_SHARE_PLAN = {
+    "PART_1": 0.01,
+    "PART_2": 0.02,
+    "PART_3": 0.04,
+}
+MULTI_BAND_SECONDARY_BAND_PLAN = {
+    "PART_1": {700: 0.10, 850: 0.18, 900: 0.28, 2100: 0.24, 2300: 0.20},
+    "PART_2": {700: 0.12, 850: 0.18, 900: 0.24, 2100: 0.24, 2300: 0.22},
+    "PART_3": {700: 0.14, 850: 0.16, 900: 0.20, 2100: 0.24, 2300: 0.26},
+}
+SYNTHETIC_BAND_TO_EARFCN = {
+    700: 700,
+    850: 850,
+    900: 900,
+    1800: 1750,
+    2100: 2100,
+    2300: 2300,
+}
+CARRIER_LOAD_SHARE_BAND_WEIGHT = {
+    700: 1.15,
+    850: 1.10,
+    900: 1.00,
+    1800: 0.90,
+    2100: 0.75,
+    2300: 0.65,
+}
 
 
 @dataclass
@@ -202,6 +230,20 @@ def _load_coverage_rows_from_run_dir(run_dir: Optional[Path]) -> Optional[pd.Dat
         return None
     df = _coerce_numeric_columns(df)
     print(f"[COVERAGE_TEST][RUN_REUSE] artifact=coverage_rows.csv rows={len(df)} path={path}")
+    return df
+
+
+def _load_project_sites_from_run_dir(run_dir: Optional[Path]) -> Optional[pd.DataFrame]:
+    if run_dir is None:
+        return None
+    path = run_dir / "project_sites.csv"
+    if not path.exists():
+        return None
+    try:
+        df = pd.read_csv(path)
+    except Exception:
+        return None
+    print(f"[COVERAGE_TEST][RUN_REUSE] artifact=project_sites.csv rows={len(df)} path={path}")
     return df
 
 
@@ -991,6 +1033,26 @@ def _load_or_build_df(
     return built
 
 
+def _load_or_build_df_from_any_cache_dir(
+    cache_dirs: Sequence[Path],
+    cache_name: str,
+    cache_key_payload: object,
+    builder,
+) -> pd.DataFrame:
+    cache_key = _make_cache_key(cache_key_payload)
+    for cache_dir in cache_dirs:
+        path_base = cache_dir / f"{cache_name}_{cache_key}"
+        cached = _read_cache_df(path_base)
+        if cached is not None:
+            print(f"[COVERAGE_TEST][CACHE_HIT] name={cache_name} key={cache_key} rows={len(cached)} source_cache_dir={cache_dir}")
+            return cached
+    print(f"[COVERAGE_TEST][CACHE_MISS] name={cache_name} key={cache_key}")
+    built = builder()
+    primary_path_base = cache_dirs[0] / f"{cache_name}_{cache_key}"
+    _write_cache_df(primary_path_base, built)
+    return built
+
+
 def _load_or_build_grid(
     cache_dir: Path,
     cache_key_payload: object,
@@ -1353,8 +1415,8 @@ def _fetch_project_sites_raw(project_id: int, region: str) -> pd.DataFrame:
 
 def _default_topology_plan() -> Dict[str, Dict[str, int]]:
     return {
-        "PART_1": {"site_count": 56, "cell_count": 166, "cell_sector_count": 340},
-        "PART_2": {"site_count": 59, "cell_count": 176, "cell_sector_count": 360},
+        "PART_1": {"site_count": 56, "cell_count": 166, "cell_sector_count": 166},
+        "PART_2": {"site_count": 59, "cell_count": 176, "cell_sector_count": 176},
     }
 
 
@@ -1416,6 +1478,19 @@ def _derive_topology_keys(site_df: pd.DataFrame) -> pd.DataFrame:
         else pd.Series(pd.NA, index=out.index, dtype="string")
     )
     sector_series = sector_series.mask(sector_series.isin(["", "nan", "NaN", "None", "<NA>"]))
+    cell_sector_fallback = (
+        out[cell_source_col]
+        .astype("string")
+        .str.strip()
+        .str.extract(r"_([^_]+)$", expand=False)
+        .astype("string")
+    )
+    cell_sector_fallback = cell_sector_fallback.mask(cell_sector_fallback.isin(["", "nan", "NaN", "None", "<NA>"]))
+    sector_series = cell_sector_fallback.where(cell_sector_fallback.notna(), sector_series)
+    if "sector" in out.columns:
+        out["sector"] = sector_series
+    if "sec_id" in out.columns:
+        out["sec_id"] = cell_sector_fallback.where(cell_sector_fallback.notna(), out["sec_id"].astype("string"))
     out["_topo_site_key"] = out[site_key_col].astype(str).str.strip().values
     out["_topo_cell_key"] = (
         out[site_key_col].astype(str).str.strip()
@@ -1610,15 +1685,91 @@ def _assign_band_mix_to_bucket(bucket_df: pd.DataFrame, bucket_label: str) -> tu
     return out, band_counts
 
 
-def _secondary_band_for_sector(bucket_label: str, sector_key: object, primary_band: object) -> int:
+def _secondary_band_for_sector(bucket_label: str, sector_key: object, primary_band: object, assigned_band: int) -> int:
     try:
         primary = int(float(primary_band))
     except (TypeError, ValueError):
         primary = None
-    candidates = [int(band) for band in MULTI_BAND_SECONDARY_BAND_POOL if band != primary]
+    if assigned_band != primary:
+        return int(assigned_band)
+    plan = MULTI_BAND_SECONDARY_BAND_PLAN.get(str(bucket_label), MULTI_BAND_SECONDARY_BAND_PLAN["PART_3"])
+    candidates = [int(band) for band in plan.keys() if int(band) != primary]
     if not candidates:
-        candidates = [int(band) for band in MULTI_BAND_SECONDARY_BAND_POOL]
-    digest = hashlib.sha1(f"{bucket_label}|{sector_key}|{primary}".encode("utf-8")).hexdigest()
+        candidates = [int(band) for band in SYNTHETIC_BAND_TO_EARFCN.keys() if int(band) != primary]
+    if not candidates:
+        return int(assigned_band)
+    digest = hashlib.sha1(f"{bucket_label}|{sector_key}|{primary}|fallback".encode("utf-8")).hexdigest()
+    return int(candidates[int(digest, 16) % len(candidates)])
+
+
+def _assign_secondary_band_mix(
+    sector_keys: List[str],
+    primary_band_by_sector: Dict[str, object],
+    bucket_label: str,
+) -> Dict[str, int]:
+    plan = MULTI_BAND_SECONDARY_BAND_PLAN.get(str(bucket_label), MULTI_BAND_SECONDARY_BAND_PLAN["PART_3"])
+    if not sector_keys:
+        return {}
+    ordered_keys = sorted(
+        sector_keys,
+        key=lambda value: hashlib.sha1(f"{bucket_label}|secondary_band|{value}".encode("utf-8")).hexdigest(),
+    )
+    bands = list(plan.keys())
+    raw_counts = [float(plan[band]) * float(len(ordered_keys)) for band in bands]
+    base_counts = [int(np.floor(value)) for value in raw_counts]
+    remainder = len(ordered_keys) - int(sum(base_counts))
+    fractional_order = sorted(
+        range(len(bands)),
+        key=lambda idx: (raw_counts[idx] - base_counts[idx], -int(bands[idx])),
+        reverse=True,
+    )
+    for idx in fractional_order[:remainder]:
+        base_counts[idx] += 1
+
+    assigned: Dict[str, int] = {}
+    cursor = 0
+    for band_value, band_count in zip(bands, base_counts):
+        for key in ordered_keys[cursor:cursor + int(band_count)]:
+            assigned[str(key)] = int(band_value)
+        cursor += int(band_count)
+    if cursor < len(ordered_keys):
+        fallback_band = int(max(plan.items(), key=lambda item: item[1])[0])
+        for key in ordered_keys[cursor:]:
+            assigned[str(key)] = fallback_band
+
+    normalized: Dict[str, int] = {}
+    for key in ordered_keys:
+        normalized[str(key)] = _secondary_band_for_sector(
+            str(bucket_label),
+            key,
+            primary_band_by_sector.get(str(key)),
+            assigned.get(str(key), int(max(plan.items(), key=lambda item: item[1])[0])),
+        )
+    return normalized
+
+
+def _tertiary_band_for_sector(
+    bucket_label: str,
+    sector_key: object,
+    primary_band: object,
+    secondary_band: object,
+) -> int:
+    try:
+        primary = int(float(primary_band))
+    except (TypeError, ValueError):
+        primary = None
+    try:
+        secondary = int(float(secondary_band))
+    except (TypeError, ValueError):
+        secondary = None
+
+    plan = MULTI_BAND_SECONDARY_BAND_PLAN.get(str(bucket_label), MULTI_BAND_SECONDARY_BAND_PLAN["PART_3"])
+    candidates = [int(band) for band in plan.keys() if int(band) not in {primary, secondary}]
+    if not candidates:
+        candidates = [int(band) for band in SYNTHETIC_BAND_TO_EARFCN.keys() if int(band) not in {primary, secondary}]
+    if not candidates:
+        return int(secondary if secondary is not None else (primary if primary is not None else 1800))
+    digest = hashlib.sha1(f"{bucket_label}|{sector_key}|{primary}|{secondary}|tertiary".encode("utf-8")).hexdigest()
     return int(candidates[int(digest, 16) % len(candidates)])
 
 
@@ -1628,11 +1779,16 @@ def _expand_multi_band_sectors(bucket_df: pd.DataFrame, bucket_label: str) -> tu
         return out, {
             "multi_band_sector_share_target": 0.0,
             "multi_band_sector_count": 0,
+            "triple_band_sector_share_target": 0.0,
+            "triple_band_sector_count": 0,
             "multi_band_carrier_rows_added": 0,
+            "triple_band_carrier_rows_added": 0,
             "multi_band_secondary_band_counts_json": json.dumps({}, sort_keys=True),
+            "multi_band_tertiary_band_counts_json": json.dumps({}, sort_keys=True),
         }
 
     sector_share_target = float(MULTI_BAND_SECTOR_SHARE_PLAN.get(str(bucket_label), 0.0))
+    triple_share_target = float(TRIPLE_BAND_SECTOR_SHARE_PLAN.get(str(bucket_label), 0.0))
     sector_keys = (
         out["_topo_cell_sector_key"]
         .astype(str)
@@ -1643,14 +1799,21 @@ def _expand_multi_band_sectors(bucket_df: pd.DataFrame, bucket_label: str) -> tu
         .tolist()
     )
     sector_target_count = min(len(sector_keys), int(round(len(sector_keys) * sector_share_target)))
+    triple_target_count = min(sector_target_count, int(round(len(sector_keys) * triple_share_target)))
     selected_sector_keys = sector_keys[:sector_target_count]
+    triple_sector_keys = selected_sector_keys[:triple_target_count]
+    dual_sector_keys = selected_sector_keys[triple_target_count:]
     if not selected_sector_keys:
         out["carrier_variant"] = 1
         return out, {
             "multi_band_sector_share_target": sector_share_target,
             "multi_band_sector_count": 0,
+            "triple_band_sector_share_target": triple_share_target,
+            "triple_band_sector_count": 0,
             "multi_band_carrier_rows_added": 0,
+            "triple_band_carrier_rows_added": 0,
             "multi_band_secondary_band_counts_json": json.dumps({}, sort_keys=True),
+            "multi_band_tertiary_band_counts_json": json.dumps({}, sort_keys=True),
         }
 
     selected_mask = out["_topo_cell_sector_key"].astype(str).isin(selected_sector_keys)
@@ -1660,22 +1823,57 @@ def _expand_multi_band_sectors(bucket_df: pd.DataFrame, bucket_label: str) -> tu
         return out, {
             "multi_band_sector_share_target": sector_share_target,
             "multi_band_sector_count": 0,
+            "triple_band_sector_share_target": triple_share_target,
+            "triple_band_sector_count": 0,
             "multi_band_carrier_rows_added": 0,
+            "triple_band_carrier_rows_added": 0,
             "multi_band_secondary_band_counts_json": json.dumps({}, sort_keys=True),
+            "multi_band_tertiary_band_counts_json": json.dumps({}, sort_keys=True),
         }
 
     primary_rows = out.copy()
     primary_rows["carrier_variant"] = 1
-    duplicate_rows = selected_rows.copy()
+    duplicate_rows = selected_rows.loc[selected_rows["_topo_cell_sector_key"].astype(str).isin(dual_sector_keys)].copy()
+    triple_rows = selected_rows.loc[selected_rows["_topo_cell_sector_key"].astype(str).isin(triple_sector_keys)].copy()
     duplicate_rows["carrier_variant"] = 2
+    triple_rows["carrier_variant"] = 3
+    for col in ["sector", "sec_id"]:
+        if col in duplicate_rows.columns:
+            duplicate_rows[col] = duplicate_rows[col].astype("string")
+        if col in triple_rows.columns:
+            triple_rows[col] = triple_rows[col].astype("string")
 
-    band_counts: Dict[str, int] = {}
+    secondary_band_counts: Dict[str, int] = {}
+    tertiary_band_counts: Dict[str, int] = {}
+    primary_band_by_sector = (
+        selected_rows.groupby("_topo_cell_sector_key", dropna=False)["band"].first().to_dict()
+        if "band" in selected_rows.columns
+        else {}
+    )
+    secondary_band_by_sector = _assign_secondary_band_mix(
+        [str(key) for key in selected_sector_keys],
+        {str(key): value for key, value in primary_band_by_sector.items()},
+        str(bucket_label),
+    )
+    tertiary_band_by_sector = {
+        str(key): _tertiary_band_for_sector(
+            str(bucket_label),
+            key,
+            primary_band_by_sector.get(str(key)),
+            secondary_band_by_sector.get(str(key)),
+        )
+        for key in triple_sector_keys
+    }
     node_col = "Node_Cell_ID" if "Node_Cell_ID" in duplicate_rows.columns else ("cell_id" if "cell_id" in duplicate_rows.columns else None)
     for row_idx, row in duplicate_rows.iterrows():
         sector_key = row["_topo_cell_sector_key"]
-        secondary_band = _secondary_band_for_sector(str(bucket_label), sector_key, row.get("band"))
-        band_counts[str(secondary_band)] = band_counts.get(str(secondary_band), 0) + 1
-        sector_value = row["sector"] if "sector" in row.index and pd.notna(row["sector"]) and str(row["sector"]).strip() not in {"", "nan", "None"} else str(sector_key).split("|")[-1]
+        secondary_band = int(secondary_band_by_sector.get(str(sector_key), row.get("band", 1800)))
+        secondary_band_counts[str(secondary_band)] = secondary_band_counts.get(str(secondary_band), 0) + 1
+        if "sector" in row.index and pd.notna(row["sector"]) and str(row["sector"]).strip() not in {"", "nan", "None", "__NULL__"}:
+            sector_value = str(row["sector"]).strip()
+        else:
+            base_sector_source = str(row["cell_id"]).strip() if "cell_id" in row.index else str(sector_key)
+            sector_value = base_sector_source.rsplit("_", 1)[-1] if "_" in base_sector_source else str(sector_key).split("|")[-1]
         base_cell = ""
         if node_col is not None:
             base_cell = str(row[node_col]).strip()
@@ -1689,11 +1887,18 @@ def _expand_multi_band_sectors(bucket_df: pd.DataFrame, bucket_label: str) -> tu
             duplicate_rows.at[row_idx, "Node_Cell_ID"] = synthetic_cell_id
         if "cell_id" in duplicate_rows.columns:
             duplicate_rows.at[row_idx, "cell_id"] = synthetic_cell_id
+        if "sector" in duplicate_rows.columns:
+            duplicate_rows.at[row_idx, "sector"] = sector_value
+        if "sec_id" in duplicate_rows.columns:
+            duplicate_rows.at[row_idx, "sec_id"] = sector_value
         if "band" in duplicate_rows.columns:
             duplicate_rows.at[row_idx, "band"] = float(secondary_band)
-        for col in ["frequency_mhz", "frequency", "downlink_frequency", "uplink_center_frequency", "earfcn"]:
+        synthetic_earfcn = float(SYNTHETIC_BAND_TO_EARFCN.get(int(secondary_band), int(secondary_band)))
+        for col in ["frequency_mhz", "frequency", "downlink_frequency", "uplink_center_frequency"]:
             if col in duplicate_rows.columns:
                 duplicate_rows.at[row_idx, col] = float(secondary_band)
+        if "earfcn" in duplicate_rows.columns:
+            duplicate_rows.at[row_idx, "earfcn"] = synthetic_earfcn
         if "cell_id_representative" in duplicate_rows.columns:
             duplicate_rows.at[row_idx, "cell_id_representative"] = synthetic_cell_id
         if "_topo_site_key" in duplicate_rows.columns and "_topo_cell_key" in duplicate_rows.columns:
@@ -1715,22 +1920,91 @@ def _expand_multi_band_sectors(bucket_df: pd.DataFrame, bucket_label: str) -> tu
                     sector_value,
                     fallback=synthetic_cell_id,
                 )
-            if "site_sector_band_key" in duplicate_rows.columns:
-                duplicate_rows.at[row_idx, "site_sector_band_key"] = build_site_sector_band_identity(
+        if "site_sector_band_key" in duplicate_rows.columns:
+            duplicate_rows.at[row_idx, "site_sector_band_key"] = build_site_sector_band_identity(
+                site_value,
+                sector_value,
+                secondary_band,
+            )
+
+    node_col_triple = "Node_Cell_ID" if "Node_Cell_ID" in triple_rows.columns else ("cell_id" if "cell_id" in triple_rows.columns else None)
+    for row_idx, row in triple_rows.iterrows():
+        sector_key = row["_topo_cell_sector_key"]
+        primary_band = row.get("band", 1800)
+        secondary_band = secondary_band_by_sector.get(str(sector_key))
+        tertiary_band = int(tertiary_band_by_sector.get(str(sector_key), row.get("band", 1800)))
+        tertiary_band_counts[str(tertiary_band)] = tertiary_band_counts.get(str(tertiary_band), 0) + 1
+        if "sector" in row.index and pd.notna(row["sector"]) and str(row["sector"]).strip() not in {"", "nan", "None", "__NULL__"}:
+            sector_value = str(row["sector"]).strip()
+        else:
+            base_sector_source = str(row["cell_id"]).strip() if "cell_id" in row.index else str(sector_key)
+            sector_value = base_sector_source.rsplit("_", 1)[-1] if "_" in base_sector_source else str(sector_key).split("|")[-1]
+        base_cell = ""
+        if node_col_triple is not None:
+            base_cell = str(row[node_col_triple]).strip()
+        if not base_cell and "cell_id" in row.index:
+            base_cell = str(row["cell_id"]).strip()
+        if not base_cell:
+            base_cell = f"{row_idx}"
+        synthetic_cell_id = f"{base_cell}__MB{tertiary_band}"
+
+        if "Node_Cell_ID" in triple_rows.columns:
+            triple_rows.at[row_idx, "Node_Cell_ID"] = synthetic_cell_id
+        if "cell_id" in triple_rows.columns:
+            triple_rows.at[row_idx, "cell_id"] = synthetic_cell_id
+        if "sector" in triple_rows.columns:
+            triple_rows.at[row_idx, "sector"] = sector_value
+        if "sec_id" in triple_rows.columns:
+            triple_rows.at[row_idx, "sec_id"] = sector_value
+        if "band" in triple_rows.columns:
+            triple_rows.at[row_idx, "band"] = float(tertiary_band)
+        synthetic_earfcn = float(SYNTHETIC_BAND_TO_EARFCN.get(int(tertiary_band), int(tertiary_band)))
+        for col in ["frequency_mhz", "frequency", "downlink_frequency", "uplink_center_frequency"]:
+            if col in triple_rows.columns:
+                triple_rows.at[row_idx, col] = float(tertiary_band)
+        if "earfcn" in triple_rows.columns:
+            triple_rows.at[row_idx, "earfcn"] = synthetic_earfcn
+        if "cell_id_representative" in triple_rows.columns:
+            triple_rows.at[row_idx, "cell_id_representative"] = synthetic_cell_id
+        if "_topo_site_key" in triple_rows.columns and "_topo_cell_key" in triple_rows.columns:
+            site_value = row["_topo_site_key"]
+            triple_rows.at[row_idx, "_topo_cell_key"] = f"{site_value}|{synthetic_cell_id}"
+            triple_rows.at[row_idx, "_topo_cell_sector_key"] = f"{site_value}|{synthetic_cell_id}|{sector_value}"
+            if "rf_identity_key" in triple_rows.columns:
+                triple_rows.at[row_idx, "rf_identity_key"] = build_rf_identity(
+                    site_value,
+                    synthetic_cell_id,
+                    sector_value,
+                    tertiary_band,
+                    fallback=synthetic_cell_id,
+                )
+            if "sector_identity_key" in triple_rows.columns:
+                triple_rows.at[row_idx, "sector_identity_key"] = build_sector_identity(
+                    site_value,
+                    synthetic_cell_id,
+                    sector_value,
+                    fallback=synthetic_cell_id,
+                )
+            if "site_sector_band_key" in triple_rows.columns:
+                triple_rows.at[row_idx, "site_sector_band_key"] = build_site_sector_band_identity(
                     site_value,
                     sector_value,
-                    secondary_band,
+                    tertiary_band,
                 )
 
-    out = pd.concat([primary_rows, duplicate_rows], ignore_index=True)
+    out = pd.concat([primary_rows, duplicate_rows, triple_rows], ignore_index=True)
     sort_cols = [col for col in ["_topo_site_key", "_topo_cell_key", "_topo_cell_sector_key", "carrier_variant", "band", "Node_Cell_ID"] if col in out.columns]
     if sort_cols:
         out = out.sort_values(sort_cols).reset_index(drop=True)
     summary = {
         "multi_band_sector_share_target": sector_share_target,
         "multi_band_sector_count": int(len(selected_sector_keys)),
-        "multi_band_carrier_rows_added": int(len(duplicate_rows)),
-        "multi_band_secondary_band_counts_json": json.dumps(band_counts, sort_keys=True),
+        "triple_band_sector_share_target": triple_share_target,
+        "triple_band_sector_count": int(len(triple_sector_keys)),
+        "multi_band_carrier_rows_added": int(len(duplicate_rows) + len(triple_rows)),
+        "triple_band_carrier_rows_added": int(len(triple_rows)),
+        "multi_band_secondary_band_counts_json": json.dumps(secondary_band_counts, sort_keys=True),
+        "multi_band_tertiary_band_counts_json": json.dumps(tertiary_band_counts, sort_keys=True),
     }
     return out, summary
 
@@ -1812,6 +2086,41 @@ def _build_bucket_site_topologies(
     return bucket_frames, pd.DataFrame(summary_rows)
 
 
+def _attach_carrier_load_share(pred_df: pd.DataFrame) -> pd.DataFrame:
+    if pred_df.empty:
+        return pred_df.copy()
+    out = pred_df.copy()
+    if "Node_Cell_ID" in out.columns:
+        carrier_id = out["Node_Cell_ID"].astype(str).str.strip()
+    elif "cell_id" in out.columns:
+        carrier_id = out["cell_id"].astype(str).str.strip()
+    else:
+        out["carrier_load_share"] = 1.0
+        return out
+
+    out["_carrier_base_key"] = carrier_id.str.replace(r"__MB\d+$", "", regex=True)
+    out["_carrier_band_value"] = pd.to_numeric(out.get("band"), errors="coerce").fillna(1800.0)
+    out["_carrier_band_weight"] = out["_carrier_band_value"].round().astype(int).map(CARRIER_LOAD_SHARE_BAND_WEIGHT).fillna(0.85)
+    rsrp_col = next((col for col in ["pred_rsrp_calibrated", "pred_rsrp_geo", "pred_rsrp"] if col in out.columns), None)
+    if rsrp_col is not None:
+        rsrp = pd.to_numeric(out[rsrp_col], errors="coerce")
+        group_keys = [col for col in ["time_bucket", "grid_id", "_carrier_base_key"] if col in out.columns]
+        rsrp_rel = rsrp - rsrp.groupby([out[col] for col in group_keys], dropna=False).transform("max")
+        strength_weight = np.exp((rsrp_rel.fillna(-12.0)).clip(-18.0, 0.0) / 6.0)
+    else:
+        strength_weight = pd.Series(1.0, index=out.index, dtype="float64")
+
+    raw_share = (out["_carrier_band_weight"] * strength_weight).clip(lower=1e-6)
+    group_keys = [col for col in ["time_bucket", "grid_id", "_carrier_base_key"] if col in out.columns]
+    if not group_keys:
+        out["carrier_load_share"] = 1.0
+        return out.drop(columns=["_carrier_base_key", "_carrier_band_value", "_carrier_band_weight"], errors="ignore")
+
+    denom = raw_share.groupby([out[col] for col in group_keys], dropna=False).transform("sum").replace(0.0, np.nan)
+    out["carrier_load_share"] = (raw_share / denom).fillna(1.0).clip(0.0, 1.0)
+    return out.drop(columns=["_carrier_base_key", "_carrier_band_value", "_carrier_band_weight"], errors="ignore")
+
+
 def _run_project_baseline_prediction(
     project_id: int,
     region: str,
@@ -1840,6 +2149,8 @@ def _run_project_baseline_prediction(
             "grid": float(grid_size_m),
             "workers": int(workers),
             "max_interference_sites": int(max_interference_sites),
+            "max_cells_per_grid": 6,
+            "min_grids_per_cell": 3,
             "use_frontend_grid_sampling": bool(use_frontend_grid_sampling),
             "grid_analytics_scenario_id": (
                 int(grid_analytics_scenario_id) if grid_analytics_scenario_id is not None else None
@@ -1852,7 +2163,7 @@ def _run_project_baseline_prediction(
     for col in ["lat", "lon", "pred_rsrp", "pred_rsrq", "pred_sinr", "pci", "earfcn", "band"]:
         if col in out.columns:
             out[col] = pd.to_numeric(out[col], errors="coerce")
-    return out
+    return _attach_carrier_load_share(out)
 
 
 def _run_bucket_baseline_predictions(
@@ -1896,6 +2207,7 @@ def _run_bucket_baseline_predictions(
             continue
         baseline_df = baseline_df.copy()
         baseline_df["time_bucket"] = str(label)
+        baseline_df = _attach_carrier_load_share(baseline_df)
         out_rows.append(baseline_df)
     return pd.concat(out_rows, ignore_index=True) if out_rows else pd.DataFrame()
 
@@ -1943,6 +2255,7 @@ def _run_bucket_corrected_predictions(
         )
         corrected_df = corrected_df.copy()
         corrected_df["time_bucket"] = str(label)
+        corrected_df = _attach_carrier_load_share(corrected_df)
         out_rows.append(corrected_df)
     return pd.concat(out_rows, ignore_index=True) if out_rows else pd.DataFrame()
 
@@ -2188,6 +2501,7 @@ def run_coverage_test(config: CoverageTestConfig) -> Path:
     timings: Dict[str, float] = {}
     reused_summary_df = _load_bucket_summary_from_run_dir(base_run_dir)
     reused_detail_df = _load_coverage_rows_from_run_dir(base_run_dir)
+    reused_project_sites_df = _load_project_sites_from_run_dir(base_run_dir)
     print(
         f"[COVERAGE_TEST][START] project_id={config.project_id} region={config.region} "
         f"site_project_id={site_project_id} "
@@ -2255,7 +2569,7 @@ def run_coverage_test(config: CoverageTestConfig) -> Path:
     project_sites_raw_df = _time_step(
         timings,
         "project_sites_raw",
-        lambda: _fetch_project_sites_raw(site_project_id, config.region),
+        lambda: reused_project_sites_df.copy() if reused_project_sites_df is not None else _fetch_project_sites_raw(site_project_id, config.region),
     )
     bucket_site_df_map, bucket_topology_summary_df = _time_step(
         timings,
@@ -2275,8 +2589,11 @@ def run_coverage_test(config: CoverageTestConfig) -> Path:
     building_df = _time_step(
         timings,
         "building_rows",
-        lambda: _load_or_build_df(
-            stable_cache_dir,
+        lambda: _load_or_build_df_from_any_cache_dir(
+            [
+                stable_cache_dir,
+                PROJECT_ROOT.parent / "tests" / "output" / f"project_{config.project_id}" / "coverage_cache",
+            ],
             "building_rows",
             {"stage": "building_rows", "site_project_id": site_project_id, "region": config.region},
             lambda: base_ml.fetch_building_data(site_project_id, region=config.region),
@@ -2375,7 +2692,9 @@ def run_coverage_test(config: CoverageTestConfig) -> Path:
     project_sites_df = _time_step(
         timings,
         "project_sites",
-        lambda: _filter_rows_to_operator(_fetch_project_sites(site_project_id, config.region), config.topology_operator),
+        lambda: _filter_rows_to_operator(reused_project_sites_df.copy(), config.topology_operator)
+        if reused_project_sites_df is not None
+        else _filter_rows_to_operator(_fetch_project_sites(site_project_id, config.region), config.topology_operator),
     )
     project_site_summary_df = _time_step(timings, "project_site_summary", lambda: _build_project_site_summary(project_sites_df))
 
@@ -2524,6 +2843,19 @@ def run_coverage_test(config: CoverageTestConfig) -> Path:
         },
     }
     _write_json(run_dir / "summary.json", summary)
+    archive_path = DATA_ROOT / f"{run_dir.name}.7z"
+    archive_path.parent.mkdir(parents=True, exist_ok=True)
+    subprocess.check_call(
+        [
+            "tar",
+            "-cf",
+            str(archive_path),
+            "-C",
+            str(run_dir.parent),
+            str(run_dir.name),
+        ]
+    )
+    write_latest_coverage_artifact(archive_path)
     print(
         f"[COVERAGE_TEST][DONE] rows={len(detail_df)} "
         f"bucket_counts={summary['bucket_row_counts']} grid_cells={len(grid_cells_df)}"

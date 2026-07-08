@@ -489,9 +489,12 @@ FRONTEND_DYNAMIC_COLOR_PALETTE = [
 
 
 FRONTEND_BAND_COLORS = {
+    "GSM 900": "#DC2626",
+    "DCS 1800": "#14B8A6",
+    "WCDMA": "#7C3AED",
     "B1": "#EF4444",
     "B2": "#F59E0B",
-    "B3": "#EF4444",
+    "B3": "#F97316",
     "B4": "#F59E0B",
     "B5": "#F59E0B",
     "B6": "#EF4444",
@@ -503,7 +506,7 @@ FRONTEND_BAND_COLORS = {
     "B17": "#3B82F6",
     "B18": "#10B981",
     "B19": "#EF4444",
-    "B20": "#3B82F6",
+    "B20": "#2563EB",
     "B25": "#8B5CF6",
     "B26": "#8B5CF6",
     "B28": "#EC4899",
@@ -525,6 +528,43 @@ def _frontend_hash_color(value):
         h = ((h << 5) - h) + ord(ch)
         h = ((h + 2**31) % 2**32) - 2**31
     return FRONTEND_DYNAMIC_COLOR_PALETTE[abs(h) % len(FRONTEND_DYNAMIC_COLOR_PALETTE)]
+
+
+def _report_band_palette(count):
+    """Build a high-separation palette for the bands present in one report."""
+    if count <= 0:
+        return []
+
+    colors = []
+    hue = 0.02
+    hue_step = 0.618033988749895  # golden-ratio spacing keeps adjacent colors apart
+    for _ in range(count):
+        hue = (hue + hue_step) % 1.0
+        r, g, b = colorsys.hsv_to_rgb(hue, 0.78, 0.92)
+        colors.append(
+            "#{:02x}{:02x}{:02x}".format(
+                int(r * 255),
+                int(g * 255),
+                int(b * 255)
+            )
+        )
+    return colors
+
+
+def build_report_band_color_map(bands):
+    """Map the known bands in a single report to distinct, repeatable colors."""
+    normalized = []
+    seen = set()
+    for band in bands or []:
+        band_name = normalize_band_name(band)
+        if band_name == "Unknown" or band_name in seen:
+            continue
+        seen.add(band_name)
+        normalized.append(band_name)
+
+    normalized.sort(key=lambda value: (0 if value.startswith("B") else 1 if value.startswith("n") else 2, value))
+    palette = _report_band_palette(len(normalized))
+    return {band: color for band, color in zip(normalized, palette)}
 
 
 def normalize_band_name(band):
@@ -636,10 +676,7 @@ def generate_categorical_kpi_map(df, kpi_column, output_html, polygon_wkt=None):
         if df.empty:
             raise ValueError("No non-Unknown band data for band map")
         value_counts = df[category_col].value_counts()
-        value_color_map = {
-            value: get_frontend_band_color(value)
-            for value in value_counts.index
-        }
+        value_color_map = build_report_band_color_map(value_counts.index.tolist())
         # Draw dominant bands first and smaller bands last so the PDF image does
         # not collapse visually into one color when points overlap.
         draw_df = df.assign(
@@ -1076,12 +1113,33 @@ def generate_handover_map(filtered_df, events, output_html, polygon_wkt=None):
     as returned by `detect_handover_events`.
     """
     df = filtered_df.dropna(subset=["lat", "lon"]).copy() if filtered_df is not None else pd.DataFrame()
+    if not df.empty:
+        df["lat"] = pd.to_numeric(df["lat"], errors="coerce")
+        df["lon"] = pd.to_numeric(df["lon"], errors="coerce")
+        df = df.dropna(subset=["lat", "lon"])
+        df = df[
+            df["lat"].between(-90, 90)
+            & df["lon"].between(-180, 180)
+        ].copy()
     if df.empty:
         raise ValueError("No GPS data to plot for handover map")
     events = [
         ev for ev in (events or [])
         if str(ev.get("type") or "").lower() == "band"
+        and pd.notna(ev.get("lat"))
+        and pd.notna(ev.get("lon"))
     ]
+    clean_events = []
+    for ev in events:
+        try:
+            lat = float(ev.get("lat"))
+            lon = float(ev.get("lon"))
+        except (TypeError, ValueError):
+            continue
+        if not (-90 <= lat <= 90 and -180 <= lon <= 180):
+            continue
+        clean_events.append({**ev, "lat": lat, "lon": lon})
+    events = clean_events
 
     m = new_report_map()
     add_fullscreen_css(m)
@@ -1091,6 +1149,7 @@ def generate_handover_map(filtered_df, events, output_html, polygon_wkt=None):
 
     # Draw dense route points only (no polylines).
     # This prevents line-like rendering and keeps handover focus on events.
+    route_layers = []
     if "session_id" in df.columns:
         df["__session_sort"] = df["session_id"].apply(_safe_sort_value)
         sessions = sorted(df["__session_sort"].dropna().unique())
@@ -1107,9 +1166,13 @@ def generate_handover_map(filtered_df, events, output_html, polygon_wkt=None):
             seg = df_route[df_route["__session_sort"] == sid]
             if seg.empty:
                 continue
-            # overlay filled points for solid appearance
-            for _, r in seg.iterrows():
-                folium.CircleMarker(location=(r["lat"], r["lon"]), radius=4, color=colors[i % len(colors)], fill=True, fill_opacity=0.95).add_to(m)
+            route_layers.append({
+                "color": colors[i % len(colors)],
+                "points": [
+                    [float(r["lat"]), float(r["lon"])]
+                    for _, r in seg.iterrows()
+                ],
+            })
 
         # Legend removed per user request - handover map should show only routes and handover events
     else:
@@ -1120,24 +1183,28 @@ def generate_handover_map(filtered_df, events, output_html, polygon_wkt=None):
         else:
             df_route = df
 
-        # Overlay dense filled points (KPI-style) for solid track appearance
-        for _, r in df_route.iterrows():
-            folium.CircleMarker(location=(r["lat"], r["lon"]), radius=4, color="#2b8cbe", fill=True, fill_opacity=0.95).add_to(m)
+        route_layers.append({
+            "color": "#2b8cbe",
+            "points": [
+                [float(r["lat"]), float(r["lon"])]
+                for _, r in df_route.iterrows()
+            ],
+        })
+
+    MAX_HANDOVER_ROUTE_DOTS = 8000
+    route_point_count = sum(len(layer["points"]) for layer in route_layers)
+    route_step = max(1, route_point_count // MAX_HANDOVER_ROUTE_DOTS)
+    for layer in route_layers:
+        if route_step > 1:
+            layer["points"] = layer["points"][::route_step]
 
     # Add handover sparks
-    spark_svg = (
-        '<div style="transform: translate(-50%, -50%);">'
-        '<svg xmlns="http://www.w3.org/2000/svg" width="28" height="28" viewBox="0 0 24 24">'
-        '<path fill="{color}" stroke="#222" stroke-width="0.6" d="M13 2 L3 14 H12 L11 22 L21 10 H12 L13 2 Z"/>'
-        '</svg></div>'
-    )
     event_colors = {
         "band": "#3b82f6",
     }
+    event_points = []
     for ev in events:
         event_type = str(ev.get("type") or "handover").lower()
-        html = spark_svg.format(color=event_colors.get(event_type, "#ff9933"))
-        icon = folium.DivIcon(html=html, icon_size=(28, 28), icon_anchor=(14, 14))
         if ev.get("from_value") is not None and ev.get("to_value") is not None:
             tooltip = (
                 f"{event_type.title()}: {ev.get('from_value')} -> {ev.get('to_value')} "
@@ -1145,7 +1212,64 @@ def generate_handover_map(filtered_df, events, output_html, polygon_wkt=None):
             )
         else:
             tooltip = f"{ev.get('from_provider')} -> {ev.get('to_provider')} (Session {ev.get('session_id')})"
-        folium.Marker(location=(ev["lat"], ev["lon"]), icon=icon, tooltip=tooltip).add_to(m)
+        event_points.append({
+            "lat": ev["lat"],
+            "lon": ev["lon"],
+            "color": event_colors.get(event_type, "#ff9933"),
+            "tooltip": tooltip,
+        })
+
+    payload = json.dumps({"routes": route_layers, "events": event_points})
+    map_name = m.get_name()
+    render_js = f"""
+    <script>
+        (function() {{
+            var payload = {payload};
+            function drawHandoverLayers() {{
+                var map = window["{map_name}"];
+                if (!map || !window.L) {{
+                    window.setTimeout(drawHandoverLayers, 50);
+                    return;
+                }}
+                var canvasRenderer = L.canvas();
+                var routeOptions = {{
+                    radius: 4,
+                    stroke: true,
+                    weight: 2,
+                    opacity: 0.9,
+                    fill: true,
+                    fillOpacity: 0.92,
+                    renderer: canvasRenderer
+                }};
+                payload.routes.forEach(function(layer) {{
+                    layer.points.forEach(function(point) {{
+                        L.circleMarker(point, Object.assign({{}}, routeOptions, {{
+                            color: layer.color,
+                            fillColor: layer.color
+                        }})).addTo(map);
+                    }});
+                }});
+                payload.events.forEach(function(ev) {{
+                    var marker = L.circleMarker([ev.lat, ev.lon], {{
+                        radius: 6,
+                        color: "#1f2937",
+                        weight: 1,
+                        opacity: 0.95,
+                        fill: true,
+                        fillColor: ev.color,
+                        fillOpacity: 0.95,
+                        renderer: canvasRenderer
+                    }}).addTo(map);
+                    if (ev.tooltip) {{
+                        marker.bindTooltip(ev.tooltip);
+                    }}
+                }});
+            }}
+            drawHandoverLayers();
+        }})();
+    </script>
+    """
+    m.get_root().html.add_child(folium.Element(render_js))
 
     if events:
         counts = {}

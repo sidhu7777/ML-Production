@@ -33,6 +33,8 @@ from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder
 from xgboost import XGBRegressor
 
+from tests.coverage_prediction.coverage_artifact_locator import resolve_coverage_artifact_path
+
 warnings.filterwarnings("ignore")
 
 
@@ -40,7 +42,7 @@ RANDOM_SEED = 42
 np.random.seed(RANDOM_SEED)
 
 DATA_DIR = Path("data")
-COVERAGE_ARCHIVE = DATA_DIR / "coverage_20260521_104406.7z"
+COVERAGE_ARCHIVE = resolve_coverage_artifact_path()
 MODEL1_DATASET_CSV = DATA_DIR / "model1_coverage_training.csv"
 MODEL1_DATASET_SUMMARY_JSON = DATA_DIR / "model1_coverage_training.summary.json"
 

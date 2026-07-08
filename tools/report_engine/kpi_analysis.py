@@ -9,7 +9,7 @@ import matplotlib.pyplot as plt
 
 from .kpi_config import KPI_CONFIG
 from .threshold_resolver import resolve_kpi_ranges
-from .map_generator import normalize_band_name
+from .map_generator import normalize_band_name, build_report_band_color_map
 
 IMAGE_DIR = "data/images/kpi_analysis"
 
@@ -197,8 +197,15 @@ def generate_band_summary(df):
 
     save_table_image(band_df, "Band Distribution", "band_table.png")
 
+    band_color_map = build_report_band_color_map(band_df["band"].tolist())
+    pie_colors = [band_color_map[band] for band in band_df["band"]]
     plt.figure(figsize=(6, 6))
-    plt.pie(band_df["% Samples"], labels=band_df["band"], autopct="%1.1f%%")
+    plt.pie(
+        band_df["% Samples"],
+        labels=band_df["band"],
+        autopct="%1.1f%%",
+        colors=pie_colors,
+    )
     plt.title("Band Distribution")
     plt.tight_layout()
     plt.savefig(os.path.join(IMAGE_DIR, "band_pie.png"), dpi=200)

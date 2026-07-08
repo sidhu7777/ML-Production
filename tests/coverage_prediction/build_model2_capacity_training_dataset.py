@@ -10,6 +10,8 @@ from typing import Dict, Tuple
 import numpy as np
 import pandas as pd
 
+from tests.coverage_prediction.coverage_artifact_locator import resolve_coverage_artifact_path
+
 
 REQUIRED_ARCHIVE_MEMBERS = (
     "grid_kpi_timeseries.csv",
@@ -217,10 +219,11 @@ def _derive_band_features_from_rows(source_df: pd.DataFrame) -> pd.DataFrame:
 
     work["band_class"] = work[band_source].map(lambda value: _classify_band_value(value, band_source))
     work = work.dropna(subset=["grid_id"])
+    work["band_weight"] = pd.to_numeric(work.get("carrier_load_share"), errors="coerce").fillna(1.0).clip(lower=0.0)
 
     counts = (
-        work.groupby(["grid_id", "time_bucket", "band_class"], dropna=False)
-        .size()
+        work.groupby(["grid_id", "time_bucket", "band_class"], dropna=False)["band_weight"]
+        .sum()
         .rename("row_count")
         .reset_index()
     )
@@ -726,7 +729,7 @@ def build_dataset(archive_path: Path, output_csv: Path, work_dir: Path) -> Tuple
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Build Model 2 capacity training dataset from saved coverage artifacts.")
-    parser.add_argument("--archive", default="data/coverage_20260521_104406.7z", help="Coverage artifact .7z archive")
+    parser.add_argument("--archive", default=str(resolve_coverage_artifact_path()), help="Coverage artifact .7z archive")
     parser.add_argument("--output", default="data/model2_capacity_training.csv", help="Output CSV path")
     parser.add_argument("--work-dir", default="data/tmp/model2_capacity_training_source", help="Temporary extract/read directory")
     return parser.parse_args()
