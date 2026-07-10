@@ -55,6 +55,15 @@ BAND_PRIORITY = {
     700.0: 1,
 }
 
+SYNTHETIC_BAND_TO_EARFCN = {
+    700: 700.0,
+    850: 850.0,
+    900: 900.0,
+    1800: 1750.0,
+    2100: 2100.0,
+    2300: 2300.0,
+}
+
 
 @dataclass
 class Model3RecommendationConfig:
@@ -147,6 +156,19 @@ def _fmt_band(value: Any) -> str:
         num = float(value)
     except Exception:
         return str(value).strip()
+    if float(num).is_integer():
+        return str(int(num))
+    return f"{num:g}"
+
+
+def _normalize_identity_text(value: Any) -> str:
+    text = str(value).strip()
+    if not text or text.lower() == "nan":
+        return ""
+    try:
+        num = float(text)
+    except Exception:
+        return text
     if float(num).is_integer():
         return str(int(num))
     return f"{num:g}"
@@ -766,21 +788,34 @@ def _build_sector_split_topology(
     return combined, source_rows
 
 
-def _run_sector_split_resimulation(
+def _extract_source_site_rows(sector_cells: pd.DataFrame, part3_site_df: pd.DataFrame) -> pd.DataFrame:
+    work = part3_site_df.copy()
+    original_ids = set()
+    for col in ["topology_original_cell_id", "topology_original_node_cell_id"]:
+        if col in sector_cells.columns:
+            original_ids.update(str(v).strip() for v in sector_cells[col].dropna().astype(str).tolist() if str(v).strip())
+    if not original_ids:
+        original_ids.update(str(v).strip() for v in sector_cells["Node_Cell_ID"].dropna().astype(str).tolist() if str(v).strip())
+    return work.loc[
+        work["Node_Cell_ID"].astype(str).isin(original_ids) | work["cell_id"].astype(str).isin(original_ids)
+    ].copy()
+
+
+def _prepare_local_action_context(
+    *,
     sector_cells: pd.DataFrame,
-    config: Model3RecommendationConfig,
+    site_df: pd.DataFrame,
     context: dict[str, Any],
+    config: Model3RecommendationConfig,
     logger: logging.Logger,
-) -> dict[str, Any]:
+    action_label: str,
+    source_rows: pd.DataFrame | None = None,
+) -> dict[str, Any] | None:
     baseline_all = context["baseline_pred_df"]
     corrected_all = context["corrected_pred_df"]
     detail_all = context["coverage_rows_df"]
     kpi_all = context["kpi_df"]
     geo_all = context["geo_df"]
-    part3_site_df = context["part3_site_df"]
-    building_df = context["building_df"]
-    hybrid_history = context["hybrid_history"]
-    model2_base_df = context["model2_base_df"]
 
     part3_baseline = baseline_all.loc[baseline_all["time_bucket"].astype(str) == "PART_3"].copy()
     part3_corrected = corrected_all.loc[corrected_all["time_bucket"].astype(str) == "PART_3"].copy()
@@ -788,119 +823,90 @@ def _run_sector_split_resimulation(
     part3_kpi = kpi_all.loc[kpi_all["time_bucket"].astype(str) == "PART_3"].copy()
     part3_geo = geo_all.loc[geo_all["time_bucket"].astype(str) == "PART_3"].copy()
 
-    split_site_df, source_rows = _build_sector_split_topology(sector_cells, part3_site_df, logger)
+    if source_rows is None:
+        source_rows = _extract_source_site_rows(sector_cells, site_df)
     if source_rows.empty:
-        return {
-            "status": "Recommended",
-            "action_reason": "Sector split topology could not be mapped back to PART_3 site rows.",
-            "projected_prb_after_pct": np.nan,
-            "projected_rrc_after_pct": np.nan,
-            "projected_rrc_users_after": np.nan,
-            "next_step": "New Site",
-            "resimulation_required": True,
-            "resimulation_flow": "PART_3 local rerun failed at topology mapping",
-        }
+        logger.info("%s_prepare_failed reason=no_source_rows", action_label)
+        return None
 
     site_lat = pd.to_numeric(source_rows["lat"], errors="coerce").mean()
     site_lon = pd.to_numeric(source_rows["lon"], errors="coerce").mean()
-    split_site_df["_site_distance_m"] = _haversine_distance_m_series(split_site_df["lat"], split_site_df["lon"], site_lat, site_lon)
+    site_work = site_df.copy()
+    site_work["_site_distance_m"] = _haversine_distance_m_series(site_work["lat"], site_work["lon"], site_lat, site_lon)
     site_distance_df = (
-        split_site_df.groupby("Site ID", as_index=False)
+        site_work.groupby("Site ID", as_index=False)
         .agg(site_distance_m=("_site_distance_m", "min"))
         .sort_values("site_distance_m", ascending=True)
     )
     nearest_site_ids = site_distance_df["Site ID"].head(25).astype(str).tolist()
-    local_site_df = split_site_df.loc[split_site_df["Site ID"].astype(str).isin(nearest_site_ids)].copy()
+    local_site_df = site_work.loc[site_work["Site ID"].astype(str).isin(nearest_site_ids)].copy()
     if local_site_df.empty:
-        local_site_df = split_site_df.copy()
+        local_site_df = site_work.copy()
+
     local_point_map = _make_local_point_map(part3_baseline)
+    if local_point_map.empty:
+        logger.info("%s_prepare_failed reason=no_point_map", action_label)
+        return None
     local_point_map["_site_distance_m"] = _haversine_distance_m_series(local_point_map["lat"], local_point_map["lon"], site_lat, site_lon)
     local_point_map = local_point_map.loc[local_point_map["_site_distance_m"] <= float(config.sector_split_local_radius_m)].copy()
     if local_point_map.empty:
-        local_point_map = _make_local_point_map(part3_baseline.loc[part3_baseline["Node_Cell_ID"].astype(str).isin(sector_cells["Node_Cell_ID"].astype(str))])
-    if local_point_map.empty:
-        return {
-            "status": "Recommended",
-            "action_reason": "Sector split local point set is empty after selecting PART_3 prediction points.",
-            "projected_prb_after_pct": np.nan,
-            "projected_rrc_after_pct": np.nan,
-            "projected_rrc_users_after": np.nan,
-            "next_step": "New Site",
-            "resimulation_required": True,
-            "resimulation_flow": "PART_3 local rerun failed at point selection",
-        }
-
-    local_detail = part3_detail.merge(local_point_map[["lat", "lon"]].drop_duplicates(), on=["lat", "lon"], how="inner")
-    if local_detail.empty:
-        local_detail = local_point_map[["lat", "lon"]].drop_duplicates().copy()
-        local_detail["time_bucket"] = "PART_3"
-    logger.info(
-        "sector_split_resim sector=%s local_points=%d local_detail_rows=%d",
-        _first_non_empty(sector_cells["sector_id"]),
-        len(local_point_map),
-        len(local_detail),
-    )
-
-    baseline_local = coverage_test._run_project_baseline_prediction(
-        project_id=int(context["summary"].get("project_id", 196)),
-        region=str(context["summary"].get("region", "india")).lower(),
-        site_df=local_site_df.drop(columns=["_site_distance_m"], errors="ignore"),
-        drive_df=local_detail,
-        building_df=building_df,
-        baseline_radius_m=float(context["summary"].get("baseline_radius_m", 500.0)),
-        grid_size_m=float(context["summary"].get("grid_size_m", 50.0)),
-        workers=1,
-        max_interference_sites=int(context["summary"].get("max_interference_sites", 50)),
-        polygon_wkt=str(context["summary"].get("polygon_wkt", "")).strip() or None,
-        use_frontend_grid_sampling=False,
-        grid_analytics_scenario_id=context["summary"].get("grid_analytics_scenario_id"),
-    )
-    if baseline_local.empty:
-        return {
-            "status": "Recommended",
-            "action_reason": "Sector split rerun produced no PART_3 baseline rows.",
-            "projected_prb_after_pct": np.nan,
-            "projected_rrc_after_pct": np.nan,
-            "projected_rrc_users_after": np.nan,
-            "next_step": "New Site",
-            "resimulation_required": True,
-            "resimulation_flow": "PART_3 local rerun produced no baseline rows",
-        }
-    baseline_local["time_bucket"] = "PART_3"
-    baseline_local = coverage_test._attach_carrier_load_share(baseline_local)
-    baseline_local = _merge_point_map_by_coordinates(
-        baseline_local,
-        local_point_map.drop(columns=["_site_distance_m"], errors="ignore"),
-    )
-    baseline_local = _ensure_grid_group_columns(baseline_local)
-
-    if not local_detail.empty and {"rsrp", "rsrq", "sinr"}.issubset(local_detail.columns):
-        corrected_local = coverage_test._run_bucket_corrected_predictions(
-            baseline_pred_df=baseline_local,
-            detail_df=local_detail.assign(time_bucket="PART_3"),
-            site_df_by_bucket={"PART_3": local_site_df.drop(columns=["_site_distance_m"], errors="ignore")},
-            building_df=building_df,
-            project_id=int(context["summary"].get("project_id", 196)),
-            region=str(context["summary"].get("region", "india")).lower(),
-            grid_size_m=float(context["summary"].get("grid_size_m", 50.0)),
-            buckets=[("PART_3", "2026-02-11 00:00:00", "2026-05-16 23:59:59")],
-            polygon_wkt=str(context["summary"].get("polygon_wkt", "")).strip() or None,
+        local_point_map = _make_local_point_map(
+            part3_baseline.loc[part3_baseline["Node_Cell_ID"].astype(str).isin(sector_cells["Node_Cell_ID"].astype(str))]
         )
-    else:
-        corrected_local = pd.DataFrame()
-    if corrected_local.empty:
-        corrected_local = baseline_local.copy()
-    corrected_local["time_bucket"] = "PART_3"
-    corrected_local = coverage_test._attach_carrier_load_share(corrected_local)
-    corrected_local = _merge_point_map_by_coordinates(
-        corrected_local,
-        local_point_map.drop(columns=["_site_distance_m"], errors="ignore"),
-    )
-    corrected_local = _ensure_grid_group_columns(corrected_local)
+    if local_point_map.empty:
+        logger.info("%s_prepare_failed reason=no_local_points", action_label)
+        return None
 
     affected_grid_ids = pd.to_numeric(local_point_map["grid_id"], errors="coerce").dropna().astype("Int64").unique().tolist()
+    local_detail = pd.DataFrame()
+    if affected_grid_ids and "grid_id" in part3_detail.columns:
+        detail_grid_ids = pd.to_numeric(part3_detail["grid_id"], errors="coerce").astype("Int64")
+        local_detail = part3_detail.loc[detail_grid_ids.isin(affected_grid_ids)].copy()
+    if local_detail.empty:
+        local_detail = part3_detail.merge(local_point_map[["lat", "lon"]].drop_duplicates(), on=["lat", "lon"], how="inner")
+    if local_detail.empty:
+        local_detail = local_point_map[["lat", "lon", "grid_id", "grid_row", "grid_col", "grid_centroid_lat", "grid_centroid_lon"]].drop_duplicates().copy()
+        local_detail["time_bucket"] = "PART_3"
+
     local_kpi = part3_kpi.loc[pd.to_numeric(part3_kpi["grid_id"], errors="coerce").astype("Int64").isin(affected_grid_ids)].copy()
     local_geo = part3_geo.loc[pd.to_numeric(part3_geo["grid_id"], errors="coerce").astype("Int64").isin(affected_grid_ids)].copy()
+    logger.info(
+        "%s_prepare local_points=%d local_detail_rows=%d local_sites=%d",
+        action_label,
+        len(local_point_map),
+        len(local_detail),
+        len(local_site_df),
+    )
+    return {
+        "part3_baseline": part3_baseline,
+        "part3_corrected": part3_corrected,
+        "local_site_df": local_site_df,
+        "local_point_map": local_point_map,
+        "local_detail": local_detail,
+        "local_kpi": local_kpi,
+        "local_geo": local_geo,
+    }
+
+
+def _build_modeled_inventory_from_surface(
+    *,
+    baseline_local: pd.DataFrame,
+    corrected_local: pd.DataFrame,
+    local_site_df: pd.DataFrame,
+    local_kpi: pd.DataFrame,
+    local_geo: pd.DataFrame,
+    context: dict[str, Any],
+    config: Model3RecommendationConfig,
+    forced_assignments: pd.DataFrame | None = None,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    hybrid_history = context["hybrid_history"]
+    model2_base_df = context["model2_base_df"]
+
+    baseline_local = coverage_test._attach_carrier_load_share(baseline_local.copy())
+    corrected_local = coverage_test._attach_carrier_load_share(corrected_local.copy())
+    baseline_local = _ensure_grid_group_columns(baseline_local)
+    corrected_local = _ensure_grid_group_columns(corrected_local)
+
     dense_part3 = _build_dense_part3_features(
         baseline_pred_df=baseline_local,
         corrected_pred_df=corrected_local,
@@ -921,7 +927,36 @@ def _run_sector_split_resimulation(
     for target, spec in context["model1_models"].items():
         infer_part3[target] = spec["model"].predict(infer_part3[spec["features"]])
 
-    base_keep = [col for col in model2_base_df.columns if col in ["grid_id", "time_bucket", "sample_count", "dl_tpt_mean", "ul_tpt_mean", "estimated_prb_mean", "cqi_mean", "dominant_pci", "green_ratio", "water_ratio", "grid_size_m", "grid_area_m2", "cell_area_m2", "road_length_m", "building_count", "building_area_ratio", "park_open_area", "open_area_ratio", "mall_presence", "metro_presence", "road_density", "geo_snapshot_mode", "geo_snapshot_source_ts"]]
+    base_keep = [
+        col
+        for col in model2_base_df.columns
+        if col
+        in [
+            "grid_id",
+            "time_bucket",
+            "sample_count",
+            "dl_tpt_mean",
+            "ul_tpt_mean",
+            "estimated_prb_mean",
+            "cqi_mean",
+            "dominant_pci",
+            "green_ratio",
+            "water_ratio",
+            "grid_size_m",
+            "grid_area_m2",
+            "cell_area_m2",
+            "road_length_m",
+            "building_count",
+            "building_area_ratio",
+            "park_open_area",
+            "open_area_ratio",
+            "mall_presence",
+            "metro_presence",
+            "road_density",
+            "geo_snapshot_mode",
+            "geo_snapshot_source_ts",
+        ]
+    ]
     base_context = model2_base_df[base_keep].drop_duplicates(subset=["grid_id", "time_bucket"]).copy()
     work = infer_part3.copy()
     for src, dst in [("pred_rsrp", "rsrp_mean"), ("pred_rsrq", "rsrq_mean"), ("pred_sinr", "sinr_mean")]:
@@ -942,7 +977,55 @@ def _run_sector_split_resimulation(
     topo_work["grid_id"] = pd.to_numeric(topo_work["grid_id"], errors="coerce").astype("Int64")
     topo_work["_rank_rsrp"] = pd.to_numeric(topo_work.get("pred_rsrp"), errors="coerce")
     topo_best = topo_work.sort_values(join_keys + ["_rank_rsrp"], ascending=[True, True, False]).drop_duplicates(subset=join_keys, keep="first")
-    topo_keep = [col for col in topo_best.columns if col in ["grid_id", "time_bucket", "Node_Cell_ID", "Site ID", "site_identity_key", "sector_identity", "sector_identity_key", "frontend_site_sector_key", "node_cell_sector_key", "sector", "band", "earfcn", "nodeb_id", "PCI", "azimuth", "canonical_sector_id", "site_sector_band_key", "rf_identity_key", "original_node_cell_id", "original_cell_id", "carrier_load_share"]]
+
+    if forced_assignments is not None and not forced_assignments.empty:
+        forced = forced_assignments.copy()
+        forced["grid_id"] = pd.to_numeric(forced["grid_id"], errors="coerce").astype("Int64")
+        forced["time_bucket"] = forced.get("time_bucket", "PART_3").astype(str)
+        topo_full = topo_work.merge(
+            forced[["grid_id", "time_bucket", "Node_Cell_ID"]].rename(columns={"Node_Cell_ID": "_forced_node_cell_id"}),
+            on=["grid_id", "time_bucket"],
+            how="left",
+        )
+        forced_rows = topo_full.loc[
+            topo_full["_forced_node_cell_id"].notna()
+            & topo_full["Node_Cell_ID"].astype(str).eq(topo_full["_forced_node_cell_id"].astype(str))
+        ].copy()
+        forced_rows = forced_rows.sort_values(join_keys + ["_rank_rsrp"], ascending=[True, True, False]).drop_duplicates(subset=join_keys, keep="first")
+        forced_keys = forced_rows[join_keys].drop_duplicates()
+        topo_best = topo_best.merge(forced_keys.assign(_drop=True), on=join_keys, how="left")
+        topo_best = topo_best.loc[topo_best["_drop"] != True].drop(columns=["_drop"], errors="ignore")
+        topo_best = pd.concat([topo_best, forced_rows[topo_best.columns.intersection(forced_rows.columns)]], ignore_index=True, sort=False)
+        topo_best = topo_best.sort_values(join_keys).drop_duplicates(subset=join_keys, keep="first")
+
+    topo_keep = [
+        col
+        for col in topo_best.columns
+        if col
+        in [
+            "grid_id",
+            "time_bucket",
+            "Node_Cell_ID",
+            "Site ID",
+            "site_identity_key",
+            "sector_identity",
+            "sector_identity_key",
+            "frontend_site_sector_key",
+            "node_cell_sector_key",
+            "sector",
+            "band",
+            "earfcn",
+            "nodeb_id",
+            "PCI",
+            "azimuth",
+            "canonical_sector_id",
+            "site_sector_band_key",
+            "rf_identity_key",
+            "original_node_cell_id",
+            "original_cell_id",
+            "carrier_load_share",
+        ]
+    ]
     topo_best = topo_best[topo_keep].copy()
     topo_best["site_id"] = _extract_site_id(topo_best["Node_Cell_ID"])
     rename_map = {
@@ -977,9 +1060,8 @@ def _run_sector_split_resimulation(
     for feature_name in model2_hybrid.ALL_FEATURES:
         if feature_name in enriched.columns:
             continue
-        fallback_sources = feature_fallbacks.get(feature_name, [])
         filled = None
-        for source_name in fallback_sources:
+        for source_name in feature_fallbacks.get(feature_name, []):
             if source_name in enriched.columns:
                 source_series = pd.to_numeric(enriched[source_name], errors="coerce")
                 filled = source_series if filled is None else filled.combine_first(source_series)
@@ -1001,34 +1083,660 @@ def _run_sector_split_resimulation(
     ).round(3)
     modeled, _ = model3_builder._apply_model3_load_profile(modeled)
     local_inventory, _ = _build_cell_inventory(modeled, config)
+    return modeled, local_inventory
 
+
+def _evaluate_action_inventory(
+    *,
+    sector_cells: pd.DataFrame,
+    after_inventory: pd.DataFrame,
+    config: Model3RecommendationConfig,
+    logger: logging.Logger,
+    action_label: str,
+) -> dict[str, Any]:
     before_cells = sector_cells["Node_Cell_ID"].astype(str).tolist()
-    after_candidates = local_inventory.loc[local_inventory["site_id"].astype(str) == str(_first_non_empty(sector_cells["site_id"]))].copy()
+    source_sector_id = str(_first_non_empty(sector_cells["sector_id"])).strip()
+    source_site_id = _normalize_identity_text(_first_non_empty(sector_cells["site_id"]))
+    source_frontend_sector_keys = {source_sector_id}
+    if "topology_frontend_site_sector_key" in sector_cells.columns:
+        source_frontend_sector_keys.update(
+            str(value).strip()
+            for value in sector_cells["topology_frontend_site_sector_key"].dropna().astype(str).tolist()
+            if str(value).strip()
+        )
+    original_lineage_ids = set(before_cells)
+    for col in ["topology_original_cell_id", "topology_original_node_cell_id"]:
+        if col in sector_cells.columns:
+            original_lineage_ids.update(
+                str(value).strip()
+                for value in sector_cells[col].dropna().astype(str).tolist()
+                if str(value).strip()
+            )
+    after_candidates = after_inventory.loc[after_inventory["sector_id"].astype(str) == source_sector_id].copy()
+    if after_candidates.empty and "topology_frontend_site_sector_key" in after_inventory.columns:
+        after_candidates = after_inventory.loc[
+            after_inventory["topology_frontend_site_sector_key"].astype(str).isin(source_frontend_sector_keys)
+        ].copy()
+    if after_candidates.empty:
+        lineage_mask = pd.Series(False, index=after_inventory.index)
+        for col in ["topology_original_cell_id", "topology_original_node_cell_id"]:
+            if col in after_inventory.columns:
+                lineage_mask = lineage_mask | after_inventory[col].astype(str).isin(original_lineage_ids)
+        after_candidates = after_inventory.loc[lineage_mask].copy()
+    if after_candidates.empty:
+        after_site_ids = after_inventory["site_id"].map(_normalize_identity_text) if "site_id" in after_inventory.columns else pd.Series("", index=after_inventory.index)
+        after_candidates = after_inventory.loc[after_site_ids == source_site_id].copy()
+
     after_prb = _to_num(after_candidates["prb_before_pct"])
     after_rrc = _to_num(after_candidates["rrc_before_pct"])
     projected_prb = float(after_prb.max()) if after_prb.notna().any() else np.nan
     projected_rrc = float(after_rrc.max()) if after_rrc.notna().any() else np.nan
-    projected_users = float(_to_num(after_candidates["rrc_users_before"]).max()) if "rrc_users_before" in after_candidates.columns and _to_num(after_candidates["rrc_users_before"]).notna().any() else np.nan
+    projected_users = (
+        float(_to_num(after_candidates["rrc_users_before"]).max())
+        if "rrc_users_before" in after_candidates.columns and _to_num(after_candidates["rrc_users_before"]).notna().any()
+        else np.nan
+    )
+    before_prb = float(_to_num(sector_cells["prb_before_pct"]).max()) if _to_num(sector_cells["prb_before_pct"]).notna().any() else np.nan
+    before_rrc = float(_to_num(sector_cells["rrc_before_pct"]).max()) if _to_num(sector_cells["rrc_before_pct"]).notna().any() else np.nan
+    before_pressure = max(before_prb if pd.notna(before_prb) else 0.0, before_rrc if pd.notna(before_rrc) else 0.0)
+    after_pressure = max(projected_prb if pd.notna(projected_prb) else 0.0, projected_rrc if pd.notna(projected_rrc) else 0.0)
     resolved = pd.notna(projected_prb) and pd.notna(projected_rrc) and projected_prb <= config.congestion_threshold and projected_rrc <= config.congestion_threshold
-    status = "Resolved" if resolved else "Partially Resolved"
+    improved = after_pressure < before_pressure - 0.5
+    worsened = after_pressure > before_pressure + 0.5
+    if resolved:
+        status = "Resolved"
+    elif worsened:
+        status = "Rejected"
+    elif improved:
+        status = "Partially Resolved"
+    else:
+        status = "No Material Change"
+    after_cells = after_candidates["Node_Cell_ID"].astype(str).dropna().tolist() if "Node_Cell_ID" in after_candidates.columns else []
     logger.info(
-        "sector_split_resim_done sector=%s before_cells=%s local_after_rows=%d actual_prb=%.3f actual_rrc=%.3f status=%s",
-        _first_non_empty(sector_cells["sector_id"]),
+        "%s_done sector=%s before_cells=%s after_cells=%s local_after_rows=%d before_prb=%.3f before_rrc=%.3f actual_prb=%.3f actual_rrc=%.3f status=%s",
+        action_label,
+        source_sector_id,
         before_cells,
+        after_cells,
         len(after_candidates),
+        before_prb if pd.notna(before_prb) else -1.0,
+        before_rrc if pd.notna(before_rrc) else -1.0,
         projected_prb if pd.notna(projected_prb) else -1.0,
         projected_rrc if pd.notna(projected_rrc) else -1.0,
         status,
     )
     return {
         "status": status,
-        "action_reason": "Sector split was rerun on the PART_3 local planning surface and then pushed through Model 1 and Model 2 inference.",
         "projected_prb_after_pct": round(projected_prb, 3) if pd.notna(projected_prb) else np.nan,
         "projected_rrc_after_pct": round(projected_rrc, 3) if pd.notna(projected_rrc) else np.nan,
         "projected_rrc_users_after": round(projected_users, 3) if pd.notna(projected_users) else np.nan,
         "next_step": "" if resolved else "New Site",
+        "after_cells": after_cells,
+    }
+
+
+def _run_sector_split_resimulation(
+    sector_cells: pd.DataFrame,
+    config: Model3RecommendationConfig,
+    context: dict[str, Any],
+    logger: logging.Logger,
+) -> dict[str, Any]:
+    part3_site_df = context["part3_site_df"]
+    building_df = context["building_df"]
+
+    split_site_df, source_rows = _build_sector_split_topology(sector_cells, part3_site_df, logger)
+    if source_rows.empty:
+        return {
+            "status": "Recommended",
+            "action_reason": "Sector split topology could not be mapped back to PART_3 site rows.",
+            "projected_prb_after_pct": np.nan,
+            "projected_rrc_after_pct": np.nan,
+            "projected_rrc_users_after": np.nan,
+            "next_step": "New Site",
+            "resimulation_required": True,
+            "resimulation_flow": "PART_3 local rerun failed at topology mapping",
+        }
+    local_ctx = _prepare_local_action_context(
+        sector_cells=sector_cells,
+        site_df=split_site_df,
+        context=context,
+        config=config,
+        logger=logger,
+        action_label="sector_split_resim",
+        source_rows=source_rows,
+    )
+    if local_ctx is None:
+        return {
+            "status": "Recommended",
+            "action_reason": "Sector split local context could not be prepared from PART_3 artifacts.",
+            "projected_prb_after_pct": np.nan,
+            "projected_rrc_after_pct": np.nan,
+            "projected_rrc_users_after": np.nan,
+            "next_step": "New Site",
+            "resimulation_required": True,
+            "resimulation_flow": "PART_3 local rerun failed during local context preparation",
+        }
+
+    baseline_local = coverage_test._run_project_baseline_prediction(
+        project_id=int(context["summary"].get("project_id", 196)),
+        region=str(context["summary"].get("region", "india")).lower(),
+        site_df=local_ctx["local_site_df"].drop(columns=["_site_distance_m"], errors="ignore"),
+        drive_df=local_ctx["local_detail"],
+        building_df=building_df,
+        baseline_radius_m=float(context["summary"].get("baseline_radius_m", 500.0)),
+        grid_size_m=float(context["summary"].get("grid_size_m", 50.0)),
+        workers=1,
+        max_interference_sites=int(context["summary"].get("max_interference_sites", 50)),
+        polygon_wkt=str(context["summary"].get("polygon_wkt", "")).strip() or None,
+        use_frontend_grid_sampling=False,
+        grid_analytics_scenario_id=context["summary"].get("grid_analytics_scenario_id"),
+    )
+    if baseline_local.empty:
+        return {
+            "status": "Recommended",
+            "action_reason": "Sector split rerun produced no PART_3 baseline rows.",
+            "projected_prb_after_pct": np.nan,
+            "projected_rrc_after_pct": np.nan,
+            "projected_rrc_users_after": np.nan,
+            "next_step": "New Site",
+            "resimulation_required": True,
+            "resimulation_flow": "PART_3 local rerun produced no baseline rows",
+        }
+    baseline_local["time_bucket"] = "PART_3"
+    baseline_local = _merge_point_map_by_coordinates(
+        baseline_local,
+        local_ctx["local_point_map"].drop(columns=["_site_distance_m"], errors="ignore"),
+    )
+    baseline_local = _ensure_grid_group_columns(baseline_local)
+
+    if not local_ctx["local_detail"].empty and {"rsrp", "rsrq", "sinr"}.issubset(local_ctx["local_detail"].columns):
+        corrected_local = coverage_test._run_bucket_corrected_predictions(
+            baseline_pred_df=baseline_local,
+            detail_df=local_ctx["local_detail"].assign(time_bucket="PART_3"),
+            site_df_by_bucket={"PART_3": local_ctx["local_site_df"].drop(columns=["_site_distance_m"], errors="ignore")},
+            building_df=building_df,
+            project_id=int(context["summary"].get("project_id", 196)),
+            region=str(context["summary"].get("region", "india")).lower(),
+            grid_size_m=float(context["summary"].get("grid_size_m", 50.0)),
+            buckets=[("PART_3", "2026-02-11 00:00:00", "2026-05-16 23:59:59")],
+            polygon_wkt=str(context["summary"].get("polygon_wkt", "")).strip() or None,
+        )
+    else:
+        corrected_local = pd.DataFrame()
+    if corrected_local.empty:
+        corrected_local = baseline_local.copy()
+    corrected_local["time_bucket"] = "PART_3"
+    corrected_local = _merge_point_map_by_coordinates(
+        corrected_local,
+        local_ctx["local_point_map"].drop(columns=["_site_distance_m"], errors="ignore"),
+    )
+    corrected_local = _ensure_grid_group_columns(corrected_local)
+    _, local_inventory = _build_modeled_inventory_from_surface(
+        baseline_local=baseline_local,
+        corrected_local=corrected_local,
+        local_site_df=local_ctx["local_site_df"],
+        local_kpi=local_ctx["local_kpi"],
+        local_geo=local_ctx["local_geo"],
+        context=context,
+        config=config,
+    )
+    outcome = _evaluate_action_inventory(
+        sector_cells=sector_cells,
+        after_inventory=local_inventory,
+        config=config,
+        logger=logger,
+        action_label="sector_split_resim",
+    )
+    status = outcome["status"]
+    if status == "Rejected":
+        action_reason = "Sector split was rerun through baseline, Model 1, and Model 2, but the affected sector lineage became more congested, so the action should be rejected."
+    elif status == "No Material Change":
+        action_reason = "Sector split was rerun through baseline, Model 1, and Model 2, but the affected sector lineage did not improve enough to count as resolved."
+    else:
+        action_reason = "Sector split was rerun on the PART_3 local planning surface and then pushed through Model 1 and Model 2 inference."
+    return {
+        "status": status,
+        "action_reason": action_reason,
+        "projected_prb_after_pct": outcome["projected_prb_after_pct"],
+        "projected_rrc_after_pct": outcome["projected_rrc_after_pct"],
+        "projected_rrc_users_after": outcome["projected_rrc_users_after"],
+        "next_step": outcome["next_step"],
         "resimulation_required": True,
         "resimulation_flow": "PART_3 topology split -> baseline rerun -> Model 1 inference -> Model 2 inference -> Model 3 reevaluation",
+    }
+
+
+def _build_carrier_addition_topology(
+    sector_cells: pd.DataFrame,
+    part3_site_df: pd.DataFrame,
+    band_to_add: str,
+    logger: logging.Logger,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    work = part3_site_df.copy()
+    source_rows = _extract_source_site_rows(sector_cells, part3_site_df)
+    if source_rows.empty:
+        return work, source_rows
+    try:
+        band_num = int(float(band_to_add))
+    except Exception:
+        band_num = 1800
+    add_rows = source_rows.copy()
+    add_rows["band"] = float(band_num)
+    add_rows["earfcn"] = float(SYNTHETIC_BAND_TO_EARFCN.get(int(band_num), band_num))
+    add_rows["carrier_variant"] = f"carrier_add_{band_num}"
+    add_rows["cell_id"] = add_rows["cell_id"].astype(str).map(lambda value: f"{value}__ADD{band_num}")
+    add_rows["Node_Cell_ID"] = add_rows["cell_id"].astype(str)
+    if "PCI" in add_rows.columns:
+        add_rows["PCI"] = (pd.to_numeric(add_rows["PCI"], errors="coerce").fillna(0).astype(int) + (band_num % 97) + 11) % 504
+    combined = pd.concat([work, add_rows], ignore_index=True)
+    logger.info(
+        "carrier_add_topology sector=%s source_rows=%d add_rows=%d band=%s",
+        _first_non_empty(sector_cells["sector_id"]),
+        len(source_rows),
+        len(add_rows),
+        band_to_add,
+    )
+    return combined, source_rows
+
+
+def _build_new_site_topology(
+    sector_cells: pd.DataFrame,
+    part3_site_df: pd.DataFrame,
+    logger: logging.Logger,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    work = part3_site_df.copy()
+    source_rows = _extract_source_site_rows(sector_cells, part3_site_df)
+    if source_rows.empty:
+        return work, source_rows
+    template = source_rows.copy()
+    site_id_seed = pd.to_numeric(work["Site ID"], errors="coerce").dropna().astype(int)
+    new_site_id = int(site_id_seed.max()) + 1001 if not site_id_seed.empty else 990001
+    lat = pd.to_numeric(template["lat"], errors="coerce").mean()
+    lon = pd.to_numeric(template["lon"], errors="coerce").mean()
+    lat_offset = 180.0 / 111320.0
+    lon_offset = 180.0 / (111320.0 * max(0.2, np.cos(np.radians(lat))))
+    new_rows: list[pd.DataFrame] = []
+    azimuths = [30.0, 150.0, 270.0]
+    bands = template["band"].astype(str).tolist()
+    for idx, azimuth in enumerate(azimuths, start=1):
+        base = template.iloc[[0]].copy()
+        band_value = float(pd.to_numeric(template["band"], errors="coerce").iloc[(idx - 1) % max(1, len(template))])
+        base["Site ID"] = new_site_id
+        base["lat"] = lat + lat_offset
+        base["lon"] = lon + lon_offset
+        base["band"] = band_value
+        base["earfcn"] = float(SYNTHETIC_BAND_TO_EARFCN.get(int(round(band_value)), int(round(band_value))))
+        base["azimuth"] = azimuth
+        base["cell_id"] = f"{new_site_id}_{idx}__NS"
+        base["Node_Cell_ID"] = base["cell_id"].astype(str)
+        if "PCI" in base.columns:
+            base["PCI"] = int((100 + idx * 29 + (int(round(band_value)) % 41)) % 504)
+        base["carrier_variant"] = "new_site"
+        new_rows.append(base)
+    new_site_df = pd.concat(new_rows, ignore_index=True) if new_rows else pd.DataFrame(columns=work.columns)
+    combined = pd.concat([work, new_site_df], ignore_index=True)
+    logger.info(
+        "new_site_topology sector=%s source_rows=%d new_site_rows=%d new_site_id=%s",
+        _first_non_empty(sector_cells["sector_id"]),
+        len(source_rows),
+        len(new_site_df),
+        new_site_id,
+    )
+    return combined, source_rows
+
+
+def _run_carrier_addition_resimulation(
+    sector_cells: pd.DataFrame,
+    config: Model3RecommendationConfig,
+    context: dict[str, Any],
+    logger: logging.Logger,
+    band_to_add: str,
+) -> dict[str, Any]:
+    part3_site_df = context["part3_site_df"]
+    building_df = context["building_df"]
+    added_site_df, source_rows = _build_carrier_addition_topology(sector_cells, part3_site_df, band_to_add, logger)
+    if source_rows.empty:
+        return {
+            "status": "Recommended",
+            "action_reason": "Carrier addition topology could not be mapped back to PART_3 site rows.",
+            "projected_prb_after_pct": np.nan,
+            "projected_rrc_after_pct": np.nan,
+            "projected_rrc_users_after": np.nan,
+            "next_step": "Sector Split",
+            "resimulation_required": True,
+            "resimulation_flow": "PART_3 carrier addition rerun failed at topology mapping",
+        }
+    local_ctx = _prepare_local_action_context(
+        sector_cells=sector_cells,
+        site_df=added_site_df,
+        context=context,
+        config=config,
+        logger=logger,
+        action_label="carrier_add_resim",
+        source_rows=source_rows,
+    )
+    if local_ctx is None:
+        return {
+            "status": "Recommended",
+            "action_reason": "Carrier addition local context could not be prepared from PART_3 artifacts.",
+            "projected_prb_after_pct": np.nan,
+            "projected_rrc_after_pct": np.nan,
+            "projected_rrc_users_after": np.nan,
+            "next_step": "Sector Split",
+            "resimulation_required": True,
+            "resimulation_flow": "PART_3 carrier addition rerun failed during local context preparation",
+        }
+    baseline_local = coverage_test._run_project_baseline_prediction(
+        project_id=int(context["summary"].get("project_id", 196)),
+        region=str(context["summary"].get("region", "india")).lower(),
+        site_df=local_ctx["local_site_df"].drop(columns=["_site_distance_m"], errors="ignore"),
+        drive_df=local_ctx["local_detail"],
+        building_df=building_df,
+        baseline_radius_m=float(context["summary"].get("baseline_radius_m", 500.0)),
+        grid_size_m=float(context["summary"].get("grid_size_m", 50.0)),
+        workers=1,
+        max_interference_sites=int(context["summary"].get("max_interference_sites", 50)),
+        polygon_wkt=str(context["summary"].get("polygon_wkt", "")).strip() or None,
+        use_frontend_grid_sampling=False,
+        grid_analytics_scenario_id=context["summary"].get("grid_analytics_scenario_id"),
+    )
+    if baseline_local.empty:
+        return {
+            "status": "Recommended",
+            "action_reason": "Carrier addition rerun produced no PART_3 baseline rows.",
+            "projected_prb_after_pct": np.nan,
+            "projected_rrc_after_pct": np.nan,
+            "projected_rrc_users_after": np.nan,
+            "next_step": "Sector Split",
+            "resimulation_required": True,
+            "resimulation_flow": "PART_3 carrier addition rerun produced no baseline rows",
+        }
+    baseline_local["time_bucket"] = "PART_3"
+    baseline_local = _merge_point_map_by_coordinates(
+        baseline_local,
+        local_ctx["local_point_map"].drop(columns=["_site_distance_m"], errors="ignore"),
+    )
+    baseline_local = _ensure_grid_group_columns(baseline_local)
+    corrected_local = coverage_test._run_bucket_corrected_predictions(
+        baseline_pred_df=baseline_local,
+        detail_df=local_ctx["local_detail"].assign(time_bucket="PART_3"),
+        site_df_by_bucket={"PART_3": local_ctx["local_site_df"].drop(columns=["_site_distance_m"], errors="ignore")},
+        building_df=building_df,
+        project_id=int(context["summary"].get("project_id", 196)),
+        region=str(context["summary"].get("region", "india")).lower(),
+        grid_size_m=float(context["summary"].get("grid_size_m", 50.0)),
+        buckets=[("PART_3", "2026-02-11 00:00:00", "2026-05-16 23:59:59")],
+        polygon_wkt=str(context["summary"].get("polygon_wkt", "")).strip() or None,
+    )
+    if corrected_local.empty:
+        corrected_local = baseline_local.copy()
+    corrected_local["time_bucket"] = "PART_3"
+    corrected_local = _merge_point_map_by_coordinates(
+        corrected_local,
+        local_ctx["local_point_map"].drop(columns=["_site_distance_m"], errors="ignore"),
+    )
+    corrected_local = _ensure_grid_group_columns(corrected_local)
+    _, local_inventory = _build_modeled_inventory_from_surface(
+        baseline_local=baseline_local,
+        corrected_local=corrected_local,
+        local_site_df=local_ctx["local_site_df"],
+        local_kpi=local_ctx["local_kpi"],
+        local_geo=local_ctx["local_geo"],
+        context=context,
+        config=config,
+    )
+    outcome = _evaluate_action_inventory(
+        sector_cells=sector_cells,
+        after_inventory=local_inventory,
+        config=config,
+        logger=logger,
+        action_label="carrier_add_resim",
+    )
+    status = outcome["status"]
+    action_reason = (
+        "Carrier addition was rerun through baseline, Model 1, and Model 2 on the updated PART_3 local topology."
+        if status in {"Resolved", "Partially Resolved"}
+        else "Carrier addition was rerun through baseline, Model 1, and Model 2, but the affected sector lineage did not improve enough."
+    )
+    return {
+        "status": status,
+        "action_reason": action_reason,
+        "projected_prb_after_pct": outcome["projected_prb_after_pct"],
+        "projected_rrc_after_pct": outcome["projected_rrc_after_pct"],
+        "projected_rrc_users_after": outcome["projected_rrc_users_after"],
+        "next_step": outcome["next_step"] or "Sector Split",
+        "resimulation_required": True,
+        "resimulation_flow": "PART_3 carrier addition topology -> baseline rerun -> Model 1 inference -> Model 2 inference -> Model 3 reevaluation",
+    }
+
+
+def _run_new_site_resimulation(
+    sector_cells: pd.DataFrame,
+    config: Model3RecommendationConfig,
+    context: dict[str, Any],
+    logger: logging.Logger,
+) -> dict[str, Any]:
+    part3_site_df = context["part3_site_df"]
+    building_df = context["building_df"]
+    new_site_df, source_rows = _build_new_site_topology(sector_cells, part3_site_df, logger)
+    if source_rows.empty:
+        return {
+            "status": "Recommended",
+            "action_reason": "New-site topology could not be mapped back to PART_3 site rows.",
+            "projected_prb_after_pct": np.nan,
+            "projected_rrc_after_pct": np.nan,
+            "projected_rrc_users_after": np.nan,
+            "next_step": "",
+            "resimulation_required": True,
+            "resimulation_flow": "PART_3 new-site rerun failed at topology mapping",
+        }
+    local_ctx = _prepare_local_action_context(
+        sector_cells=sector_cells,
+        site_df=new_site_df,
+        context=context,
+        config=config,
+        logger=logger,
+        action_label="new_site_resim",
+        source_rows=source_rows,
+    )
+    if local_ctx is None:
+        return {
+            "status": "Recommended",
+            "action_reason": "New-site local context could not be prepared from PART_3 artifacts.",
+            "projected_prb_after_pct": np.nan,
+            "projected_rrc_after_pct": np.nan,
+            "projected_rrc_users_after": np.nan,
+            "next_step": "",
+            "resimulation_required": True,
+            "resimulation_flow": "PART_3 new-site rerun failed during local context preparation",
+        }
+    baseline_local = coverage_test._run_project_baseline_prediction(
+        project_id=int(context["summary"].get("project_id", 196)),
+        region=str(context["summary"].get("region", "india")).lower(),
+        site_df=local_ctx["local_site_df"].drop(columns=["_site_distance_m"], errors="ignore"),
+        drive_df=local_ctx["local_detail"],
+        building_df=building_df,
+        baseline_radius_m=float(context["summary"].get("baseline_radius_m", 500.0)),
+        grid_size_m=float(context["summary"].get("grid_size_m", 50.0)),
+        workers=1,
+        max_interference_sites=int(context["summary"].get("max_interference_sites", 50)),
+        polygon_wkt=str(context["summary"].get("polygon_wkt", "")).strip() or None,
+        use_frontend_grid_sampling=False,
+        grid_analytics_scenario_id=context["summary"].get("grid_analytics_scenario_id"),
+    )
+    if baseline_local.empty:
+        return {
+            "status": "Recommended",
+            "action_reason": "New-site rerun produced no PART_3 baseline rows.",
+            "projected_prb_after_pct": np.nan,
+            "projected_rrc_after_pct": np.nan,
+            "projected_rrc_users_after": np.nan,
+            "next_step": "",
+            "resimulation_required": True,
+            "resimulation_flow": "PART_3 new-site rerun produced no baseline rows",
+        }
+    baseline_local["time_bucket"] = "PART_3"
+    baseline_local = _merge_point_map_by_coordinates(
+        baseline_local,
+        local_ctx["local_point_map"].drop(columns=["_site_distance_m"], errors="ignore"),
+    )
+    baseline_local = _ensure_grid_group_columns(baseline_local)
+    corrected_local = coverage_test._run_bucket_corrected_predictions(
+        baseline_pred_df=baseline_local,
+        detail_df=local_ctx["local_detail"].assign(time_bucket="PART_3"),
+        site_df_by_bucket={"PART_3": local_ctx["local_site_df"].drop(columns=["_site_distance_m"], errors="ignore")},
+        building_df=building_df,
+        project_id=int(context["summary"].get("project_id", 196)),
+        region=str(context["summary"].get("region", "india")).lower(),
+        grid_size_m=float(context["summary"].get("grid_size_m", 50.0)),
+        buckets=[("PART_3", "2026-02-11 00:00:00", "2026-05-16 23:59:59")],
+        polygon_wkt=str(context["summary"].get("polygon_wkt", "")).strip() or None,
+    )
+    if corrected_local.empty:
+        corrected_local = baseline_local.copy()
+    corrected_local["time_bucket"] = "PART_3"
+    corrected_local = _merge_point_map_by_coordinates(
+        corrected_local,
+        local_ctx["local_point_map"].drop(columns=["_site_distance_m"], errors="ignore"),
+    )
+    corrected_local = _ensure_grid_group_columns(corrected_local)
+    _, local_inventory = _build_modeled_inventory_from_surface(
+        baseline_local=baseline_local,
+        corrected_local=corrected_local,
+        local_site_df=local_ctx["local_site_df"],
+        local_kpi=local_ctx["local_kpi"],
+        local_geo=local_ctx["local_geo"],
+        context=context,
+        config=config,
+    )
+    outcome = _evaluate_action_inventory(
+        sector_cells=sector_cells,
+        after_inventory=local_inventory,
+        config=config,
+        logger=logger,
+        action_label="new_site_resim",
+    )
+    status = outcome["status"]
+    action_reason = (
+        "New site was rerun through baseline, Model 1, and Model 2 on the updated PART_3 local topology."
+        if status in {"Resolved", "Partially Resolved"}
+        else "New site was rerun through baseline, Model 1, and Model 2, but the affected sector lineage did not improve enough."
+    )
+    return {
+        "status": status,
+        "action_reason": action_reason,
+        "projected_prb_after_pct": outcome["projected_prb_after_pct"],
+        "projected_rrc_after_pct": outcome["projected_rrc_after_pct"],
+        "projected_rrc_users_after": outcome["projected_rrc_users_after"],
+        "next_step": "",
+        "resimulation_required": True,
+        "resimulation_flow": "PART_3 new-site topology -> baseline rerun -> Model 1 inference -> Model 2 inference -> Model 3 reevaluation",
+    }
+
+
+def _run_load_balance_resimulation(
+    sector_cells: pd.DataFrame,
+    config: Model3RecommendationConfig,
+    context: dict[str, Any],
+    logger: logging.Logger,
+    load_candidate: dict[str, Any],
+) -> dict[str, Any]:
+    local_ctx = _prepare_local_action_context(
+        sector_cells=sector_cells,
+        site_df=context["part3_site_df"],
+        context=context,
+        config=config,
+        logger=logger,
+        action_label="load_balance_resim",
+        source_rows=_extract_source_site_rows(sector_cells, context["part3_site_df"]),
+    )
+    if local_ctx is None:
+        return {
+            "status": "Recommended",
+            "action_reason": "Load-balance local context could not be prepared from PART_3 artifacts.",
+            "projected_prb_after_pct": np.nan,
+            "projected_rrc_after_pct": np.nan,
+            "projected_rrc_users_after": np.nan,
+            "next_step": "Add Carrier",
+            "resimulation_required": True,
+            "resimulation_flow": "Model 2 load-balance rerun failed during local context preparation",
+        }
+    source_id = str(load_candidate["source_node_cell_id"])
+    target_id = str(load_candidate["target_node_cell_id"])
+    corrected_local = local_ctx["part3_corrected"].merge(
+        local_ctx["local_point_map"][["lat", "lon"]].drop_duplicates(), on=["lat", "lon"], how="inner"
+    )
+    corrected_local["grid_id"] = pd.to_numeric(corrected_local["grid_id"], errors="coerce").astype("Int64")
+    corrected_local["time_bucket"] = corrected_local["time_bucket"].astype(str)
+    corrected_local["_rsrp"] = pd.to_numeric(corrected_local.get("pred_rsrp"), errors="coerce")
+    pair = corrected_local.loc[corrected_local["Node_Cell_ID"].astype(str).isin([source_id, target_id])].copy()
+    pair = pair.pivot_table(index=["grid_id", "time_bucket"], columns="Node_Cell_ID", values="_rsrp", aggfunc="max").reset_index()
+    if source_id not in pair.columns or target_id not in pair.columns:
+        return {
+            "status": "No Material Change",
+            "action_reason": "Load-balance rerun could not find both source and target carriers on the same local grid set.",
+            "projected_prb_after_pct": np.nan,
+            "projected_rrc_after_pct": np.nan,
+            "projected_rrc_users_after": np.nan,
+            "next_step": "Add Carrier",
+            "resimulation_required": True,
+            "resimulation_flow": "Model 2 grid reassignment could not find overlapping source/target candidates",
+        }
+    pair["_delta_db"] = pd.to_numeric(pair[target_id], errors="coerce") - pd.to_numeric(pair[source_id], errors="coerce")
+    movable = pair.loc[pair["_delta_db"] >= -6.0].sort_values("_delta_db", ascending=False).copy()
+    if movable.empty:
+        return {
+            "status": "No Material Change",
+            "action_reason": "Load-balance rerun found no grids where the target carrier had acceptable RF overlap with the source carrier.",
+            "projected_prb_after_pct": np.nan,
+            "projected_rrc_after_pct": np.nan,
+            "projected_rrc_users_after": np.nan,
+            "next_step": "Add Carrier",
+            "resimulation_required": True,
+            "resimulation_flow": "Model 2 grid reassignment found no movable overlapping grids",
+        }
+    move_count = max(1, int(round(len(movable) * 0.30)))
+    forced_assignments = movable.head(move_count)[["grid_id", "time_bucket"]].copy()
+    forced_assignments["Node_Cell_ID"] = target_id
+    baseline_local = local_ctx["part3_baseline"].merge(
+        local_ctx["local_point_map"][["lat", "lon"]].drop_duplicates(), on=["lat", "lon"], how="inner"
+    )
+    baseline_local = _merge_point_map_by_coordinates(
+        baseline_local,
+        local_ctx["local_point_map"].drop(columns=["_site_distance_m"], errors="ignore"),
+    )
+    baseline_local = _ensure_grid_group_columns(baseline_local)
+    corrected_local = _merge_point_map_by_coordinates(
+        corrected_local,
+        local_ctx["local_point_map"].drop(columns=["_site_distance_m"], errors="ignore"),
+    )
+    corrected_local = _ensure_grid_group_columns(corrected_local)
+    _, local_inventory = _build_modeled_inventory_from_surface(
+        baseline_local=baseline_local,
+        corrected_local=corrected_local,
+        local_site_df=local_ctx["local_site_df"],
+        local_kpi=local_ctx["local_kpi"],
+        local_geo=local_ctx["local_geo"],
+        context=context,
+        config=config,
+        forced_assignments=forced_assignments,
+    )
+    outcome = _evaluate_action_inventory(
+        sector_cells=sector_cells,
+        after_inventory=local_inventory,
+        config=config,
+        logger=logger,
+        action_label="load_balance_resim",
+    )
+    return {
+        "status": outcome["status"],
+        "action_reason": f"Load balancing reassigned {move_count} overlapping local grids from {source_id} to {target_id} and reran Model 2 aggregation on the updated state.",
+        "projected_prb_after_pct": outcome["projected_prb_after_pct"],
+        "projected_rrc_after_pct": outcome["projected_rrc_after_pct"],
+        "projected_rrc_users_after": outcome["projected_rrc_users_after"],
+        "next_step": outcome["next_step"] or "Add Carrier",
+        "resimulation_required": True,
+        "resimulation_flow": "Grid reassignment -> Model 2 inference -> Model 3 reevaluation",
     }
 
 
@@ -1094,6 +1802,24 @@ def _simulate_recommendation(
 
     if load_balance_possible:
         decision_path.append(f"Load balance candidate found: {candidate_band}")
+        if context is not None:
+            resim = _run_load_balance_resimulation(sector_cells, config, context, logger, load_candidate)
+            action = f"Load Balance -> {candidate_band} MHz"
+            return {
+                "action": action,
+                "status": resim["status"],
+                "decision_path": " | ".join(decision_path),
+                "load_balance_possible": True,
+                "selected_peer_node_cell_id": candidate_cell,
+                "selected_peer_band": candidate_band,
+                "projected_prb_after_pct": resim["projected_prb_after_pct"],
+                "projected_rrc_after_pct": resim["projected_rrc_after_pct"],
+                "projected_rrc_users_after": resim["projected_rrc_users_after"],
+                "action_reason": resim["action_reason"],
+                "next_step": resim["next_step"],
+                "resimulation_required": True,
+                "resimulation_flow": resim["resimulation_flow"],
+            }
         projected_prb = float(load_candidate["projected_prb_after_pct"])
         projected_rrc = float(load_candidate["projected_rrc_after_pct"])
         projected_users = float(load_candidate["projected_rrc_users_after"]) if pd.notna(load_candidate["projected_rrc_users_after"]) else np.nan
@@ -1134,6 +1860,23 @@ def _simulate_recommendation(
     if can_add and add_row is not None and str(add_row["recommended_band_to_add"]).strip():
         band = str(add_row["recommended_band_to_add"]).strip()
         decision_path.append(f"Carrier addition possible: {band}")
+        if context is not None:
+            resim = _run_carrier_addition_resimulation(sector_cells, config, context, logger, band)
+            return {
+                "action": f"Add Carrier -> {band} MHz",
+                "status": resim["status"],
+                "decision_path": " | ".join(decision_path),
+                "load_balance_possible": load_balance_possible,
+                "selected_peer_node_cell_id": source_cell_id,
+                "selected_peer_band": candidate_band,
+                "projected_prb_after_pct": resim["projected_prb_after_pct"],
+                "projected_rrc_after_pct": resim["projected_rrc_after_pct"],
+                "projected_rrc_users_after": resim["projected_rrc_users_after"],
+                "action_reason": resim["action_reason"],
+                "next_step": resim["next_step"],
+                "resimulation_required": True,
+                "resimulation_flow": resim["resimulation_flow"],
+            }
         add_factor = 0.65 if load_balance_possible else 0.70
         projected_prb = max(0.0, source_prb * add_factor)
         projected_rrc = max(0.0, source_rrc * add_factor)
@@ -1217,6 +1960,23 @@ def _simulate_recommendation(
 
     decision_path.append("New site branch")
     action = "New Site"
+    if context is not None:
+        resim = _run_new_site_resimulation(sector_cells, config, context, logger)
+        return {
+            "action": action,
+            "status": resim["status"],
+            "decision_path": " | ".join(decision_path),
+            "load_balance_possible": load_balance_possible,
+            "selected_peer_node_cell_id": source_cell_id,
+            "selected_peer_band": candidate_band,
+            "projected_prb_after_pct": resim["projected_prb_after_pct"],
+            "projected_rrc_after_pct": resim["projected_rrc_after_pct"],
+            "projected_rrc_users_after": resim["projected_rrc_users_after"],
+            "action_reason": resim["action_reason"],
+            "next_step": resim["next_step"],
+            "resimulation_required": True,
+            "resimulation_flow": resim["resimulation_flow"],
+        }
     status = "Recommended"
     action_reason = "No viable in-sector or same-site relief remains."
     logger.info(

@@ -1,0 +1,117 @@
+{
+  "Introduction": "This telecom drive test report provides an overview of the performance of wireless communication services in Mumbai, India. Drive testing is a critical process that assesses signal strength, coverage, and overall provider performance, enabling service providers to identify areas of strong and weak coverage. This report presents map visualizations highlighting the distribution of coverage areas, providing valuable insights into network performance. The findings presented in this report offer actionable recommendations for optimization and deployment planning, supporting informed decision-making to enhance the quality of wireless services.",
+  "Introduction_source": "llm",
+  "Area Summary": {
+    "Overview": "Drive route covers key operational areas identified based on spatial distribution of samples and session density.",
+    "Hotspots & Marked Locations": "Hanuman Nagar, Balasheth Mandurkar Marg, Rai Pada",
+    "Crowded & High-Traffic Locations": "Rai Pada",
+    "Major Areas Covered": "The drive covered major areas including Hanuman Nagar (highway residential, 15811 samples), Balasheth Mandurkar Marg (highway residential, 835 samples), Rai Pada (highway residential, 633 samples), Kasturba Road (highway residential, 284 samples), Pandurang Budhkar Marg (highway secondary, 233 samples), Dadar West (highway primary, 171 samples)."
+  },
+  "Drive Summary (new format)": {
+    "objective": "The objective of this drive test was to evaluate LTE radio coverage, radio quality, mobility performance and end-user service experience along the planned drive route. Measurements were collected using STracer and analysed against operator acceptance criteria.",
+    "scope": [
+      "Coverage assessment using Band Distribution, RSRP, RSRQ and SINR.",
+      "Mobility assessment using Serving Cell, PCI Distribution and Neighbor behaviour.",
+      "Handover verification including Intra-frequency, Inter-frequency and Inter-RAT events where available.",
+      "Service quality evaluation using Throughput, MOS, Latency, Jitter and Packet Loss."
+    ],
+    "kpi_rows": [
+      [
+        "Coverage",
+        "Good",
+        "Average RSRP -71.9 dBm; 94% of samples above -95 dBm."
+      ],
+      [
+        "Radio Quality - 4G (LTE Anchor - NSA)",
+        "Fair",
+        "[13,574 samples] Average SINR 19.5 dB; Average RSRQ -7.3 dB."
+      ],
+      [
+        "Radio Quality - 4G",
+        "Fair",
+        "[5,909 samples] Average SINR 18.7 dB; Average RSRQ -7.2 dB."
+      ],
+      [
+        "Radio Quality - 5G NSA",
+        "Fair",
+        "[3,823 samples] Average SINR 23.8 dB; Average RSRQ -10.3 dB."
+      ],
+      [
+        "Mobility",
+        "Good",
+        "129 unique serving PCIs (top PCI 41% of samples)."
+      ],
+      [
+        "Handover",
+        "Good",
+        "891 band handover events; no major mobility interruption observed."
+      ]
+    ],
+    "observations": [
+      "Coverage classified as Good (94% of RSRP samples above -95 dBm, average -71.9 dBm).",
+      "Radio quality (4G (LTE Anchor - NSA)) classified as Fair. Requires optimization.",
+      "Radio quality (4G) classified as Fair. Requires optimization.",
+      "Radio quality (5G NSA) classified as Fair. Requires optimization."
+    ],
+    "overall_assessment": "The network showed mixed RF performance with some KPI groups below the Good threshold. Targeted optimization is recommended for the KPI groups flagged Fair or Poor above.",
+    "coverage": {
+      "status": "Good",
+      "remarks": "Average RSRP -71.9 dBm; 94% of samples above -95 dBm."
+    },
+    "quality_entries": [
+      {
+        "technology": "4G (LTE Anchor - NSA)",
+        "status": "Fair",
+        "remarks": "[13,574 samples] Average SINR 19.5 dB; Average RSRQ -7.3 dB."
+      },
+      {
+        "technology": "4G",
+        "status": "Fair",
+        "remarks": "[5,909 samples] Average SINR 18.7 dB; Average RSRQ -7.2 dB."
+      },
+      {
+        "technology": "5G NSA",
+        "status": "Fair",
+        "remarks": "[3,823 samples] Average SINR 23.8 dB; Average RSRQ -10.3 dB."
+      }
+    ]
+  },
+  "Session distances (km, Haversine consecutive-points)": {
+    "4742": 15.62,
+    "4714": 20.57,
+    "4530": 0.66
+  },
+  "Total distance (km)": 36.85,
+  "Band Summary": [
+    {
+      "band": "n77",
+      "sample_count": 13574,
+      "sample_percentage": 58.24
+    },
+    {
+      "band": "n78",
+      "sample_count": 3823,
+      "sample_percentage": 16.4
+    },
+    {
+      "band": "B1",
+      "sample_count": 3667,
+      "sample_percentage": 15.73
+    },
+    {
+      "band": "B3",
+      "sample_count": 1464,
+      "sample_percentage": 6.28
+    },
+    {
+      "band": "B41",
+      "sample_count": 441,
+      "sample_percentage": 1.89
+    },
+    {
+      "band": "B8",
+      "sample_count": 337,
+      "sample_percentage": 1.45
+    }
+  ]
+}

@@ -1,0 +1,84 @@
+{
+  "location": {
+    "city": "Mumbai",
+    "country": "India"
+  },
+  "introduction": "Data includes 23306 samples from 3 sessions.",
+  "area_summary": {
+    "Overview": "Drive route covers key operational areas identified based on spatial distribution of samples and session density.",
+    "Hotspots & Marked Locations": "Hanuman Nagar, Balasheth Mandurkar Marg, Rai Pada",
+    "Crowded & High-Traffic Locations": "Rai Pada",
+    "Major Areas Covered": "The drive covered major areas including Hanuman Nagar (highway residential, 15811 samples), Balasheth Mandurkar Marg (highway residential, 835 samples), Rai Pada (highway residential, 633 samples), Kasturba Road (highway residential, 284 samples), Pandurang Budhkar Marg (highway secondary, 233 samples), Dadar West (highway primary, 171 samples)."
+  },
+  "drive_summary": {
+    "distance_covered": 36.85,
+    "total_samples": 23306,
+    "total_sessions": 3,
+    "number_of_days": 3,
+    "start_date": "2026-05-22",
+    "end_date": "2026-06-05",
+    "sessions": [
+      {
+        "session_id": 4530,
+        "date": "22-05-2026",
+        "start_time": "14:11",
+        "end_time": "14:22",
+        "duration": "11 min",
+        "distance": 0.66
+      },
+      {
+        "session_id": 4714,
+        "date": "04-06-2026",
+        "start_time": "13:38",
+        "end_time": "18:23",
+        "duration": "4 hours 45 min",
+        "distance": 20.57
+      },
+      {
+        "session_id": 4742,
+        "date": "05-06-2026",
+        "start_time": "07:14",
+        "end_time": "08:10",
+        "duration": "55 min",
+        "distance": 15.62
+      }
+    ]
+  },
+  "kpi_summary": {},
+  "band_summary": [
+    {
+      "band": "n77",
+      "sample_count": 13574,
+      "sample_percentage": 58.24
+    },
+    {
+      "band": "n78",
+      "sample_count": 3823,
+      "sample_percentage": 16.4
+    },
+    {
+      "band": "B1",
+      "sample_count": 3667,
+      "sample_percentage": 15.73
+    },
+    {
+      "band": "B3",
+      "sample_count": 1464,
+      "sample_percentage": 6.28
+    },
+    {
+      "band": "B41",
+      "sample_count": 441,
+      "sample_percentage": 1.89
+    },
+    {
+      "band": "B8",
+      "sample_count": 337,
+      "sample_percentage": 1.45
+    }
+  ],
+  "pci_summary": {
+    "total_unique_pci": 129,
+    "top_30_pci_percentage": 86.75
+  }
+}
