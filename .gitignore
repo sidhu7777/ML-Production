@@ -61,6 +61,9 @@ models/
 data/reports/
 tests/output/
 tests/output/project_*/
+
+# new_pdf_report test case: generated PDFs/PNGs/HTML/JSON only, code stays tracked
+tests/new_pdf_report/output/
 tests/output/**/RF_Optimization_Report*.xlsx
 tests/output/**/recommendations*.csv
 tests/output/**/forecast*.csv

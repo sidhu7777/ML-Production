@@ -61,6 +61,17 @@ import pytest  # noqa: E402
 
 DEFAULT_PROJECT_ID = 248
 
+# KPI map color ranges must come from the DB's own configured thresholds
+# (tools/report_engine.threshold_resolver.resolve_kpi_ranges ->
+# db.get_user_thresholds), not an auto-computed fallback. That resolver
+# needs a real user_id: project 248's own tbl_project.created_by_user_id
+# is NULL, so there is no direct project -> user link in this dataset.
+# Per direction received, use user_id=13 (has real RSRP/RSRQ/SINR/DL/UL
+# thresholds configured in the `thresholds` table) as the placeholder
+# threshold owner for this test case until a definitive project-to-user
+# mapping is available.
+DEFAULT_THRESHOLD_USER_ID = 13
+
 OUTPUT_ROOT = Path(__file__).resolve().parent / "output"
 PDF_NAME = "new_format_report.pdf"  # single evolving artifact, replaced each run
 
@@ -203,14 +214,16 @@ def _render_coverage_kpi_images(report_df, polygon_wkt, out_dir: Path, user_id=N
     images arrive when the Service/Mobility KPI Analysis sections
     (Steps 3/5) are built.
 
-    RSRP is comparable in dBm terms across RATs (same as its blended 4.2
-    table), so it keeps a single map coloring each point by its own actual
-    measured value. RSRQ/SINR are classified PER TECHNOLOGY in their 4.3/4.4
-    tables (their characteristic ranges differ by RAT), so their maps are
-    now split the same way: one map per technology present in `network`,
-    named "{rsrq,sinr}_map_{_tech_slug(tech)}.png", instead of a single map
-    blending every RAT's points together. The CDF charts stay a single
-    blended distribution per KPI, matching production's own
+    RSRP/RSRQ/SINR maps are each generated ONE PER TECHNOLOGY present in
+    `network` (named "{rsrp,rsrq,sinr}_map_{_tech_slug(tech)}.png"),
+    instead of a single map blending every RAT's points together — this
+    applies to all three KPIs' maps, even though RSRP's own numeric
+    classification in the 4.2 table stays blended (per direction
+    received: RSRP is dBm-comparable across RATs for averaging purposes;
+    a map is a different kind of visualization showing each point's own
+    actual value, so splitting it per technology is still useful and was
+    requested to match RSRQ/SINR's treatment). The CDF charts stay a
+    single blended distribution per KPI, matching production's own
     generate_all_cdf_plots_from_df behaviour (unchanged).
     """
     from tools.report_engine.threshold_resolver import resolve_kpi_ranges
@@ -244,50 +257,48 @@ def _render_coverage_kpi_images(report_df, polygon_wkt, out_dir: Path, user_id=N
         except Exception as exc:
             print(f"[map] WARNING: failed to generate band map/pie: {exc}")
 
-    # ---- RSRP map (single, blended across technologies) ----
+    # ---- Poor-region maps (RSRP < -105 dBm / RSRQ < -14, blended —
+    # production's generate_poor_region_maps doesn't take a technology
+    # filter, and "poor" here is an absolute-threshold breach rather than
+    # a per-RAT-range concern, so this stays a single map). Uses the
+    # test-case-only generate_poor_region_map_fixed (see
+    # new_report_sections.py) instead of production's own
+    # generate_poor_region_maps — that function has a confirmed legend bug
+    # (renders "Poor Samples : 632 : 632", a duplicated count) that we do
+    # not fix in tools/report_engine itself. ----
     if "rsrp" in report_df.columns:
-        df_kpi = report_df[report_df["rsrp"].notna() & report_df["lat"].notna() & report_df["lon"].notna()]
-        if df_kpi.empty or not has_valid_numeric_data(report_df, "rsrp"):
-            print("[map] skipped RSRP map: no valid data")
+        from tests.new_pdf_report.new_report_sections import generate_poor_region_map_fixed
+
+        poor_rsrp_png = maps_dir / "rsrp_poor_regions.png"
+        poor_rsrq_png = maps_dir / "rsrq_poor_regions.png"
+        if _asset_exists(poor_rsrp_png) and _asset_exists(poor_rsrq_png):
+            print("[map] reused existing poor-region maps")
         else:
-            png_path = maps_dir / "rsrp_map.png"
-            if _asset_exists(png_path):
-                print("[map] reused existing rsrp_map.png")
-            else:
-                try:
-                    ranges = resolve_kpi_ranges(kpi_name="RSRP", user_id=user_id, values=report_df["rsrp"])
-                    html_path = html_dir / "rsrp.html"
-                    generate_kpi_map(
-                        df=df_kpi, kpi_column="rsrp", color_func=rsrp_colour_manual,
-                        ranges=ranges, output_html=str(html_path), polygon_wkt=polygon_wkt,
-                    )
-                    html_to_png(str(html_path), str(png_path), width=1200, height=900, device_scale_factor=1)
-                    print("[map] generated rsrp_map.png")
-                except Exception as exc:
-                    print(f"[map] WARNING: failed to generate RSRP map: {exc}")
             try:
-                poor_rsrp_png = maps_dir / "rsrp_poor_regions.png"
-                poor_rsrq_png = maps_dir / "rsrq_poor_regions.png"
-                if _asset_exists(poor_rsrp_png) and _asset_exists(poor_rsrq_png):
-                    print("[map] reused existing poor-region maps")
-                else:
-                    from tools.report_engine.map_generator import generate_poor_region_maps
-                    generate_poor_region_maps(
-                        report_df,
-                        output_dir=str(maps_dir),
-                        tmp_dir=str(html_dir),
-                        polygon_wkt=polygon_wkt,
-                        render_width=1200,
-                        render_height=900,
-                        device_scale_factor=1,
-                    )
-                    print("[map] generated rsrp_poor_regions.png + rsrq_poor_regions.png")
+                generate_poor_region_map_fixed(
+                    report_df, "rsrp", -105,
+                    str(poor_rsrp_png), str(html_dir / "rsrp_poor_regions.html"),
+                    "RSRP < -105", polygon_wkt=polygon_wkt,
+                )
+                generate_poor_region_map_fixed(
+                    report_df, "rsrq", -14,
+                    str(poor_rsrq_png), str(html_dir / "rsrq_poor_regions.html"),
+                    "RSRQ < -14", polygon_wkt=polygon_wkt,
+                )
+                print("[map] generated rsrp_poor_regions.png + rsrq_poor_regions.png (legend fixed)")
             except Exception as exc:
                 print(f"[map] WARNING: failed to generate poor-region maps: {exc}")
 
-    # ---- RSRQ / SINR maps — one per technology, never blended (their
-    # KPI tables are already per-technology; see module docstring above) ----
+    # ---- RSRP / RSRQ / SINR maps — one per technology, never blended.
+    # RSRP's numeric classification in the 4.2 table STAYS blended (per
+    # direction received: RSRP is dBm-comparable across RATs for
+    # averaging), but a map is a different kind of visualization — each
+    # point plots its own actual measured value, so per-technology maps
+    # add real value there too and match the treatment already used for
+    # RSRQ/SINR (per direction received: add the missing technology-wise
+    # map images for RSRP, matching RSRQ/SINR). ----
     per_tech_kpi_specs = [
+        ("RSRP", "rsrp", rsrp_colour_manual, "rsrp_map"),
         ("RSRQ", "rsrq", rsrq_color_manual, "rsrq_map"),
         ("SINR", "sinr", sinr_color_manual, "sinr_map"),
     ]
@@ -392,6 +403,50 @@ def _render_mobility_kpi_images(report_df, polygon_wkt, out_dir: Path) -> None:
         print(f"[map] WARNING: failed to generate PCI map: {exc}")
 
 
+def _render_handover_kpi_images(handover_df, band_events, tech_events, polygon_wkt, out_dir: Path) -> None:
+    """
+    Section 6 visuals: the band-handover route map (production's own
+    generate_handover_map, reused unmodified, but fed the frontend-style
+    undeduped band_events from compute_handover_analysis instead of
+    production's own detect_handover_events -- see that function's
+    docstring for why: production's location-based dedup undercounts real
+    events ~10x) and the Inter-RAT technology-transition map (test-case
+    only, see new_report_sections.generate_tech_handover_map).
+    """
+    from tools.report_engine.map_generator import generate_handover_map
+    from tools.report_engine.playwright_utils import html_to_png
+    from tests.new_pdf_report.new_report_sections import generate_tech_handover_map
+
+    html_dir = out_dir / "html"
+    maps_dir = out_dir / "images" / "kpi_maps"
+
+    band_png = maps_dir / "handover_map.png"
+    if _asset_exists(band_png):
+        print("[map] reused existing handover_map.png")
+    else:
+        try:
+            html_path = html_dir / "handover_map.html"
+            generate_handover_map(handover_df, band_events, str(html_path), polygon_wkt=polygon_wkt)
+            html_to_png(str(html_path), str(band_png), width=1200, height=900, device_scale_factor=1)
+            print(f"[map] generated handover_map.png ({len(band_events)} band events)")
+        except Exception as exc:
+            print(f"[map] WARNING: failed to generate handover map: {exc}")
+
+    tech_png = maps_dir / "tech_handover_map.png"
+    if _asset_exists(tech_png):
+        print("[map] reused existing tech_handover_map.png")
+    else:
+        try:
+            html_path = html_dir / "tech_handover_map.html"
+            ok = generate_tech_handover_map(
+                tech_events, str(html_path), str(tech_png), polygon_wkt=polygon_wkt,
+            )
+            if ok:
+                print(f"[map] generated tech_handover_map.png ({len(tech_events)} tech events)")
+        except Exception as exc:
+            print(f"[map] WARNING: failed to generate tech handover map: {exc}")
+
+
 def _render_service_kpi_images(report_df, polygon_wkt, out_dir: Path, user_id=None) -> None:
     """
     Section 7 visuals - reuse existing assets where possible and only
@@ -402,39 +457,57 @@ def _render_service_kpi_images(report_df, polygon_wkt, out_dir: Path, user_id=No
     from tools.report_engine.playwright_utils import html_to_png
     from tools.report_engine.kpi_config import dl_colour_manual, ul_colour_manual, mos_colour_manual
     from tools.report_engine import kpi_analysis
+    from tests.new_pdf_report.new_report_sections import _technology_groups, _tech_slug
 
     html_dir = out_dir / "html"
     maps_dir = out_dir / "images" / "kpi_maps"
     analysis_dir = out_dir / "images" / "kpi_analysis"
 
+    # DL/UL/MOS maps — one per technology, never blended, matching the
+    # RSRP/RSRQ/SINR treatment in _render_coverage_kpi_images (per
+    # direction received: add the missing technology-wise map images for
+    # DL/UL/MOS too, not just RSRQ/SINR).
     service_specs = [
-        ("DL", "dl_tpt", dl_colour_manual, "dl_map.png"),
-        ("UL", "ul_tpt", ul_colour_manual, "ul_map.png"),
-        ("MOS", "mos", mos_colour_manual, "mos_map.png"),
+        ("DL", "dl_tpt", dl_colour_manual, "dl_map"),
+        ("UL", "ul_tpt", ul_colour_manual, "ul_map"),
+        ("MOS", "mos", mos_colour_manual, "mos_map"),
     ]
+    tech_list = _technology_groups(report_df)
+    network_col = (
+        report_df["network"].fillna("").astype(str).str.strip()
+        if "network" in report_df.columns else None
+    )
 
-    for kpi_name, col, color_func, map_name in service_specs:
+    for kpi_name, col, color_func, map_prefix in service_specs:
         if col not in report_df.columns:
             continue
-        png_path = maps_dir / map_name
-        if _asset_exists(png_path):
-            print(f"[map] reused existing {map_name}")
-            continue
-        df_kpi = report_df[report_df[col].notna() & report_df["lat"].notna() & report_df["lon"].notna()]
-        if df_kpi.empty or not has_valid_numeric_data(report_df, col):
-            print(f"[map] skipped {map_name}: no valid data")
-            continue
-        try:
-            ranges = resolve_kpi_ranges(kpi_name=kpi_name, user_id=user_id, values=report_df[col])
-            html_path = html_dir / f"{col}.html"
-            generate_kpi_map(
-                df=df_kpi, kpi_column=col, color_func=color_func,
-                ranges=ranges, output_html=str(html_path), polygon_wkt=polygon_wkt,
-            )
-            html_to_png(str(html_path), str(png_path), width=1200, height=900, device_scale_factor=1)
-            print(f"[map] generated {map_name}")
-        except Exception as exc:
-            print(f"[map] WARNING: failed to generate {map_name}: {exc}")
+        techs = tech_list if (tech_list and network_col is not None) else [None]
+        for tech in techs:
+            df_tech = report_df if tech is None else report_df.loc[network_col == tech]
+            df_kpi = df_tech[df_tech[col].notna() & df_tech["lat"].notna() & df_tech["lon"].notna()]
+            tech_label = tech or "ALL"
+            if df_kpi.empty or not has_valid_numeric_data(df_tech, col):
+                print(f"[map] skipped {kpi_name} map for {tech_label}: no valid data")
+                continue
+            try:
+                # Ranges stay based on the full KPI distribution (not the
+                # per-technology subset) so color scales are comparable
+                # across each technology's map for the same KPI.
+                ranges = resolve_kpi_ranges(kpi_name=kpi_name, user_id=user_id, values=report_df[col])
+                slug = _tech_slug(tech) if tech else "all"
+                html_path = html_dir / f"{col}_{slug}.html"
+                png_path = maps_dir / f"{map_prefix}_{slug}.png"
+                if _asset_exists(png_path):
+                    print(f"[map] reused existing {png_path.name} ({tech_label})")
+                    continue
+                generate_kpi_map(
+                    df=df_kpi, kpi_column=col, color_func=color_func,
+                    ranges=ranges, output_html=str(html_path), polygon_wkt=polygon_wkt,
+                )
+                html_to_png(str(html_path), str(png_path), width=1200, height=900, device_scale_factor=1)
+                print(f"[map] generated {png_path.name} ({tech_label})")
+            except Exception as exc:
+                print(f"[map] WARNING: failed to generate {kpi_name} map for {tech_label}: {exc}")
 
     if not _asset_exists(analysis_dir / "network_quality_summary.png"):
         try:
@@ -469,7 +542,6 @@ def run_report(project_id: int = DEFAULT_PROJECT_ID, use_llm: bool = True) -> Pa
     """
     from tools.report_engine import kpi_analysis
     from tools.report_engine.kpi_analysis import generate_drive_summary_images
-    from tools.report_engine.map_generator import detect_handover_events
     from tools.report_engine.metadata_generator import build_metadata, write_metadata_file
 
     from tests.new_pdf_report.new_report_sections import (
@@ -477,6 +549,7 @@ def run_report(project_id: int = DEFAULT_PROJECT_ID, use_llm: bool = True) -> Pa
         derive_executive_summary,
         generate_introduction_text,
         compute_session_distances_km,
+        compute_handover_analysis,
     )
 
     out_dir = _output_dir(project_id)
@@ -485,6 +558,20 @@ def run_report(project_id: int = DEFAULT_PROJECT_ID, use_llm: bool = True) -> Pa
     _, report_df, handover_df, project_meta = _load_report_data(project_id)
     assert not report_df.empty, f"Project {project_id} produced no report rows"
     neighbor_df = _load_neighbor_data(project_meta)
+
+    # ---------- 1b. HANDOVER ANALYSIS (Section 6 data; computed early so both
+    #             the image rendering step and the Executive Summary's
+    #             handover_count can reuse the SAME event set — see
+    #             compute_handover_analysis docstring for the ground-truth
+    #             check behind what's included/excluded here) ----------
+    handover_data = compute_handover_analysis(handover_df)
+    print(
+        f"[handover] band={len(handover_data['band_events'])} "
+        f"intra-freq={len(handover_data['intra_freq_events'])} "
+        f"inter-RAT={len(handover_data['tech_events'])} "
+        f"intra-eNodeB={len(handover_data['intra_enodeb_events'])} "
+        f"inter-eNodeB={len(handover_data['inter_enodeb_events'])}"
+    )
 
     # ---------- 2. DRIVE SUMMARY METADATA (production) ----------
     kpi_analysis.IMAGE_DIR = str(out_dir / "images" / "kpi_analysis")
@@ -528,20 +615,37 @@ def run_report(project_id: int = DEFAULT_PROJECT_ID, use_llm: bool = True) -> Pa
     _render_base_route_map(report_df, project_meta.get("region"), out_dir)
 
     # ---------- 4b. COVERAGE KPI IMAGES (Section 4: Band/RSRP/RSRQ/SINR
-    #             maps + CDF charts, production's own map/CDF generators) ----------
-    _render_coverage_kpi_images(report_df, project_meta.get("region"), out_dir)
+    #             maps + CDF charts, production's own map/CDF generators).
+    #             user_id is REQUIRED here so map color ranges come from
+    #             the DB's own configured thresholds (resolve_kpi_ranges ->
+    #             get_user_thresholds), not an auto-computed fallback —
+    #             see DEFAULT_THRESHOLD_USER_ID above. ----------
+    _render_coverage_kpi_images(
+        report_df, project_meta.get("region"), out_dir, user_id=DEFAULT_THRESHOLD_USER_ID,
+    )
 
     # ---------- 4c. MOBILITY KPI IMAGES (Section 5: PCI map +
     #             PCI distribution chart/table, production helpers) ----------
     _render_mobility_kpi_images(report_df, project_meta.get("region"), out_dir)
 
+    # ---------- 4c2. HANDOVER KPI IMAGES (Section 6: band-handover route map
+    #             [production's own generate_handover_map, unmodified] +
+    #             Inter-RAT technology-transition map [test-case only]) ----------
+    _render_handover_kpi_images(
+        handover_df, handover_data["band_events"], handover_data["tech_events"],
+        project_meta.get("region"), out_dir,
+    )
+
     # ---------- 4d. SERVICE KPI IMAGES (Section 7: DL/UL/MOS maps +
-    #             QoS charts/tables, reusing existing artifacts when present) ----------
-    _render_service_kpi_images(report_df, project_meta.get("region"), out_dir)
+    #             QoS charts/tables, reusing existing artifacts when present).
+    #             Same DB-threshold requirement as 4b above. ----------
+    _render_service_kpi_images(
+        report_df, project_meta.get("region"), out_dir, user_id=DEFAULT_THRESHOLD_USER_ID,
+    )
 
     # ---------- 5. INTRODUCTION (LLM, minimal prompt; synth fallback) ----------
     if use_llm:
-        intro_text, intro_source = generate_introduction_text(metadata)
+        intro_text, intro_source = generate_introduction_text(metadata, report_df)
     else:
         from tools.report_engine.llm_integration import _fill_missing_sections_from_metadata
         intro_text = _fill_missing_sections_from_metadata(
@@ -552,15 +656,11 @@ def run_report(project_id: int = DEFAULT_PROJECT_ID, use_llm: bool = True) -> Pa
     print(f"[text] Introduction source: {intro_source}")
 
     # ---------- 6. EXECUTIVE SUMMARY (rule-based) ----------
-    # Handover EVENT DETECTION genuinely needs the broader all-cells,
-    # polygon-only time series (transitions can pass through rows that
-    # wouldn't survive a primary/band filter) — this matches production's
-    # own stated intent for handover_df and is unchanged.
-    try:
-        handover_count = len(detect_handover_events(handover_df))
-    except Exception as exc:
-        print(f"[exec] handover detection skipped: {exc}")
-        handover_count = None
+    # Handover count reuses the SAME band_events computed in step 1b
+    # (compute_handover_analysis), instead of calling
+    # detect_handover_events a second time, so Section 3's "685 band
+    # handover events" and Section 6 can never disagree.
+    handover_count = len(handover_data["band_events"])
     # Mobility (PCI dominance) now uses the SAME corrected report_df as
     # Coverage and Radio Quality — see filter_primary_rows_including_nr:
     # once report_df properly includes 5G NSA via the `primary` column,
@@ -610,7 +710,11 @@ def run_report(project_id: int = DEFAULT_PROJECT_ID, use_llm: bool = True) -> Pa
     report.add_drive_summary_v2(drive_summary, exec_summary, distances_km=distances_km)
     report.add_coverage_kpi_analysis(report_df, exec_summary, band_summary)
     report.add_mobility_kpi_analysis(report_df, neighbor_df=neighbor_df)
-    report.add_service_kpi_analysis(report_df)
+    report.add_handover_kpi_analysis(handover_data)
+    report.add_service_kpi_analysis(
+        report_df, exec_summary=exec_summary, drive_summary=drive_summary,
+        handover_data=handover_data, metadata=metadata,
+    )
     report.build()
 
     size_kb = pdf_path.stat().st_size / 1024

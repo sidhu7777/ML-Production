@@ -129,6 +129,90 @@ def filter_primary_rows_including_nr(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # ------------------------------------------------------------------
+# Poor-region map — corrected replacement for production's
+# map_generator.generate_poor_region_map() (test-case only; that file is
+# NOT modified).
+#
+# CONFIRMED BUG: generate_poor_region_map() calls
+#     add_legend(fmap, title, [(f"Poor Samples : {true_count}", ..., true_count)])
+# but add_legend()'s own row template is
+#     f"<span>{label} : {count}</span>"
+# i.e. it ALREADY appends " : {count}" to every label. Passing a label
+# that already embeds the count produces a rendered legend reading
+# "Poor Samples : 632 : 632" (visible in rsrp_poor_regions.png /
+# rsrq_poor_regions.png). Fixed here by passing the plain "Poor Samples"
+# label and letting add_legend() append the count exactly once — every
+# other step (new_report_map, add_fullscreen_css, add_legend,
+# draw_polygon_overlay, fit_data_bounds, html_to_png) reuses production's
+# own unmodified helpers.
+# ------------------------------------------------------------------
+
+def generate_poor_region_map_fixed(
+    filtered_df: pd.DataFrame,
+    value_col: str,
+    threshold: float,
+    output_png: str,
+    tmp_html: str,
+    title: str,
+    polygon_wkt: str | None = None,
+    render_width: int = 1200,
+    render_height: int = 900,
+    device_scale_factor: int = 1,
+) -> bool:
+    import folium
+    from tools.report_engine.map_generator import (
+        new_report_map, add_fullscreen_css, add_legend, draw_polygon_overlay, fit_data_bounds,
+    )
+    from tools.report_engine.playwright_utils import html_to_png
+
+    if value_col not in filtered_df.columns:
+        print(f" Missing column: {value_col}")
+        return False
+
+    df = filtered_df[["lat", "lon", value_col]].copy()
+    df[value_col] = pd.to_numeric(df[value_col], errors="coerce")
+    df = df.dropna(subset=["lat", "lon", value_col])
+
+    poor = df[df[value_col] < threshold]
+    if poor.empty:
+        print(f" No poor samples for {value_col}")
+        return False
+
+    MAX_POOR_DOTS = 8000
+    true_count = len(poor)
+    draw_df = poor.iloc[:: max(1, true_count // MAX_POOR_DOTS)] if true_count > MAX_POOR_DOTS else poor
+
+    fmap = new_report_map()
+    add_fullscreen_css(fmap)
+    for _, p in draw_df.iterrows():
+        folium.CircleMarker(
+            location=[p["lat"], p["lon"]], radius=4, color="#e31a1c",
+            fill=True, fill_opacity=0.85,
+        ).add_to(fmap)
+
+    add_legend(fmap, title, [("Poor Samples", "#e31a1c", true_count)])  # count appended once, not twice
+    draw_polygon_overlay(fmap, polygon_wkt)
+    fit_data_bounds(fmap, df, reserve_legend_space=True)
+    fmap.save(tmp_html)
+
+    try:
+        html_to_png(
+            tmp_html, output_png,
+            width=render_width, height=render_height, device_scale_factor=device_scale_factor,
+        )
+        return True
+    except Exception as exc:
+        print(f" Warning: failed to convert poor region html to png: {exc}")
+        return False
+    finally:
+        try:
+            if os.path.exists(tmp_html):
+                os.remove(tmp_html)
+        except Exception:
+            pass
+
+
+# ------------------------------------------------------------------
 # Session distance — Haversine sum of CONSECUTIVE GPS points (test-case
 # only; production's tbl_session distance query is permission-denied and
 # silently returns 0.0 km, so this is not a production bug fix — it fills
@@ -257,13 +341,25 @@ def build_session_native_table(drive_summary: dict, distances_km: dict) -> pd.Da
 # ------------------------------------------------------------------
 
 INTRO_INSTRUCTIONS = """
-Write a professional introduction for a telecom drive test report (3-4 sentences).
-Use an executive summary style.
-Mention the test location if available in metadata.location.city/country (e.g., "in <city>, <country>").
-Explain the PURPOSE and IMPORTANCE of drive testing in general terms (signal strength, coverage, provider performance).
-Mention that map visualizations highlight strong/weak coverage areas.
-State that the report provides actionable insights for optimization and deployment planning.
-DO NOT include specific drive details (distance, samples, dates) - those belong in Drive Summary.
+Write a SHORT introduction for a telecom drive test report -- exactly 4 sentences, no more.
+This section is an INTRODUCTION, not a summary or conclusion: it must describe the PURPOSE
+and SCOPE of drive testing in general terms and must NEVER state any verdict, judgement or
+result about THIS drive's own performance (do not say this drive's coverage/quality was
+"good", "strong", "reliable", "poor", "fair", or similar -- those judgements belong in later
+report sections, never the introduction).
+Sentence 1: state that this report provides actionable insights for optimization and
+deployment planning, mentioning the test location if available in metadata.location.city/country
+(e.g., "in <city>, <country>").
+Sentence 2: state that drive testing is crucial for evaluating signal strength, coverage, and
+provider performance.
+Sentence 3: state that the report highlights strong and weak coverage areas through map
+visualizations, enabling informed decisions for network improvement.
+Sentence 4: state that detailed findings are presented in the following sections.
+If metadata.facts.technologies is present, you may naturally fold in which network technologies
+were observed (e.g. "across its 4G and 5G NSA carriers") in sentence 1 or 2, but this is optional
+and must never turn into a performance claim.
+DO NOT include specific drive details (distance, samples, dates, percentages, dB values, or any
+Good/Fair/Poor/strong/weak status about this drive) - those belong in later sections.
 DO NOT invent any facts not present in metadata.
 Return ONLY the introduction paragraph as plain text (no JSON, no markdown).
 """
@@ -271,6 +367,7 @@ Return ONLY the introduction paragraph as plain text (no JSON, no markdown).
 
 def generate_introduction_text(
     metadata: dict,
+    report_df: pd.DataFrame | None = None,
     model: str = "llama-3.1-8b-instant",
     max_retries: int = 3,
     verbose: bool = True,
@@ -280,6 +377,15 @@ def generate_introduction_text(
     rules as production llm_integration, but a minimal prompt so we do not
     burn the small API quota on sections that are rule-based here).
 
+    report_df, if supplied, is used to compute one real per-project fact
+    (technologies observed) so the generated paragraph can vary by project
+    instead of reading as fixed boilerplate every run -- reusing this file's
+    own _technology_groups() classification, never inventing a new one. This
+    deliberately excludes any performance verdict (coverage/quality status):
+    the introduction must only describe what drive testing IS and what the
+    report contains, never judge how this particular drive performed --
+    that judgement belongs in the Executive Summary / Conclusion sections.
+
     Returns (text, source) where source is "llm" or "synth".
     """
     from groq import Groq
@@ -287,9 +393,16 @@ def generate_introduction_text(
         _fill_missing_sections_from_metadata,
     )
 
+    facts: dict = {}
+    if report_df is not None:
+        tech_list = _technology_groups(report_df)
+        if tech_list:
+            facts["technologies"] = tech_list
+
     llm_metadata = {
         "location": metadata.get("location", {}),
         "introduction": metadata.get("introduction"),
+        "facts": facts,
     }
     prompt = (
         f"METADATA:\n{json.dumps(llm_metadata, indent=2, default=str)}\n\n"
@@ -558,6 +671,351 @@ def classify_quality_by_technology(report_df: pd.DataFrame) -> list[dict]:
     return results
 
 
+# ------------------------------------------------------------------
+# Section 6 "Handover KPI Analysis" (test-case only).
+#
+# Ground-truth check before building this (verified directly against the
+# DB for project 248): `call_state` and `volte_call` on tbl_network_log are
+# NULL for 100% of rows, and tbl_network_log.tbl_sub_session_cs_id is 0 for
+# every row (zero CS/voice sub-sessions were ever linked — the only 10
+# tbl_sub_session rows that exist for this project are type=1 PS/data
+# speed-test attempts, all FAILED). There is no handover attempt/failure
+# signal anywhere in this dataset, so Radio Link Failure, Call Drop Rate,
+# CSSR and voice-call content are excluded entirely rather than shown with
+# invented numbers — only real transition COUNTS are reported below.
+#
+# Every transition type here is detected the same way the frontend
+# independently computes its own handover tabs (buildHandoverTransitions()
+# in StraceExeFron/src/pages/UnifiedMapView.jsx): per-session,
+# time-ordered, "did this column's value change from one row to the next"
+# -- with NO deduplication by location. Technology upgrade/downgrade/lateral
+# classification mirrors the frontend's own getHandoverType() in
+# StraceExeFron/src/components/unifiedMap/tabs/HandoverAnalysisTab.jsx
+# (TECH_ORDER rank comparison), so labels/colors are consistent with what
+# a user already sees live in the app.
+#
+# IMPORTANT: band events are NOT detected via production's own
+# detect_handover_events()/_detect_frontend_style_handover_events()
+# (map_generator.py) despite that function's docstring claiming to match
+# the frontend. Verified by direct comparison on project 248: production's
+# version applies a dedup step keyed on (session_id, rounded lat/lon,
+# from_value, to_value) -- WITHOUT timestamp -- so if the UE sits at one
+# GPS fix while GPS updates slower than radio reports (common at
+# junctions/stationary points) and genuinely flips A->B->A->B several times
+# at different moments but the same coordinate, that dedup collapses all of
+# them into one event. That is not noise removal, it is discarding real
+# distinct handover events in time. Confirmed effect: 685 (production,
+# deduped) vs 6,678 (raw, frontend-style) band transitions on the same
+# data -- a ~10x undercount. The frontend's own buildHandoverTransitions()
+# has no such dedup, so this module's own _detect_column_transitions is
+# used for ALL three transition types (band/PCI/network) instead, for
+# consistency with the frontend and with each other.
+# ------------------------------------------------------------------
+
+_TECH_RANK_PATTERNS = [
+    ("5g", 5),
+    ("4g", 4),
+    ("3g", 3),
+    ("wcdma", 3),
+    ("umts", 3),
+    ("2g", 2),
+    ("gsm", 2),
+    ("edge", 2),
+]
+
+
+def _tech_rank(value) -> int:
+    text = str(value or "").strip().lower()
+    for needle, rank in _TECH_RANK_PATTERNS:
+        if needle in text:
+            return rank
+    return 0
+
+
+def _handover_type(from_value, to_value) -> str:
+    """Upgrade/Downgrade/Lateral, same rank-comparison rule as the
+    frontend's getHandoverType() (HandoverAnalysisTab.jsx)."""
+    from_rank = _tech_rank(from_value)
+    to_rank = _tech_rank(to_value)
+    if to_rank > from_rank:
+        return "Upgrade"
+    if to_rank < from_rank:
+        return "Downgrade"
+    return "Lateral"
+
+
+def _clean_transition_text(value):
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text or text.lower() in {"unknown", "n/a", "na", "null", "undefined", "-", "0", "0.0"}:
+        return None
+    return text
+
+
+def _detect_column_transitions(df: pd.DataFrame, value_col: str, meta_cols: tuple = ()) -> list[dict]:
+    """
+    Generic per-session, time-ordered transition detector for `value_col` —
+    same session/timestamp ordering rule as production's
+    `_detect_frontend_style_handover_events` (map_generator.py) and the
+    frontend's `buildHandoverTransitions()`, just generalized to any column
+    instead of only `band`. `meta_cols` are captured from both the "from"
+    and "to" rows (as `from_<col>`/`to_<col>`) so callers can classify a
+    transition further (e.g. same-band PCI change, same-eNodeB PCI change)
+    without a second pass over the data.
+    """
+    if df is None or df.empty or value_col not in df.columns or "session_id" not in df.columns:
+        return []
+
+    data = df.reset_index(drop=True).copy()
+    data["__sort_session"] = data["session_id"].astype(str)
+    data["__sort_time"] = data["timestamp"].astype(str) if "timestamp" in data.columns else ""
+    data = data.reset_index(drop=False)
+    data = data.sort_values(["__sort_session", "__sort_time", "index"])
+
+    events: list[dict] = []
+    for session_id, group in data.groupby("__sort_session", sort=False):
+        previous_value = None
+        previous_row = None
+        for _, row in group.iterrows():
+            current_value = _clean_transition_text(row.get(value_col))
+            if current_value is None:
+                continue
+            if previous_value is not None and current_value != previous_value and previous_row is not None:
+                event = {
+                    "session_id": session_id,
+                    "timestamp": row.get("timestamp"),
+                    "lat": row.get("lat"),
+                    "lon": row.get("lon"),
+                    "from": previous_value,
+                    "to": current_value,
+                }
+                for col in meta_cols:
+                    event[f"from_{col}"] = _clean_transition_text(previous_row.get(col))
+                    event[f"to_{col}"] = _clean_transition_text(row.get(col))
+                events.append(event)
+            previous_value = current_value
+            previous_row = row
+    return events
+
+
+def compute_handover_analysis(handover_df: pd.DataFrame) -> dict:
+    """
+    Section 6 data. Uses `handover_df` (the same all-cells, polygon-filtered
+    population production already uses for handover detection) for every
+    transition type here, so Section 6 stays internally consistent with
+    itself and with Section 3's Executive KPI Summary "Handover" row (both
+    now derive from this same band_events list).
+
+    Band events are detected with THIS module's own _detect_column_transitions
+    (frontend-style, no location dedup) rather than production's
+    detect_handover_events — see the module comment above this function for
+    why: production's dedup undercounts real events by ~10x on this project.
+    normalize_band_name is still applied first (production's own band-name
+    cleanup), just without the buggy dedup step afterward.
+    """
+    from tools.report_engine.map_generator import normalize_band_name
+
+    band_df = handover_df.copy()
+    if "band" in band_df.columns:
+        band_df["band"] = band_df["band"].apply(normalize_band_name)
+    band_events = _detect_column_transitions(band_df, "band")
+    for e in band_events:
+        e["type"] = "band"
+        e["from_value"] = e["from"]
+        e["to_value"] = e["to"]
+
+    pci_events = _detect_column_transitions(handover_df, "pci", meta_cols=("band", "nodeb_id"))
+    intra_freq_events = [
+        e for e in pci_events
+        if e.get("from_band") and e.get("to_band") and e["from_band"] == e["to_band"]
+    ]
+
+    tech_events = _detect_column_transitions(handover_df, "network")
+    for e in tech_events:
+        e["handover_type"] = _handover_type(e["from"], e["to"])
+
+    nodeb_capable_events = [e for e in pci_events if e.get("from_nodeb_id") and e.get("to_nodeb_id")]
+    intra_enodeb_events = [e for e in nodeb_capable_events if e["from_nodeb_id"] == e["to_nodeb_id"]]
+    inter_enodeb_events = [e for e in nodeb_capable_events if e["from_nodeb_id"] != e["to_nodeb_id"]]
+
+    return {
+        "band_events": band_events,
+        "pci_events": pci_events,
+        "intra_freq_events": intra_freq_events,
+        "tech_events": tech_events,
+        "intra_enodeb_events": intra_enodeb_events,
+        "inter_enodeb_events": inter_enodeb_events,
+    }
+
+
+def _event_pair(e: dict) -> tuple:
+    """band_events come from production's detect_handover_events, which
+    keys the transition as from_value/to_value; every other event set here
+    (_detect_column_transitions) keys it as from/to. Normalize both."""
+    if "from" in e:
+        return (e["from"], e["to"])
+    return (e.get("from_value"), e.get("to_value"))
+
+
+def _summarize_transition_pairs(events: list[dict], limit: int = 5) -> list[tuple[tuple, int]]:
+    counts: dict[tuple, int] = {}
+    for e in events:
+        pair = _event_pair(e)
+        counts[pair] = counts.get(pair, 0) + 1
+    return sorted(counts.items(), key=lambda kv: kv[1], reverse=True)[:limit]
+
+
+def build_band_handover_summary_table(band_events: list[dict]) -> pd.DataFrame:
+    sessions = {e.get("session_id") for e in band_events if e.get("session_id") is not None}
+    rows = [
+        ("Total Band Handover Events", f"{len(band_events):,}"),
+        ("Sessions with Band Handovers", f"{len(sessions):,}"),
+    ]
+    return pd.DataFrame(rows, columns=["Metric", "Observed Value"])
+
+
+def build_intra_frequency_summary_table(pci_events: list[dict], intra_freq_events: list[dict]) -> pd.DataFrame:
+    sessions = {e.get("session_id") for e in intra_freq_events if e.get("session_id") is not None}
+    rows = [
+        ("Total Serving-Cell (PCI) Transitions", f"{len(pci_events):,}"),
+        ("   - Intra-frequency (same band)", f"{len(intra_freq_events):,}"),
+        ("Sessions with Intra-frequency Handovers", f"{len(sessions):,}"),
+    ]
+    return pd.DataFrame(rows, columns=["Metric", "Observed Value"])
+
+
+def build_tech_handover_summary_table(tech_events: list[dict]) -> pd.DataFrame:
+    upgrade = sum(1 for e in tech_events if e["handover_type"] == "Upgrade")
+    downgrade = sum(1 for e in tech_events if e["handover_type"] == "Downgrade")
+    lateral = sum(1 for e in tech_events if e["handover_type"] == "Lateral")
+    rows = [
+        ("Total Inter-RAT Events", f"{len(tech_events):,}"),
+        ("Upgrade", f"{upgrade:,}"),
+        ("Downgrade", f"{downgrade:,}"),
+        ("Lateral", f"{lateral:,}"),
+    ]
+    return pd.DataFrame(rows, columns=["Metric", "Observed Value"])
+
+
+def build_nodeb_summary_table(intra_enodeb_events: list[dict], inter_enodeb_events: list[dict]) -> pd.DataFrame:
+    total = len(intra_enodeb_events) + len(inter_enodeb_events)
+    pct_inter = (len(inter_enodeb_events) / total * 100) if total else 0.0
+    rows = [
+        ("Total Serving-Cell Changes (with eNodeB data)", f"{total:,}"),
+        ("Intra-eNodeB (Sector Change)", f"{len(intra_enodeb_events):,}"),
+        ("Inter-eNodeB Change", f"{len(inter_enodeb_events):,}"),
+        ("% Inter-eNodeB", f"{pct_inter:.0f}%"),
+    ]
+    return pd.DataFrame(rows, columns=["Metric", "Observed Value"])
+
+
+def build_transition_pairs_table(events: list[dict], column_label: str, limit: int = 5) -> pd.DataFrame:
+    pairs = _summarize_transition_pairs(events, limit=limit)
+    rows = [(f"{f} -> {t}", f"{c:,}") for (f, t), c in pairs]
+    return pd.DataFrame(rows, columns=[column_label, "Count"])
+
+
+def build_handover_kpi_summary_table(handover_data: dict) -> pd.DataFrame:
+    tech_events = handover_data["tech_events"]
+    upgrade = sum(1 for e in tech_events if e["handover_type"] == "Upgrade")
+    downgrade = sum(1 for e in tech_events if e["handover_type"] == "Downgrade")
+    lateral = sum(1 for e in tech_events if e["handover_type"] == "Lateral")
+    rows = [
+        ("Inter-frequency (Band) Handover", f"{len(handover_data['band_events']):,}"),
+        ("Intra-frequency (PCI, same band) Handover", f"{len(handover_data['intra_freq_events']):,}"),
+        ("Inter-RAT (Technology) Handover", f"{len(tech_events):,}"),
+        ("   - Upgrade", f"{upgrade:,}"),
+        ("   - Downgrade", f"{downgrade:,}"),
+        ("   - Lateral", f"{lateral:,}"),
+        ("Intra-eNodeB (Sector) Change", f"{len(handover_data['intra_enodeb_events']):,}"),
+        ("Inter-eNodeB Change", f"{len(handover_data['inter_enodeb_events']):,}"),
+    ]
+    return pd.DataFrame(rows, columns=["KPI", "Observed Count"])
+
+
+def build_handover_kpi_summary_observation(handover_data: dict) -> str:
+    band_count = len(handover_data["band_events"])
+    intra_freq_count = len(handover_data["intra_freq_events"])
+    tech_count = len(handover_data["tech_events"])
+    total = band_count + intra_freq_count + tech_count
+
+    categories = [
+        ("inter-RAT (technology)", tech_count),
+        ("inter-frequency (band)", band_count),
+        ("intra-frequency (PCI)", intra_freq_count),
+    ]
+    dominant_label, dominant_count = max(categories, key=lambda c: c[1])
+    dominant_share = (dominant_count / total * 100) if total else 0.0
+
+    return (
+        f"Observation: {total:,} total handover events were detected across the drive route "
+        f"({tech_count:,} inter-RAT, {band_count:,} inter-frequency/band, {intra_freq_count:,} "
+        f"intra-frequency/PCI); {dominant_label} transitions were the largest share "
+        f"({dominant_share:.1f}%). No call-level, radio-link-failure or disconnect-cause data "
+        f"exists in this project's dataset (verified directly against the DB), so drop/failure "
+        f"rates could not be computed."
+    )
+
+
+def generate_tech_handover_map(tech_events: list[dict], output_html: str, output_png: str, polygon_wkt: str | None = None) -> bool:
+    """
+    Test-case-only map for Inter-RAT (technology) handover events, colored
+    green/red/blue for upgrade/downgrade/lateral — the exact same color
+    convention the frontend already uses (TYPE_STYLES in
+    StraceExeFron/src/components/unifiedMap/tabs/HandoverAnalysisTab.jsx),
+    so this visual is consistent with the live app instead of an invented
+    palette. Structure (route-less event markers + legend) mirrors
+    production's own generate_handover_map() (map_generator.py).
+    """
+    import folium
+    from tools.report_engine.map_generator import (
+        new_report_map, add_fullscreen_css, add_legend, draw_polygon_overlay, fit_data_bounds,
+    )
+    from tools.report_engine.playwright_utils import html_to_png
+
+    valid_events = [e for e in tech_events if e.get("lat") is not None and e.get("lon") is not None]
+    if not valid_events:
+        print(" No technology handover events with GPS to plot")
+        return False
+
+    points_df = pd.DataFrame({
+        "lat": [float(e["lat"]) for e in valid_events],
+        "lon": [float(e["lon"]) for e in valid_events],
+    })
+
+    fmap = new_report_map()
+    add_fullscreen_css(fmap)
+
+    color_map = {"Upgrade": "#22c55e", "Downgrade": "#ef4444", "Lateral": "#3b82f6"}
+    counts = {"Upgrade": 0, "Downgrade": 0, "Lateral": 0}
+    for e in valid_events:
+        kind = e.get("handover_type", "Lateral")
+        counts[kind] = counts.get(kind, 0) + 1
+        folium.CircleMarker(
+            location=(float(e["lat"]), float(e["lon"])),
+            radius=5,
+            color=color_map.get(kind, "#999999"),
+            fill=True,
+            fill_opacity=0.85,
+            tooltip=f"{kind}: {e['from']} -> {e['to']}",
+        ).add_to(fmap)
+
+    add_legend(fmap, "Inter-RAT Handover", [
+        (kind, color_map[kind], counts[kind]) for kind in ("Upgrade", "Downgrade", "Lateral") if counts[kind] > 0
+    ])
+    draw_polygon_overlay(fmap, polygon_wkt)
+    fit_data_bounds(fmap, points_df, reserve_legend_space=True)
+    fmap.save(output_html)
+
+    try:
+        html_to_png(output_html, output_png, width=1200, height=900, device_scale_factor=1)
+        return True
+    except Exception as exc:
+        print(f" Warning: failed to convert tech handover html to png: {exc}")
+        return False
+
+
 def derive_executive_summary(
     report_df: pd.DataFrame,
     handover_count: int | None = None,
@@ -783,17 +1241,6 @@ def build_coverage_kpi_summary_table(
     """
     rows = []
 
-    # ---- RSRP (blended across technologies, per direction received) ----
-    if not rsrp.empty:
-        avg_rsrp = float(rsrp.mean())
-        pct_within = float((rsrp > -95).mean() * 100)
-        rows.append((
-            "RSRP", "> -95 dBm (90% of samples)", f"{avg_rsrp:.1f} dBm",
-            "PASS" if coverage_status == "Good" else "FAIL",
-            f"{pct_within:.0f}%", f"{100 - pct_within:.0f}%",
-        ))
-
-    # ---- RSRQ / SINR (per technology, never blended) ----
     tech_list = _technology_groups(report_df)
     network_col = (
         report_df["network"].fillna("").astype(str).str.strip()
@@ -807,6 +1254,36 @@ def build_coverage_kpi_summary_table(
             for tech in tech_list:
                 yield tech, report_df.loc[network_col == tech]
 
+    # ---- RSRP — Blended row (matches the classification actually used
+    # for Coverage's Good/Fair/Poor status elsewhere in the report, per
+    # direction received: RSRP is dBm-comparable across RATs) PLUS one row
+    # per technology (per direction received, for visual consistency with
+    # RSRQ/SINR below — each technology's own row is its own independent
+    # Good/Fair/Poor call via classify_coverage on that technology's
+    # samples only, not a shared blended threshold). ----
+    if not rsrp.empty:
+        avg_rsrp = float(rsrp.mean())
+        pct_within = float((rsrp > -95).mean() * 100)
+        rows.append((
+            "RSRP (Blended)", "> -95 dBm", f"{avg_rsrp:.1f} dBm",
+            "PASS" if coverage_status == "Good" else "FAIL",
+            f"{pct_within:.0f}%", f"{100 - pct_within:.0f}%",
+        ))
+
+    for tech, sub in _tech_subsets():
+        rsrp_sub = _series(sub, "rsrp")
+        if rsrp_sub.empty:
+            continue
+        avg_rsrp_tech = float(rsrp_sub.mean())
+        pct_within_tech = float((rsrp_sub > -95).mean() * 100)
+        tech_status, _ = classify_coverage(rsrp_sub)
+        rows.append((
+            f"RSRP - {tech}", "> -95 dBm", f"{avg_rsrp_tech:.1f} dBm",
+            "PASS" if tech_status == "Good" else "FAIL",
+            f"{pct_within_tech:.0f}%", f"{100 - pct_within_tech:.0f}%",
+        ))
+
+    # ---- RSRQ / SINR (per technology, never blended) ----
     for tech, sub in _tech_subsets():
         rsrq = _series(sub, "rsrq")
         if rsrq.empty:
@@ -1134,6 +1611,121 @@ def build_mobility_kpi_summary_table(report_df: pd.DataFrame, neighbor_df: pd.Da
     return pd.DataFrame(rows, columns=["KPI", "Acceptance", "Observed", "Status"])
 
 
+# LTE theoretical peak throughput per 3GPP channel bandwidth (Category 4 UE,
+# reference values supplied directly by the user), used only to derive the
+# Good (>=75% of peak) / Fair (50-75%) / Poor (<50%) classification bounds
+# below -- the percentages are the rule, the peak-Mbps figures are the
+# reference; neither is invented by this module.
+_LTE_BANDWIDTH_PEAK_THROUGHPUT = {
+    5: {"dl": 37, "ul": 18},
+    10: {"dl": 75, "ul": 37},
+    15: {"dl": 113, "ul": 56},
+    20: {"dl": 150, "ul": 75},
+}
+
+
+def _bandwidth_mhz_from_bw(raw_bw) -> int | None:
+    """tbl_network_log.bw is reported in kHz for LTE rows (verified against
+    the DB for project 248: values of 10000/20000 correspond to 10 MHz/20
+    MHz channels; 5G NSA rows report bw=0, i.e. not applicable here)."""
+    try:
+        khz = float(raw_bw)
+    except (TypeError, ValueError):
+        return None
+    mhz = khz / 1000.0
+    for bucket in _LTE_BANDWIDTH_PEAK_THROUGHPUT:
+        if abs(mhz - bucket) < 0.5:
+            return bucket
+    return None
+
+
+def compute_lte_throughput_classification(report_df: pd.DataFrame, value_col: str, direction: str) -> dict:
+    """
+    Classify each LTE sample's throughput (dl_tpt/ul_tpt) against the
+    bandwidth-specific Good/Fair/Poor thresholds for its own reported channel
+    bandwidth (tbl_network_log.bw). Samples with no recognized LTE bandwidth
+    (5G NSA, or missing/invalid bw) are counted as unclassified rather than
+    guessed at.
+    """
+    empty = {"classified": 0, "unclassified": 0, "good": 0, "fair": 0, "poor": 0, "by_bandwidth": {}}
+    if report_df is None or report_df.empty or value_col not in report_df.columns or "bw" not in report_df.columns:
+        return empty
+
+    good = fair = poor = unclassified = 0
+    by_bandwidth: dict = {}
+    for raw_bw, raw_value in zip(report_df["bw"], report_df[value_col]):
+        bucket = _bandwidth_mhz_from_bw(raw_bw)
+        try:
+            value = float(raw_value)
+        except (TypeError, ValueError):
+            value = None
+        if bucket is None or value is None:
+            unclassified += 1
+            continue
+        peak = _LTE_BANDWIDTH_PEAK_THROUGHPUT[bucket][direction]
+        stats = by_bandwidth.setdefault(bucket, {"good": 0, "fair": 0, "poor": 0})
+        if value >= 0.75 * peak:
+            good += 1
+            stats["good"] += 1
+        elif value >= 0.50 * peak:
+            fair += 1
+            stats["fair"] += 1
+        else:
+            poor += 1
+            stats["poor"] += 1
+
+    return {
+        "classified": good + fair + poor,
+        "unclassified": unclassified,
+        "good": good,
+        "fair": fair,
+        "poor": poor,
+        "by_bandwidth": by_bandwidth,
+    }
+
+
+def build_lte_throughput_classification_table(classification: dict) -> pd.DataFrame:
+    columns = ["LTE Bandwidth", "Samples", "Good (>=75% peak)", "Fair (50-75% peak)", "Poor (<50% peak)"]
+    rows = []
+    for bandwidth in sorted(classification["by_bandwidth"]):
+        stats = classification["by_bandwidth"][bandwidth]
+        total = stats["good"] + stats["fair"] + stats["poor"]
+        if total == 0:
+            continue
+        rows.append((
+            f"{bandwidth} MHz",
+            f"{total:,}",
+            f"{stats['good'] / total * 100:.1f}%",
+            f"{stats['fair'] / total * 100:.1f}%",
+            f"{stats['poor'] / total * 100:.1f}%",
+        ))
+    return pd.DataFrame(rows, columns=columns)
+
+
+def build_throughput_observation_text(classification: dict, label: str) -> str:
+    classified = classification["classified"]
+    if classified == 0:
+        return (
+            f"Observation: No samples carried a recognized LTE channel-bandwidth reference "
+            f"(tbl_network_log.bw), so {label} could not be classified against the "
+            f"bandwidth-specific throughput reference."
+        )
+    good_pct = classification["good"] / classified * 100
+    fair_pct = classification["fair"] / classified * 100
+    poor_pct = classification["poor"] / classified * 100
+    text = (
+        f"Observation: Of {classified:,} LTE samples with a recognized channel bandwidth, "
+        f"{good_pct:.1f}% achieved Good {label} (>=75% of the theoretical peak for the observed "
+        f"bandwidth), {fair_pct:.1f}% Fair (50-75%) and {poor_pct:.1f}% Poor (<50%)."
+    )
+    if classification["unclassified"]:
+        text += (
+            f" {classification['unclassified']:,} samples (including 5G NSA, which has no LTE "
+            f"channel-bandwidth reference) were excluded from this classification."
+        )
+    return text
+
+
 def build_service_metric_table(report_df: pd.DataFrame, column: str, label: str, unit: str) -> pd.DataFrame:
     series = _series(report_df, column)
     if series.empty:
@@ -1281,6 +1873,204 @@ def build_application_overall_observation(report_df: pd.DataFrame, observation_d
     return f"Application performance for {app_names} followed the underlying radio and IP quality trends, with responsiveness reducing where latency, jitter or throughput degraded."
 
 
+def _join_list(items: list[str]) -> str:
+    """'A' / 'A and B' / 'A, B and C' -- used to name a variable-length set
+    of technologies/KPIs/apps in narrative text instead of a fixed string."""
+    items = [str(i) for i in items if str(i).strip()]
+    if not items:
+        return ""
+    if len(items) == 1:
+        return items[0]
+    if len(items) == 2:
+        return f"{items[0]} and {items[1]}"
+    return ", ".join(items[:-1]) + f" and {items[-1]}"
+
+
+def build_conclusion_paragraphs(
+    report_df: pd.DataFrame,
+    exec_summary: dict,
+    drive_summary: dict,
+    handover_data: dict,
+    metadata: dict,
+) -> list[str]:
+    """
+    Section 7.10 "Conclusion" -- a data-driven narrative built entirely from
+    values already computed elsewhere in this report (Drive Summary,
+    Executive Summary, Section 4's coverage KPI table, Section 6's handover
+    counts, Section 7's own service KPIs/app list), so it reads differently
+    per project instead of being a fixed paragraph. No new thresholds or
+    business rules are introduced here -- every PASS/FAIL/Good/Fair call
+    reuses the exact classification already shown elsewhere in the report.
+    """
+    location = metadata.get("location") or {}
+    city = location.get("city")
+    country = location.get("country")
+    place = ", ".join([p for p in (city, country) if p]) or "the surveyed area"
+
+    distance = drive_summary.get("distance_covered")
+    distance_text = f"{distance:.1f} km" if isinstance(distance, (int, float)) and distance > 0 else "an unspecified distance"
+    sessions = int(drive_summary.get("total_sessions", 0))
+    samples = int(drive_summary.get("total_samples", 0))
+
+    para_overview = (
+        f"The drive test was conducted across {distance_text} in {place} over "
+        f"{sessions} test session{'s' if sessions != 1 else ''}, collecting {samples:,} radio "
+        f"measurement samples to evaluate LTE/5G network coverage, radio quality, mobility, "
+        f"handover performance, and end-user service experience."
+    )
+
+    # ---- Coverage ----
+    rsrp = _series(report_df, "rsrp")
+    coverage = exec_summary.get("coverage", {})
+    coverage_status = coverage.get("status", "N/A")
+    tech_list = _technology_groups(report_df)
+    tech_text = _join_list(tech_list) if tech_list else "the deployed radio"
+    if not rsrp.empty:
+        avg_rsrp = float(rsrp.mean())
+        pct_above_95 = float((rsrp > -95).mean() * 100)
+        para_coverage = (
+            f"Overall, the network demonstrated {coverage_status.lower()} coverage performance, "
+            f"with an average RSRP of {avg_rsrp:.1f} dBm and {pct_above_95:.0f}% of measured "
+            f"samples exceeding the operator acceptance threshold of -95 dBm, indicating that "
+            f"users can expect "
+            f"{'reliable' if coverage_status == 'Good' else 'inconsistent'} network availability "
+            f"throughout {'most of' if pct_above_95 < 100 else 'the'} the evaluated route. "
+            f"Band utilization was well distributed across {tech_text} carriers without "
+            f"unexpected frequency behavior."
+        )
+    else:
+        para_coverage = "Coverage could not be assessed: no RSRP samples were available for this project."
+
+    # ---- Radio quality (reuses Section 4.5's own PASS/FAIL classification,
+    # so the KPIs named here can never disagree with that table) ----
+    quality_summary_df = build_coverage_kpi_summary_table(report_df, rsrp, coverage_status)
+    fail_labels = []
+    for _, row in quality_summary_df.iterrows():
+        kpi = str(row["KPI"])
+        if row["Status"] == "FAIL" and (kpi.startswith("SINR") or kpi.startswith("RSRQ")):
+            metric, _, tech = kpi.partition(" - ")
+            fail_labels.append(f"{metric} for {tech}")
+    if fail_labels:
+        para_quality = (
+            "Radio quality, however, showed opportunities for optimization. While signal "
+            "quality remained generally acceptable overall, several KPIs—including "
+            f"{_join_list(fail_labels)}—did not consistently meet the desired acceptance "
+            "criteria, indicating localized interference or quality degradation in specific "
+            "areas. These conditions may impact user experience during periods of high traffic "
+            "or at cell edges."
+        )
+    else:
+        para_quality = (
+            "Radio quality remained within acceptance criteria across all evaluated "
+            "technologies, with no SINR or RSRQ KPIs flagged for optimization."
+        )
+
+    # ---- Mobility + handover ----
+    mobility_status = next(
+        (status for label, status, _ in exec_summary.get("kpi_rows", []) if label == "Mobility"),
+        "N/A",
+    )
+    unique_pci = int(_series(report_df, "pci").nunique())
+    band_count = len(handover_data.get("band_events", []))
+    intra_count = len(handover_data.get("intra_freq_events", []))
+    tech_count = len(handover_data.get("tech_events", []))
+    para_mobility = (
+        f"Mobility performance was found to be "
+        f"{'stable' if mobility_status == 'Good' else mobility_status.lower()} throughout the "
+        f"drive. The network utilized {unique_pci} unique serving PCIs, maintained "
+        f"{'balanced' if mobility_status == 'Good' else 'uneven'} serving-cell distribution, and "
+        f"supported frequent mobility transitions. A total of {band_count:,} inter-frequency "
+        f"handovers, {intra_count:,} intra-frequency handovers, and {tech_count:,} inter-RAT "
+        f"transitions were observed"
+        + (
+            ", without evidence of significant mobility interruptions, demonstrating an "
+            "effective mobility strategy across the observed radio layers."
+            if mobility_status == "Good"
+            else ", though the serving-cell instability observed warrants a review of PCI/"
+            "neighbor-list planning."
+        )
+    )
+
+    # ---- Service ----
+    mos = _series(report_df, "mos")
+    packet_loss = _series(report_df, "packet_loss")
+    dl = _series(report_df, "dl_tpt")
+    ul = _series(report_df, "ul_tpt")
+    latency = _series(report_df, "latency")
+    app_df = build_application_observation_table(report_df)
+    app_names = app_df["Application"].head(4).tolist() if not app_df.empty else []
+    apps_text = _join_list(app_names) if app_names else "the observed applications"
+
+    service_kpi_df = build_service_kpi_summary_table(report_df)
+    latency_row = service_kpi_df[service_kpi_df["KPI"] == "Latency"] if not service_kpi_df.empty else pd.DataFrame()
+    latency_target = latency_row.iloc[0]["Target"] if not latency_row.empty else None
+    latency_status = latency_row.iloc[0]["Status"] if not latency_row.empty else None
+
+    service_bits = [
+        f"From a service perspective, common applications including {apps_text} remained "
+        f"functional and responsive during the drive."
+    ]
+    if not mos.empty:
+        service_bits.append(f"Voice quality achieved a MOS of {float(mos.mean()):.2f},")
+    if not packet_loss.empty:
+        service_bits.append(f"while packet loss remained {'low' if float(packet_loss.mean()) < 1 else 'elevated'} at {float(packet_loss.mean()):.2f}%, indicating {'stable' if float(packet_loss.mean()) < 1 else 'unstable'} IP connectivity.")
+    service_para1 = " ".join(service_bits)
+
+    throughput_bits = []
+    if not dl.empty and not ul.empty and not latency.empty:
+        throughput_bits.append(
+            f"However, measured download throughput ({float(dl.mean()):.1f} Mbps), upload "
+            f"throughput ({float(ul.mean()):.1f} Mbps), and latency ({float(latency.mean()):.1f} ms) "
+            f"suggest that overall user data performance is "
+            f"{'constrained despite strong radio coverage' if coverage_status == 'Good' else 'limited'}."
+        )
+    if latency_status == "FAIL" and latency_target:
+        throughput_bits.append(
+            f"The elevated latency exceeded the project target ({latency_target}), indicating "
+            f"that further investigation into scheduler efficiency, cell loading, backhaul "
+            f"capacity, or network congestion is warranted."
+        )
+    service_para2 = " ".join(throughput_bits) if throughput_bits else ""
+
+    # ---- Closing ----
+    strengths = []
+    weaknesses = []
+    for label, status, _ in exec_summary.get("kpi_rows", []):
+        if status == "Good":
+            strengths.append(label)
+        elif status not in ("N/A",):
+            weaknesses.append(label)
+    strengths_text = _join_list(strengths) if strengths else None
+    weaknesses_text = _join_list(weaknesses) if weaknesses else None
+    if strengths_text and weaknesses_text:
+        closing = (
+            f"In conclusion, the evaluated network provides strong performance in "
+            f"{strengths_text}, supporting reliable service continuity across the tested area. "
+            f"The primary opportunities for improvement lie in {weaknesses_text}. Addressing "
+            f"these areas will enhance overall Quality of Experience (QoE) and further "
+            f"strengthen network performance in high-demand environments."
+        )
+    elif strengths_text:
+        closing = (
+            f"In conclusion, the evaluated network provides strong performance in "
+            f"{strengths_text} across the tested area, with no KPI groups flagged for "
+            f"optimization in this drive."
+        )
+    else:
+        closing = (
+            f"In conclusion, the evaluated network requires targeted optimization across "
+            f"{weaknesses_text or 'the KPI groups flagged above'}. Addressing these areas will "
+            f"enhance overall Quality of Experience (QoE) and strengthen network performance "
+            f"in high-demand environments."
+        )
+
+    paragraphs = [para_overview, para_coverage, para_quality, para_mobility, service_para1]
+    if service_para2:
+        paragraphs.append(service_para2)
+    paragraphs.append(closing)
+    return paragraphs
+
+
 # ------------------------------------------------------------------
 # PDF builder (subclass of the production generator)
 # ------------------------------------------------------------------
@@ -1308,8 +2098,23 @@ class NewFormatPDFReport(PDFReportGenerator):
         ReportLab can never strand the heading at the bottom of a page while
         the content flows to the next one (the "Key Engineering
         Observations" heading/content page-split bug).
+
+        Labels that carry a numbered subsection prefix (e.g. "4.1 Band
+        Distribution", "7.10 Conclusion") are also registered as a level-1
+        TOC entry, the same afterFlowable/add_toc_heading mechanism
+        production's own PDFReportGenerator uses -- so the Table of
+        Contents lists real subsections dynamically instead of only the
+        7 top-level sections. Unnumbered labels (e.g. "Executive Summary",
+        "Scope") are left out of the TOC, matching production's own
+        behaviour of only indexing numbered subsections.
         """
-        block = [Paragraph(f"<b>{label}</b>", self.styles["SubSection"]), Spacer(1, 4), *flowables]
+        heading = Paragraph(f"<b>{label}</b>", self.styles["SubSection"])
+        match = re.match(r"^(\d+)\.(\d+)\b", label)
+        if match:
+            heading.toc_level = 1
+            heading.toc_text = label
+            heading.toc_key = f"subsec_{match.group(1)}_{match.group(2)}"
+        block = [heading, Spacer(1, 4), *flowables]
         self.story.append(KeepTogether(block))
         self.story.append(Spacer(1, trailing_space))
 
@@ -1355,18 +2160,46 @@ class NewFormatPDFReport(PDFReportGenerator):
             flowables.append(Spacer(1, 6))
         return flowables
 
+    def _labeled_image_flowables(self, label, filename, subdir="kpi_maps", max_width=5.8 * inch, max_height=4 * inch):
+        """
+        Like _optional_image_flowables, but with a heading glued to the
+        image via KeepTogether (e.g. "Poor RSRP" above the poor-region
+        map) — plain images with no caption read as a stray, unlabeled
+        picture; this makes clear what each map is showing.
+        """
+        path = os.path.join(self.images_dir, subdir, filename)
+        if not os.path.exists(path):
+            return []
+        use_path = self._compress_png(path) if subdir == "kpi_maps" else path
+        return [
+            KeepTogether([
+                Paragraph(f"<b>{label}</b>", self.styles["Body"]),
+                Spacer(1, 2),
+                self._sized_image(use_path, max_width, max_height),
+            ]),
+            Spacer(1, 6),
+        ]
+        return flowables
+
     def _kpi_image_flowables_per_technology(
         self, report_df, map_prefix: str, cdf_filename: str, max_height=4 * inch,
     ):
         """
         Same as _kpi_image_flowables, but for KPIs classified PER
-        TECHNOLOGY (RSRQ/SINR): one map per technology present in
-        `report_df["network"]` (matching test_new_pdf_report.py's
+        TECHNOLOGY (RSRP/RSRQ/SINR/DL/UL/MOS): one map per technology
+        present in `report_df["network"]` (matching test_new_pdf_report.py's
         `{map_prefix}_{_tech_slug(tech)}.png` naming), each labeled with
         its technology, instead of a single map blending every RAT
         together. The CDF chart stays a single blended distribution
         (unchanged) since the per-technology breakdown already lives in
-        the 4.3/4.4 tables.
+        the relevant KPI table.
+
+        Each technology's [label, image] pair is wrapped in its own
+        KeepTogether — without this, ReportLab was free to strand the
+        "<tech name>" heading at the bottom of a page while its map
+        rendered at the top of the next one (a page-split bug, not
+        cosmetic — the reader loses which map belongs to which
+        technology).
         """
         flowables = []
         tech_list = _technology_groups(report_df)
@@ -1376,9 +2209,11 @@ class NewFormatPDFReport(PDFReportGenerator):
             map_path = os.path.join(maps_dir, f"{map_prefix}_{_tech_slug(tech)}.png")
             if not os.path.exists(map_path):
                 continue
-            flowables.append(Paragraph(f"<b>{tech}</b>", self.styles["Body"]))
-            flowables.append(Spacer(1, 2))
-            flowables.append(self._sized_image(self._compress_png(map_path), 5.8 * inch, max_height))
+            flowables.append(KeepTogether([
+                Paragraph(f"<b>{tech}</b>", self.styles["Body"]),
+                Spacer(1, 2),
+                self._sized_image(self._compress_png(map_path), 5.8 * inch, max_height),
+            ]))
             flowables.append(Spacer(1, 6))
             any_map = True
         if not any_map:
@@ -1500,7 +2335,9 @@ class NewFormatPDFReport(PDFReportGenerator):
         # RSRP/RSRQ/SINR images below (avoid an oversized KeepTogether block).
         self.story.extend(self._kpi_image_flowables("band_map.png", "band_pie.png", max_height=4.5 * inch))
 
-        # ---- 4.2 RSRP Analysis (Coverage) — blended across technologies ----
+        # ---- 4.2 RSRP Analysis (Coverage) — numeric stats stay blended
+        # (RSRP is dBm-comparable across RATs), but the map visualization
+        # is per-technology, same as RSRQ/SINR below ----
         rsrp_flowables = [
             Paragraph(
                 "Definition: Reference Signal Received Power (RSRP) is the primary LTE "
@@ -1526,9 +2363,15 @@ class NewFormatPDFReport(PDFReportGenerator):
         self.add_labeled_block("4.2 RSRP Analysis (Coverage)", rsrp_flowables)
         # Map + CDF appended separately (not inside the KeepTogether block
         # above) so a full-page image can flow naturally instead of risking
-        # a "content too large for one page" layout failure.
-        self.story.extend(self._kpi_image_flowables("rsrp_map.png", "cdf_rsrp.png"))
-        self.story.extend(self._optional_image_flowables(["rsrp_poor_regions.png"], subdir="kpi_maps", max_width=5.8 * inch, max_height=4.5 * inch))
+        # a "content too large for one page" layout failure. Per-technology
+        # maps (one per RAT present), matching RSRQ/SINR's treatment below.
+        self.story.extend(
+            self._kpi_image_flowables_per_technology(report_df, "rsrp_map", "cdf_rsrp.png")
+        )
+        self.story.extend(self._labeled_image_flowables(
+            "Poor RSRP (< -105 dBm)", "rsrp_poor_regions.png", subdir="kpi_maps",
+            max_width=5.8 * inch, max_height=4.5 * inch,
+        ))
 
         # ---- 4.3 RSRQ Analysis — per technology, never blended ----
         rsrq_table = build_rsrq_technology_table(report_df)
@@ -1564,7 +2407,10 @@ class NewFormatPDFReport(PDFReportGenerator):
         self.story.extend(
             self._kpi_image_flowables_per_technology(report_df, "rsrq_map", "cdf_rsrq.png")
         )
-        self.story.extend(self._optional_image_flowables(["rsrq_poor_regions.png"], subdir="kpi_maps", max_width=5.8 * inch, max_height=4.5 * inch))
+        self.story.extend(self._labeled_image_flowables(
+            "Poor RSRQ (< -14 dB)", "rsrq_poor_regions.png", subdir="kpi_maps",
+            max_width=5.8 * inch, max_height=4.5 * inch,
+        ))
 
         # ---- 4.4 SINR Analysis — per technology, never blended ----
         sinr_table = build_sinr_technology_table(report_df)
@@ -1603,7 +2449,16 @@ class NewFormatPDFReport(PDFReportGenerator):
         # own findings (NOT a repeat of Section 3's Executive KPI Summary,
         # which uses different columns and is about Mobility/Handover too) ----
         summary_df = build_coverage_kpi_summary_table(report_df, rsrp, coverage_status)
-        self.add_labeled_block("4.5 Coverage KPI Summary", [make_native_table(summary_df)])
+        # Display-only: per direction received, this table shows FAIL rows
+        # with a blank Status cell instead of the word "FAIL" for now. The
+        # underlying PASS/FAIL classification is untouched -- Section 7.10's
+        # Conclusion (build_conclusion_paragraphs) calls
+        # build_coverage_kpi_summary_table() again on its own and still sees
+        # "FAIL" internally, so the two can never disagree on which KPIs
+        # actually failed.
+        display_df = summary_df.copy()
+        display_df["Status"] = display_df["Status"].replace("FAIL", "")
+        self.add_labeled_block("4.5 Coverage KPI Summary", [make_native_table(display_df)])
 
         # ---- Overall Coverage Assessment ----
         all_statuses = [coverage_status] + [e["status"] for e in quality_entries]
@@ -1707,11 +2562,8 @@ class NewFormatPDFReport(PDFReportGenerator):
         top_pci_flowables = []
         if not top_pci_analysis_df.empty:
             top_pci_flowables.append(make_native_table(top_pci_analysis_df))
-            top_pci_flowables.append(Spacer(1, 4))
-        top_pci_flowables.append(Paragraph(
-            "Recommendation: review PCI reuse only if future expansion introduces additional neighboring sites.",
-            self.styles["Body"],
-        ))
+        else:
+            top_pci_flowables.append(Paragraph("No top PCI entries are available.", self.styles["Body"]))
         self.add_labeled_block("5.3 Top PCI Analysis", top_pci_flowables)
 
         poor_rsrp_flowables = []
@@ -1799,7 +2651,156 @@ class NewFormatPDFReport(PDFReportGenerator):
         summary_flowables.append(Paragraph(f"Observation: {overall_text}", self.styles["Body"]))
         self.add_labeled_block("5.8 Mobility Summary", summary_flowables)
 
-    def add_service_kpi_analysis(self, report_df: pd.DataFrame):
+    def add_handover_kpi_analysis(self, handover_data: dict):
+        """
+        Section 6 "Handover KPI Analysis" (test-case only). Only KPIs with a
+        real DB-backed signal are included — see compute_handover_analysis
+        docstring for why Radio Link Failure, Call Drop Rate, CSSR and
+        voice-call content are excluded entirely for this project (no
+        attempt/failure signal exists anywhere in the dataset).
+        """
+        self.story.append(PageBreak())
+        self.add_toc_heading("6. Handover KPI Analysis", self.styles["Section"], 0, "sec6")
+        self.story.append(Paragraph(
+            "Handover analysis evaluates the mobility transitions the UE makes between bands, "
+            "technologies and cells while moving through the network, using the same all-cells "
+            "drive population production already uses for handover detection.",
+            self.styles["Body"],
+        ))
+        self.story.append(Spacer(1, 8))
+
+        band_events = handover_data["band_events"]
+        pci_events = handover_data["pci_events"]
+        intra_freq_events = handover_data["intra_freq_events"]
+        tech_events = handover_data["tech_events"]
+        intra_enodeb_events = handover_data["intra_enodeb_events"]
+        inter_enodeb_events = handover_data["inter_enodeb_events"]
+
+        scope_flowables = [
+            Paragraph(
+                "Objective: define the handover event types detected for this drive route and the "
+                "data scope used to detect them.",
+                self.styles["Body"],
+            ),
+            Spacer(1, 4),
+            Paragraph(
+                "This project's dataset has no handover attempt/failure signal (no Radio Link "
+                "Failure, call-state or disconnect-cause data was found on tbl_network_log or its "
+                "linked sub-sessions for this project), so the sections below (6.2-6.6) report "
+                "detected event COUNTS only, never a success or failure percentage.",
+                self.styles["Body"],
+            ),
+        ]
+        self.add_labeled_block("6.1 Handover KPI Scope & Methodology", scope_flowables)
+
+        band_flowables = [
+            Paragraph(
+                "Objective: verify mobility across LTE/NR carrier frequencies (band changes).",
+                self.styles["Body"],
+            ),
+            Spacer(1, 4),
+            make_native_table(build_band_handover_summary_table(band_events)),
+        ]
+        band_pairs_df = build_transition_pairs_table(band_events, "Band Transition")
+        if not band_pairs_df.empty:
+            band_flowables.append(Spacer(1, 4))
+            band_flowables.append(make_native_table(band_pairs_df))
+        band_flowables.append(Spacer(1, 4))
+        band_flowables.append(Paragraph(
+            f"Observation: {len(band_events):,} inter-frequency (band) handover events were "
+            f"detected across the drive route.",
+            self.styles["Body"],
+        ))
+        self.add_labeled_block("6.2 Inter-frequency (Band) Handover", band_flowables)
+
+        handover_map_path = os.path.join(self.images_dir, "kpi_maps", "handover_map.png")
+        if os.path.exists(handover_map_path):
+            self.story.append(self._sized_image(handover_map_path, 5.8 * inch, 4.5 * inch))
+            self.story.append(Spacer(1, 6))
+
+        intra_flowables = [
+            Paragraph(
+                "Objective: identify PCI/serving-cell changes that occur without a band change.",
+                self.styles["Body"],
+            ),
+            Spacer(1, 4),
+            make_native_table(build_intra_frequency_summary_table(pci_events, intra_freq_events)),
+        ]
+        intra_pairs_df = build_transition_pairs_table(pci_events, "PCI Transition")
+        if not intra_pairs_df.empty:
+            intra_flowables.append(Spacer(1, 4))
+            intra_flowables.append(make_native_table(intra_pairs_df))
+        intra_flowables.append(Spacer(1, 4))
+        intra_flowables.append(Paragraph(
+            f"Observation: {len(pci_events):,} total serving-cell (PCI) transitions were detected, "
+            f"of which {len(intra_freq_events):,} occurred without a band change (intra-frequency).",
+            self.styles["Body"],
+        ))
+        self.add_labeled_block("6.3 Intra-frequency Handover", intra_flowables)
+
+        upgrade = sum(1 for e in tech_events if e["handover_type"] == "Upgrade")
+        downgrade = sum(1 for e in tech_events if e["handover_type"] == "Downgrade")
+        lateral = sum(1 for e in tech_events if e["handover_type"] == "Lateral")
+        tech_flowables = [
+            Paragraph(
+                "Objective: verify mobility across radio access technologies (e.g. LTE to 5G NSA), "
+                "classified as upgrade/downgrade/lateral by technology rank, matching the frontend's "
+                "own handover classification.",
+                self.styles["Body"],
+            ),
+            Spacer(1, 4),
+            make_native_table(build_tech_handover_summary_table(tech_events)),
+        ]
+        tech_pairs_df = build_transition_pairs_table(tech_events, "Technology Transition")
+        if not tech_pairs_df.empty:
+            tech_flowables.append(Spacer(1, 4))
+            tech_flowables.append(make_native_table(tech_pairs_df))
+        tech_flowables.append(Spacer(1, 4))
+        tech_flowables.append(Paragraph(
+            f"Observation: {len(tech_events):,} inter-RAT handover events "
+            f"({upgrade:,} upgrade, {downgrade:,} downgrade, {lateral:,} lateral).",
+            self.styles["Body"],
+        ))
+        self.add_labeled_block("6.4 Inter-RAT (Technology) Handover", tech_flowables)
+
+        tech_map_path = os.path.join(self.images_dir, "kpi_maps", "tech_handover_map.png")
+        if os.path.exists(tech_map_path):
+            self.story.append(self._sized_image(tech_map_path, 5.8 * inch, 4.5 * inch))
+            self.story.append(Spacer(1, 6))
+
+        total_nodeb_events = len(intra_enodeb_events) + len(inter_enodeb_events)
+        nodeb_flowables = [
+            Paragraph(
+                "Objective: classify serving-cell changes as intra-eNodeB (sector change within the "
+                "same eNodeB) or inter-eNodeB, using the reported nodeb_id/cell_id.",
+                self.styles["Body"],
+            ),
+            Spacer(1, 4),
+            make_native_table(build_nodeb_summary_table(intra_enodeb_events, inter_enodeb_events)),
+            Spacer(1, 4),
+            Paragraph(
+                f"Observation: {len(inter_enodeb_events):,} of {total_nodeb_events:,} serving-cell "
+                f"changes with eNodeB data crossed to a different eNodeB.",
+                self.styles["Body"],
+            ),
+        ]
+        self.add_labeled_block("6.5 Node-B (eNodeB) Level Handover", nodeb_flowables)
+
+        summary_flowables = [
+            make_native_table(build_handover_kpi_summary_table(handover_data)),
+            Spacer(1, 4),
+            Paragraph(build_handover_kpi_summary_observation(handover_data), self.styles["Body"]),
+        ]
+        self.add_labeled_block("6.6 Handover KPI Summary", summary_flowables)
+
+    def add_service_kpi_analysis(
+        self,
+        report_df: pd.DataFrame,
+        exec_summary: dict,
+        drive_summary: dict,
+        handover_data: dict,
+        metadata: dict,
+    ):
         self.story.append(PageBreak())
         self.add_toc_heading("7. Service KPI Analysis", self.styles["Section"], 0, "sec7")
         self.story.append(Paragraph(
@@ -1809,34 +2810,40 @@ class NewFormatPDFReport(PDFReportGenerator):
         ))
         self.story.append(Spacer(1, 8))
 
+        dl_classification = compute_lte_throughput_classification(report_df, "dl_tpt", "dl")
+        dl_class_df = build_lte_throughput_classification_table(dl_classification)
         dl_flowables = [
             Paragraph("Objective: measure achievable download speed under live network conditions.", self.styles["Body"]),
             Spacer(1, 4),
             make_native_table(build_service_metric_table(report_df, "dl_tpt", "DL Throughput", "Mbps")),
-            Spacer(1, 4),
-            Paragraph(
-                "Observation: Download throughput remained satisfactory across most of the route. "
-                "Reduced throughput is typically associated with higher cell loading.",
-                self.styles["Body"],
-            ),
-            Spacer(1, 4),
-            Paragraph("Recommendation: review scheduler utilization, carrier aggregation and cell loading.", self.styles["Body"]),
         ]
+        if not dl_class_df.empty:
+            dl_flowables.append(Spacer(1, 4))
+            dl_flowables.append(make_native_table(dl_class_df))
+        dl_flowables.append(Spacer(1, 4))
+        dl_flowables.append(Paragraph(build_throughput_observation_text(dl_classification, "DL throughput"), self.styles["Body"]))
         self.add_labeled_block("7.1 Downlink Throughput", dl_flowables)
-        self.story.extend(self._optional_image_flowables(["dl_map.png"], subdir="kpi_maps", max_width=5.8 * inch, max_height=4.5 * inch))
-        self.story.extend(self._optional_image_flowables(["cdf_dl_tpt.png"], subdir="kpi_analysis", max_width=TABLE_MAX_WIDTH, max_height=4.5 * inch))
+        # Per-technology maps (one per RAT present), matching RSRQ/SINR's
+        # treatment in Section 4 — DL throughput characteristics differ by
+        # RAT too, so a single blended map would hide that.
+        self.story.extend(
+            self._kpi_image_flowables_per_technology(report_df, "dl_map", "cdf_dl_tpt.png", max_height=4.5 * inch)
+        )
 
+        ul_classification = compute_lte_throughput_classification(report_df, "ul_tpt", "ul")
+        ul_class_df = build_lte_throughput_classification_table(ul_classification)
         ul_flowables = [
             make_native_table(build_service_metric_table(report_df, "ul_tpt", "UL Throughput", "Mbps")),
-            Spacer(1, 4),
-            Paragraph(
-                "Observation: Uplink performance remained stable with isolated degradation in cell-edge regions.",
-                self.styles["Body"],
-            ),
         ]
+        if not ul_class_df.empty:
+            ul_flowables.append(Spacer(1, 4))
+            ul_flowables.append(make_native_table(ul_class_df))
+        ul_flowables.append(Spacer(1, 4))
+        ul_flowables.append(Paragraph(build_throughput_observation_text(ul_classification, "UL throughput"), self.styles["Body"]))
         self.add_labeled_block("7.2 Uplink Throughput", ul_flowables)
-        self.story.extend(self._optional_image_flowables(["ul_map.png"], subdir="kpi_maps", max_width=5.8 * inch, max_height=4.5 * inch))
-        self.story.extend(self._optional_image_flowables(["cdf_ul_tpt.png"], subdir="kpi_analysis", max_width=TABLE_MAX_WIDTH, max_height=4.5 * inch))
+        self.story.extend(
+            self._kpi_image_flowables_per_technology(report_df, "ul_map", "cdf_ul_tpt.png", max_height=4.5 * inch)
+        )
 
         mos = _series(report_df, "mos")
         mos_table = (
@@ -1852,8 +2859,9 @@ class NewFormatPDFReport(PDFReportGenerator):
             ),
         ]
         self.add_labeled_block("7.3 Voice Quality (MOS)", mos_flowables)
-        self.story.extend(self._optional_image_flowables(["mos_map.png"], subdir="kpi_maps", max_width=5.8 * inch, max_height=4.5 * inch))
-        self.story.extend(self._optional_image_flowables(["cdf_mos.png"], subdir="kpi_analysis", max_width=TABLE_MAX_WIDTH, max_height=4.5 * inch))
+        self.story.extend(
+            self._kpi_image_flowables_per_technology(report_df, "mos_map", "cdf_mos.png", max_height=4.5 * inch)
+        )
 
         latency = _series(report_df, "latency")
         latency_table = (
@@ -1930,12 +2938,14 @@ class NewFormatPDFReport(PDFReportGenerator):
         if not summary_df.empty:
             self.add_labeled_block("7.9 Service KPI Summary", [make_native_table(summary_df)])
 
-        self.add_labeled_block("7.10 Engineering Conclusion", [Paragraph(
-            "Overall service performance was satisfactory throughout the evaluated route. Data throughput supported "
-            "common user applications, voice quality remained acceptable, and IP connectivity metrics stayed within "
-            "acceptable limits. Localized degradation should be investigated through capacity optimization and scheduler analysis.",
-            self.styles["Body"],
-        )])
+        conclusion_paragraphs = build_conclusion_paragraphs(
+            report_df, exec_summary, drive_summary, handover_data, metadata,
+        )
+        conclusion_flowables = []
+        for para in conclusion_paragraphs:
+            conclusion_flowables.append(Paragraph(para, self.styles["Body"]))
+            conclusion_flowables.append(Spacer(1, 6))
+        self.add_labeled_block("7.10 Conclusion", conclusion_flowables)
 
     def build(self):
         self.doc.multiBuild(self.story, canvasmaker=PageNumCanvas)
