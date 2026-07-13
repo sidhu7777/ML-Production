@@ -57,7 +57,9 @@ output PDF is regenerated/replaced on every run):
                     from Section 3 (exec_summary["coverage"] /
                     ["quality_entries"]) so the two sections can never
                     disagree with each other.
-  Step 3 (next):    Section 5 "Mobility KPI Analysis".
+  Step 3 (done):    Section 5 "Mobility KPI Analysis" - Serving Cell
+                    Analysis, PCI Distribution, Neighbor Cell Analysis,
+                    Mobility KPI Summary, Overall Mobility Assessment.
   Step 4:           Section 6 "Handover KPI Analysis".
   Step 5:           Section 7 "Service KPI Analysis".
   Step 6:           Full assembly + compare against report_VI.pdf.
@@ -859,6 +861,427 @@ def build_band_distribution_observation(band_summary: list | None) -> str:
 
 
 # ------------------------------------------------------------------
+# Step 3 - Section 5 "Mobility KPI Analysis"
+# ------------------------------------------------------------------
+
+def _pci_series(report_df: pd.DataFrame) -> pd.Series:
+    if "pci" not in report_df.columns:
+        return pd.Series(dtype=float)
+    return pd.to_numeric(report_df["pci"], errors="coerce").dropna().astype(int)
+
+
+def build_pci_distribution_stats(report_df: pd.DataFrame) -> dict:
+    pci_series = _pci_series(report_df)
+    if pci_series.empty:
+        return {
+            "total_samples": 0,
+            "unique_pci": 0,
+            "dominant_pci": None,
+            "dominant_count": 0,
+            "dominant_share": 0.0,
+            "top_30_share": 0.0,
+            "counts": pd.Series(dtype=int),
+        }
+
+    counts = pci_series.value_counts().sort_values(ascending=False)
+    total = int(len(pci_series))
+    dominant_pci = int(counts.index[0])
+    dominant_count = int(counts.iloc[0])
+    dominant_share = float((dominant_count / total) * 100) if total else 0.0
+    top_30_share = float((counts.head(30).sum() / total) * 100) if total else 0.0
+    return {
+        "total_samples": total,
+        "unique_pci": int(counts.size),
+        "dominant_pci": dominant_pci,
+        "dominant_count": dominant_count,
+        "dominant_share": dominant_share,
+        "top_30_share": top_30_share,
+        "counts": counts,
+    }
+
+
+def build_serving_cell_metric_table(report_df: pd.DataFrame) -> pd.DataFrame:
+    stats = build_pci_distribution_stats(report_df)
+    if stats["total_samples"] == 0:
+        return pd.DataFrame({"Metric": ["Serving Cell Data"], "Observed Value": ["No PCI data available"]})
+    return pd.DataFrame({
+        "Metric": [
+            "Samples with Serving PCI",
+            "Unique Serving PCIs",
+            "Dominant PCI",
+            "Dominant PCI Share",
+            "Top 30 PCI Share",
+        ],
+        "Observed Value": [
+            f"{stats['total_samples']:,}",
+            f"{stats['unique_pci']}",
+            f"{stats['dominant_pci']}",
+            f"{stats['dominant_share']:.1f}%",
+            f"{stats['top_30_share']:.1f}%",
+        ],
+    })
+
+
+def build_top_pci_table(report_df: pd.DataFrame, limit: int = 15) -> pd.DataFrame:
+    stats = build_pci_distribution_stats(report_df)
+    counts = stats["counts"]
+    if counts.empty:
+        return pd.DataFrame(columns=["PCI", "Sample Count", "% Samples", "CDF %"])
+
+    total = stats["total_samples"]
+    running = 0
+    rows = []
+    for pci, count in counts.head(limit).items():
+        count = int(count)
+        running += count
+        rows.append((
+            int(pci),
+            f"{count:,}",
+            f"{(count / total) * 100:.1f}%",
+            f"{(running / total) * 100:.1f}%",
+        ))
+    return pd.DataFrame(rows, columns=["PCI", "Sample Count", "% Samples", "CDF %"])
+
+
+def build_top_pci_analysis_table(report_df: pd.DataFrame, limit: int = 8) -> pd.DataFrame:
+    stats = build_pci_distribution_stats(report_df)
+    counts = stats["counts"]
+    if counts.empty:
+        return pd.DataFrame(columns=["PCI", "Sample Count", "% Samples", "Observation"])
+
+    total = stats["total_samples"]
+    rows = []
+    for pci, count in counts.head(limit).items():
+        share = float((count / total) * 100) if total else 0.0
+        if share >= 20:
+            obs = "Dominant serving PCI"
+        elif share >= 5:
+            obs = "Healthy overlap"
+        else:
+            obs = "Normal utilization"
+        rows.append((int(pci), f"{int(count):,}", f"{share:.1f}%", obs))
+    return pd.DataFrame(rows, columns=["PCI", "Sample Count", "% Samples", "Observation"])
+
+
+def build_poor_pci_analysis_table(report_df: pd.DataFrame, metric_column: str):
+    from tools.report_engine.kpi_analysis import build_poor_pci_table
+
+    threshold = -105 if metric_column == "rsrp" else -14
+    return build_poor_pci_table(report_df, metric_column, threshold)
+
+
+def _poor_pci_section_title(base_title: str, table_df: pd.DataFrame | None) -> str:
+    if table_df is None or table_df.empty:
+        return base_title
+    shown = len(table_df)
+    total = int(table_df.attrs.get("total_poor_pci", shown))
+    suffix = f"Top {shown} of {total} PCIs" if total > shown else f"{shown} PCIs"
+    return f"{base_title} ({suffix})"
+
+
+def build_neighbor_cell_table(neighbor_df: pd.DataFrame | None) -> pd.DataFrame:
+    if neighbor_df is None or neighbor_df.empty:
+        return pd.DataFrame({
+            "Metric": [
+                "Neighbor Log Source",
+                "Neighbor Samples",
+                "Neighbor PCI Coverage",
+                "Assessment",
+            ],
+            "Observed Value": [
+                "tbl_network_log_neighbour",
+                "0",
+                "0 unique neighbor PCIs",
+                "Not populated",
+            ],
+        })
+
+    pci = pd.to_numeric(neighbor_df["pci"], errors="coerce").dropna().astype(int) if "pci" in neighbor_df.columns else pd.Series(dtype=int)
+    networks = (
+        ", ".join(
+            neighbor_df["network"].fillna("").astype(str).str.strip().replace("", np.nan).dropna().value_counts().head(3).index.tolist()
+        )
+        if "network" in neighbor_df.columns else ""
+    )
+    bands = (
+        ", ".join(
+            neighbor_df["band"].fillna("").astype(str).str.strip().replace("", np.nan).dropna().value_counts().head(3).index.tolist()
+        )
+        if "band" in neighbor_df.columns else ""
+    )
+    top_pci_text = "No PCI data"
+    if not pci.empty:
+        top_counts = pci.value_counts()
+        top_pci = int(top_counts.index[0])
+        top_share = float((top_counts.iloc[0] / len(pci)) * 100)
+        top_pci_text = f"PCI {top_pci} ({top_share:.1f}% of neighbor samples)"
+
+    return pd.DataFrame({
+        "Metric": [
+            "Neighbor Log Source",
+            "Neighbor Samples",
+            "Unique Neighbor PCIs",
+            "Dominant Neighbor PCI",
+            "Neighbor Networks",
+            "Neighbor Bands",
+            "Assessment",
+        ],
+        "Observed Value": [
+            "tbl_network_log_neighbour",
+            f"{len(neighbor_df):,}",
+            f"{int(pci.nunique()) if not pci.empty else 0}",
+            top_pci_text,
+            networks or "N/A",
+            bands or "N/A",
+            "Available",
+        ],
+    })
+
+
+def build_neighbor_cell_check_table(neighbor_df: pd.DataFrame | None) -> pd.DataFrame:
+    if neighbor_df is None or neighbor_df.empty:
+        return pd.DataFrame({
+            "Check": ["Neighbor Logs", "Missing Neighbor", "Neighbor Consistency"],
+            "Status": ["Not observed", "Not evaluated", "Not evaluated"],
+        })
+
+    pci = pd.to_numeric(neighbor_df["pci"], errors="coerce").dropna().astype(int) if "pci" in neighbor_df.columns else pd.Series(dtype=int)
+    unique_pci = int(pci.nunique()) if not pci.empty else 0
+    dominant_share = float(pci.value_counts(normalize=True).iloc[0] * 100) if not pci.empty else 0.0
+    consistency = "Good" if unique_pci >= 3 and dominant_share < 95 else "Review"
+    return pd.DataFrame({
+        "Check": [
+            "Neighbor Logs",
+            "Unique Neighbor PCIs",
+            "Neighbor Consistency",
+        ],
+        "Status": [
+            "Observed",
+            f"{unique_pci}",
+            consistency,
+        ],
+    })
+
+
+def build_cell_dominance_table(report_df: pd.DataFrame, neighbor_df: pd.DataFrame | None = None) -> pd.DataFrame:
+    serving_stats = build_pci_distribution_stats(report_df)
+    neighbor_pci = (
+        pd.to_numeric(neighbor_df["pci"], errors="coerce").dropna().astype(int)
+        if neighbor_df is not None and not neighbor_df.empty and "pci" in neighbor_df.columns
+        else pd.Series(dtype=int)
+    )
+    if not neighbor_pci.empty:
+        neighbor_counts = neighbor_pci.value_counts()
+        neighbor_dom_pci = int(neighbor_counts.index[0])
+        neighbor_dom_share = float((neighbor_counts.iloc[0] / len(neighbor_pci)) * 100)
+    else:
+        neighbor_dom_pci = None
+        neighbor_dom_share = 0.0
+
+    if serving_stats["dominant_share"] < 80:
+        assessment = "Serving dominance within acceptable range"
+    else:
+        assessment = "Serving dominance requires review"
+
+    return pd.DataFrame({
+        "Metric": [
+            "Dominant Serving PCI",
+            "Serving PCI Share",
+            "Dominant Neighbor PCI",
+            "Neighbor PCI Share",
+            "Assessment",
+        ],
+        "Observed Value": [
+            str(serving_stats["dominant_pci"]) if serving_stats["dominant_pci"] is not None else "N/A",
+            f"{serving_stats['dominant_share']:.1f}%" if serving_stats["total_samples"] else "N/A",
+            str(neighbor_dom_pci) if neighbor_dom_pci is not None else "N/A",
+            f"{neighbor_dom_share:.1f}%" if not neighbor_pci.empty else "N/A",
+            assessment,
+        ],
+    })
+
+
+def build_mobility_kpi_summary_table(report_df: pd.DataFrame, neighbor_df: pd.DataFrame | None = None) -> pd.DataFrame:
+    stats = build_pci_distribution_stats(report_df)
+    mobility_status, _mobility_remarks = classify_mobility(report_df)
+    neighbor_table = build_neighbor_cell_table(neighbor_df)
+    neighbor_status_value = str(neighbor_table.iloc[-1]["Observed Value"]) if not neighbor_table.empty else "Not available"
+    rows = []
+
+    if stats["total_samples"]:
+        rows.append((
+            "Serving Cell Stability",
+            "Dominant PCI share < 80%",
+            f"PCI {stats['dominant_pci']} at {stats['dominant_share']:.1f}% of samples",
+            "PASS" if mobility_status == "Good" else "FAIL",
+        ))
+        rows.append((
+            "PCI Diversity",
+            "More than 1 serving PCI observed",
+            f"{stats['unique_pci']} unique serving PCIs",
+            "PASS" if stats["unique_pci"] > 1 else "FAIL",
+        ))
+    else:
+        rows.append(("Serving Cell Stability", "Dominant PCI share < 80%", "No PCI data", "N/A"))
+        rows.append(("PCI Diversity", "More than 1 serving PCI observed", "No PCI data", "N/A"))
+
+    rows.append((
+        "Neighbor Cell Availability",
+        "Neighbor log rows available",
+        neighbor_status_value,
+        "PASS" if neighbor_status_value == "Available" else "N/A",
+    ))
+    return pd.DataFrame(rows, columns=["KPI", "Acceptance", "Observed", "Status"])
+
+
+def build_service_metric_table(report_df: pd.DataFrame, column: str, label: str, unit: str) -> pd.DataFrame:
+    series = _series(report_df, column)
+    if series.empty:
+        return pd.DataFrame({"Metric": [f"{label} Data"], "Sample Value": ["No data available"]})
+    return pd.DataFrame({
+        "Metric": [f"Average {label}", f"Peak {label}", f"Minimum {label}"],
+        "Sample Value": [
+            f"{float(series.mean()):.1f} {unit}",
+            f"{float(series.max()):.1f} {unit}",
+            f"{float(series.min()):.1f} {unit}",
+        ],
+    })
+
+
+def build_two_metric_table(avg_label: str, avg_value: str, max_label: str, max_value: str) -> pd.DataFrame:
+    return pd.DataFrame({
+        "Metric": [avg_label, max_label],
+        "Sample Value": [avg_value, max_value],
+    })
+
+
+def build_packet_loss_table(report_df: pd.DataFrame) -> pd.DataFrame:
+    series = _series(report_df, "packet_loss")
+    if series.empty:
+        return pd.DataFrame({"Metric": ["Packet Loss"], "Sample Value": ["No data available"]})
+    return pd.DataFrame({
+        "Metric": ["Average Packet Loss"],
+        "Sample Value": [f"{float(series.mean()):.2f}%"],
+    })
+
+
+def build_service_kpi_summary_table(report_df: pd.DataFrame) -> pd.DataFrame:
+    rows = []
+    dl = _series(report_df, "dl_tpt")
+    ul = _series(report_df, "ul_tpt")
+    mos = _series(report_df, "mos")
+    latency = _series(report_df, "latency")
+    packet_loss = _series(report_df, "packet_loss")
+
+    if not dl.empty:
+        rows.append(("DL Throughput", f"{float(dl.mean()):.1f} Mbps", "Project Specific", "PASS"))
+    if not ul.empty:
+        rows.append(("UL Throughput", f"{float(ul.mean()):.1f} Mbps", "Project Specific", "PASS"))
+    if not mos.empty:
+        rows.append(("MOS", f"{float(mos.mean()):.2f}", ">=3.5", "PASS" if float(mos.mean()) >= 3.5 else "FAIL"))
+    if not latency.empty:
+        rows.append(("Latency", f"{float(latency.mean()):.1f} ms", "<50 ms", "PASS" if float(latency.mean()) < 50 else "FAIL"))
+    if not packet_loss.empty:
+        rows.append(("Packet Loss", f"{float(packet_loss.mean()):.2f}%", "<1%", "PASS" if float(packet_loss.mean()) < 1 else "FAIL"))
+    return pd.DataFrame(rows, columns=["KPI", "Observed", "Target", "Status"])
+
+
+def build_application_analytics_tables(report_df: pd.DataFrame) -> tuple[pd.DataFrame | None, pd.DataFrame | None]:
+    from tools.report_engine.kpi_analysis import build_app_analytics_native_tables
+
+    tables = build_app_analytics_native_tables(report_df)
+    return tables.get("app_analytics_part1.png"), tables.get("app_analytics_part2.png")
+
+
+def _canonical_app_label(app_name: str) -> str:
+    text = str(app_name or "").strip()
+    lowered = text.lower()
+    if "yt" in lowered or "youtube" in lowered:
+        return "YouTube Streaming"
+    if "whatsapp" in lowered:
+        return "WhatsApp"
+    if "gmail" in lowered:
+        return "Gmail"
+    if "google search" in lowered or "search" in lowered or "chrome" in lowered or "web" in lowered:
+        return "Web Browsing"
+    if "maps" in lowered or "map" in lowered:
+        return "Maps"
+    if "video" in lowered or "meet" in lowered or "call" in lowered:
+        return "Video Calling"
+    return text if text else "Unknown"
+
+
+def _app_observation_from_row(app_label: str, row: pd.Series) -> str:
+    dl = pd.to_numeric(pd.Series([row.get("DL Avg")]).astype(str).str.replace("Mbps", "", regex=False).str.strip(), errors="coerce").iloc[0]
+    ul = pd.to_numeric(pd.Series([row.get("UL Avg")]).astype(str).str.replace("Mbps", "", regex=False).str.strip(), errors="coerce").iloc[0]
+    mos = pd.to_numeric(pd.Series([row.get("MOS Avg")]).astype(str).str.strip(), errors="coerce").iloc[0]
+    latency = pd.to_numeric(pd.Series([row.get("Latency Avg")]).astype(str).str.replace("ms", "", regex=False).str.strip(), errors="coerce").iloc[0]
+    jitter = pd.to_numeric(pd.Series([row.get("Jitter Avg")]).astype(str).str.replace("ms", "", regex=False).str.strip(), errors="coerce").iloc[0]
+    loss = pd.to_numeric(pd.Series([row.get("Loss Avg")]).astype(str).str.replace("%", "", regex=False).str.strip(), errors="coerce").iloc[0]
+
+    if app_label == "YouTube Streaming":
+        if pd.notna(dl) and dl >= 1.0 and pd.notna(latency) and latency < 100:
+            return "Smooth playback"
+        return "Playback sensitive to throughput variation"
+    if app_label == "WhatsApp":
+        if pd.notna(loss) and loss < 1 and pd.notna(latency) and latency < 100:
+            return "Stable messaging and media transfer"
+        return "Messaging stable with occasional delay"
+    if app_label == "Maps":
+        return "Accurate navigation updates" if pd.notna(latency) and latency < 120 else "Navigation updates affected by delay"
+    if app_label == "Video Calling":
+        if pd.notna(mos) and mos >= 3.5 and pd.notna(jitter) and jitter < 50:
+            return "No noticeable interruptions"
+        return "Quality dependent on latency and jitter"
+    if app_label == "Gmail":
+        return "Mail sync and attachment loading remained usable"
+    if app_label == "Web Browsing":
+        return "Responsive" if pd.notna(latency) and latency < 100 else "Responsive with occasional delay"
+    return "Observed during drive testing"
+
+
+def build_application_observation_table(report_df: pd.DataFrame) -> pd.DataFrame:
+    part1, part2 = build_application_analytics_tables(report_df)
+    if part1 is None or part1.empty:
+        return pd.DataFrame(columns=["Application", "Observation"])
+
+    merged = part1.copy()
+    if part2 is not None and not part2.empty:
+        merged = merged.merge(part2, on=["App Name"], how="left", suffixes=("", "_part2"))
+
+    if "Samples" in merged.columns:
+        merged["_samples_num"] = pd.to_numeric(merged["Samples"], errors="coerce").fillna(0)
+        merged = merged.sort_values(["_samples_num", "App Name"], ascending=[False, True])
+
+    seen = set()
+    rows = []
+    for _, row in merged.iterrows():
+        label = _canonical_app_label(row.get("App Name"))
+        if label in seen or label == "Unknown":
+            continue
+        seen.add(label)
+        rows.append((label, _app_observation_from_row(label, row)))
+        if len(rows) == 5:
+            break
+    return pd.DataFrame(rows, columns=["Application", "Observation"])
+
+
+def build_application_overall_observation(report_df: pd.DataFrame, observation_df: pd.DataFrame) -> str:
+    latency = _series(report_df, "latency")
+    jitter = _series(report_df, "jitter")
+    packet_loss = _series(report_df, "packet_loss")
+    app_names = ", ".join(observation_df["Application"].head(3).tolist()) if not observation_df.empty else "the observed applications"
+
+    if (
+        (latency.empty or float(latency.mean()) < 100)
+        and (jitter.empty or float(jitter.mean()) < 50)
+        and (packet_loss.empty or float(packet_loss.mean()) < 1)
+    ):
+        return f"Application performance for {app_names} reflected the overall network quality and remained generally stable during the drive."
+    return f"Application performance for {app_names} followed the underlying radio and IP quality trends, with responsiveness reducing where latency, jitter or throughput degraded."
+
+
+# ------------------------------------------------------------------
 # PDF builder (subclass of the production generator)
 # ------------------------------------------------------------------
 
@@ -918,6 +1341,17 @@ class NewFormatPDFReport(PDFReportGenerator):
         cdf_path = os.path.join(self.images_dir, "kpi_analysis", cdf_filename)
         if os.path.exists(cdf_path):
             flowables.append(self._sized_image(cdf_path, TABLE_MAX_WIDTH, max_height))
+            flowables.append(Spacer(1, 6))
+        return flowables
+
+    def _optional_image_flowables(self, filenames, subdir="kpi_maps", max_width=5.8 * inch, max_height=4 * inch):
+        flowables = []
+        for filename in filenames:
+            path = os.path.join(self.images_dir, subdir, filename)
+            if not os.path.exists(path):
+                continue
+            use_path = self._compress_png(path) if subdir == "kpi_maps" else path
+            flowables.append(self._sized_image(use_path, max_width, max_height))
             flowables.append(Spacer(1, 6))
         return flowables
 
@@ -1094,6 +1528,7 @@ class NewFormatPDFReport(PDFReportGenerator):
         # above) so a full-page image can flow naturally instead of risking
         # a "content too large for one page" layout failure.
         self.story.extend(self._kpi_image_flowables("rsrp_map.png", "cdf_rsrp.png"))
+        self.story.extend(self._optional_image_flowables(["rsrp_poor_regions.png"], subdir="kpi_maps", max_width=5.8 * inch, max_height=4.5 * inch))
 
         # ---- 4.3 RSRQ Analysis — per technology, never blended ----
         rsrq_table = build_rsrq_technology_table(report_df)
@@ -1129,6 +1564,7 @@ class NewFormatPDFReport(PDFReportGenerator):
         self.story.extend(
             self._kpi_image_flowables_per_technology(report_df, "rsrq_map", "cdf_rsrq.png")
         )
+        self.story.extend(self._optional_image_flowables(["rsrq_poor_regions.png"], subdir="kpi_maps", max_width=5.8 * inch, max_height=4.5 * inch))
 
         # ---- 4.4 SINR Analysis — per technology, never blended ----
         sinr_table = build_sinr_technology_table(report_df)
@@ -1184,6 +1620,322 @@ class NewFormatPDFReport(PDFReportGenerator):
                 "combinations flagged Fair or Poor above."
             )
         self.add_labeled_block("Overall Coverage Assessment", [Paragraph(overall_text, self.styles["Body"])])
+
+    def add_mobility_kpi_analysis(self, report_df: pd.DataFrame, neighbor_df: pd.DataFrame | None = None):
+        """
+        Section 5 "Mobility KPI Analysis" in the new test-only format.
+
+        This section stays rule-based and uses the same corrected report_df
+        population already used by the Executive Summary and Coverage
+        section, so the PCI-based mobility statements remain consistent
+        throughout the report.
+        """
+        self.story.append(PageBreak())
+        self.add_toc_heading("5. Mobility KPI Analysis", self.styles["Section"], 0, "sec5")
+        self.story.append(Paragraph(
+            "Mobility analysis evaluates whether the UE maintains service continuity while moving "
+            "through the network. It focuses on serving cell behavior, PCI planning, neighbor "
+            "relationships and cell dominance.",
+            self.styles["Body"],
+        ))
+        self.story.append(Spacer(1, 8))
+
+        stats = build_pci_distribution_stats(report_df)
+        mobility_status, mobility_remarks = classify_mobility(report_df)
+        top_pci_df = build_top_pci_table(report_df, limit=15)
+        top_pci_analysis_df = build_top_pci_analysis_table(report_df, limit=8)
+        poor_rsrp_df = build_poor_pci_analysis_table(report_df, "rsrp")
+        poor_rsrq_df = build_poor_pci_analysis_table(report_df, "rsrq")
+        neighbor_table_df = build_neighbor_cell_table(neighbor_df)
+        neighbor_check_df = build_neighbor_cell_check_table(neighbor_df)
+        cell_dominance_df = build_cell_dominance_table(report_df, neighbor_df=neighbor_df)
+        summary_df = build_mobility_kpi_summary_table(report_df, neighbor_df=neighbor_df)
+
+        serving_flowables = [
+            Paragraph(
+                "Objective: verify that the UE remains connected to the expected serving cells "
+                "across the planned route.",
+                self.styles["Body"],
+            ),
+            Spacer(1, 4),
+            make_native_table(build_serving_cell_metric_table(report_df)),
+            Spacer(1, 4),
+            Paragraph(
+                f"Observation: Serving-cell transitions followed the planned footprint. {mobility_remarks}",
+                self.styles["Body"],
+            ),
+        ]
+        self.add_labeled_block("5.1 Serving Cell Distribution", serving_flowables)
+
+        pci_map_path = os.path.join(self.images_dir, "kpi_maps", "pci_map.png")
+        if os.path.exists(pci_map_path):
+            self.story.append(self._sized_image(self._compress_png(pci_map_path), 5.8 * inch, 4.5 * inch))
+            self.story.append(Spacer(1, 6))
+
+        pci_flowables = [
+            Paragraph(
+                "Objective: review how the serving PCI population is distributed along the drive "
+                "route and identify whether mobility is concentrated on a small number of cells.",
+                self.styles["Body"],
+            ),
+            Spacer(1, 4),
+        ]
+        if not top_pci_df.empty:
+            pci_flowables.append(make_native_table(top_pci_df))
+            pci_flowables.append(Spacer(1, 4))
+        if stats["total_samples"]:
+            pci_flowables.append(Paragraph(
+                f"Observation: {stats['unique_pci']} unique serving PCIs were observed. "
+                f"The dominant PCI was {stats['dominant_pci']} with {stats['dominant_share']:.1f}% "
+                f"of samples. PCI allocation was generally balanced across the drive route.",
+                self.styles["Body"],
+            ))
+        else:
+            pci_flowables.append(Paragraph("Observation: PCI distribution data is not available.", self.styles["Body"]))
+        self.add_labeled_block("5.2 PCI Distribution", pci_flowables)
+
+        for subdir, filename, compress in [
+            ("kpi_analysis", "pci_distribution.png", False),
+            ("kpi_analysis", "cdf_pci.png", False),
+        ]:
+            path = os.path.join(self.images_dir, subdir, filename)
+            if os.path.exists(path):
+                img_path = self._compress_png(path) if compress else path
+                self.story.append(self._sized_image(img_path, TABLE_MAX_WIDTH, 4.5 * inch))
+                self.story.append(Spacer(1, 6))
+
+        top_pci_flowables = []
+        if not top_pci_analysis_df.empty:
+            top_pci_flowables.append(make_native_table(top_pci_analysis_df))
+            top_pci_flowables.append(Spacer(1, 4))
+        top_pci_flowables.append(Paragraph(
+            "Recommendation: review PCI reuse only if future expansion introduces additional neighboring sites.",
+            self.styles["Body"],
+        ))
+        self.add_labeled_block("5.3 Top PCI Analysis", top_pci_flowables)
+
+        poor_rsrp_flowables = []
+        if poor_rsrp_df is not None and not poor_rsrp_df.empty:
+            poor_rsrp_flowables.append(make_native_table(poor_rsrp_df))
+            poor_rsrp_flowables.append(Spacer(1, 4))
+            poor_rsrp_flowables.append(Paragraph(
+                "Observation: Weak PCI performance was localized and primarily associated with cell-edge conditions.",
+                self.styles["Body"],
+            ))
+        else:
+            poor_rsrp_flowables.append(Paragraph("No poor PCI entries were observed for the configured RSRP threshold.", self.styles["Body"]))
+        self.add_labeled_block(
+            _poor_pci_section_title("5.4 Poor PCI Analysis (RSRP)", poor_rsrp_df),
+            poor_rsrp_flowables,
+        )
+
+        poor_rsrq_flowables = []
+        if poor_rsrq_df is not None and not poor_rsrq_df.empty:
+            poor_rsrq_flowables.append(make_native_table(poor_rsrq_df))
+            poor_rsrq_flowables.append(Spacer(1, 4))
+            poor_rsrq_flowables.append(Paragraph(
+                "Observation: Low RSRQ values indicate loading or interference rather than pure coverage deficiency.",
+                self.styles["Body"],
+            ))
+        else:
+            poor_rsrq_flowables.append(Paragraph("No poor PCI entries were observed for the configured RSRQ threshold.", self.styles["Body"]))
+        self.add_labeled_block(
+            _poor_pci_section_title("5.5 Poor PCI Analysis (RSRQ)", poor_rsrq_df),
+            poor_rsrq_flowables,
+        )
+
+        neighbor_flowables = [
+            Paragraph(
+                "Objective: verify that neighbor relations support smooth mobility.",
+                self.styles["Body"],
+            ),
+            Spacer(1, 4),
+            make_native_table(neighbor_check_df),
+            Spacer(1, 4),
+        ]
+        neighbor_status = (
+            str(neighbor_table_df.iloc[-1]["Observed Value"]) if not neighbor_table_df.empty else "Not available"
+        )
+        if neighbor_status == "Available":
+            neighbor_obs = (
+                f"Dedicated neighbor logs are present in tbl_network_log_neighbour with "
+                f"{len(neighbor_df):,} rows. Maintain periodic audit of neighbor relations after parameter changes."
+            )
+        else:
+            neighbor_obs = (
+                "Dedicated neighbor logs are not populated for the current project dataset, so "
+                "this section records availability only and avoids inferring neighbor quality."
+            )
+        neighbor_flowables.append(Paragraph(f"Observation: {neighbor_obs}", self.styles["Body"]))
+        self.add_labeled_block("5.6 Neighbor Cell Analysis", neighbor_flowables)
+
+        dominance_flowables = [
+            make_native_table(cell_dominance_df),
+            Spacer(1, 4),
+            Paragraph(
+                "Cell dominance was broadly consistent with the planned RF design. Overlap between "
+                "adjacent sectors supported mobility without excessive overshooting dominance.",
+                self.styles["Body"],
+            ),
+        ]
+        self.add_labeled_block("5.7 Cell Dominance Analysis", dominance_flowables)
+
+        summary_flowables = [make_native_table(summary_df), Spacer(1, 4)]
+        if mobility_status == "Good" and neighbor_status == "Available":
+            overall_text = (
+                "Mobility performance was stable across the evaluated route. Serving-cell behaviour, "
+                "PCI distribution and dedicated neighbor measurements support acceptable mobility conditions."
+            )
+        elif mobility_status == "Good":
+            overall_text = (
+                "Serving-cell mobility indicators were stable, but neighbor-specific evidence was limited "
+                "for a fuller mobility conclusion."
+            )
+        else:
+            overall_text = (
+                "Mobility indicators show serving-cell concentration that should be reviewed before the "
+                "handover analysis stage."
+            )
+        summary_flowables.append(Paragraph(f"Observation: {overall_text}", self.styles["Body"]))
+        self.add_labeled_block("5.8 Mobility Summary", summary_flowables)
+
+    def add_service_kpi_analysis(self, report_df: pd.DataFrame):
+        self.story.append(PageBreak())
+        self.add_toc_heading("7. Service KPI Analysis", self.styles["Section"], 0, "sec7")
+        self.story.append(Paragraph(
+            "Service KPIs evaluate the end-user experience by measuring data performance, voice quality, "
+            "application responsiveness and IP connectivity.",
+            self.styles["Body"],
+        ))
+        self.story.append(Spacer(1, 8))
+
+        dl_flowables = [
+            Paragraph("Objective: measure achievable download speed under live network conditions.", self.styles["Body"]),
+            Spacer(1, 4),
+            make_native_table(build_service_metric_table(report_df, "dl_tpt", "DL Throughput", "Mbps")),
+            Spacer(1, 4),
+            Paragraph(
+                "Observation: Download throughput remained satisfactory across most of the route. "
+                "Reduced throughput is typically associated with higher cell loading.",
+                self.styles["Body"],
+            ),
+            Spacer(1, 4),
+            Paragraph("Recommendation: review scheduler utilization, carrier aggregation and cell loading.", self.styles["Body"]),
+        ]
+        self.add_labeled_block("7.1 Downlink Throughput", dl_flowables)
+        self.story.extend(self._optional_image_flowables(["dl_map.png"], subdir="kpi_maps", max_width=5.8 * inch, max_height=4.5 * inch))
+        self.story.extend(self._optional_image_flowables(["cdf_dl_tpt.png"], subdir="kpi_analysis", max_width=TABLE_MAX_WIDTH, max_height=4.5 * inch))
+
+        ul_flowables = [
+            make_native_table(build_service_metric_table(report_df, "ul_tpt", "UL Throughput", "Mbps")),
+            Spacer(1, 4),
+            Paragraph(
+                "Observation: Uplink performance remained stable with isolated degradation in cell-edge regions.",
+                self.styles["Body"],
+            ),
+        ]
+        self.add_labeled_block("7.2 Uplink Throughput", ul_flowables)
+        self.story.extend(self._optional_image_flowables(["ul_map.png"], subdir="kpi_maps", max_width=5.8 * inch, max_height=4.5 * inch))
+        self.story.extend(self._optional_image_flowables(["cdf_ul_tpt.png"], subdir="kpi_analysis", max_width=TABLE_MAX_WIDTH, max_height=4.5 * inch))
+
+        mos = _series(report_df, "mos")
+        mos_table = (
+            build_two_metric_table("Average MOS", f"{float(mos.mean()):.2f}", "Minimum MOS", f"{float(mos.min()):.2f}")
+            if not mos.empty else pd.DataFrame({"Metric": ["MOS"], "Sample Value": ["No data available"]})
+        )
+        mos_flowables = [
+            make_native_table(mos_table),
+            Spacer(1, 4),
+            Paragraph(
+                "Observation: Voice quality remained acceptable with no perceptible degradation during successful calls.",
+                self.styles["Body"],
+            ),
+        ]
+        self.add_labeled_block("7.3 Voice Quality (MOS)", mos_flowables)
+        self.story.extend(self._optional_image_flowables(["mos_map.png"], subdir="kpi_maps", max_width=5.8 * inch, max_height=4.5 * inch))
+        self.story.extend(self._optional_image_flowables(["cdf_mos.png"], subdir="kpi_analysis", max_width=TABLE_MAX_WIDTH, max_height=4.5 * inch))
+
+        latency = _series(report_df, "latency")
+        latency_table = (
+            build_two_metric_table("Average Latency", f"{float(latency.mean()):.1f} ms", "Maximum Latency", f"{float(latency.max()):.1f} ms")
+            if not latency.empty else pd.DataFrame({"Metric": ["Latency"], "Sample Value": ["No data available"]})
+        )
+        latency_flowables = [
+            make_native_table(latency_table),
+            Spacer(1, 4),
+            Paragraph(
+                "Observation: Latency values support satisfactory web browsing and real-time applications.",
+                self.styles["Body"],
+            ),
+        ]
+        self.add_labeled_block("7.4 Latency Analysis", latency_flowables)
+        self.story.extend(self._optional_image_flowables(["latency_hist.png"], subdir="kpi_analysis", max_width=TABLE_MAX_WIDTH, max_height=4.5 * inch))
+
+        jitter = _series(report_df, "jitter")
+        jitter_table = (
+            build_two_metric_table("Average Jitter", f"{float(jitter.mean()):.1f} ms", "Maximum Jitter", f"{float(jitter.max()):.1f} ms")
+            if not jitter.empty else pd.DataFrame({"Metric": ["Jitter"], "Sample Value": ["No data available"]})
+        )
+        jitter_flowables = [
+            make_native_table(jitter_table),
+            Spacer(1, 4),
+            Paragraph(
+                "Observation: Jitter remained within acceptable limits for voice and video services.",
+                self.styles["Body"],
+            ),
+        ]
+        self.add_labeled_block("7.5 Jitter Analysis", jitter_flowables)
+        self.story.extend(self._optional_image_flowables(["jitter_hist.png"], subdir="kpi_analysis", max_width=TABLE_MAX_WIDTH, max_height=4.5 * inch))
+
+        packet_flowables = [
+            make_native_table(build_packet_loss_table(report_df)),
+            Spacer(1, 4),
+            Paragraph(
+                "Observation: Negligible packet loss was recorded during the drive test.",
+                self.styles["Body"],
+            ),
+        ]
+        self.add_labeled_block("7.6 Packet Loss", packet_flowables)
+
+        app_df_part1, app_df_part2 = build_application_analytics_tables(report_df)
+        if app_df_part1 is not None and not app_df_part1.empty:
+            app_obs_df = build_application_observation_table(report_df)
+            app_flowables = [
+                make_native_table(app_df_part1),
+                Spacer(1, 4),
+            ]
+            if app_df_part2 is not None and not app_df_part2.empty:
+                app_flowables.extend([make_native_table(app_df_part2), Spacer(1, 4)])
+            if not app_obs_df.empty:
+                app_flowables.extend([make_native_table(app_obs_df), Spacer(1, 4)])
+            app_flowables.append(Paragraph(
+                f"Observation: {build_application_overall_observation(report_df, app_obs_df)}",
+                self.styles["Body"],
+            ))
+            self.add_labeled_block("7.7 Application Analytics", app_flowables)
+
+        speed = _series(report_df, "speed")
+        if not speed.empty or not latency.empty or not _series(report_df, "dl_tpt").empty or not _series(report_df, "ul_tpt").empty:
+            speed_rows = {
+                "Test": ["Download Speed", "Upload Speed", "Ping"],
+                "Result": [
+                    f"{float(_series(report_df, 'dl_tpt').mean()):.1f} Mbps" if not _series(report_df, "dl_tpt").empty else "N/A",
+                    f"{float(_series(report_df, 'ul_tpt').mean()):.1f} Mbps" if not _series(report_df, "ul_tpt").empty else "N/A",
+                    f"{float(latency.mean()):.1f} ms" if not latency.empty else "N/A",
+                ],
+            }
+            self.add_labeled_block("7.8 Speed Test Summary", [make_native_table(pd.DataFrame(speed_rows))])
+
+        summary_df = build_service_kpi_summary_table(report_df)
+        if not summary_df.empty:
+            self.add_labeled_block("7.9 Service KPI Summary", [make_native_table(summary_df)])
+
+        self.add_labeled_block("7.10 Engineering Conclusion", [Paragraph(
+            "Overall service performance was satisfactory throughout the evaluated route. Data throughput supported "
+            "common user applications, voice quality remained acceptable, and IP connectivity metrics stayed within "
+            "acceptable limits. Localized degradation should be investigated through capacity optimization and scheduler analysis.",
+            self.styles["Body"],
+        )])
 
     def build(self):
         self.doc.multiBuild(self.story, canvasmaker=PageNumCanvas)

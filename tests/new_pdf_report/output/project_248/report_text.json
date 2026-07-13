@@ -1,11 +1,11 @@
 {
-  "Introduction": "This telecom drive test report provides an overview of the performance of wireless communication services in Mumbai, India. Drive testing is a critical process that assesses signal strength, coverage, and overall provider performance, enabling service providers to identify areas of strong and weak coverage. This report presents map visualizations highlighting the distribution of coverage areas, providing valuable insights into network performance. The findings presented in this report offer actionable recommendations for optimization and deployment planning, supporting informed decision-making to enhance the quality of wireless services.",
-  "Introduction_source": "llm",
+  "Introduction": "Data includes 23285 samples from 3 sessions.",
+  "Introduction_source": "synth (--no-llm)",
   "Area Summary": {
     "Overview": "Drive route covers key operational areas identified based on spatial distribution of samples and session density.",
     "Hotspots & Marked Locations": "Hanuman Nagar, Balasheth Mandurkar Marg, Rai Pada",
     "Crowded & High-Traffic Locations": "Rai Pada",
-    "Major Areas Covered": "The drive covered major areas including Hanuman Nagar (highway residential, 15811 samples), Balasheth Mandurkar Marg (highway residential, 835 samples), Rai Pada (highway residential, 633 samples), Kasturba Road (highway residential, 284 samples), Pandurang Budhkar Marg (highway secondary, 233 samples), Dadar West (highway primary, 171 samples)."
+    "Major Areas Covered": "The drive covered major areas including Hanuman Nagar (highway residential, 15811 samples), Balasheth Mandurkar Marg (highway residential, 835 samples), Rai Pada (highway residential, 612 samples), Kasturba Road (highway residential, 284 samples), Pandurang Budhkar Marg (highway secondary, 233 samples), Dadar West (highway primary, 171 samples)."
   },
   "Drive Summary (new format)": {
     "objective": "The objective of this drive test was to evaluate LTE radio coverage, radio quality, mobility performance and end-user service experience along the planned drive route. Measurements were collected using STracer and analysed against operator acceptance criteria.",
@@ -24,7 +24,7 @@
       [
         "Radio Quality - 4G (LTE Anchor - NSA)",
         "Fair",
-        "[13,574 samples] Average SINR 19.5 dB; Average RSRQ -7.3 dB."
+        "[13,553 samples] Average SINR 19.5 dB; Average RSRQ -7.3 dB."
       ],
       [
         "Radio Quality - 4G",
@@ -44,7 +44,7 @@
       [
         "Handover",
         "Good",
-        "891 band handover events; no major mobility interruption observed."
+        "685 band handover events; no major mobility interruption observed."
       ]
     ],
     "observations": [
@@ -62,7 +62,7 @@
       {
         "technology": "4G (LTE Anchor - NSA)",
         "status": "Fair",
-        "remarks": "[13,574 samples] Average SINR 19.5 dB; Average RSRQ -7.3 dB."
+        "remarks": "[13,553 samples] Average SINR 19.5 dB; Average RSRQ -7.3 dB."
       },
       {
         "technology": "4G",
@@ -84,34 +84,31 @@
   "Total distance (km)": 36.85,
   "Band Summary": [
     {
-      "band": "n77",
-      "sample_count": 13574,
-      "sample_percentage": 58.24
+      "band": "B1",
+      "sample_count": 13377,
+      "sample_percentage": 57.45
+    },
+    {
+      "band": "B3",
+      "sample_count": 4134,
+      "sample_percentage": 17.75
     },
     {
       "band": "n78",
       "sample_count": 3823,
-      "sample_percentage": 16.4
-    },
-    {
-      "band": "B1",
-      "sample_count": 3667,
-      "sample_percentage": 15.73
-    },
-    {
-      "band": "B3",
-      "sample_count": 1464,
-      "sample_percentage": 6.28
-    },
-    {
-      "band": "B41",
-      "sample_count": 441,
-      "sample_percentage": 1.89
+      "sample_percentage": 16.42
     },
     {
       "band": "B8",
-      "sample_count": 337,
-      "sample_percentage": 1.45
+      "sample_count": 1142,
+      "sample_percentage": 4.9
+    },
+    {
+      "band": "B41",
+      "sample_count": 809,
+      "sample_percentage": 3.47
     }
-  ]
+  ],
+  "Mobility KPI Remarks": "129 unique serving PCIs (top PCI 41% of samples).",
+  "Neighbor Rows (tbl_network_log_neighbour)": 4025
 }

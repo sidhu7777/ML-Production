@@ -47,6 +47,8 @@ import os
 import sys
 from pathlib import Path
 
+import pandas as pd
+
 # --- Bootstrap: make `tools.` / `utils.` importable and load ML/.env ---
 ML_ROOT = Path(__file__).resolve().parents[2]
 if str(ML_ROOT) not in sys.path:
@@ -69,6 +71,10 @@ def _output_dir(project_id: int) -> Path:
     (out / "images" / "kpi_analysis").mkdir(parents=True, exist_ok=True)
     (out / "html").mkdir(parents=True, exist_ok=True)
     return out
+
+
+def _asset_exists(path: Path) -> bool:
+    return path.exists() and path.stat().st_size > 0
 
 
 def _load_report_data(project_id: int):
@@ -124,6 +130,45 @@ def _load_report_data(project_id: int):
     return raw_df, report_df, handover_df, project_meta
 
 
+def _load_neighbor_data(project_meta: dict):
+    """
+    Load dedicated neighbor logs from tbl_network_log_neighbour for the
+    project's sessions, then apply the same project polygon filter used by
+    the report pipeline. This stays test-only: production report_engine is
+    not modified.
+    """
+    from sqlalchemy import text, bindparam
+    from tools.report_engine.db import get_engine
+    from tools.report_engine.load_data_db import polygon_filter_all_cells
+
+    session_ids = [
+        int(s.strip())
+        for s in str(project_meta.get("ref_session_id", "")).split(",")
+        if s.strip().isdigit()
+    ]
+    if not session_ids:
+        return pd.DataFrame()
+
+    engine = get_engine()
+    query = text("""
+        SELECT *
+        FROM tbl_network_log_neighbour
+        WHERE session_id IN :session_ids
+    """).bindparams(bindparam("session_ids", expanding=True))
+    with engine.connect() as conn:
+        neighbor_raw_df = pd.read_sql(query, conn, params={"session_ids": session_ids})
+
+    neighbor_df = polygon_filter_all_cells(neighbor_raw_df, project_meta.get("region"))
+    print(f"[neighbor] dedicated neighbor rows (raw)            : {len(neighbor_raw_df)}")
+    print(f"[neighbor] dedicated neighbor rows (polygon)        : {len(neighbor_df)}")
+    if not neighbor_df.empty and "network" in neighbor_df.columns:
+        print(
+            f"[neighbor] technologies                            : "
+            f"{neighbor_df['network'].fillna('').astype(str).str.strip().value_counts().to_dict()}"
+        )
+    return neighbor_df
+
+
 def _render_base_route_map(report_df, polygon_wkt, out_dir: Path) -> bool:
     """Base route map exactly like production main.py (folium + Playwright)."""
     from tools.report_engine.map_generator import generate_base_route_map
@@ -131,6 +176,9 @@ def _render_base_route_map(report_df, polygon_wkt, out_dir: Path) -> bool:
 
     html_path = out_dir / "html" / "base_route.html"
     png_path = out_dir / "images" / "kpi_maps" / "base_route_map.png"
+    if _asset_exists(png_path):
+        print(f"[map] reused existing base route map: {png_path.name}")
+        return True
     try:
         generate_base_route_map(report_df, polygon_wkt, str(html_path))
         html_to_png(
@@ -180,17 +228,21 @@ def _render_coverage_kpi_images(report_df, polygon_wkt, out_dir: Path, user_id=N
     # ---- Band categorical map + pie chart (kpi_analysis.generate_band_summary
     # writes band_pie.png as a side effect into kpi_analysis.IMAGE_DIR,
     # which run_report() already points at this project's images folder) ----
-    try:
-        kpi_analysis.generate_band_summary(report_df)
-        html_path = html_dir / "band.html"
-        png_path = maps_dir / "band_map.png"
-        generate_categorical_kpi_map(
-            df=report_df, kpi_column="band", output_html=str(html_path), polygon_wkt=polygon_wkt,
-        )
-        html_to_png(str(html_path), str(png_path), width=1200, height=900, device_scale_factor=1)
-        print("[map] generated band_map.png + band_pie.png")
-    except Exception as exc:
-        print(f"[map] WARNING: failed to generate band map/pie: {exc}")
+    band_png = maps_dir / "band_map.png"
+    band_pie = out_dir / "images" / "kpi_analysis" / "band_pie.png"
+    if _asset_exists(band_png) and _asset_exists(band_pie):
+        print("[map] reused existing band_map.png + band_pie.png")
+    else:
+        try:
+            kpi_analysis.generate_band_summary(report_df)
+            html_path = html_dir / "band.html"
+            generate_categorical_kpi_map(
+                df=report_df, kpi_column="band", output_html=str(html_path), polygon_wkt=polygon_wkt,
+            )
+            html_to_png(str(html_path), str(band_png), width=1200, height=900, device_scale_factor=1)
+            print("[map] generated band_map.png + band_pie.png")
+        except Exception as exc:
+            print(f"[map] WARNING: failed to generate band map/pie: {exc}")
 
     # ---- RSRP map (single, blended across technologies) ----
     if "rsrp" in report_df.columns:
@@ -198,18 +250,40 @@ def _render_coverage_kpi_images(report_df, polygon_wkt, out_dir: Path, user_id=N
         if df_kpi.empty or not has_valid_numeric_data(report_df, "rsrp"):
             print("[map] skipped RSRP map: no valid data")
         else:
+            png_path = maps_dir / "rsrp_map.png"
+            if _asset_exists(png_path):
+                print("[map] reused existing rsrp_map.png")
+            else:
+                try:
+                    ranges = resolve_kpi_ranges(kpi_name="RSRP", user_id=user_id, values=report_df["rsrp"])
+                    html_path = html_dir / "rsrp.html"
+                    generate_kpi_map(
+                        df=df_kpi, kpi_column="rsrp", color_func=rsrp_colour_manual,
+                        ranges=ranges, output_html=str(html_path), polygon_wkt=polygon_wkt,
+                    )
+                    html_to_png(str(html_path), str(png_path), width=1200, height=900, device_scale_factor=1)
+                    print("[map] generated rsrp_map.png")
+                except Exception as exc:
+                    print(f"[map] WARNING: failed to generate RSRP map: {exc}")
             try:
-                ranges = resolve_kpi_ranges(kpi_name="RSRP", user_id=user_id, values=report_df["rsrp"])
-                html_path = html_dir / "rsrp.html"
-                png_path = maps_dir / "rsrp_map.png"
-                generate_kpi_map(
-                    df=df_kpi, kpi_column="rsrp", color_func=rsrp_colour_manual,
-                    ranges=ranges, output_html=str(html_path), polygon_wkt=polygon_wkt,
-                )
-                html_to_png(str(html_path), str(png_path), width=1200, height=900, device_scale_factor=1)
-                print("[map] generated rsrp_map.png")
+                poor_rsrp_png = maps_dir / "rsrp_poor_regions.png"
+                poor_rsrq_png = maps_dir / "rsrq_poor_regions.png"
+                if _asset_exists(poor_rsrp_png) and _asset_exists(poor_rsrq_png):
+                    print("[map] reused existing poor-region maps")
+                else:
+                    from tools.report_engine.map_generator import generate_poor_region_maps
+                    generate_poor_region_maps(
+                        report_df,
+                        output_dir=str(maps_dir),
+                        tmp_dir=str(html_dir),
+                        polygon_wkt=polygon_wkt,
+                        render_width=1200,
+                        render_height=900,
+                        device_scale_factor=1,
+                    )
+                    print("[map] generated rsrp_poor_regions.png + rsrq_poor_regions.png")
             except Exception as exc:
-                print(f"[map] WARNING: failed to generate RSRP map: {exc}")
+                print(f"[map] WARNING: failed to generate poor-region maps: {exc}")
 
     # ---- RSRQ / SINR maps — one per technology, never blended (their
     # KPI tables are already per-technology; see module docstring above) ----
@@ -241,6 +315,9 @@ def _render_coverage_kpi_images(report_df, polygon_wkt, out_dir: Path, user_id=N
                 slug = _tech_slug(tech) if tech else "all"
                 html_path = html_dir / f"{kpi_name.lower()}_{slug}.html"
                 png_path = maps_dir / f"{map_prefix}_{slug}.png"
+                if _asset_exists(png_path):
+                    print(f"[map] reused existing {png_path.name} ({tech_label})")
+                    continue
                 generate_kpi_map(
                     df=df_kpi, kpi_column=col, color_func=color_func,
                     ranges=ranges, output_html=str(html_path), polygon_wkt=polygon_wkt,
@@ -252,17 +329,143 @@ def _render_coverage_kpi_images(report_df, polygon_wkt, out_dir: Path, user_id=N
 
     # ---- RSRP / RSRQ / SINR CDF charts (also generates DL/UL/MOS/PCI CDFs
     # for later steps, matching production's single-call behaviour) ----
+    cdf_dir = out_dir / "images" / "kpi_analysis"
+    cdf_required = [
+        cdf_dir / "cdf_rsrp.png",
+        cdf_dir / "cdf_rsrq.png",
+        cdf_dir / "cdf_sinr.png",
+        cdf_dir / "cdf_dl_tpt.png",
+        cdf_dir / "cdf_ul_tpt.png",
+        cdf_dir / "cdf_mos.png",
+        cdf_dir / "cdf_pci.png",
+    ]
+    if all(_asset_exists(p) for p in cdf_required):
+        print("[map] reused existing CDF plots")
+    else:
+        try:
+            from tools.report_engine.cdf_kpi import generate_all_cdf_plots_from_df
+            generate_all_cdf_plots_from_df(report_df, output_dir=str(cdf_dir))
+        except Exception as exc:
+            print(f"[map] WARNING: failed to generate CDF plots: {exc}")
+
+
+def _render_mobility_kpi_images(report_df, polygon_wkt, out_dir: Path) -> None:
+    """
+    Section 5 (Mobility KPI Analysis) visuals - PCI categorical map and
+    PCI distribution artifacts generated using production's own helpers.
+    """
+    from tools.report_engine import kpi_analysis
+    from tools.report_engine.map_generator import (
+        generate_categorical_kpi_map, has_valid_categorical_data,
+    )
+    from tools.report_engine.playwright_utils import html_to_png
+
+    html_dir = out_dir / "html"
+    maps_dir = out_dir / "images" / "kpi_maps"
+
+    pci_dist = out_dir / "images" / "kpi_analysis" / "pci_distribution.png"
+    pci_table = out_dir / "images" / "kpi_analysis" / "pci_table.png"
+    if _asset_exists(pci_dist) and _asset_exists(pci_table):
+        print("[map] reused existing pci_distribution.png + pci_table.png")
+    else:
+        try:
+            kpi_analysis.generate_pci_distribution(report_df)
+            print("[map] generated pci_distribution.png + pci_table.png")
+        except Exception as exc:
+            print(f"[map] WARNING: failed to generate PCI distribution artifacts: {exc}")
+
     try:
-        from tools.report_engine.cdf_kpi import generate_all_cdf_plots_from_df
-        generate_all_cdf_plots_from_df(report_df, output_dir=str(out_dir / "images" / "kpi_analysis"))
+        if "pci" not in report_df.columns or not has_valid_categorical_data(report_df, "pci"):
+            print("[map] skipped PCI map: no valid categorical PCI data")
+            return
+        html_path = html_dir / "pci.html"
+        png_path = maps_dir / "pci_map.png"
+        if _asset_exists(png_path):
+            print("[map] reused existing pci_map.png")
+            return
+        generate_categorical_kpi_map(
+            df=report_df, kpi_column="pci", output_html=str(html_path), polygon_wkt=polygon_wkt,
+        )
+        html_to_png(str(html_path), str(png_path), width=1200, height=900, device_scale_factor=1)
+        print("[map] generated pci_map.png")
     except Exception as exc:
-        print(f"[map] WARNING: failed to generate CDF plots: {exc}")
+        print(f"[map] WARNING: failed to generate PCI map: {exc}")
+
+
+def _render_service_kpi_images(report_df, polygon_wkt, out_dir: Path, user_id=None) -> None:
+    """
+    Section 7 visuals - reuse existing assets where possible and only
+    generate missing service maps/charts/tables.
+    """
+    from tools.report_engine.threshold_resolver import resolve_kpi_ranges
+    from tools.report_engine.map_generator import generate_kpi_map, has_valid_numeric_data
+    from tools.report_engine.playwright_utils import html_to_png
+    from tools.report_engine.kpi_config import dl_colour_manual, ul_colour_manual, mos_colour_manual
+    from tools.report_engine import kpi_analysis
+
+    html_dir = out_dir / "html"
+    maps_dir = out_dir / "images" / "kpi_maps"
+    analysis_dir = out_dir / "images" / "kpi_analysis"
+
+    service_specs = [
+        ("DL", "dl_tpt", dl_colour_manual, "dl_map.png"),
+        ("UL", "ul_tpt", ul_colour_manual, "ul_map.png"),
+        ("MOS", "mos", mos_colour_manual, "mos_map.png"),
+    ]
+
+    for kpi_name, col, color_func, map_name in service_specs:
+        if col not in report_df.columns:
+            continue
+        png_path = maps_dir / map_name
+        if _asset_exists(png_path):
+            print(f"[map] reused existing {map_name}")
+            continue
+        df_kpi = report_df[report_df[col].notna() & report_df["lat"].notna() & report_df["lon"].notna()]
+        if df_kpi.empty or not has_valid_numeric_data(report_df, col):
+            print(f"[map] skipped {map_name}: no valid data")
+            continue
+        try:
+            ranges = resolve_kpi_ranges(kpi_name=kpi_name, user_id=user_id, values=report_df[col])
+            html_path = html_dir / f"{col}.html"
+            generate_kpi_map(
+                df=df_kpi, kpi_column=col, color_func=color_func,
+                ranges=ranges, output_html=str(html_path), polygon_wkt=polygon_wkt,
+            )
+            html_to_png(str(html_path), str(png_path), width=1200, height=900, device_scale_factor=1)
+            print(f"[map] generated {map_name}")
+        except Exception as exc:
+            print(f"[map] WARNING: failed to generate {map_name}: {exc}")
+
+    if not _asset_exists(analysis_dir / "network_quality_summary.png"):
+        try:
+            kpi_analysis.generate_network_quality_summary(report_df)
+            print("[map] generated network_quality_summary.png")
+        except Exception as exc:
+            print(f"[map] WARNING: failed to generate network_quality_summary.png: {exc}")
+    else:
+        print("[map] reused existing network_quality_summary.png")
+
+    qos_jobs = [
+        ("latency", "Latency", "latency", "latency_hist.png"),
+        ("jitter", "Jitter", "jitter", "jitter_hist.png"),
+        ("speed", "Speed", "speed", "speed_hist.png"),
+    ]
+    for col, title, prefix, hist_name in qos_jobs:
+        if _asset_exists(analysis_dir / hist_name):
+            print(f"[map] reused existing {hist_name}")
+            continue
+        try:
+            kpi_analysis.generate_qos_metrics(report_df, col, title, prefix)
+            print(f"[map] generated {hist_name}")
+        except Exception as exc:
+            print(f"[map] WARNING: failed to generate {hist_name}: {exc}")
 
 
 def run_report(project_id: int = DEFAULT_PROJECT_ID, use_llm: bool = True) -> Path:
     """
     Generate the new-format report with everything implemented so far
-    (pages 1-4: cover, TOC, Introduction, Area Summary, new Drive Summary).
+    (cover, TOC, Introduction, Area Summary, Drive Summary, Coverage KPI
+    Analysis, Mobility KPI Analysis, Service KPI Analysis).
     """
     from tools.report_engine import kpi_analysis
     from tools.report_engine.kpi_analysis import generate_drive_summary_images
@@ -281,6 +484,7 @@ def run_report(project_id: int = DEFAULT_PROJECT_ID, use_llm: bool = True) -> Pa
     # ---------- 1. DATA (production loaders / filters) ----------
     _, report_df, handover_df, project_meta = _load_report_data(project_id)
     assert not report_df.empty, f"Project {project_id} produced no report rows"
+    neighbor_df = _load_neighbor_data(project_meta)
 
     # ---------- 2. DRIVE SUMMARY METADATA (production) ----------
     kpi_analysis.IMAGE_DIR = str(out_dir / "images" / "kpi_analysis")
@@ -326,6 +530,14 @@ def run_report(project_id: int = DEFAULT_PROJECT_ID, use_llm: bool = True) -> Pa
     # ---------- 4b. COVERAGE KPI IMAGES (Section 4: Band/RSRP/RSRQ/SINR
     #             maps + CDF charts, production's own map/CDF generators) ----------
     _render_coverage_kpi_images(report_df, project_meta.get("region"), out_dir)
+
+    # ---------- 4c. MOBILITY KPI IMAGES (Section 5: PCI map +
+    #             PCI distribution chart/table, production helpers) ----------
+    _render_mobility_kpi_images(report_df, project_meta.get("region"), out_dir)
+
+    # ---------- 4d. SERVICE KPI IMAGES (Section 7: DL/UL/MOS maps +
+    #             QoS charts/tables, reusing existing artifacts when present) ----------
+    _render_service_kpi_images(report_df, project_meta.get("region"), out_dir)
 
     # ---------- 5. INTRODUCTION (LLM, minimal prompt; synth fallback) ----------
     if use_llm:
@@ -373,6 +585,11 @@ def run_report(project_id: int = DEFAULT_PROJECT_ID, use_llm: bool = True) -> Pa
                 "Session distances (km, Haversine consecutive-points)": distances_km,
                 "Total distance (km)": total_distance_km,
                 "Band Summary": band_summary,
+                "Mobility KPI Remarks": next(
+                    (remarks for label, _status, remarks in exec_summary["kpi_rows"] if label == "Mobility"),
+                    "",
+                ),
+                "Neighbor Rows (tbl_network_log_neighbour)": int(len(neighbor_df)),
             },
             indent=2, default=str, ensure_ascii=False,
         ),
@@ -392,6 +609,8 @@ def run_report(project_id: int = DEFAULT_PROJECT_ID, use_llm: bool = True) -> Pa
     report.add_area_summary(area_summary)
     report.add_drive_summary_v2(drive_summary, exec_summary, distances_km=distances_km)
     report.add_coverage_kpi_analysis(report_df, exec_summary, band_summary)
+    report.add_mobility_kpi_analysis(report_df, neighbor_df=neighbor_df)
+    report.add_service_kpi_analysis(report_df)
     report.build()
 
     size_kb = pdf_path.stat().st_size / 1024
@@ -407,7 +626,7 @@ def run_report(project_id: int = DEFAULT_PROJECT_ID, use_llm: bool = True) -> Pa
 @pytest.mark.skipif(
     not os.getenv("DATABASE_URL"), reason="DATABASE_URL not configured"
 )
-def test_new_format_report_pages_1_to_4():
+def test_new_format_report_pages_1_to_5():
     run_report(DEFAULT_PROJECT_ID)
 
 
