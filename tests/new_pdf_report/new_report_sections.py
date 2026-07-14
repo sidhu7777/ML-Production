@@ -65,6 +65,7 @@ output PDF is regenerated/replaced on every run):
   Step 6:           Full assembly + compare against report_VI.pdf.
 """
 
+import colorsys
 import json
 import os
 import re
@@ -210,6 +211,293 @@ def generate_poor_region_map_fixed(
                 os.remove(tmp_html)
         except Exception:
             pass
+
+
+# ------------------------------------------------------------------
+# Handover map — corrected replacement for production's
+# map_generator.generate_handover_map() (test-case only; that file is NOT
+# modified).
+#
+# CONFIRMED GAP #1 (not a crash, a missing-legend readability issue): the
+# map draws TWO independent layers -- a per-session route trace underneath
+# (each session gets its own color from generate_distinct_colors) and the
+# band-handover-event markers on top (always blue, #3b82f6). Production's
+# own add_legend() call only lists the blue event count ("Band Handover
+# Events" / "Band : N") -- the per-session route colors are never
+# explained anywhere on the map (production's own comment even says
+# "Legend removed per user request"). Wherever a stretch of route has no
+# handover event covering it, the underlying session-colored dots show
+# through unexplained, which reads as stray/confusing colors (per
+# direction received: a reviewer asked what the extra colors meant).
+#
+# CONFIRMED GAP #2 (found after fixing #1 and rendering project 248):
+# production's generate_distinct_colors(n) spaces hues evenly around the
+# FULL color wheel (hue = i/n) with no awareness that the event markers on
+# the SAME map are a fixed blue (#3b82f6). For n=3 sessions that puts hue
+# 2/3 on session index 2 almost exactly on that same blue -- "Session 4742
+# route" rendered visually indistinguishable from the "Band" event dots in
+# project 248's map. generate_session_colors() below fixes this by (a)
+# excluding a hue band around the reserved event color so a session route
+# can never land on it, (b) spacing hues with the golden angle (137.508
+# degrees) instead of n equal slices, which stays well-separated as N
+# grows instead of clustering, and (c) cycling saturation/value through a
+# light/medium/dark band every 3rd color, so even sessions whose hues
+# happen to be close together are still distinguishable by shade -- this
+# scales to any session count (7, 15, ...), not just today's 3.
+#
+# Legend size: an unbounded one-row-per-session legend would run off the
+# map for a project with many sessions. Capped to
+# MAX_SESSION_LEGEND_ROWS individual rows (5); above that, the remaining
+# sessions are folded into one "+N more sessions" row carrying their
+# combined point count (so no session's data silently disappears from the
+# legend, it's just grouped) and the legend title notes e.g. "(5 of 15
+# sessions shown)". Every session still gets its own distinct color ON THE
+# MAP regardless of this cap -- only the legend TEXT is condensed.
+#
+# Fixed here by duplicating production's own route/event drawing logic
+# verbatim and only changing the color source (generate_session_colors
+# instead of generate_distinct_colors) and the final add_legend() call --
+# every other step (new_report_map, add_fullscreen_css, draw_polygon_overlay,
+# add_legend, fit_data_bounds) reuses production's own unmodified helpers.
+# ------------------------------------------------------------------
+
+_HANDOVER_EVENT_COLOR = "#3b82f6"  # must match event_colors["band"] below
+MAX_SESSION_LEGEND_ROWS = 5
+
+
+def _hex_to_hue_degrees(hex_color: str) -> float:
+    r = int(hex_color[1:3], 16) / 255
+    g = int(hex_color[3:5], 16) / 255
+    b = int(hex_color[5:7], 16) / 255
+    hue, _sat, _val = colorsys.rgb_to_hsv(r, g, b)
+    return hue * 360.0
+
+
+def generate_session_colors(n: int) -> list[str]:
+    """
+    `n` visually distinct per-session route colors -- dynamically
+    generated for ANY session count, and guaranteed to never collide with
+    the fixed "Band" handover-event marker color (see module comment
+    above for the confirmed collision this replaces). Hues are placed
+    using the golden angle so they stay spread out as `n` grows, and
+    saturation/value cycle through light/medium/dark bands so colors
+    remain distinguishable even once hues start repeating for large `n`.
+    """
+    if n <= 0:
+        return []
+    reserved_hue = _hex_to_hue_degrees(_HANDOVER_EVENT_COLOR)
+    hue_exclusion_deg = 20.0
+    golden_angle_deg = 137.508
+
+    colors: list[str] = []
+    hue = 0.0
+    guard = 0
+    while len(colors) < n and guard < n * 6 + 20:
+        guard += 1
+        candidate_hue = hue % 360.0
+        hue += golden_angle_deg
+        gap = abs(candidate_hue - reserved_hue)
+        gap = min(gap, 360.0 - gap)
+        if gap < hue_exclusion_deg:
+            continue
+        band = len(colors) % 3
+        saturation = (0.85, 0.70, 0.60)[band]
+        value = (0.55, 0.80, 0.95)[band]  # dark / medium / light, cycling
+        r, g, b = colorsys.hsv_to_rgb(candidate_hue / 360.0, saturation, value)
+        colors.append("#{:02x}{:02x}{:02x}".format(int(r * 255), int(g * 255), int(b * 255)))
+    return colors
+
+
+def generate_handover_map_with_session_legend(
+    filtered_df: pd.DataFrame,
+    events: list[dict],
+    output_html: str,
+    polygon_wkt: str | None = None,
+) -> None:
+    import folium
+    from tools.report_engine.map_generator import (
+        new_report_map, add_fullscreen_css, draw_polygon_overlay,
+        add_legend, fit_data_bounds, _safe_sort_value,
+    )
+
+    df = filtered_df.dropna(subset=["lat", "lon"]).copy() if filtered_df is not None else pd.DataFrame()
+    if not df.empty:
+        df["lat"] = pd.to_numeric(df["lat"], errors="coerce")
+        df["lon"] = pd.to_numeric(df["lon"], errors="coerce")
+        df = df.dropna(subset=["lat", "lon"])
+        df = df[df["lat"].between(-90, 90) & df["lon"].between(-180, 180)].copy()
+    if df.empty:
+        raise ValueError("No GPS data to plot for handover map")
+
+    events = [
+        ev for ev in (events or [])
+        if str(ev.get("type") or "").lower() == "band"
+        and pd.notna(ev.get("lat")) and pd.notna(ev.get("lon"))
+    ]
+    clean_events = []
+    for ev in events:
+        try:
+            lat = float(ev.get("lat"))
+            lon = float(ev.get("lon"))
+        except (TypeError, ValueError):
+            continue
+        if not (-90 <= lat <= 90 and -180 <= lon <= 180):
+            continue
+        clean_events.append({**ev, "lat": lat, "lon": lon})
+    events = clean_events
+
+    m = new_report_map()
+    add_fullscreen_css(m)
+    draw_polygon_overlay(m, polygon_wkt)
+
+    # Draw dense route points only (no polylines), one layer per session so
+    # each can carry its own color -- identical to production, except we
+    # also remember (label, color, count) per session for the legend below.
+    route_layers = []
+    session_legend_items = []
+    if "session_id" in df.columns:
+        df["__session_sort"] = df["session_id"].apply(_safe_sort_value)
+        sessions = sorted(df["__session_sort"].dropna().unique())
+        if "timestamp" in df.columns:
+            df["__timestamp_sort"] = df["timestamp"].apply(_safe_sort_value)
+            df_route = df.sort_values(["__session_sort", "__timestamp_sort"]).copy()
+        else:
+            df_route = df.sort_values(["__session_sort"]).copy()
+
+        colors = generate_session_colors(len(sessions)) if sessions else ["#2b8cbe"]
+
+        for i, sid in enumerate(sessions):
+            seg = df_route[df_route["__session_sort"] == sid]
+            if seg.empty:
+                continue
+            color = colors[i % len(colors)]
+            route_layers.append({
+                "color": color,
+                "points": [[float(r["lat"]), float(r["lon"])] for _, r in seg.iterrows()],
+            })
+            session_legend_items.append((f"Session {sid} route", color, len(seg)))
+    else:
+        # Fallback: single route backbone, no per-session legend to add.
+        if "timestamp" in df.columns:
+            df["__timestamp_sort"] = df["timestamp"].apply(_safe_sort_value)
+            df_route = df.sort_values(["__timestamp_sort"])
+        else:
+            df_route = df
+        route_layers.append({
+            "color": "#2b8cbe",
+            "points": [[float(r["lat"]), float(r["lon"])] for _, r in df_route.iterrows()],
+        })
+
+    MAX_HANDOVER_ROUTE_DOTS = 8000
+    route_point_count = sum(len(layer["points"]) for layer in route_layers)
+    route_step = max(1, route_point_count // MAX_HANDOVER_ROUTE_DOTS)
+    for layer in route_layers:
+        if route_step > 1:
+            layer["points"] = layer["points"][::route_step]
+
+    event_colors = {"band": "#3b82f6"}
+    event_points = []
+    for ev in events:
+        event_type = str(ev.get("type") or "handover").lower()
+        if ev.get("from_value") is not None and ev.get("to_value") is not None:
+            tooltip = (
+                f"{event_type.title()}: {ev.get('from_value')} -> {ev.get('to_value')} "
+                f"(Session {ev.get('session_id')})"
+            )
+        else:
+            tooltip = f"{ev.get('from_provider')} -> {ev.get('to_provider')} (Session {ev.get('session_id')})"
+        event_points.append({
+            "lat": ev["lat"],
+            "lon": ev["lon"],
+            "color": event_colors.get(event_type, "#ff9933"),
+            "tooltip": tooltip,
+        })
+
+    payload = json.dumps({"routes": route_layers, "events": event_points})
+    map_name = m.get_name()
+    render_js = f"""
+    <script>
+        (function() {{
+            var payload = {payload};
+            function drawHandoverLayers() {{
+                var map = window["{map_name}"];
+                if (!map || !window.L) {{
+                    window.setTimeout(drawHandoverLayers, 50);
+                    return;
+                }}
+                var canvasRenderer = L.canvas();
+                var routeOptions = {{
+                    radius: 4,
+                    stroke: true,
+                    weight: 2,
+                    opacity: 0.9,
+                    fill: true,
+                    fillOpacity: 0.92,
+                    renderer: canvasRenderer
+                }};
+                payload.routes.forEach(function(layer) {{
+                    layer.points.forEach(function(point) {{
+                        L.circleMarker(point, Object.assign({{}}, routeOptions, {{
+                            color: layer.color,
+                            fillColor: layer.color
+                        }})).addTo(map);
+                    }});
+                }});
+                payload.events.forEach(function(ev) {{
+                    var marker = L.circleMarker([ev.lat, ev.lon], {{
+                        radius: 6,
+                        color: "#1f2937",
+                        weight: 1,
+                        opacity: 0.95,
+                        fill: true,
+                        fillColor: ev.color,
+                        fillOpacity: 0.95,
+                        renderer: canvasRenderer
+                    }}).addTo(map);
+                    if (ev.tooltip) {{
+                        marker.bindTooltip(ev.tooltip);
+                    }}
+                }});
+            }}
+            drawHandoverLayers();
+        }})();
+    </script>
+    """
+    m.get_root().html.add_child(folium.Element(render_js))
+
+    legend_items = []
+    if events:
+        counts = {}
+        for ev in events:
+            event_type = str(ev.get("type") or "handover").lower()
+            counts[event_type] = counts.get(event_type, 0) + 1
+        legend_items.extend(
+            (event_type.title(), event_colors.get(event_type, "#ff9933"), count)
+            for event_type, count in counts.items()
+        )
+    # The addition vs. production: explain the per-session route colors too,
+    # not just the blue event markers. Every session still gets its own
+    # distinct color ON THE MAP regardless of the cap below -- only the
+    # legend TEXT is condensed once there are more sessions than
+    # MAX_SESSION_LEGEND_ROWS, so a busy multi-session project doesn't run
+    # the legend off the map.
+    legend_title = "Band Handover Events"
+    if len(session_legend_items) > MAX_SESSION_LEGEND_ROWS:
+        shown = session_legend_items[:MAX_SESSION_LEGEND_ROWS]
+        hidden = session_legend_items[MAX_SESSION_LEGEND_ROWS:]
+        hidden_points = sum(count for _, _, count in hidden)
+        shown = shown + [(f"+{len(hidden)} more sessions", "#9ca3af", hidden_points)]
+        legend_items.extend(shown)
+        legend_title = (
+            f"Band Handover Events ({MAX_SESSION_LEGEND_ROWS} of {len(session_legend_items)} sessions shown)"
+        )
+    else:
+        legend_items.extend(session_legend_items)
+    if legend_items:
+        add_legend(m, legend_title, legend_items)
+
+    fit_data_bounds(m, df, reserve_legend_space=bool(legend_items))
+    m.save(output_html)
 
 
 # ------------------------------------------------------------------
@@ -867,20 +1155,16 @@ def _summarize_transition_pairs(events: list[dict], limit: int = 5) -> list[tupl
 
 
 def build_band_handover_summary_table(band_events: list[dict]) -> pd.DataFrame:
-    sessions = {e.get("session_id") for e in band_events if e.get("session_id") is not None}
     rows = [
         ("Total Band Handover Events", f"{len(band_events):,}"),
-        ("Sessions with Band Handovers", f"{len(sessions):,}"),
     ]
     return pd.DataFrame(rows, columns=["Metric", "Observed Value"])
 
 
 def build_intra_frequency_summary_table(pci_events: list[dict], intra_freq_events: list[dict]) -> pd.DataFrame:
-    sessions = {e.get("session_id") for e in intra_freq_events if e.get("session_id") is not None}
     rows = [
         ("Total Serving-Cell (PCI) Transitions", f"{len(pci_events):,}"),
         ("   - Intra-frequency (same band)", f"{len(intra_freq_events):,}"),
-        ("Sessions with Intra-frequency Handovers", f"{len(sessions):,}"),
     ]
     return pd.DataFrame(rows, columns=["Metric", "Observed Value"])
 
@@ -1894,181 +2178,196 @@ def build_conclusion_paragraphs(
     metadata: dict,
 ) -> list[str]:
     """
-    Section 7.10 "Conclusion" -- a data-driven narrative built entirely from
-    values already computed elsewhere in this report (Drive Summary,
-    Executive Summary, Section 4's coverage KPI table, Section 6's handover
-    counts, Section 7's own service KPIs/app list), so it reads differently
-    per project instead of being a fixed paragraph. No new thresholds or
-    business rules are introduced here -- every PASS/FAIL/Good/Fair call
-    reuses the exact classification already shown elsewhere in the report.
+    Section 7.10 "Conclusion" -- a short, data-driven wrap-up of Section 7's
+    own service KPIs only (throughput, voice quality, IP connectivity),
+    built from the same PASS/FAIL classification as 7.9's Service KPI
+    Summary table so the two can never disagree. Deliberately brief: the
+    report-wide narrative (coverage, mobility, and which eNodeB performed
+    best/worst) lives in Section 8 "Key Findings" instead, so the two
+    sections don't repeat each other.
     """
-    location = metadata.get("location") or {}
-    city = location.get("city")
-    country = location.get("country")
-    place = ", ".join([p for p in (city, country) if p]) or "the surveyed area"
-
-    distance = drive_summary.get("distance_covered")
-    distance_text = f"{distance:.1f} km" if isinstance(distance, (int, float)) and distance > 0 else "an unspecified distance"
-    sessions = int(drive_summary.get("total_sessions", 0))
-    samples = int(drive_summary.get("total_samples", 0))
-
-    para_overview = (
-        f"The drive test was conducted across {distance_text} in {place} over "
-        f"{sessions} test session{'s' if sessions != 1 else ''}, collecting {samples:,} radio "
-        f"measurement samples to evaluate LTE/5G network coverage, radio quality, mobility, "
-        f"handover performance, and end-user service experience."
-    )
-
-    # ---- Coverage ----
-    rsrp = _series(report_df, "rsrp")
-    coverage = exec_summary.get("coverage", {})
-    coverage_status = coverage.get("status", "N/A")
-    tech_list = _technology_groups(report_df)
-    tech_text = _join_list(tech_list) if tech_list else "the deployed radio"
-    if not rsrp.empty:
-        avg_rsrp = float(rsrp.mean())
-        pct_above_95 = float((rsrp > -95).mean() * 100)
-        para_coverage = (
-            f"Overall, the network demonstrated {coverage_status.lower()} coverage performance, "
-            f"with an average RSRP of {avg_rsrp:.1f} dBm and {pct_above_95:.0f}% of measured "
-            f"samples exceeding the operator acceptance threshold of -95 dBm, indicating that "
-            f"users can expect "
-            f"{'reliable' if coverage_status == 'Good' else 'inconsistent'} network availability "
-            f"throughout {'most of' if pct_above_95 < 100 else 'the'} the evaluated route. "
-            f"Band utilization was well distributed across {tech_text} carriers without "
-            f"unexpected frequency behavior."
-        )
-    else:
-        para_coverage = "Coverage could not be assessed: no RSRP samples were available for this project."
-
-    # ---- Radio quality (reuses Section 4.5's own PASS/FAIL classification,
-    # so the KPIs named here can never disagree with that table) ----
-    quality_summary_df = build_coverage_kpi_summary_table(report_df, rsrp, coverage_status)
-    fail_labels = []
-    for _, row in quality_summary_df.iterrows():
-        kpi = str(row["KPI"])
-        if row["Status"] == "FAIL" and (kpi.startswith("SINR") or kpi.startswith("RSRQ")):
-            metric, _, tech = kpi.partition(" - ")
-            fail_labels.append(f"{metric} for {tech}")
-    if fail_labels:
-        para_quality = (
-            "Radio quality, however, showed opportunities for optimization. While signal "
-            "quality remained generally acceptable overall, several KPIs—including "
-            f"{_join_list(fail_labels)}—did not consistently meet the desired acceptance "
-            "criteria, indicating localized interference or quality degradation in specific "
-            "areas. These conditions may impact user experience during periods of high traffic "
-            "or at cell edges."
-        )
-    else:
-        para_quality = (
-            "Radio quality remained within acceptance criteria across all evaluated "
-            "technologies, with no SINR or RSRQ KPIs flagged for optimization."
-        )
-
-    # ---- Mobility + handover ----
-    mobility_status = next(
-        (status for label, status, _ in exec_summary.get("kpi_rows", []) if label == "Mobility"),
-        "N/A",
-    )
-    unique_pci = int(_series(report_df, "pci").nunique())
-    band_count = len(handover_data.get("band_events", []))
-    intra_count = len(handover_data.get("intra_freq_events", []))
-    tech_count = len(handover_data.get("tech_events", []))
-    para_mobility = (
-        f"Mobility performance was found to be "
-        f"{'stable' if mobility_status == 'Good' else mobility_status.lower()} throughout the "
-        f"drive. The network utilized {unique_pci} unique serving PCIs, maintained "
-        f"{'balanced' if mobility_status == 'Good' else 'uneven'} serving-cell distribution, and "
-        f"supported frequent mobility transitions. A total of {band_count:,} inter-frequency "
-        f"handovers, {intra_count:,} intra-frequency handovers, and {tech_count:,} inter-RAT "
-        f"transitions were observed"
-        + (
-            ", without evidence of significant mobility interruptions, demonstrating an "
-            "effective mobility strategy across the observed radio layers."
-            if mobility_status == "Good"
-            else ", though the serving-cell instability observed warrants a review of PCI/"
-            "neighbor-list planning."
-        )
-    )
-
-    # ---- Service ----
     mos = _series(report_df, "mos")
     packet_loss = _series(report_df, "packet_loss")
     dl = _series(report_df, "dl_tpt")
     ul = _series(report_df, "ul_tpt")
-    latency = _series(report_df, "latency")
-    app_df = build_application_observation_table(report_df)
-    app_names = app_df["Application"].head(4).tolist() if not app_df.empty else []
-    apps_text = _join_list(app_names) if app_names else "the observed applications"
 
     service_kpi_df = build_service_kpi_summary_table(report_df)
-    latency_row = service_kpi_df[service_kpi_df["KPI"] == "Latency"] if not service_kpi_df.empty else pd.DataFrame()
-    latency_target = latency_row.iloc[0]["Target"] if not latency_row.empty else None
-    latency_status = latency_row.iloc[0]["Status"] if not latency_row.empty else None
+    fail_kpis = (
+        service_kpi_df.loc[service_kpi_df["Status"] == "FAIL", "KPI"].tolist()
+        if not service_kpi_df.empty else []
+    )
+    overall_ok = not fail_kpis
 
-    service_bits = [
-        f"From a service perspective, common applications including {apps_text} remained "
-        f"functional and responsive during the drive."
-    ]
+    sentence1 = (
+        f"Overall service performance was {'satisfactory' if overall_ok else 'mixed'} "
+        f"throughout the evaluated route."
+    )
+
+    clauses = []
+    if not dl.empty and not ul.empty:
+        clauses.append(
+            "data throughput supported common user applications"
+            if overall_ok else
+            f"data throughput averaged {float(dl.mean()):.1f} Mbps down / {float(ul.mean()):.1f} Mbps up"
+        )
     if not mos.empty:
-        service_bits.append(f"Voice quality achieved a MOS of {float(mos.mean()):.2f},")
+        avg_mos = float(mos.mean())
+        clauses.append(
+            f"voice quality {'remained acceptable' if avg_mos >= 3.5 else 'fell short of target'} "
+            f"at a MOS of {avg_mos:.2f}"
+        )
     if not packet_loss.empty:
-        service_bits.append(f"while packet loss remained {'low' if float(packet_loss.mean()) < 1 else 'elevated'} at {float(packet_loss.mean()):.2f}%, indicating {'stable' if float(packet_loss.mean()) < 1 else 'unstable'} IP connectivity.")
-    service_para1 = " ".join(service_bits)
+        avg_loss = float(packet_loss.mean())
+        clauses.append(
+            f"IP connectivity metrics {'stayed within acceptable limits' if avg_loss < 1 else 'showed elevated packet loss'} "
+            f"({avg_loss:.2f}% packet loss)"
+        )
+    sentence2 = ""
+    if clauses:
+        joined = _join_list(clauses) + "."
+        sentence2 = joined[0].upper() + joined[1:]
 
-    throughput_bits = []
-    if not dl.empty and not ul.empty and not latency.empty:
-        throughput_bits.append(
-            f"However, measured download throughput ({float(dl.mean()):.1f} Mbps), upload "
-            f"throughput ({float(ul.mean()):.1f} Mbps), and latency ({float(latency.mean()):.1f} ms) "
-            f"suggest that overall user data performance is "
-            f"{'constrained despite strong radio coverage' if coverage_status == 'Good' else 'limited'}."
-        )
-    if latency_status == "FAIL" and latency_target:
-        throughput_bits.append(
-            f"The elevated latency exceeded the project target ({latency_target}), indicating "
-            f"that further investigation into scheduler efficiency, cell loading, backhaul "
-            f"capacity, or network congestion is warranted."
-        )
-    service_para2 = " ".join(throughput_bits) if throughput_bits else ""
+    sentence3 = (
+        f"{_join_list(fail_kpis)} should be investigated through capacity optimization and "
+        f"scheduler analysis." if fail_kpis else
+        "No service KPI was flagged for optimization in this drive."
+    )
 
-    # ---- Closing ----
-    strengths = []
-    weaknesses = []
-    for label, status, _ in exec_summary.get("kpi_rows", []):
-        if status == "Good":
-            strengths.append(label)
-        elif status not in ("N/A",):
-            weaknesses.append(label)
-    strengths_text = _join_list(strengths) if strengths else None
-    weaknesses_text = _join_list(weaknesses) if weaknesses else None
-    if strengths_text and weaknesses_text:
-        closing = (
-            f"In conclusion, the evaluated network provides strong performance in "
-            f"{strengths_text}, supporting reliable service continuity across the tested area. "
-            f"The primary opportunities for improvement lie in {weaknesses_text}. Addressing "
-            f"these areas will enhance overall Quality of Experience (QoE) and further "
-            f"strengthen network performance in high-demand environments."
-        )
-    elif strengths_text:
-        closing = (
-            f"In conclusion, the evaluated network provides strong performance in "
-            f"{strengths_text} across the tested area, with no KPI groups flagged for "
-            f"optimization in this drive."
+    return [" ".join(s for s in (sentence1, sentence2, sentence3) if s)]
+
+
+def _nodeb_coverage_extremes(report_df: pd.DataFrame, min_samples: int = 5):
+    """
+    Per-eNodeB average RSRP, used by Section 8 "Key Findings" to name the
+    best- and worst-covered eNodeB. Groups on the same `nodeb_id` column
+    Section 6's Node-B handover breakdown reads, so both sections refer to
+    the same identifiers. eNodeBs with fewer than `min_samples` RSRP
+    readings are dropped so a single stray sample can't decide the
+    "best"/"worst" label.
+
+    Returns (best, worst), each either None or a dict with keys
+    "nodeb_id", "avg_rsrp", "samples". `worst` is None when fewer than
+    two eNodeBs qualify (nothing meaningful to contrast).
+    """
+    if "nodeb_id" not in report_df.columns or "rsrp" not in report_df.columns:
+        return None, None
+    df = report_df[["nodeb_id", "rsrp"]].copy()
+    df["nodeb_id"] = df["nodeb_id"].apply(_clean_transition_text)
+    df["rsrp"] = pd.to_numeric(df["rsrp"], errors="coerce")
+    df = df.dropna(subset=["nodeb_id", "rsrp"])
+    if df.empty:
+        return None, None
+
+    grouped = df.groupby("nodeb_id")["rsrp"].agg(["mean", "count"])
+    grouped = grouped[grouped["count"] >= min_samples]
+    if grouped.empty:
+        return None, None
+
+    def _entry(nodeb_id):
+        return {
+            "nodeb_id": nodeb_id,
+            "avg_rsrp": float(grouped.loc[nodeb_id, "mean"]),
+            "samples": int(grouped.loc[nodeb_id, "count"]),
+        }
+
+    best_id = grouped["mean"].idxmax()
+    worst_id = grouped["mean"].idxmin()
+    best = _entry(best_id)
+    worst = _entry(worst_id) if worst_id != best_id else None
+    return best, worst
+
+
+def build_key_findings_bullets(
+    report_df: pd.DataFrame,
+    exec_summary: dict,
+    drive_summary: dict,
+    handover_data: dict,
+    metadata: dict,
+) -> tuple[list[str], list[str]]:
+    """
+    Section 8 "Key Findings" -- one Outcome bullet list and one Areas-for-
+    Improvement bullet list giving a report-wide, at-a-glance read of the
+    drive, each grounded in this project's own numbers rather than fixed
+    text: the KPI groups the Executive Summary already scored
+    Good/Fair/Poor, plus the best- and worst-covered eNodeB by average
+    RSRP (see _nodeb_coverage_extremes), so the bullets change from
+    project to project.
+
+    Independent of whether this project has a polygon: eNodeB coverage
+    here is computed directly from report_df's own nodeb_id/rsrp columns
+    (the same report_df Sections 4/7 use for their KPI tables), never from
+    the grid lattice those sections build for polygon projects -- so these
+    bullets render identically regardless of which map-rendering mode
+    (grid vs raw points) this report used above.
+    """
+    location = metadata.get("location") or {}
+    place = location.get("city") or "the surveyed area"
+
+    kpi_rows = exec_summary.get("kpi_rows", [])
+    strengths = [label for label, status, _ in kpi_rows if status == "Good"]
+    weaknesses = [label for label, status, _ in kpi_rows if status not in ("Good", "N/A")]
+
+    best_nodeb, worst_nodeb = _nodeb_coverage_extremes(report_df)
+
+    rsrp = _series(report_df, "rsrp")
+    mos = _series(report_df, "mos")
+    dl = _series(report_df, "dl_tpt")
+
+    # ---- Outcome bullets ----
+    outcome_bullets = []
+    if strengths:
+        outcome_bullets.append(
+            f"Solid performance in {_join_list(strengths)} across {place}, with no "
+            f"corrective action required in those areas."
         )
     else:
-        closing = (
-            f"In conclusion, the evaluated network requires targeted optimization across "
-            f"{weaknesses_text or 'the KPI groups flagged above'}. Addressing these areas will "
-            f"enhance overall Quality of Experience (QoE) and strengthen network performance "
-            f"in high-demand environments."
+        outcome_bullets.append(
+            f"The drive test across {place} completed with usable coverage across the "
+            f"majority of the route."
+        )
+    if best_nodeb:
+        outcome_bullets.append(
+            f"eNodeB {best_nodeb['nodeb_id']} delivered the strongest coverage on this drive, "
+            f"averaging {best_nodeb['avg_rsrp']:.1f} dBm RSRP over {best_nodeb['samples']:,} "
+            f"samples, and can serve as a coverage benchmark for neighboring sectors."
+        )
+    if not mos.empty and float(mos.mean()) >= 3.5:
+        outcome_bullets.append(f"Voice quality also held up well, averaging a MOS of {float(mos.mean()):.2f}.")
+    elif not dl.empty:
+        outcome_bullets.append(
+            f"Data throughput remained usable for common applications, averaging "
+            f"{float(dl.mean()):.1f} Mbps download."
         )
 
-    paragraphs = [para_overview, para_coverage, para_quality, para_mobility, service_para1]
-    if service_para2:
-        paragraphs.append(service_para2)
-    paragraphs.append(closing)
-    return paragraphs
+    # ---- Areas for improvement bullets ----
+    improvement_bullets = []
+    if weaknesses:
+        improvement_bullets.append(
+            f"The main opportunities for improvement are in {_join_list(weaknesses)}, where "
+            f"results fell short of the acceptance criteria applied elsewhere in this report."
+        )
+    else:
+        improvement_bullets.append(
+            "No KPI group was flagged outright, though isolated pockets of weaker "
+            "performance were still observed."
+        )
+    if worst_nodeb:
+        improvement_bullets.append(
+            f"eNodeB {worst_nodeb['nodeb_id']} recorded the weakest coverage on this drive, "
+            f"averaging {worst_nodeb['avg_rsrp']:.1f} dBm RSRP over {worst_nodeb['samples']:,} "
+            f"samples, and should be prioritized for a site audit or capacity review."
+        )
+    if not rsrp.empty:
+        pct_below = float((rsrp <= -95).mean() * 100)
+        if pct_below > 0:
+            improvement_bullets.append(
+                f"Roughly {pct_below:.0f}% of samples fell below the -95 dBm acceptance threshold."
+            )
+    improvement_bullets.append(
+        "Addressing these areas will improve consistency of the end-user experience across the route."
+    )
+
+    return outcome_bullets, improvement_bullets
 
 
 # ------------------------------------------------------------------
@@ -2104,7 +2403,7 @@ class NewFormatPDFReport(PDFReportGenerator):
         TOC entry, the same afterFlowable/add_toc_heading mechanism
         production's own PDFReportGenerator uses -- so the Table of
         Contents lists real subsections dynamically instead of only the
-        7 top-level sections. Unnumbered labels (e.g. "Executive Summary",
+        8 top-level sections. Unnumbered labels (e.g. "Executive Summary",
         "Scope") are left out of the TOC, matching production's own
         behaviour of only indexing numbered subsections.
         """
@@ -2946,6 +3245,42 @@ class NewFormatPDFReport(PDFReportGenerator):
             conclusion_flowables.append(Paragraph(para, self.styles["Body"]))
             conclusion_flowables.append(Spacer(1, 6))
         self.add_labeled_block("7.10 Conclusion", conclusion_flowables)
+
+    def add_key_findings_section(
+        self,
+        report_df: pd.DataFrame,
+        exec_summary: dict,
+        drive_summary: dict,
+        handover_data: dict,
+        metadata: dict,
+    ):
+        """
+        Top-level Section 8 "Key Findings" -- a report-wide, at-a-glance
+        Outcome / Areas-for-Improvement bullet read (see
+        build_key_findings_bullets), kept separate from 7.10's short,
+        service-only conclusion so the two don't repeat each other. Driven
+        entirely by report_df/exec_summary, so it renders the same bullets
+        whether the project has a polygon (grid maps above) or not (raw
+        point maps above) -- this section never touches the grid lattice.
+        """
+        self.story.append(PageBreak())
+        self.add_toc_heading("8. Key Findings", self.styles["Section"], 0, "sec8")
+        self.story.append(Paragraph(
+            "Key Findings highlights the strongest and weakest results observed across the "
+            "full drive, including the best- and worst-covered eNodeB.",
+            self.styles["Body"],
+        ))
+        self.story.append(Spacer(1, 8))
+
+        outcome_bullets, improvement_bullets = build_key_findings_bullets(
+            report_df, exec_summary, drive_summary, handover_data, metadata,
+        )
+        self.story.append(Paragraph("<b>Outcome</b>", self.styles["Body"]))
+        self.story.extend(self._bullet_flowables(outcome_bullets))
+        self.story.append(Spacer(1, 8))
+        self.story.append(Paragraph("<b>Areas for Improvement</b>", self.styles["Body"]))
+        self.story.extend(self._bullet_flowables(improvement_bullets))
+        self.story.append(Spacer(1, 6))
 
     def build(self):
         self.doc.multiBuild(self.story, canvasmaker=PageNumCanvas)

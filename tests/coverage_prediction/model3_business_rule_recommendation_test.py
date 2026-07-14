@@ -796,9 +796,13 @@ def _extract_source_site_rows(sector_cells: pd.DataFrame, part3_site_df: pd.Data
             original_ids.update(str(v).strip() for v in sector_cells[col].dropna().astype(str).tolist() if str(v).strip())
     if not original_ids:
         original_ids.update(str(v).strip() for v in sector_cells["Node_Cell_ID"].dropna().astype(str).tolist() if str(v).strip())
-    return work.loc[
+    matched = work.loc[
         work["Node_Cell_ID"].astype(str).isin(original_ids) | work["cell_id"].astype(str).isin(original_ids)
     ].copy()
+    dedupe_cols = [col for col in ["Node_Cell_ID", "cell_id", "Site ID", "band", "earfcn", "azimuth", "PCI"] if col in matched.columns]
+    if dedupe_cols:
+        matched = matched.drop_duplicates(subset=dedupe_cols, keep="first").copy()
+    return matched
 
 
 def _prepare_local_action_context(
@@ -1097,14 +1101,24 @@ def _evaluate_action_inventory(
     before_cells = sector_cells["Node_Cell_ID"].astype(str).tolist()
     source_sector_id = str(_first_non_empty(sector_cells["sector_id"])).strip()
     source_site_id = _normalize_identity_text(_first_non_empty(sector_cells["site_id"]))
-    source_frontend_sector_keys = {source_sector_id}
-    if "topology_frontend_site_sector_key" in sector_cells.columns:
-        source_frontend_sector_keys.update(
-            str(value).strip()
-            for value in sector_cells["topology_frontend_site_sector_key"].dropna().astype(str).tolist()
-            if str(value).strip()
-        )
-    original_lineage_ids = set(before_cells)
+    source_frontend_sector_keys = {source_sector_id} if source_sector_id else set()
+    source_topology_sector_keys: set[str] = set()
+    for col in [
+        "topology_frontend_site_sector_key",
+        "topology_node_cell_sector_key",
+        "topology_sector_identity_key",
+        "topology_canonical_sector_id",
+        "topology_site_sector_band_key",
+        "sector_id",
+    ]:
+        if col in sector_cells.columns:
+            source_topology_sector_keys.update(
+                str(value).strip()
+                for value in sector_cells[col].dropna().astype(str).tolist()
+                if str(value).strip()
+            )
+    source_frontend_sector_keys.update(source_topology_sector_keys)
+    original_lineage_ids = set(value for value in before_cells if str(value).strip())
     for col in ["topology_original_cell_id", "topology_original_node_cell_id"]:
         if col in sector_cells.columns:
             original_lineage_ids.update(
@@ -1112,33 +1126,116 @@ def _evaluate_action_inventory(
                 for value in sector_cells[col].dropna().astype(str).tolist()
                 if str(value).strip()
             )
-    after_candidates = after_inventory.loc[after_inventory["sector_id"].astype(str) == source_sector_id].copy()
-    if after_candidates.empty and "topology_frontend_site_sector_key" in after_inventory.columns:
-        after_candidates = after_inventory.loc[
-            after_inventory["topology_frontend_site_sector_key"].astype(str).isin(source_frontend_sector_keys)
-        ].copy()
-    if after_candidates.empty:
-        lineage_mask = pd.Series(False, index=after_inventory.index)
-        for col in ["topology_original_cell_id", "topology_original_node_cell_id"]:
-            if col in after_inventory.columns:
-                lineage_mask = lineage_mask | after_inventory[col].astype(str).isin(original_lineage_ids)
-        after_candidates = after_inventory.loc[lineage_mask].copy()
-    if after_candidates.empty:
+
+    def _scope_mask(
+        df: pd.DataFrame,
+        *,
+        sector_keys: set[str],
+        lineage_ids: set[str],
+        site_id: str,
+    ) -> pd.Series:
+        mask = pd.Series(False, index=df.index)
+        if source_sector_id and "sector_id" in df.columns:
+            mask = mask | df["sector_id"].astype(str).eq(source_sector_id)
+        for col in [
+            "sector_id",
+            "topology_frontend_site_sector_key",
+            "topology_node_cell_sector_key",
+            "topology_sector_identity_key",
+            "topology_canonical_sector_id",
+            "topology_site_sector_band_key",
+        ]:
+            if col in df.columns and sector_keys:
+                mask = mask | df[col].astype(str).isin(sector_keys)
+        for col in ["Node_Cell_ID", "topology_original_cell_id", "topology_original_node_cell_id"]:
+            if col in df.columns and lineage_ids:
+                mask = mask | df[col].astype(str).isin(lineage_ids)
+        if site_id and "site_id" in df.columns:
+            mask = mask | df["site_id"].map(_normalize_identity_text).eq(site_id)
+        return mask
+
+    primary_mask = _scope_mask(
+        after_inventory,
+        sector_keys=source_frontend_sector_keys,
+        lineage_ids=original_lineage_ids,
+        site_id="",
+    )
+    primary_matches = after_inventory.loc[primary_mask].copy()
+
+    affected_sector_keys = set(source_frontend_sector_keys)
+    if not primary_matches.empty:
+        for col in [
+            "sector_id",
+            "topology_frontend_site_sector_key",
+            "topology_node_cell_sector_key",
+            "topology_sector_identity_key",
+            "topology_canonical_sector_id",
+            "topology_site_sector_band_key",
+        ]:
+            if col in primary_matches.columns:
+                affected_sector_keys.update(
+                    str(value).strip()
+                    for value in primary_matches[col].dropna().astype(str).tolist()
+                    if str(value).strip()
+                )
+        for col in ["Node_Cell_ID", "topology_original_cell_id", "topology_original_node_cell_id"]:
+            if col in primary_matches.columns:
+                original_lineage_ids.update(
+                    str(value).strip()
+                    for value in primary_matches[col].dropna().astype(str).tolist()
+                    if str(value).strip()
+                )
+
+    final_mask = _scope_mask(
+        after_inventory,
+        sector_keys=affected_sector_keys,
+        lineage_ids=original_lineage_ids,
+        site_id="",
+    )
+    after_candidates = after_inventory.loc[final_mask].copy()
+    if after_candidates.empty and source_site_id:
         after_site_ids = after_inventory["site_id"].map(_normalize_identity_text) if "site_id" in after_inventory.columns else pd.Series("", index=after_inventory.index)
         after_candidates = after_inventory.loc[after_site_ids == source_site_id].copy()
 
-    after_prb = _to_num(after_candidates["prb_before_pct"])
-    after_rrc = _to_num(after_candidates["rrc_before_pct"])
-    projected_prb = float(after_prb.max()) if after_prb.notna().any() else np.nan
-    projected_rrc = float(after_rrc.max()) if after_rrc.notna().any() else np.nan
-    projected_users = (
-        float(_to_num(after_candidates["rrc_users_before"]).max())
-        if "rrc_users_before" in after_candidates.columns and _to_num(after_candidates["rrc_users_before"]).notna().any()
-        else np.nan
-    )
+    scope_mode = "matched_scope"
+
+    def _summarize_scope(df: pd.DataFrame) -> tuple[float, float, float]:
+        prb = _to_num(df["prb_before_pct"])
+        rrc = _to_num(df["rrc_before_pct"])
+        users = _to_num(df["rrc_users_before"]) if "rrc_users_before" in df.columns else pd.Series(dtype=float)
+        return (
+            float(prb.max()) if prb.notna().any() else np.nan,
+            float(rrc.max()) if rrc.notna().any() else np.nan,
+            float(users.max()) if users.notna().any() else np.nan,
+        )
+
+    projected_prb, projected_rrc, projected_users = _summarize_scope(after_candidates)
     before_prb = float(_to_num(sector_cells["prb_before_pct"]).max()) if _to_num(sector_cells["prb_before_pct"]).notna().any() else np.nan
     before_rrc = float(_to_num(sector_cells["rrc_before_pct"]).max()) if _to_num(sector_cells["rrc_before_pct"]).notna().any() else np.nan
     before_pressure = max(before_prb if pd.notna(before_prb) else 0.0, before_rrc if pd.notna(before_rrc) else 0.0)
+
+    # If the matched scope is emptied out after topology changes, widen to the same-site
+    # post-action scope so we do not falsely mark zero-load source lineages as resolved.
+    if (
+        source_site_id
+        and not after_candidates.empty
+        and pd.notna(before_prb)
+        and before_prb > 0
+        and (not pd.notna(projected_prb) or projected_prb <= 0.0)
+        and (not pd.notna(projected_rrc) or projected_rrc <= 0.0)
+        and "site_id" in after_inventory.columns
+    ):
+        site_scope = after_inventory.loc[after_inventory["site_id"].map(_normalize_identity_text).eq(source_site_id)].copy()
+        site_scope = site_scope.loc[
+            (_to_num(site_scope.get("prb_before_pct", pd.Series(dtype=float))) > 0.0)
+            | (_to_num(site_scope.get("rrc_before_pct", pd.Series(dtype=float))) > 0.0)
+            | (_to_num(site_scope.get("rrc_users_before", pd.Series(dtype=float))) > 0.0)
+        ].copy()
+        if not site_scope.empty:
+            after_candidates = site_scope
+            projected_prb, projected_rrc, projected_users = _summarize_scope(after_candidates)
+            scope_mode = "same_site_nonzero_fallback"
+
     after_pressure = max(projected_prb if pd.notna(projected_prb) else 0.0, projected_rrc if pd.notna(projected_rrc) else 0.0)
     resolved = pd.notna(projected_prb) and pd.notna(projected_rrc) and projected_prb <= config.congestion_threshold and projected_rrc <= config.congestion_threshold
     improved = after_pressure < before_pressure - 0.5
@@ -1153,12 +1250,15 @@ def _evaluate_action_inventory(
         status = "No Material Change"
     after_cells = after_candidates["Node_Cell_ID"].astype(str).dropna().tolist() if "Node_Cell_ID" in after_candidates.columns else []
     logger.info(
-        "%s_done sector=%s before_cells=%s after_cells=%s local_after_rows=%d before_prb=%.3f before_rrc=%.3f actual_prb=%.3f actual_rrc=%.3f status=%s",
+        "%s_done sector=%s before_cells=%s after_cells=%s local_after_rows=%d scope_mode=%s scope_keys=%s lineage_ids=%s before_prb=%.3f before_rrc=%.3f actual_prb=%.3f actual_rrc=%.3f status=%s",
         action_label,
         source_sector_id,
         before_cells,
         after_cells,
         len(after_candidates),
+        scope_mode,
+        sorted(affected_sector_keys)[:8],
+        sorted(original_lineage_ids)[:8],
         before_prb if pd.notna(before_prb) else -1.0,
         before_rrc if pd.notna(before_rrc) else -1.0,
         projected_prb if pd.notna(projected_prb) else -1.0,
