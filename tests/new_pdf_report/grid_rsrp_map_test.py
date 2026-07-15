@@ -241,27 +241,36 @@ def aggregate_grid_cells(df: pd.DataFrame, lattice: pd.DataFrame, value_col: str
     return grouped[["row_idx", "col_idx", "south", "west", "north", "east", "value_agg", "sample_count"]], total, populated
 
 
-def _fit_bounds_including_polygon(m, bounds_df: pd.DataFrame, polygon_wkt: str | None, reserve_legend_space: bool = True) -> None:
+def fit_bounds_including_polygon(m, bounds_df: pd.DataFrame, polygon_wkt: str | None, reserve_legend_space: bool = True) -> None:
     """
+    Shared viewport-fitting rule for every map in the new-format report:
+    fit to the polygon's OWN bounds when the project has one, else fall
+    back to the GPS data bounds (production's original fit_data_bounds
+    behaviour). Used by every map-rendering function in this report (grid
+    KPI maps, Band/PCI maps, base route map, poor-region maps, handover
+    maps) via new_report_sections.py, not just the grid maps.
+
     Production's OWN fit_data_bounds() (map_generator.py:42-51) fits the
     viewport to the GPS DATA bounds ONLY, by its own docstring's admission:
     "the polygon is drawn as an overlay but does NOT expand the view".
-    That's a safe default for a raw-point map, where the drawn polygon
-    outline is always well inside the data extent it's filtering.
-
-    For a GRID map the polygon IS the thing being rendered -- every cell in
-    the lattice comes from the polygon's OWN bounding box (see
-    build_polygon_lattice), and a project's polygon commonly extends a bit
-    further than wherever GPS samples happen to exist. Fitting to
-    data-only bounds then clips the polygon outline (and can crop grid
-    cells near its edge) at the screenshot boundary -- confirmed against a
-    real project polygon (292's southern tip sat within ~20px of the
-    900px-tall screenshot's bottom edge before this fix).
+    That's fine when there's no polygon, but once a project HAS one, the
+    polygon -- not wherever GPS samples happened to reach -- defines the
+    analysis area, and a project's polygon commonly extends a bit further
+    than the drive route itself. Fitting to data-only bounds then clips
+    the polygon outline (and, for grid maps, can crop lattice cells near
+    its edge) at the screenshot boundary -- confirmed against a real
+    project polygon (292's southern tip sat within ~20px of the 900px-tall
+    screenshot's bottom edge, and ~2km/~20% narrower on its west edge,
+    before this fix).
 
     Fix: union the data bounds with the polygon's own bounds (shapely
     .bounds) using production's own merge_bounds() (map_generator.py:220-224,
-    previously unused for this) before fitting, so the full polygon is
-    always inside the frame, not just wherever the data reaches.
+    previously unused for this) before fitting. Since polygon-filtered data
+    is always a subset of the polygon, this union is equivalent to "polygon
+    bounds when present, else data bounds" -- it's written as a union
+    rather than a hard replacement only so a project whose data somehow
+    exceeds a stale/misconfigured polygon still gets a frame that includes
+    all of it, not a frame that silently clips real data.
     """
     bounds = get_df_bounds(bounds_df)
     if polygon_wkt:
@@ -286,13 +295,25 @@ def generate_kpi_grid_map(
     bounds_df: pd.DataFrame,
     metric_label: str = "rsrp",
     unit: str = "dBm",
+    total_cells: int | None = None,
 ) -> None:
     """`bounds_df` fits the viewport to the full (all-technology) route so a
     per-technology grid map frames the same area as its raw-point
     counterpart in Section 4/7. `metric_label`/`unit` only affect the
     tooltip/legend text (e.g. "sinr (grid, 100m cells, median)",
     "SINR median: 12.3 dB") -- the aggregation itself is identical for
-    every KPI (see aggregate_grid_cells)."""
+    every KPI (see aggregate_grid_cells).
+
+    `total_cells` is the TOTAL number of polygon-interior lattice cells
+    (populated or not -- the same "total" aggregate_grid_cells returns,
+    identical across every technology since it only depends on the
+    polygon + grid size), added to the legend alongside this
+    technology's own populated-cell count so a reader can see e.g.
+    "Total Grid Cells: 4442" next to "Populated (this technology): 167"
+    instead of only ever seeing the per-range breakdown of the populated
+    subset with no sense of how big the full grid is. Omitted from the
+    legend when not supplied.
+    """
     m = new_report_map()
     add_fullscreen_css(m)
 
@@ -305,10 +326,16 @@ def generate_kpi_grid_map(
         ).add_to(m)
 
     legend_items = build_legend_from_ranges(pd.DataFrame({metric_label: cells["value_agg"]}), metric_label, ranges)
+    if total_cells is not None:
+        legend_items = [
+            ("Total Grid Cells", "#6b7280", total_cells),
+            ("Populated (this technology)", "#374151", len(cells)),
+            *legend_items,
+        ]
     add_legend(m, f"{metric_label} (grid, {int(grid_size_meters)}m cells, {AGGREGATION})", legend_items)
 
     draw_polygon_overlay(m, polygon_wkt)
-    _fit_bounds_including_polygon(m, bounds_df.dropna(subset=["lat", "lon"]), polygon_wkt, reserve_legend_space=True)
+    fit_bounds_including_polygon(m, bounds_df.dropna(subset=["lat", "lon"]), polygon_wkt, reserve_legend_space=True)
 
     m.save(output_html)
 

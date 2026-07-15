@@ -66,22 +66,181 @@ output PDF is regenerated/replaced on every run):
 """
 
 import colorsys
+import contextlib
 import json
 import os
 import re
 import time
 
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-from reportlab.platypus import Paragraph, Spacer, PageBreak, CondPageBreak, KeepTogether, Image
+from reportlab.platypus import (
+    Paragraph, Spacer, PageBreak, CondPageBreak, KeepTogether, Image, Table, TableStyle,
+)
+from reportlab.lib import colors
+from reportlab.lib.styles import ParagraphStyle
 from reportlab.lib.units import inch
 
 from tools.report_engine.pdf_generator import (
     PDFReportGenerator,
     PageNumCanvas,
-    make_native_table,
     TABLE_MAX_WIDTH,
+    _NATIVE_CELL_STYLE,
+    _NATIVE_HEADER_STYLE,
 )
+from tools.report_engine.metadata_generator import (
+    build_spatial_grid,
+    select_spatially_separated_cells,
+    reverse_geocode_area,
+    haversine,
+)
+from tests.new_pdf_report.grid_rsrp_map_test import fit_bounds_including_polygon
+from tools.report_engine.kpi_config import KPI_CONFIG
+
+
+# ------------------------------------------------------------------
+# Polygon-aware viewport fitting for maps that still call production's
+# generate_categorical_kpi_map (Band/PCI) / generate_base_route_map
+# directly (tools/report_engine is NOT modified). Rather than duplicate
+# either function's real drawing logic (band normalization, distinct-color
+# generation, legend building, ...) just to change one internal call, this
+# temporarily swaps production's module-level fit_data_bounds reference for
+# fit_bounds_including_polygon (see grid_rsrp_map_test.py for why) for the
+# duration of a single render, then restores it — the production file on
+# disk, and its behaviour for any other caller, is untouched.
+# ------------------------------------------------------------------
+
+@contextlib.contextmanager
+def _polygon_aware_fit_bounds(polygon_wkt):
+    """
+    `polygon_wkt` is captured here (not passed through by the production
+    caller, which only knows fit_data_bounds's original (m, df,
+    reserve_legend_space) signature) so the monkeypatched adapter below can
+    still forward it to fit_bounds_including_polygon.
+    """
+    from tools.report_engine import map_generator
+    original = map_generator.fit_data_bounds
+
+    def _adapter(m, df, reserve_legend_space=False):
+        fit_bounds_including_polygon(m, df, polygon_wkt, reserve_legend_space=reserve_legend_space)
+
+    map_generator.fit_data_bounds = _adapter
+    try:
+        yield
+    finally:
+        map_generator.fit_data_bounds = original
+
+
+def generate_categorical_kpi_map_polygon_aware(df, kpi_column, output_html, polygon_wkt=None):
+    """
+    Same as production's generate_categorical_kpi_map (Band/PCI maps), but
+    when the project has a polygon the viewport is fit to include the full
+    polygon extent instead of just the GPS data — see
+    fit_bounds_including_polygon's docstring for why (production's own
+    fit_data_bounds ignores the polygon by design, which visibly crops a
+    polygon that extends past the drive route, as confirmed for project
+    292 — a real km-scale gap between the polygon and the route, not a bug
+    in the polygon geometry itself).
+    """
+    from tools.report_engine.map_generator import generate_categorical_kpi_map
+    with _polygon_aware_fit_bounds(polygon_wkt):
+        generate_categorical_kpi_map(df, kpi_column, output_html, polygon_wkt=polygon_wkt)
+
+
+def generate_base_route_map_polygon_aware(df, polygon_wkt, output_html):
+    """Same treatment as generate_categorical_kpi_map_polygon_aware, for
+    production's generate_base_route_map (Area Summary's route map)."""
+    from tools.report_engine.map_generator import generate_base_route_map
+    with _polygon_aware_fit_bounds(polygon_wkt):
+        generate_base_route_map(df, polygon_wkt, output_html)
+
+
+# ------------------------------------------------------------------
+# Native table rendering — test-case-only copy of production's
+# make_native_table() (tools/report_engine/pdf_generator.py, NOT modified)
+# with one addition: any "Status" column gets its Good/Fair/Poor (or
+# PASS/FAIL) text colour-coded (green/orange/red) so severity reads at a
+# glance. Reuses production's own cell/header styles and layout constants
+# (_NATIVE_CELL_STYLE, _NATIVE_HEADER_STYLE, TABLE_MAX_WIDTH) so tables
+# still look identical to production apart from the Status colouring.
+# ------------------------------------------------------------------
+
+_STATUS_TEXT_COLORS = {
+    "good": colors.HexColor("#1a7f37"),
+    "pass": colors.HexColor("#1a7f37"),
+    "fair": colors.HexColor("#b35c00"),
+    "poor": colors.HexColor("#c62828"),
+    "fail": colors.HexColor("#c62828"),
+}
+_STATUS_CELL_STYLES = {
+    key: ParagraphStyle(
+        f"NewFormatStatus_{key}", parent=_NATIVE_CELL_STYLE,
+        textColor=color, fontName="Helvetica-Bold",
+    )
+    for key, color in _STATUS_TEXT_COLORS.items()
+}
+
+
+def _status_cell(value) -> Paragraph:
+    text = str(value).strip()
+    style = _STATUS_CELL_STYLES.get(text.lower(), _NATIVE_CELL_STYLE)
+    return Paragraph(text, style)
+
+
+def _bulletize_remarks(text: str) -> str:
+    """
+    Turn a "clause; clause; clause." remark into an HTML bullet list (each
+    ; -separated clause on its own line) for a ReportLab table cell, so
+    the Executive KPI Summary's Remarks column reads as bullet points
+    instead of one dense run-on sentence. Single-clause remarks are left
+    as plain text (a 1-item bullet list reads worse than a sentence).
+    """
+    clauses = [c.strip() for c in text.split(";") if c.strip()]
+    if len(clauses) <= 1:
+        return text
+    return "<br/>".join(f"&bull; {c}" for c in clauses)
+
+
+def make_native_table(df):
+    """Render a compact, crisp native ReportLab table from a DataFrame,
+    colour-coding any "Status" column's Good/Fair/Poor/PASS/FAIL text."""
+    status_cols = {i for i, col in enumerate(df.columns) if str(col).strip().lower() == "status"}
+
+    table_data = [[Paragraph(str(col), _NATIVE_HEADER_STYLE) for col in df.columns]]
+    for row in df.itertuples(index=False):
+        table_data.append([
+            (
+                Paragraph("", _NATIVE_CELL_STYLE) if pd.isna(value)
+                else _status_cell(value) if i in status_cols
+                else Paragraph(str(value), _NATIVE_CELL_STYLE)
+            )
+            for i, value in enumerate(row)
+        ])
+
+    col_widths = None
+    if len(df.columns) == 5:
+        col_widths = [0.55 * inch, 0.9 * inch, 0.95 * inch, 0.95 * inch, 3.25 * inch]
+    elif len(df.columns) > 0:
+        col_widths = [TABLE_MAX_WIDTH / len(df.columns)] * len(df.columns)
+
+    table = Table(table_data, repeatRows=1, hAlign="LEFT", colWidths=col_widths)
+    table.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#4472C4")),
+        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+        ("FONTSIZE", (0, 0), (-1, -1), 8),
+        ("LEADING", (0, 0), (-1, -1), 9),
+        ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ("GRID", (0, 0), (-1, -1), 0.35, colors.HexColor("#9aa6b2")),
+        ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.whitesmoke, colors.HexColor("#eef2f7")]),
+        ("LEFTPADDING", (0, 0), (-1, -1), 4),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 4),
+        ("TOPPADDING", (0, 0), (-1, -1), 3),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
+    ]))
+    return table
 
 
 # ------------------------------------------------------------------
@@ -144,8 +303,9 @@ def filter_primary_rows_including_nr(df: pd.DataFrame) -> pd.DataFrame:
 # rsrq_poor_regions.png). Fixed here by passing the plain "Poor Samples"
 # label and letting add_legend() append the count exactly once — every
 # other step (new_report_map, add_fullscreen_css, add_legend,
-# draw_polygon_overlay, fit_data_bounds, html_to_png) reuses production's
-# own unmodified helpers.
+# draw_polygon_overlay, html_to_png) reuses production's own unmodified
+# helpers; the viewport fit uses fit_bounds_including_polygon instead of
+# production's fit_data_bounds (see that function's docstring).
 # ------------------------------------------------------------------
 
 def generate_poor_region_map_fixed(
@@ -162,7 +322,7 @@ def generate_poor_region_map_fixed(
 ) -> bool:
     import folium
     from tools.report_engine.map_generator import (
-        new_report_map, add_fullscreen_css, add_legend, draw_polygon_overlay, fit_data_bounds,
+        new_report_map, add_fullscreen_css, add_legend, draw_polygon_overlay,
     )
     from tools.report_engine.playwright_utils import html_to_png
 
@@ -193,7 +353,7 @@ def generate_poor_region_map_fixed(
 
     add_legend(fmap, title, [("Poor Samples", "#e31a1c", true_count)])  # count appended once, not twice
     draw_polygon_overlay(fmap, polygon_wkt)
-    fit_data_bounds(fmap, df, reserve_legend_space=True)
+    fit_bounds_including_polygon(fmap, df, polygon_wkt, reserve_legend_space=True)
     fmap.save(tmp_html)
 
     try:
@@ -258,7 +418,8 @@ def generate_poor_region_map_fixed(
 # verbatim and only changing the color source (generate_session_colors
 # instead of generate_distinct_colors) and the final add_legend() call --
 # every other step (new_report_map, add_fullscreen_css, draw_polygon_overlay,
-# add_legend, fit_data_bounds) reuses production's own unmodified helpers.
+# add_legend) reuses production's own unmodified helpers; the viewport fit
+# uses fit_bounds_including_polygon instead of production's fit_data_bounds.
 # ------------------------------------------------------------------
 
 _HANDOVER_EVENT_COLOR = "#3b82f6"  # must match event_colors["band"] below
@@ -317,7 +478,7 @@ def generate_handover_map_with_session_legend(
     import folium
     from tools.report_engine.map_generator import (
         new_report_map, add_fullscreen_css, draw_polygon_overlay,
-        add_legend, fit_data_bounds, _safe_sort_value,
+        add_legend, _safe_sort_value,
     )
 
     df = filtered_df.dropna(subset=["lat", "lon"]).copy() if filtered_df is not None else pd.DataFrame()
@@ -348,6 +509,22 @@ def generate_handover_map_with_session_legend(
 
     m = new_report_map()
     add_fullscreen_css(m)
+    # Leaflet's default .leaflet-div-icon has a white box + border baked in
+    # (leaflet.css) -- reset it so the hand glyph below renders on its own,
+    # not inside a little white square.
+    m.get_root().header.add_child(folium.Element(
+        """
+        <style>
+            .handover-hand-icon { background: transparent; border: none; }
+            .handover-hand-glyph {
+                font-size: 14px;
+                line-height: 1;
+                text-align: center;
+                filter: drop-shadow(0 0 1px rgba(0,0,0,0.6));
+            }
+        </style>
+        """
+    ))
     draw_polygon_overlay(m, polygon_wkt)
 
     # Draw dense route points only (no polylines), one layer per session so
@@ -443,17 +620,14 @@ def generate_handover_map_with_session_legend(
                         }})).addTo(map);
                     }});
                 }});
+                var handIcon = L.divIcon({{
+                    html: '<div class="handover-hand-glyph">✋</div>',
+                    className: "handover-hand-icon",
+                    iconSize: [16, 16],
+                    iconAnchor: [8, 8],
+                }});
                 payload.events.forEach(function(ev) {{
-                    var marker = L.circleMarker([ev.lat, ev.lon], {{
-                        radius: 6,
-                        color: "#1f2937",
-                        weight: 1,
-                        opacity: 0.95,
-                        fill: true,
-                        fillColor: ev.color,
-                        fillOpacity: 0.95,
-                        renderer: canvasRenderer
-                    }}).addTo(map);
+                    var marker = L.marker([ev.lat, ev.lon], {{ icon: handIcon }}).addTo(map);
                     if (ev.tooltip) {{
                         marker.bindTooltip(ev.tooltip);
                     }}
@@ -496,7 +670,7 @@ def generate_handover_map_with_session_legend(
     if legend_items:
         add_legend(m, legend_title, legend_items)
 
-    fit_data_bounds(m, df, reserve_legend_space=bool(legend_items))
+    fit_bounds_including_polygon(m, df, polygon_wkt, reserve_legend_space=bool(legend_items))
     m.save(output_html)
 
 
@@ -786,6 +960,153 @@ def _worst_status(statuses) -> str:
     return max(known, key=lambda s: _STATUS_RANK[s])
 
 
+# ------------------------------------------------------------------
+# CDF generation — test-case-only copy of production's
+# generate_cdf_plot_from_series() / generate_all_cdf_plots_from_df()
+# (tools/report_engine/cdf_kpi.py, NOT modified), with one addition: a red
+# crosshair (dashed line from the y-axis + dashed line from the x-axis,
+# meeting at a point on the curve) marks where each KPI's acceptance
+# threshold intersects the CDF, labelled with the % of samples failing
+# that threshold. The curve itself stays blue, unchanged from production.
+# ------------------------------------------------------------------
+
+# Acceptance ("Good") threshold per KPI, all higher-is-better: a sample
+# fails acceptance when its value is BELOW this cutoff. RSRP/RSRQ/SINR
+# reuse the exact Good thresholds already shown elsewhere in this report
+# (Executive KPI Summary / Coverage KPI Summary "Acceptance" column:
+# "> -95 dBm", "> -10 dB", "> 20 dB"). DL/UL/MOS reuse
+# tools/report_engine/kpi_config.py's FIXED_THRESHOLD_CONFIG (DL
+# excellent_threshold, UL/MOS poor_threshold) as their single acceptance
+# cutoff, per direction received.
+CDF_ACCEPTANCE_THRESHOLDS = {
+    "RSRP": -95.0,
+    "RSRQ": -10.0,
+    "SINR": 20.0,
+    "DL": 15.0,
+    "UL": 5.0,
+    "MOS": 3.0,
+}
+
+
+def _cdf_filename_for_kpi(kpi_name: str, column: str) -> str:
+    if kpi_name == "DL":
+        return "cdf_dl_tpt.png"
+    if kpi_name == "UL":
+        return "cdf_ul_tpt.png"
+    return f"cdf_{column.lower()}.png"
+
+
+def generate_cdf_plot_from_series(values, title: str, x_label: str, output_path: str,
+                                   acceptance_threshold: float | None = None):
+    """
+    Render a CDF plot (with P10/P50/P90 markers) from a pandas Series.
+
+    When `acceptance_threshold` is given, a red crosshair marks where the
+    KPI's acceptance cutoff meets the curve: a horizontal segment from the
+    y-axis over to that point and a vertical segment from the x-axis up to
+    it, with the % of samples failing acceptance printed at the point. The
+    curve itself stays blue; only this marker is red. Position is dynamic
+    per drive since it's driven by where the data actually sits relative
+    to the threshold, not a fixed box.
+    """
+    values = pd.to_numeric(values, errors="coerce").dropna().sort_values()
+    if values.empty:
+        return None
+
+    y = np.arange(1, len(values) + 1) / len(values) * 100
+    fig, ax = plt.subplots(figsize=(10, 5))
+    ax.step(values.to_numpy(), y, where="post", linewidth=2.0, color="#1f77b4", zorder=3)
+    ax.set_xlabel(x_label, fontsize=11)
+    ax.set_ylabel("Cumulative Probability (%)", fontsize=11)
+    ax.set_title(title, fontsize=13, pad=10)
+    ax.grid(True, linestyle="--", linewidth=0.5, alpha=0.25)
+    ax.set_facecolor("white")
+    fig.patch.set_facecolor("white")
+    ax.set_ylim(0, 100)
+
+    if acceptance_threshold is not None:
+        data_min = float(values.iloc[0])
+        data_max = float(values.iloc[-1])
+        ax.set_xlim(min(data_min, acceptance_threshold), max(data_max, acceptance_threshold))
+        left_edge, right_edge = ax.get_xlim()
+
+        # % of samples that fail acceptance (the CDF value at the cutoff) —
+        # same figure already used in the Executive KPI Summary text, so
+        # the chart and the table never disagree.
+        pct_fail = float((values < acceptance_threshold).mean() * 100)
+
+        ax.hlines(pct_fail, left_edge, acceptance_threshold, colors="red",
+                  linestyles="--", linewidth=1.3, alpha=0.85, zorder=4)
+        ax.vlines(acceptance_threshold, 0, pct_fail, colors="red",
+                  linestyles="--", linewidth=1.3, alpha=0.85, zorder=4)
+        ax.scatter([acceptance_threshold], [pct_fail], s=40, color="red",
+                   edgecolor="white", linewidth=0.8, zorder=5)
+        ax.text(
+            acceptance_threshold, pct_fail, f" {pct_fail:.1f}%",
+            fontsize=11, color="red", ha="left", va="bottom", fontweight="bold",
+            zorder=5,
+        )
+
+    offsets = {10: (18, 14), 50: (18, -24), 90: (-56, 14)}
+    for p in (10, 50, 90):
+        percentile_value = float(np.percentile(values, p))
+        ax.scatter([percentile_value], [p], s=34, color="#d62728",
+                   edgecolor="white", linewidth=0.8, zorder=4)
+        ax.annotate(
+            f"P{p} = {percentile_value:.2f}",
+            xy=(percentile_value, p), xytext=offsets[p],
+            textcoords="offset points", fontsize=8.5, color="#333333",
+            arrowprops={"arrowstyle": "->", "color": "#d62728", "lw": 0.8, "alpha": 0.85},
+            bbox={"boxstyle": "round,pad=0.22", "fc": "white", "ec": "#d0d7de", "alpha": 0.95},
+        )
+
+    ax.tick_params(axis="both", labelsize=9)
+    for spine in ax.spines.values():
+        spine.set_linewidth(0.8)
+        spine.set_color("#444444")
+
+    fig.tight_layout()
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    fig.savefig(output_path, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+    return len(values), float(values.min()), float(values.max())
+
+
+def generate_all_cdf_plots_from_df(report_df: pd.DataFrame, output_dir: str):
+    """Generate every CDF from the exact report dataframe (range KPIs + PCI)."""
+    print("\n" + "=" * 80)
+    print("GENERATING CDF DISTRIBUTION GRAPHS FROM REPORT FILTERED DATA")
+    print("=" * 80)
+    print(f"Rows used for CDF: {len(report_df)}")
+    os.makedirs(output_dir, exist_ok=True)
+
+    for kpi_name, cfg in KPI_CONFIG.items():
+        col = cfg.get("column")
+        if cfg.get("type") == "range" and col in report_df.columns:
+            filename = _cdf_filename_for_kpi(kpi_name, col)
+            stats = generate_cdf_plot_from_series(
+                report_df[col],
+                f"CDF Distribution - {kpi_name}",
+                f"{kpi_name} Value",
+                os.path.join(output_dir, filename),
+                acceptance_threshold=CDF_ACCEPTANCE_THRESHOLDS.get(kpi_name),
+            )
+            if stats:
+                count, min_value, max_value = stats
+                print(f"  {filename}: rows={count}, min={min_value:.2f}, max={max_value:.2f}")
+
+    if "pci" in report_df.columns:
+        stats = generate_cdf_plot_from_series(
+            report_df["pci"],
+            "CDF Distribution - PCI",
+            "PCI Value",
+            os.path.join(output_dir, "cdf_pci.png"),
+        )
+        if stats:
+            count, min_value, max_value = stats
+            print(f"  cdf_pci.png: rows={count}, min={min_value:.2f}, max={max_value:.2f}")
+
+
 def classify_coverage(rsrp: pd.Series) -> tuple[str, str]:
     if rsrp.empty:
         return "N/A", "No RSRP samples available."
@@ -827,23 +1148,36 @@ def classify_quality(sinr: pd.Series, rsrq: pd.Series) -> tuple[str, str]:
     Quality status from Average SINR and Average RSRQ only (CQI/BLER are
     not part of this decision — see module notes above). Each metric is
     banded independently and the worse band wins.
+
+    Remarks report a "% of samples at/above the Good threshold" figure for
+    both SINR and RSRQ, mirroring Coverage's "% of samples above -95 dBm"
+    (Good SINR > 20 dB, Good RSRQ > -10 dB — see module notes above) so all
+    Executive KPI Summary rows carry a percentage, not just Coverage.
     """
     if sinr.empty:
         return "N/A", "No SINR samples available."
 
     avg_sinr = float(sinr.mean())
     sinr_band = _band_sinr(avg_sinr)
+    pct_sinr_good = float((sinr > 20).mean() * 100)
 
     if rsrq.empty:
         status = sinr_band
-        remarks = f"Average SINR {avg_sinr:.1f} dB. No RSRQ samples available."
+        remarks = (
+            f"Average SINR {avg_sinr:.1f} dB ({pct_sinr_good:.0f}% of samples above 20 dB). "
+            f"No RSRQ samples available."
+        )
         return status, remarks
 
     avg_rsrq = float(rsrq.mean())
     rsrq_band = _band_rsrq(avg_rsrq)
+    pct_rsrq_good = float((rsrq > -10).mean() * 100)
     status = max([sinr_band, rsrq_band], key=lambda b: _STATUS_RANK[b])
 
-    remarks = f"Average SINR {avg_sinr:.1f} dB; Average RSRQ {avg_rsrq:.1f} dB."
+    remarks = (
+        f"Average SINR {avg_sinr:.1f} dB ({pct_sinr_good:.0f}% of samples above 20 dB); "
+        f"Average RSRQ {avg_rsrq:.1f} dB ({pct_rsrq_good:.0f}% of samples above -10 dB)."
+    )
     return status, remarks
 
 
@@ -954,9 +1288,100 @@ def classify_quality_by_technology(report_df: pd.DataFrame) -> list[dict]:
         results.append({
             "technology": tech,
             "status": status,
-            "remarks": f"[{len(sub):,} samples] {remarks}",
+            "remarks": remarks,
         })
     return results
+
+
+def build_poor_region_summary(
+    filtered_df: pd.DataFrame, value_col: str, threshold: float,
+    top_n: int = 3, sleep_sec: float = 1.0,
+) -> dict | None:
+    """
+    % of samples below `threshold` for `value_col`, plus up to `top_n`
+    named locations (reverse-geocoded, spatially separated) where those
+    poor samples concentrate. Test-case only — reuses production's own
+    build_spatial_grid / select_spatially_separated_cells /
+    reverse_geocode_area (tools.report_engine.metadata_generator, NOT
+    modified) with the exact same grid + reverse-geocode pipeline
+    build_area_summary() already uses for the whole drive, just scoped to
+    the samples that fail this KPI's poor threshold. Fully driven by
+    `filtered_df`, so it is dynamic per project/drive — no hardcoded
+    project data.
+    """
+    if value_col not in filtered_df.columns or not {"lat", "lon"}.issubset(filtered_df.columns):
+        return None
+
+    values = pd.to_numeric(filtered_df[value_col], errors="coerce")
+    valid = filtered_df.loc[values.notna()].copy()
+    valid[value_col] = values.dropna()
+    total = len(valid)
+    if total == 0:
+        return None
+
+    poor_df = valid[valid[value_col] < threshold]
+    poor_count = len(poor_df)
+    result = {
+        "column": value_col,
+        "threshold": threshold,
+        "total_samples": total,
+        "poor_samples": poor_count,
+        "poor_percentage": round(poor_count / total * 100, 1),
+        "locations": [],
+    }
+    if poor_df.empty:
+        return result
+
+    grid = build_spatial_grid(poor_df)
+    if grid.empty:
+        return result
+
+    grid = grid.sort_values("sample_count", ascending=False)
+    selected_cells = select_spatially_separated_cells(grid, max_cells=top_n)
+    for cell in selected_cells:
+        geo = reverse_geocode_area(cell.center_lat, cell.center_lon, sleep_sec=sleep_sec)
+        if not geo or not geo.get("labels"):
+            continue
+        result["locations"].append({
+            "name": geo["labels"][0],
+            "samples": int(cell.sample_count),
+        })
+
+    return result
+
+
+def build_poor_region_text(summary: dict | None, label: str, unit: str) -> str:
+    """
+    Turn a build_poor_region_summary() dict into the observation sentence
+    placed above the "Poor RSRP"/"Poor RSRQ" maps — % of poor samples plus
+    the named locations where they concentrate (reverse-geocoded per
+    project, same as the Area Summary section).
+    """
+    if not summary:
+        return f"Poor {label} location analysis is not available (missing lat/lon or {label} data)."
+
+    poor_samples = summary.get("poor_samples", 0)
+    total_samples = summary.get("total_samples", 0)
+    pct = summary.get("poor_percentage", 0.0)
+    threshold = summary.get("threshold")
+
+    if not poor_samples:
+        return (
+            f"No samples fell below the poor {label} threshold "
+            f"({threshold:g} {unit}) out of {total_samples:,} samples analyzed."
+        )
+
+    text = (
+        f"{pct:.1f}% of samples ({poor_samples:,} of {total_samples:,}) recorded poor "
+        f"{label} (&lt; {threshold:g} {unit})"
+    )
+    locations = summary.get("locations") or []
+    if locations:
+        named = ", ".join(f"{loc['name']} ({loc['samples']:,} samples)" for loc in locations)
+        text += f", concentrated primarily around {named}."
+    else:
+        text += "; no named locations could be resolved for these coordinates."
+    return text
 
 
 # ------------------------------------------------------------------
@@ -1032,6 +1457,17 @@ def _handover_type(from_value, to_value) -> str:
     return "Lateral"
 
 
+def _inter_rat_events(tech_events: list[dict]) -> list[dict]:
+    """
+    Inter-RAT handover means crossing between different RAT tiers, so a
+    "Lateral" tech_events entry (same tech-rank on both sides — e.g. one
+    "4G" variant relabeled to another) isn't a real inter-RAT transition,
+    per direction received. Excluded from every Inter-RAT (Technology)
+    Handover count/map/table in this report, not just hidden from one view.
+    """
+    return [e for e in tech_events if e.get("handover_type") != "Lateral"]
+
+
 def _clean_transition_text(value):
     if value is None:
         return None
@@ -1041,7 +1477,9 @@ def _clean_transition_text(value):
     return text
 
 
-def _detect_column_transitions(df: pd.DataFrame, value_col: str, meta_cols: tuple = ()) -> list[dict]:
+def _detect_column_transitions(
+    df: pd.DataFrame, value_col: str, meta_cols: tuple = (), numeric_meta_cols: tuple = (),
+) -> list[dict]:
     """
     Generic per-session, time-ordered transition detector for `value_col` —
     same session/timestamp ordering rule as production's
@@ -1051,6 +1489,12 @@ def _detect_column_transitions(df: pd.DataFrame, value_col: str, meta_cols: tupl
     and "to" rows (as `from_<col>`/`to_<col>`) so callers can classify a
     transition further (e.g. same-band PCI change, same-eNodeB PCI change)
     without a second pass over the data.
+
+    `numeric_meta_cols` (e.g. "rsrp"/"sinr"/"rsrq") are captured the same
+    way but via pd.to_numeric instead of _clean_transition_text — that
+    text-sentinel filter treats "0"/"0.0" as missing (correct for
+    categorical meta like band/nodeb_id, where 0 is a real "no value"
+    sentinel) which would silently drop a genuine 0 dB SINR reading.
     """
     if df is None or df.empty or value_col not in df.columns or "session_id" not in df.columns:
         return []
@@ -1081,6 +1525,9 @@ def _detect_column_transitions(df: pd.DataFrame, value_col: str, meta_cols: tupl
                 for col in meta_cols:
                     event[f"from_{col}"] = _clean_transition_text(previous_row.get(col))
                     event[f"to_{col}"] = _clean_transition_text(row.get(col))
+                for col in numeric_meta_cols:
+                    event[f"from_{col}"] = pd.to_numeric(previous_row.get(col), errors="coerce")
+                    event[f"to_{col}"] = pd.to_numeric(row.get(col), errors="coerce")
                 events.append(event)
             previous_value = current_value
             previous_row = row
@@ -1119,7 +1566,9 @@ def compute_handover_analysis(handover_df: pd.DataFrame) -> dict:
         if e.get("from_band") and e.get("to_band") and e["from_band"] == e["to_band"]
     ]
 
-    tech_events = _detect_column_transitions(handover_df, "network")
+    tech_events = _detect_column_transitions(
+        handover_df, "network", numeric_meta_cols=("rsrp", "sinr", "rsrq"),
+    )
     for e in tech_events:
         e["handover_type"] = _handover_type(e["from"], e["to"])
 
@@ -1170,14 +1619,13 @@ def build_intra_frequency_summary_table(pci_events: list[dict], intra_freq_event
 
 
 def build_tech_handover_summary_table(tech_events: list[dict]) -> pd.DataFrame:
+    tech_events = _inter_rat_events(tech_events)
     upgrade = sum(1 for e in tech_events if e["handover_type"] == "Upgrade")
     downgrade = sum(1 for e in tech_events if e["handover_type"] == "Downgrade")
-    lateral = sum(1 for e in tech_events if e["handover_type"] == "Lateral")
     rows = [
         ("Total Inter-RAT Events", f"{len(tech_events):,}"),
         ("Upgrade", f"{upgrade:,}"),
         ("Downgrade", f"{downgrade:,}"),
-        ("Lateral", f"{lateral:,}"),
     ]
     return pd.DataFrame(rows, columns=["Metric", "Observed Value"])
 
@@ -1194,24 +1642,55 @@ def build_nodeb_summary_table(intra_enodeb_events: list[dict], inter_enodeb_even
     return pd.DataFrame(rows, columns=["Metric", "Observed Value"])
 
 
-def build_transition_pairs_table(events: list[dict], column_label: str, limit: int = 5) -> pd.DataFrame:
+def _avg_metric_str(events: list[dict], key: str) -> str:
+    values = [e[key] for e in events if e.get(key) is not None and not pd.isna(e.get(key))]
+    if not values:
+        return "N/A"
+    return f"{sum(values) / len(values):.1f}"
+
+
+def build_transition_pairs_table(
+    events: list[dict], column_label: str, limit: int = 5, include_kpi_avg: bool = False,
+) -> pd.DataFrame:
+    """
+    `include_kpi_avg` adds Avg RSRP/SINR/RSRQ columns, averaged per pair
+    over the POST-transition ("to") sample of each event in that pair —
+    only meaningful for event sets captured with
+    numeric_meta_cols=("rsrp", "sinr", "rsrq") (currently just tech_events,
+    see compute_handover_analysis).
+    """
     pairs = _summarize_transition_pairs(events, limit=limit)
-    rows = [(f"{f} -> {t}", f"{c:,}") for (f, t), c in pairs]
-    return pd.DataFrame(rows, columns=[column_label, "Count"])
+    columns = [column_label, "Count"]
+    if include_kpi_avg:
+        columns += ["Avg RSRP (dBm)", "Avg SINR (dB)", "Avg RSRQ (dB)"]
+        events_by_pair: dict[tuple, list[dict]] = {}
+        for e in events:
+            events_by_pair.setdefault(_event_pair(e), []).append(e)
+
+    rows = []
+    for (f, t), c in pairs:
+        row = [f"{f} -> {t}", f"{c:,}"]
+        if include_kpi_avg:
+            pair_events = events_by_pair.get((f, t), [])
+            row += [
+                _avg_metric_str(pair_events, "to_rsrp"),
+                _avg_metric_str(pair_events, "to_sinr"),
+                _avg_metric_str(pair_events, "to_rsrq"),
+            ]
+        rows.append(tuple(row))
+    return pd.DataFrame(rows, columns=columns)
 
 
 def build_handover_kpi_summary_table(handover_data: dict) -> pd.DataFrame:
-    tech_events = handover_data["tech_events"]
+    tech_events = _inter_rat_events(handover_data["tech_events"])
     upgrade = sum(1 for e in tech_events if e["handover_type"] == "Upgrade")
     downgrade = sum(1 for e in tech_events if e["handover_type"] == "Downgrade")
-    lateral = sum(1 for e in tech_events if e["handover_type"] == "Lateral")
     rows = [
         ("Inter-frequency (Band) Handover", f"{len(handover_data['band_events']):,}"),
         ("Intra-frequency (PCI, same band) Handover", f"{len(handover_data['intra_freq_events']):,}"),
         ("Inter-RAT (Technology) Handover", f"{len(tech_events):,}"),
         ("   - Upgrade", f"{upgrade:,}"),
         ("   - Downgrade", f"{downgrade:,}"),
-        ("   - Lateral", f"{lateral:,}"),
         ("Intra-eNodeB (Sector) Change", f"{len(handover_data['intra_enodeb_events']):,}"),
         ("Inter-eNodeB Change", f"{len(handover_data['inter_enodeb_events']):,}"),
     ]
@@ -1244,21 +1723,27 @@ def build_handover_kpi_summary_observation(handover_data: dict) -> str:
 
 def generate_tech_handover_map(tech_events: list[dict], output_html: str, output_png: str, polygon_wkt: str | None = None) -> bool:
     """
-    Test-case-only map for Inter-RAT (technology) handover events, colored
-    green/red/blue for upgrade/downgrade/lateral — the exact same color
-    convention the frontend already uses (TYPE_STYLES in
-    StraceExeFron/src/components/unifiedMap/tabs/HandoverAnalysisTab.jsx),
-    so this visual is consistent with the live app instead of an invented
-    palette. Structure (route-less event markers + legend) mirrors
-    production's own generate_handover_map() (map_generator.py).
+    Test-case-only map for Inter-RAT (technology) handover events. Lateral
+    (same-tier) transitions are excluded via _inter_rat_events — see that
+    function's docstring — matching every other Inter-RAT count/table in
+    this report, so this map is never out of sync with the 6.4 section's
+    own totals. Events render as small colored hand badges (green Upgrade
+    / red Downgrade) instead of plain circles, drawn via a single injected
+    Leaflet script (same technique as
+    generate_handover_map_with_session_legend's hand markers) rather than
+    one folium.Marker per event, which matters once there are a few
+    thousand events. Structure (route-less event markers + legend)
+    mirrors production's own generate_handover_map() (map_generator.py).
     """
     import folium
     from tools.report_engine.map_generator import (
-        new_report_map, add_fullscreen_css, add_legend, draw_polygon_overlay, fit_data_bounds,
+        new_report_map, add_fullscreen_css, add_legend, draw_polygon_overlay,
     )
     from tools.report_engine.playwright_utils import html_to_png
 
-    valid_events = [e for e in tech_events if e.get("lat") is not None and e.get("lon") is not None]
+    valid_events = _inter_rat_events([
+        e for e in tech_events if e.get("lat") is not None and e.get("lon") is not None
+    ])
     if not valid_events:
         print(" No technology handover events with GPS to plot")
         return False
@@ -1270,26 +1755,69 @@ def generate_tech_handover_map(tech_events: list[dict], output_html: str, output
 
     fmap = new_report_map()
     add_fullscreen_css(fmap)
+    fmap.get_root().header.add_child(folium.Element(
+        """
+        <style>
+            .tech-handover-hand-icon { background: transparent; border: none; }
+            .tech-handover-hand-badge {
+                width: 16px; height: 16px; border-radius: 50%;
+                display: flex; align-items: center; justify-content: center;
+                box-shadow: 0 0 1px rgba(0,0,0,0.6);
+            }
+            .tech-handover-hand-badge span { font-size: 9px; line-height: 1; }
+        </style>
+        """
+    ))
 
-    color_map = {"Upgrade": "#22c55e", "Downgrade": "#ef4444", "Lateral": "#3b82f6"}
-    counts = {"Upgrade": 0, "Downgrade": 0, "Lateral": 0}
+    color_map = {"Upgrade": "#22c55e", "Downgrade": "#ef4444"}
+    counts = {"Upgrade": 0, "Downgrade": 0}
+    event_points = []
     for e in valid_events:
-        kind = e.get("handover_type", "Lateral")
+        kind = e["handover_type"]
         counts[kind] = counts.get(kind, 0) + 1
-        folium.CircleMarker(
-            location=(float(e["lat"]), float(e["lon"])),
-            radius=5,
-            color=color_map.get(kind, "#999999"),
-            fill=True,
-            fill_opacity=0.85,
-            tooltip=f"{kind}: {e['from']} -> {e['to']}",
-        ).add_to(fmap)
+        event_points.append({
+            "lat": float(e["lat"]),
+            "lon": float(e["lon"]),
+            "color": color_map[kind],
+            "tooltip": f"{kind}: {e['from']} -> {e['to']}",
+        })
+
+    payload = json.dumps(event_points)
+    map_name = fmap.get_name()
+    render_js = f"""
+    <script>
+        (function() {{
+            var events = {payload};
+            function drawTechHandoverEvents() {{
+                var map = window["{map_name}"];
+                if (!map || !window.L) {{
+                    window.setTimeout(drawTechHandoverEvents, 50);
+                    return;
+                }}
+                events.forEach(function(ev) {{
+                    var icon = L.divIcon({{
+                        html: '<div class="tech-handover-hand-badge" style="background:' + ev.color + ';"><span>✋</span></div>',
+                        className: "tech-handover-hand-icon",
+                        iconSize: [16, 16],
+                        iconAnchor: [8, 8]
+                    }});
+                    var marker = L.marker([ev.lat, ev.lon], {{ icon: icon }}).addTo(map);
+                    if (ev.tooltip) {{
+                        marker.bindTooltip(ev.tooltip);
+                    }}
+                }});
+            }}
+            drawTechHandoverEvents();
+        }})();
+    </script>
+    """
+    fmap.get_root().html.add_child(folium.Element(render_js))
 
     add_legend(fmap, "Inter-RAT Handover", [
-        (kind, color_map[kind], counts[kind]) for kind in ("Upgrade", "Downgrade", "Lateral") if counts[kind] > 0
+        (kind, color_map[kind], counts[kind]) for kind in ("Upgrade", "Downgrade") if counts[kind] > 0
     ])
     draw_polygon_overlay(fmap, polygon_wkt)
-    fit_data_bounds(fmap, points_df, reserve_legend_space=True)
+    fit_bounds_including_polygon(fmap, points_df, polygon_wkt, reserve_legend_space=True)
     fmap.save(output_html)
 
     try:
@@ -1684,24 +2212,95 @@ def build_serving_cell_metric_table(report_df: pd.DataFrame) -> pd.DataFrame:
 
 
 def build_top_pci_table(report_df: pd.DataFrame, limit: int = 15) -> pd.DataFrame:
+    """
+    PCI | Sample Count | % Samples | Good/Poor RSRP %
+
+    Replaces the previous cumulative "CDF %" column (which only showed
+    running sample share, saying nothing about whether a PCI's own
+    coverage was actually good) with a Good/Poor RSRP split for each PCI's
+    own samples. Uses the SAME single -95 dBm acceptance cutoff as every
+    other "poor RSRP" reference in this report (Executive KPI Summary,
+    Coverage KPI Summary "Acceptance" column, Poor RSRP map/text — see
+    CDF_ACCEPTANCE_THRESHOLDS), per direction received: one threshold,
+    not a different number in different sections.
+    """
     stats = build_pci_distribution_stats(report_df)
     counts = stats["counts"]
+    columns = ["PCI", "Sample Count", "% Samples", "Good/Poor RSRP %"]
     if counts.empty:
-        return pd.DataFrame(columns=["PCI", "Sample Count", "% Samples", "CDF %"])
+        return pd.DataFrame(columns=columns)
 
     total = stats["total_samples"]
-    running = 0
+    rsrp_threshold = CDF_ACCEPTANCE_THRESHOLDS["RSRP"]
+    pci_numeric = pd.to_numeric(report_df["pci"], errors="coerce") if "pci" in report_df.columns else pd.Series(dtype=float)
+    rsrp_numeric = pd.to_numeric(report_df["rsrp"], errors="coerce") if "rsrp" in report_df.columns else pd.Series(dtype=float)
+
     rows = []
     for pci, count in counts.head(limit).items():
         count = int(count)
-        running += count
+        pci_rsrp = rsrp_numeric[(pci_numeric == pci) & rsrp_numeric.notna()]
+        if not pci_rsrp.empty:
+            good_pct = float((pci_rsrp >= rsrp_threshold).mean() * 100)
+            good_poor = f"{good_pct:.1f}% / {100 - good_pct:.1f}%"
+        else:
+            good_poor = "N/A"
         rows.append((
             int(pci),
             f"{count:,}",
             f"{(count / total) * 100:.1f}%",
-            f"{(running / total) * 100:.1f}%",
+            good_poor,
         ))
-    return pd.DataFrame(rows, columns=["PCI", "Sample Count", "% Samples", "CDF %"])
+    return pd.DataFrame(rows, columns=columns)
+
+
+def build_pci_spread_table(report_df: pd.DataFrame, limit: int = 15) -> pd.DataFrame:
+    """
+    PCI | Sample Count | > 2 km | > 5 km | > 10 km
+
+    For the same top-N PCIs shown in 5.2/5.3, measures how far that PCI's
+    OWN samples are scattered from that PCI's own centroid (the mean
+    lat/lon of its samples) — a cell whose samples are stretched many km
+    from its own average position suggests overshoot/interference rather
+    than a tight, well-contained serving footprint. Distance uses
+    production's own haversine() (tools/report_engine/metadata_generator.py,
+    unchanged). The three distance columns are cumulative ("> 2 km"
+    includes samples also counted in "> 5 km" and "> 10 km"), matching how
+    the request was phrased (how many are > 2km, how many > 5km, how many
+    > 10km — not disjoint bands).
+    """
+    stats = build_pci_distribution_stats(report_df)
+    counts = stats["counts"]
+    columns = ["PCI", "Sample Count", "> 2 km", "> 5 km", "> 10 km"]
+    if counts.empty or not {"lat", "lon"}.issubset(report_df.columns):
+        return pd.DataFrame(columns=columns)
+
+    pci_numeric = pd.to_numeric(report_df["pci"], errors="coerce")
+    lat_numeric = pd.to_numeric(report_df["lat"], errors="coerce")
+    lon_numeric = pd.to_numeric(report_df["lon"], errors="coerce")
+
+    def _bucket(distances_km, threshold_km):
+        n_over = int((distances_km > threshold_km).sum())
+        pct = (n_over / len(distances_km) * 100) if len(distances_km) else 0.0
+        return f"{n_over} ({pct:.1f}%)"
+
+    rows = []
+    for pci, count in counts.head(limit).items():
+        count = int(count)
+        mask = (pci_numeric == pci) & lat_numeric.notna() & lon_numeric.notna()
+        lats, lons = lat_numeric[mask], lon_numeric[mask]
+        if lats.empty:
+            rows.append((int(pci), f"{count:,}", "N/A", "N/A", "N/A"))
+            continue
+        center_lat, center_lon = float(lats.mean()), float(lons.mean())
+        distances_km = np.array([
+            haversine(center_lat, center_lon, lat, lon) / 1000.0
+            for lat, lon in zip(lats, lons)
+        ])
+        rows.append((
+            int(pci), f"{count:,}",
+            _bucket(distances_km, 2), _bucket(distances_km, 5), _bucket(distances_km, 10),
+        ))
+    return pd.DataFrame(rows, columns=columns)
 
 
 def build_top_pci_analysis_table(report_df: pd.DataFrame, limit: int = 8) -> pd.DataFrame:
@@ -1725,9 +2324,15 @@ def build_top_pci_analysis_table(report_df: pd.DataFrame, limit: int = 8) -> pd.
 
 
 def build_poor_pci_analysis_table(report_df: pd.DataFrame, metric_column: str):
+    """
+    Uses the SAME single acceptance threshold as every other "poor"
+    RSRP/RSRQ reference in this report (-95 dBm / -10 dB — see
+    CDF_ACCEPTANCE_THRESHOLDS), not the separate -105/-14 Poor-band
+    boundary, per direction received.
+    """
     from tools.report_engine.kpi_analysis import build_poor_pci_table
 
-    threshold = -105 if metric_column == "rsrp" else -14
+    threshold = CDF_ACCEPTANCE_THRESHOLDS["RSRP" if metric_column == "rsrp" else "RSRQ"]
     return build_poor_pci_table(report_df, metric_column, threshold)
 
 
@@ -1795,69 +2400,6 @@ def build_neighbor_cell_table(neighbor_df: pd.DataFrame | None) -> pd.DataFrame:
             networks or "N/A",
             bands or "N/A",
             "Available",
-        ],
-    })
-
-
-def build_neighbor_cell_check_table(neighbor_df: pd.DataFrame | None) -> pd.DataFrame:
-    if neighbor_df is None or neighbor_df.empty:
-        return pd.DataFrame({
-            "Check": ["Neighbor Logs", "Missing Neighbor", "Neighbor Consistency"],
-            "Status": ["Not observed", "Not evaluated", "Not evaluated"],
-        })
-
-    pci = pd.to_numeric(neighbor_df["pci"], errors="coerce").dropna().astype(int) if "pci" in neighbor_df.columns else pd.Series(dtype=int)
-    unique_pci = int(pci.nunique()) if not pci.empty else 0
-    dominant_share = float(pci.value_counts(normalize=True).iloc[0] * 100) if not pci.empty else 0.0
-    consistency = "Good" if unique_pci >= 3 and dominant_share < 95 else "Review"
-    return pd.DataFrame({
-        "Check": [
-            "Neighbor Logs",
-            "Unique Neighbor PCIs",
-            "Neighbor Consistency",
-        ],
-        "Status": [
-            "Observed",
-            f"{unique_pci}",
-            consistency,
-        ],
-    })
-
-
-def build_cell_dominance_table(report_df: pd.DataFrame, neighbor_df: pd.DataFrame | None = None) -> pd.DataFrame:
-    serving_stats = build_pci_distribution_stats(report_df)
-    neighbor_pci = (
-        pd.to_numeric(neighbor_df["pci"], errors="coerce").dropna().astype(int)
-        if neighbor_df is not None and not neighbor_df.empty and "pci" in neighbor_df.columns
-        else pd.Series(dtype=int)
-    )
-    if not neighbor_pci.empty:
-        neighbor_counts = neighbor_pci.value_counts()
-        neighbor_dom_pci = int(neighbor_counts.index[0])
-        neighbor_dom_share = float((neighbor_counts.iloc[0] / len(neighbor_pci)) * 100)
-    else:
-        neighbor_dom_pci = None
-        neighbor_dom_share = 0.0
-
-    if serving_stats["dominant_share"] < 80:
-        assessment = "Serving dominance within acceptable range"
-    else:
-        assessment = "Serving dominance requires review"
-
-    return pd.DataFrame({
-        "Metric": [
-            "Dominant Serving PCI",
-            "Serving PCI Share",
-            "Dominant Neighbor PCI",
-            "Neighbor PCI Share",
-            "Assessment",
-        ],
-        "Observed Value": [
-            str(serving_stats["dominant_pci"]) if serving_stats["dominant_pci"] is not None else "N/A",
-            f"{serving_stats['dominant_share']:.1f}%" if serving_stats["total_samples"] else "N/A",
-            str(neighbor_dom_pci) if neighbor_dom_pci is not None else "N/A",
-            f"{neighbor_dom_share:.1f}%" if not neighbor_pci.empty else "N/A",
-            assessment,
         ],
     })
 
@@ -1999,8 +2541,8 @@ def build_throughput_observation_text(classification: dict, label: str) -> str:
     poor_pct = classification["poor"] / classified * 100
     text = (
         f"Observation: Of {classified:,} LTE samples with a recognized channel bandwidth, "
-        f"{good_pct:.1f}% achieved Good {label} (>=75% of the theoretical peak for the observed "
-        f"bandwidth), {fair_pct:.1f}% Fair (50-75%) and {poor_pct:.1f}% Poor (<50%)."
+        f"{good_pct:.1f}% achieved Good {label}, {fair_pct:.1f}% Fair and {poor_pct:.1f}% Poor "
+        f"(see Acceptance Criteria above for the Good/Fair/Poor thresholds)."
     )
     if classification["unclassified"]:
         text += (
@@ -2459,26 +3001,30 @@ class NewFormatPDFReport(PDFReportGenerator):
             flowables.append(Spacer(1, 6))
         return flowables
 
-    def _labeled_image_flowables(self, label, filename, subdir="kpi_maps", max_width=5.8 * inch, max_height=4 * inch):
+    def _labeled_image_flowables(self, label, filename, subdir="kpi_maps", max_width=5.8 * inch,
+                                  max_height=4 * inch, extra_text: str | None = None):
         """
         Like _optional_image_flowables, but with a heading glued to the
         image via KeepTogether (e.g. "Poor RSRP" above the poor-region
         map) — plain images with no caption read as a stray, unlabeled
         picture; this makes clear what each map is showing.
+
+        `extra_text` (e.g. build_poor_region_text()'s output) is rendered
+        as a paragraph between the heading and the image when given.
         """
         path = os.path.join(self.images_dir, subdir, filename)
         if not os.path.exists(path):
             return []
         use_path = self._compress_png(path) if subdir == "kpi_maps" else path
-        return [
-            KeepTogether([
-                Paragraph(f"<b>{label}</b>", self.styles["Body"]),
-                Spacer(1, 2),
-                self._sized_image(use_path, max_width, max_height),
-            ]),
-            Spacer(1, 6),
+        block = [
+            Paragraph(f"<b>{label}</b>", self.styles["Body"]),
+            Spacer(1, 2),
         ]
-        return flowables
+        if extra_text:
+            block.append(Paragraph(extra_text, self.styles["Body"]))
+            block.append(Spacer(1, 4))
+        block.append(self._sized_image(use_path, max_width, max_height))
+        return [KeepTogether(block), Spacer(1, 6)]
 
     def _kpi_image_flowables_per_technology(
         self, report_df, map_prefix: str, cdf_filename: str, max_height=4 * inch,
@@ -2578,7 +3124,9 @@ class NewFormatPDFReport(PDFReportGenerator):
         self.add_labeled_block("Scope", self._bullet_flowables(exec_summary["scope"]))
 
         kpi_df = pd.DataFrame(
-            exec_summary["kpi_rows"], columns=["KPI Group", "Status", "Remarks"]
+            [(label, status, _bulletize_remarks(remarks))
+             for label, status, remarks in exec_summary["kpi_rows"]],
+            columns=["KPI Group", "Status", "Remarks"],
         )
         self.add_labeled_block("Executive KPI Summary", [make_native_table(kpi_df)])
 
@@ -2590,7 +3138,10 @@ class NewFormatPDFReport(PDFReportGenerator):
             "Overall Assessment", [Paragraph(exec_summary["overall_assessment"], self.styles["Body"])]
         )
 
-    def add_coverage_kpi_analysis(self, report_df: pd.DataFrame, exec_summary: dict, band_summary: list | None):
+    def add_coverage_kpi_analysis(
+        self, report_df: pd.DataFrame, exec_summary: dict, band_summary: list | None,
+        poor_rsrp_summary: dict | None = None, poor_rsrq_summary: dict | None = None,
+    ):
         """
         Section 4 'Coverage KPI Analysis' (report_VI.pdf layout, Step 2).
 
@@ -2598,6 +3149,11 @@ class NewFormatPDFReport(PDFReportGenerator):
         (computed once in Section 3 via classify_coverage /
         classify_quality_by_technology) rather than recomputing — this
         section and the Executive KPI Summary can never disagree.
+
+        poor_rsrp_summary / poor_rsrq_summary come from
+        metadata_generator.build_poor_region_summary() (test_new_pdf_report.py)
+        — % of poor samples plus reverse-geocoded named locations, rendered
+        above the "Poor RSRP"/"Poor RSRQ" maps via build_poor_region_text().
         """
         self.story.append(PageBreak())
         self.add_toc_heading("4. Coverage KPI Analysis", self.styles["Section"], 0, "sec4")
@@ -2668,8 +3224,9 @@ class NewFormatPDFReport(PDFReportGenerator):
             self._kpi_image_flowables_per_technology(report_df, "rsrp_map", "cdf_rsrp.png")
         )
         self.story.extend(self._labeled_image_flowables(
-            "Poor RSRP (< -105 dBm)", "rsrp_poor_regions.png", subdir="kpi_maps",
+            f"Poor RSRP (< {CDF_ACCEPTANCE_THRESHOLDS['RSRP']:g} dBm)", "rsrp_poor_regions.png", subdir="kpi_maps",
             max_width=5.8 * inch, max_height=4.5 * inch,
+            extra_text=build_poor_region_text(poor_rsrp_summary, "RSRP", "dBm"),
         ))
 
         # ---- 4.3 RSRQ Analysis — per technology, never blended ----
@@ -2707,8 +3264,9 @@ class NewFormatPDFReport(PDFReportGenerator):
             self._kpi_image_flowables_per_technology(report_df, "rsrq_map", "cdf_rsrq.png")
         )
         self.story.extend(self._labeled_image_flowables(
-            "Poor RSRQ (< -14 dB)", "rsrq_poor_regions.png", subdir="kpi_maps",
+            f"Poor RSRQ (< {CDF_ACCEPTANCE_THRESHOLDS['RSRQ']:g} dB)", "rsrq_poor_regions.png", subdir="kpi_maps",
             max_width=5.8 * inch, max_height=4.5 * inch,
+            extra_text=build_poor_region_text(poor_rsrq_summary, "RSRQ", "dB"),
         ))
 
         # ---- 4.4 SINR Analysis — per technology, never blended ----
@@ -2800,9 +3358,14 @@ class NewFormatPDFReport(PDFReportGenerator):
         top_pci_analysis_df = build_top_pci_analysis_table(report_df, limit=8)
         poor_rsrp_df = build_poor_pci_analysis_table(report_df, "rsrp")
         poor_rsrq_df = build_poor_pci_analysis_table(report_df, "rsrq")
+        pci_spread_df = build_pci_spread_table(report_df, limit=15)
         neighbor_table_df = build_neighbor_cell_table(neighbor_df)
-        neighbor_check_df = build_neighbor_cell_check_table(neighbor_df)
-        cell_dominance_df = build_cell_dominance_table(report_df, neighbor_df=neighbor_df)
+        # Used below in the Mobility Summary's overall_text logic even
+        # though the standalone Neighbor Cell Analysis section (formerly
+        # 5.6) was removed as not needed.
+        neighbor_status = (
+            str(neighbor_table_df.iloc[-1]["Observed Value"]) if not neighbor_table_df.empty else "Not available"
+        )
         summary_df = build_mobility_kpi_summary_table(report_df, neighbor_df=neighbor_df)
 
         serving_flowables = [
@@ -2895,41 +3458,28 @@ class NewFormatPDFReport(PDFReportGenerator):
             poor_rsrq_flowables,
         )
 
-        neighbor_flowables = [
+        spread_flowables = [
             Paragraph(
-                "Objective: verify that neighbor relations support smooth mobility.",
+                "Objective: for each top serving PCI, measure how far its own samples are "
+                "scattered from that PCI's own average position — a cell whose samples spread "
+                "many kilometers from its own center suggests overshoot or interference rather "
+                "than a tight, well-contained serving footprint.",
                 self.styles["Body"],
             ),
             Spacer(1, 4),
-            make_native_table(neighbor_check_df),
-            Spacer(1, 4),
         ]
-        neighbor_status = (
-            str(neighbor_table_df.iloc[-1]["Observed Value"]) if not neighbor_table_df.empty else "Not available"
-        )
-        if neighbor_status == "Available":
-            neighbor_obs = (
-                f"Dedicated neighbor logs are present in tbl_network_log_neighbour with "
-                f"{len(neighbor_df):,} rows. Maintain periodic audit of neighbor relations after parameter changes."
-            )
+        if not pci_spread_df.empty:
+            spread_flowables.append(make_native_table(pci_spread_df))
+            spread_flowables.append(Spacer(1, 4))
+            spread_flowables.append(Paragraph(
+                "Observation: distance columns are cumulative (\"&gt; 2 km\" includes samples "
+                "also counted in \"&gt; 5 km\" and \"&gt; 10 km\"). PCIs with a large share of "
+                "samples beyond 5-10 km from their own center are candidates for overshoot review.",
+                self.styles["Body"],
+            ))
         else:
-            neighbor_obs = (
-                "Dedicated neighbor logs are not populated for the current project dataset, so "
-                "this section records availability only and avoids inferring neighbor quality."
-            )
-        neighbor_flowables.append(Paragraph(f"Observation: {neighbor_obs}", self.styles["Body"]))
-        self.add_labeled_block("5.6 Neighbor Cell Analysis", neighbor_flowables)
-
-        dominance_flowables = [
-            make_native_table(cell_dominance_df),
-            Spacer(1, 4),
-            Paragraph(
-                "Cell dominance was broadly consistent with the planned RF design. Overlap between "
-                "adjacent sectors supported mobility without excessive overshooting dominance.",
-                self.styles["Body"],
-            ),
-        ]
-        self.add_labeled_block("5.7 Cell Dominance Analysis", dominance_flowables)
+            spread_flowables.append(Paragraph("PCI coverage spread data is not available.", self.styles["Body"]))
+        self.add_labeled_block("5.6 Top PCI Coverage Spread", spread_flowables)
 
         summary_flowables = [make_native_table(summary_df), Spacer(1, 4)]
         if mobility_status == "Good" and neighbor_status == "Available":
@@ -2948,7 +3498,7 @@ class NewFormatPDFReport(PDFReportGenerator):
                 "handover analysis stage."
             )
         summary_flowables.append(Paragraph(f"Observation: {overall_text}", self.styles["Body"]))
-        self.add_labeled_block("5.8 Mobility Summary", summary_flowables)
+        self.add_labeled_block("5.7 Mobility Summary", summary_flowables)
 
     def add_handover_kpi_analysis(self, handover_data: dict):
         """
@@ -3037,27 +3587,30 @@ class NewFormatPDFReport(PDFReportGenerator):
         ))
         self.add_labeled_block("6.3 Intra-frequency Handover", intra_flowables)
 
+        tech_events = _inter_rat_events(tech_events)
         upgrade = sum(1 for e in tech_events if e["handover_type"] == "Upgrade")
         downgrade = sum(1 for e in tech_events if e["handover_type"] == "Downgrade")
-        lateral = sum(1 for e in tech_events if e["handover_type"] == "Lateral")
         tech_flowables = [
             Paragraph(
                 "Objective: verify mobility across radio access technologies (e.g. LTE to 5G NSA), "
-                "classified as upgrade/downgrade/lateral by technology rank, matching the frontend's "
-                "own handover classification.",
+                "classified as upgrade/downgrade by technology rank, matching the frontend's own "
+                "handover classification. Same-tier (\"Lateral\") transitions are not true inter-RAT "
+                "events and are excluded.",
                 self.styles["Body"],
             ),
             Spacer(1, 4),
             make_native_table(build_tech_handover_summary_table(tech_events)),
         ]
-        tech_pairs_df = build_transition_pairs_table(tech_events, "Technology Transition")
+        tech_pairs_df = build_transition_pairs_table(
+            tech_events, "Technology Transition", include_kpi_avg=True,
+        )
         if not tech_pairs_df.empty:
             tech_flowables.append(Spacer(1, 4))
             tech_flowables.append(make_native_table(tech_pairs_df))
         tech_flowables.append(Spacer(1, 4))
         tech_flowables.append(Paragraph(
             f"Observation: {len(tech_events):,} inter-RAT handover events "
-            f"({upgrade:,} upgrade, {downgrade:,} downgrade, {lateral:,} lateral).",
+            f"({upgrade:,} upgrade, {downgrade:,} downgrade).",
             self.styles["Body"],
         ))
         self.add_labeled_block("6.4 Inter-RAT (Technology) Handover", tech_flowables)
@@ -3112,7 +3665,20 @@ class NewFormatPDFReport(PDFReportGenerator):
         dl_classification = compute_lte_throughput_classification(report_df, "dl_tpt", "dl")
         dl_class_df = build_lte_throughput_classification_table(dl_classification)
         dl_flowables = [
-            Paragraph("Objective: measure achievable download speed under live network conditions.", self.styles["Body"]),
+            Paragraph(
+                "Definition: Downlink (DL) throughput is the achievable download data rate, "
+                "classified relative to the theoretical peak throughput for the sample's own "
+                "LTE channel bandwidth (tbl_network_log.bw) — not a single fixed Mbps figure, "
+                "since the achievable peak itself scales with bandwidth.",
+                self.styles["Body"],
+            ),
+            Spacer(1, 4),
+            Paragraph("<b>Acceptance Criteria</b>", self.styles["Body"]),
+            *self._bullet_flowables([
+                "Good: DL throughput &gt;= 75% of the theoretical peak for the observed bandwidth",
+                "Fair: DL throughput 50-75% of the theoretical peak",
+                "Poor: DL throughput &lt; 50% of the theoretical peak",
+            ]),
             Spacer(1, 4),
             make_native_table(build_service_metric_table(report_df, "dl_tpt", "DL Throughput", "Mbps")),
         ]
@@ -3132,6 +3698,20 @@ class NewFormatPDFReport(PDFReportGenerator):
         ul_classification = compute_lte_throughput_classification(report_df, "ul_tpt", "ul")
         ul_class_df = build_lte_throughput_classification_table(ul_classification)
         ul_flowables = [
+            Paragraph(
+                "Definition: Uplink (UL) throughput is the achievable upload data rate, "
+                "classified relative to the theoretical peak throughput for the sample's own "
+                "LTE channel bandwidth (tbl_network_log.bw), same rule as DL throughput above.",
+                self.styles["Body"],
+            ),
+            Spacer(1, 4),
+            Paragraph("<b>Acceptance Criteria</b>", self.styles["Body"]),
+            *self._bullet_flowables([
+                "Good: UL throughput &gt;= 75% of the theoretical peak for the observed bandwidth",
+                "Fair: UL throughput 50-75% of the theoretical peak",
+                "Poor: UL throughput &lt; 50% of the theoretical peak",
+            ]),
+            Spacer(1, 4),
             make_native_table(build_service_metric_table(report_df, "ul_tpt", "UL Throughput", "Mbps")),
         ]
         if not ul_class_df.empty:
