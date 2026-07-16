@@ -970,18 +970,25 @@ def _worst_status(statuses) -> str:
 # that threshold. The curve itself stays blue, unchanged from production.
 # ------------------------------------------------------------------
 
-# Acceptance ("Good") threshold per KPI, all higher-is-better: a sample
-# fails acceptance when its value is BELOW this cutoff. RSRP/RSRQ/SINR
-# reuse the exact Good thresholds already shown elsewhere in this report
-# (Executive KPI Summary / Coverage KPI Summary "Acceptance" column:
-# "> -95 dBm", "> -10 dB", "> 20 dB"). DL/UL/MOS reuse
-# tools/report_engine/kpi_config.py's FIXED_THRESHOLD_CONFIG (DL
-# excellent_threshold, UL/MOS poor_threshold) as their single acceptance
-# cutoff, per direction received.
+# Acceptance threshold per KPI, all higher-is-better: a sample fails
+# acceptance when its value is BELOW this cutoff. RSRP/RSRQ/SINR use the
+# POOR-band boundary (not the Good-band boundary) per direction received:
+# Fair is also considered acceptable, so only truly Poor samples should
+# count as failing -- e.g. RSRP Good >-95 dBm, Fair -95 to -105 dBm, Poor
+# <-105 dBm (see classify_coverage/_band_rsrq/_band_sinr above), so the
+# acceptance cutoff here is -105 dBm, not -95. Same reasoning for RSRQ
+# (-15 dB, not -10) and SINR (13 dB, not 20). This single dict is the ONE
+# source of truth for every "poor"/"acceptance" reference in this report
+# (Executive KPI Summary, Coverage KPI Summary "Acceptance" column, Poor
+# RSRP/RSRQ maps + location text, PCI Good/Poor % columns, Poor PCI
+# Analysis tables, CDF acceptance crosshairs) so they can never disagree.
+# DL/UL/MOS reuse tools/report_engine/kpi_config.py's
+# FIXED_THRESHOLD_CONFIG (DL excellent_threshold, UL/MOS poor_threshold)
+# as their single acceptance cutoff, per direction received.
 CDF_ACCEPTANCE_THRESHOLDS = {
-    "RSRP": -95.0,
-    "RSRQ": -10.0,
-    "SINR": 20.0,
+    "RSRP": -105.0,
+    "RSRQ": -15.0,
+    "SINR": 13.0,
     "DL": 15.0,
     "UL": 5.0,
     "MOS": 3.0,
@@ -2047,11 +2054,17 @@ def build_coverage_kpi_summary_table(
 
     Adds two columns beyond report_VI's own layout, per direction
     received: "% Within Acceptance" / "% Outside Acceptance" — the % of
-    THAT KPI's own individual samples that clear the Good numeric cutoff
-    (>-95 dBm / >-10 dB / >20 dB), as distinct from the single averaged
-    "Observed" value used for PASS/FAIL.
+    THAT KPI's own individual samples that clear the acceptance cutoff.
+    Acceptance uses the POOR-band boundary, not the Good-band boundary
+    (CDF_ACCEPTANCE_THRESHOLDS — see that dict's comment above), per
+    direction received: Fair is also considered acceptable, so PASS means
+    Good OR Fair, and only truly Poor samples count as FAIL.
     """
     rows = []
+    rsrp_threshold = CDF_ACCEPTANCE_THRESHOLDS["RSRP"]
+    rsrq_threshold = CDF_ACCEPTANCE_THRESHOLDS["RSRQ"]
+    sinr_threshold = CDF_ACCEPTANCE_THRESHOLDS["SINR"]
+    acceptable_statuses = ("Good", "Fair")
 
     tech_list = _technology_groups(report_df)
     network_col = (
@@ -2075,10 +2088,10 @@ def build_coverage_kpi_summary_table(
     # samples only, not a shared blended threshold). ----
     if not rsrp.empty:
         avg_rsrp = float(rsrp.mean())
-        pct_within = float((rsrp > -95).mean() * 100)
+        pct_within = float((rsrp > rsrp_threshold).mean() * 100)
         rows.append((
-            "RSRP (Blended)", "> -95 dBm", f"{avg_rsrp:.1f} dBm",
-            "PASS" if coverage_status == "Good" else "FAIL",
+            "RSRP (Blended)", f"> {rsrp_threshold:g} dBm", f"{avg_rsrp:.1f} dBm",
+            "PASS" if coverage_status in acceptable_statuses else "FAIL",
             f"{pct_within:.0f}%", f"{100 - pct_within:.0f}%",
         ))
 
@@ -2087,11 +2100,11 @@ def build_coverage_kpi_summary_table(
         if rsrp_sub.empty:
             continue
         avg_rsrp_tech = float(rsrp_sub.mean())
-        pct_within_tech = float((rsrp_sub > -95).mean() * 100)
+        pct_within_tech = float((rsrp_sub > rsrp_threshold).mean() * 100)
         tech_status, _ = classify_coverage(rsrp_sub)
         rows.append((
-            f"RSRP - {tech}", "> -95 dBm", f"{avg_rsrp_tech:.1f} dBm",
-            "PASS" if tech_status == "Good" else "FAIL",
+            f"RSRP - {tech}", f"> {rsrp_threshold:g} dBm", f"{avg_rsrp_tech:.1f} dBm",
+            "PASS" if tech_status in acceptable_statuses else "FAIL",
             f"{pct_within_tech:.0f}%", f"{100 - pct_within_tech:.0f}%",
         ))
 
@@ -2101,10 +2114,10 @@ def build_coverage_kpi_summary_table(
         if rsrq.empty:
             continue
         avg_rsrq = float(rsrq.mean())
-        pct_within = float((rsrq > -10).mean() * 100)
+        pct_within = float((rsrq > rsrq_threshold).mean() * 100)
         rows.append((
-            f"RSRQ - {tech}", "> -10 dB", f"{avg_rsrq:.1f} dB",
-            "PASS" if _band_rsrq(avg_rsrq) == "Good" else "FAIL",
+            f"RSRQ - {tech}", f"> {rsrq_threshold:g} dB", f"{avg_rsrq:.1f} dB",
+            "PASS" if _band_rsrq(avg_rsrq) in acceptable_statuses else "FAIL",
             f"{pct_within:.0f}%", f"{100 - pct_within:.0f}%",
         ))
 
@@ -2113,10 +2126,10 @@ def build_coverage_kpi_summary_table(
         if sinr.empty:
             continue
         avg_sinr = float(sinr.mean())
-        pct_within = float((sinr > 20).mean() * 100)
+        pct_within = float((sinr > sinr_threshold).mean() * 100)
         rows.append((
-            f"SINR - {tech}", "> 20 dB", f"{avg_sinr:.1f} dB",
-            "PASS" if _band_sinr(avg_sinr) == "Good" else "FAIL",
+            f"SINR - {tech}", f"> {sinr_threshold:g} dB", f"{avg_sinr:.1f} dB",
+            "PASS" if _band_sinr(avg_sinr) in acceptable_statuses else "FAIL",
             f"{pct_within:.0f}%", f"{100 - pct_within:.0f}%",
         ))
 
@@ -2255,7 +2268,7 @@ def build_top_pci_table(report_df: pd.DataFrame, limit: int = 15) -> pd.DataFram
 
 def build_pci_spread_table(report_df: pd.DataFrame, limit: int = 15) -> pd.DataFrame:
     """
-    PCI | Sample Count | > 2 km | > 5 km | > 10 km
+    PCI | Sample Count | < 2 km | 2-5 km | > 5 km
 
     For the same top-N PCIs shown in 5.2/5.3, measures how far that PCI's
     OWN samples are scattered from that PCI's own centroid (the mean
@@ -2263,14 +2276,12 @@ def build_pci_spread_table(report_df: pd.DataFrame, limit: int = 15) -> pd.DataF
     from its own average position suggests overshoot/interference rather
     than a tight, well-contained serving footprint. Distance uses
     production's own haversine() (tools/report_engine/metadata_generator.py,
-    unchanged). The three distance columns are cumulative ("> 2 km"
-    includes samples also counted in "> 5 km" and "> 10 km"), matching how
-    the request was phrased (how many are > 2km, how many > 5km, how many
-    > 10km — not disjoint bands).
+    unchanged). The three distance columns are disjoint bands (every
+    sample falls into exactly one), per direction received.
     """
     stats = build_pci_distribution_stats(report_df)
     counts = stats["counts"]
-    columns = ["PCI", "Sample Count", "> 2 km", "> 5 km", "> 10 km"]
+    columns = ["PCI", "Sample Count", "< 2 km", "2-5 km", "> 5 km"]
     if counts.empty or not {"lat", "lon"}.issubset(report_df.columns):
         return pd.DataFrame(columns=columns)
 
@@ -2278,10 +2289,11 @@ def build_pci_spread_table(report_df: pd.DataFrame, limit: int = 15) -> pd.DataF
     lat_numeric = pd.to_numeric(report_df["lat"], errors="coerce")
     lon_numeric = pd.to_numeric(report_df["lon"], errors="coerce")
 
-    def _bucket(distances_km, threshold_km):
-        n_over = int((distances_km > threshold_km).sum())
-        pct = (n_over / len(distances_km) * 100) if len(distances_km) else 0.0
-        return f"{n_over} ({pct:.1f}%)"
+    def _band(distances_km, lo, hi):
+        mask = (distances_km >= lo) if hi is None else ((distances_km >= lo) & (distances_km < hi))
+        n = int(mask.sum())
+        pct = (n / len(distances_km) * 100) if len(distances_km) else 0.0
+        return f"{n} ({pct:.1f}%)"
 
     rows = []
     for pci, count in counts.head(limit).items():
@@ -2298,7 +2310,7 @@ def build_pci_spread_table(report_df: pd.DataFrame, limit: int = 15) -> pd.DataF
         ])
         rows.append((
             int(pci), f"{count:,}",
-            _bucket(distances_km, 2), _bucket(distances_km, 5), _bucket(distances_km, 10),
+            _band(distances_km, 0, 2), _band(distances_km, 2, 5), _band(distances_km, 5, None),
         ))
     return pd.DataFrame(rows, columns=columns)
 
@@ -2328,12 +2340,44 @@ def build_poor_pci_analysis_table(report_df: pd.DataFrame, metric_column: str):
     Uses the SAME single acceptance threshold as every other "poor"
     RSRP/RSRQ reference in this report (-95 dBm / -10 dB — see
     CDF_ACCEPTANCE_THRESHOLDS), not the separate -105/-14 Poor-band
-    boundary, per direction received.
+    boundary, per direction received. Adds a Good/Poor % column — each
+    listed PCI's OWN samples (not just its already-filtered poor subset)
+    split by that same threshold — matching the 5.2 PCI Distribution
+    table's Good/Poor RSRP % column.
     """
     from tools.report_engine.kpi_analysis import build_poor_pci_table
 
     threshold = CDF_ACCEPTANCE_THRESHOLDS["RSRP" if metric_column == "rsrp" else "RSRQ"]
-    return build_poor_pci_table(report_df, metric_column, threshold)
+    df = build_poor_pci_table(report_df, metric_column, threshold)
+    if df is None or df.empty:
+        return df
+
+    pci_numeric = pd.to_numeric(report_df["pci"], errors="coerce") if "pci" in report_df.columns else pd.Series(dtype=float)
+    metric_numeric = (
+        pd.to_numeric(report_df[metric_column], errors="coerce")
+        if metric_column in report_df.columns else pd.Series(dtype=float)
+    )
+
+    good_poor_col = []
+    for pci in df["PCI"]:
+        # build_poor_pci_table's own "PCI" column comes out as strings
+        # (object dtype), not numbers -- coerce before comparing against
+        # report_df's numeric pci column or every row silently matches 0
+        # samples.
+        pci_value = pd.to_numeric(pci, errors="coerce")
+        values = metric_numeric[(pci_numeric == pci_value) & metric_numeric.notna()]
+        if values.empty:
+            good_poor_col.append("N/A")
+            continue
+        good_pct = float((values >= threshold).mean() * 100)
+        good_poor_col.append(f"{good_pct:.1f}% / {100 - good_pct:.1f}%")
+
+    total_poor_pci = df.attrs.get("total_poor_pci")
+    df = df.copy()
+    df["Good/Poor %"] = good_poor_col
+    if total_poor_pci is not None:
+        df.attrs["total_poor_pci"] = total_poor_pci
+    return df
 
 
 def _poor_pci_section_title(base_title: str, table_df: pd.DataFrame | None) -> str:
@@ -3472,9 +3516,9 @@ class NewFormatPDFReport(PDFReportGenerator):
             spread_flowables.append(make_native_table(pci_spread_df))
             spread_flowables.append(Spacer(1, 4))
             spread_flowables.append(Paragraph(
-                "Observation: distance columns are cumulative (\"&gt; 2 km\" includes samples "
-                "also counted in \"&gt; 5 km\" and \"&gt; 10 km\"). PCIs with a large share of "
-                "samples beyond 5-10 km from their own center are candidates for overshoot review.",
+                "Observation: distance bands are disjoint (each sample falls into exactly one of "
+                "\"&lt; 2 km\", \"2-5 km\" or \"&gt; 5 km\"). PCIs with a large share of samples "
+                "beyond 5 km from their own center are candidates for overshoot review.",
                 self.styles["Body"],
             ))
         else:

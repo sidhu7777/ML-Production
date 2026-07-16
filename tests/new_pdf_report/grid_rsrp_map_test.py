@@ -99,6 +99,7 @@ map screenshot test_new_pdf_report.py takes -- unchanged here.
 Run directly with (from the ML/ directory):
     venv-win/Scripts/python.exe -m tests.new_pdf_report.grid_rsrp_map_test
 """
+import json
 import math
 from pathlib import Path
 
@@ -304,15 +305,16 @@ def generate_kpi_grid_map(
     "SINR median: 12.3 dB") -- the aggregation itself is identical for
     every KPI (see aggregate_grid_cells).
 
-    `total_cells` is the TOTAL number of polygon-interior lattice cells
-    (populated or not -- the same "total" aggregate_grid_cells returns,
-    identical across every technology since it only depends on the
-    polygon + grid size), added to the legend alongside this
-    technology's own populated-cell count so a reader can see e.g.
-    "Total Grid Cells: 4442" next to "Populated (this technology): 167"
-    instead of only ever seeing the per-range breakdown of the populated
-    subset with no sense of how big the full grid is. Omitted from the
-    legend when not supplied.
+    `total_cells` is the number of grid cells actually touched by the
+    DRIVE ROUTE for this KPI across every technology combined (i.e.
+    aggregate_grid_cells() run on the full, not per-technology, dataframe)
+    -- NOT the full polygon-interior lattice size, which is usually far
+    bigger than the driven path and was confirmed wrong for this purpose
+    (project 292: 4442 polygon-interior cells vs. 185 actually touched by
+    the drive). Rendered as a small summary line BELOW the color-range
+    rows (appended to the legend box after add_legend's own rows have
+    rendered), alongside this technology's own populated-cell count.
+    Omitted from the legend when not supplied.
     """
     m = new_report_map()
     add_fullscreen_css(m)
@@ -326,13 +328,35 @@ def generate_kpi_grid_map(
         ).add_to(m)
 
     legend_items = build_legend_from_ranges(pd.DataFrame({metric_label: cells["value_agg"]}), metric_label, ranges)
-    if total_cells is not None:
-        legend_items = [
-            ("Total Grid Cells", "#6b7280", total_cells),
-            ("Populated (this technology)", "#374151", len(cells)),
-            *legend_items,
-        ]
     add_legend(m, f"{metric_label} (grid, {int(grid_size_meters)}m cells, {AGGREGATION})", legend_items)
+
+    if total_cells is not None:
+        summary_html = (
+            '<div style="margin-top:10px; padding-top:8px; '
+            'border-top:1px solid rgba(0,0,0,0.15); font-size:12px; color:#4b5563;">'
+            f"Total Grid Cells (drive route): {total_cells}<br/>"
+            f"Populated (this technology): {len(cells)}"
+            "</div>"
+        )
+        payload = json.dumps(summary_html)
+        summary_js = f"""
+        <script>
+            (function() {{
+                function appendGridSummary() {{
+                    var legend = document.querySelector('.kpi-legend');
+                    if (!legend) {{
+                        window.setTimeout(appendGridSummary, 100);
+                        return;
+                    }}
+                    var wrapper = document.createElement('div');
+                    wrapper.innerHTML = {payload};
+                    legend.appendChild(wrapper.firstElementChild);
+                }}
+                window.setTimeout(appendGridSummary, 400);
+            }})();
+        </script>
+        """
+        m.get_root().html.add_child(folium.Element(summary_js))
 
     draw_polygon_overlay(m, polygon_wkt)
     fit_bounds_including_polygon(m, bounds_df.dropna(subset=["lat", "lon"]), polygon_wkt, reserve_legend_space=True)

@@ -239,6 +239,21 @@ def _render_kpi_map_per_technology(
 
     use_grid = bool(polygon_wkt) and grid_lattice is not None and not grid_lattice.empty
 
+    # Grid cells actually touched by the drive route for this KPI, ALL
+    # technologies combined -- the legend's "Total Grid Cells" figure.
+    # Computed once (not per technology) since it doesn't depend on which
+    # technology's map is being rendered, only on the KPI + the whole
+    # route. Deliberately NOT the full polygon-interior lattice size
+    # (len(grid_lattice)), which is usually far bigger than the driven
+    # path and was confirmed wrong for this purpose (project 292: 4442
+    # polygon-interior cells vs. 185 actually touched by the drive).
+    drive_route_total_cells = None
+    if use_grid and col in report_df.columns:
+        df_kpi_all_tech = report_df[
+            report_df[col].notna() & report_df["lat"].notna() & report_df["lon"].notna()
+        ]
+        _, _, drive_route_total_cells = aggregate_grid_cells(df_kpi_all_tech, grid_lattice, value_col=col)
+
     tech_list = _technology_groups(report_df)
     network_col = (
         report_df["network"].fillna("").astype(str).str.strip()
@@ -273,7 +288,7 @@ def _render_kpi_map_per_technology(
                 generate_kpi_grid_map(
                     cells, ranges, str(html_path), polygon_wkt=polygon_wkt,
                     grid_size_meters=grid_size_meters, bounds_df=report_df,
-                    metric_label=kpi_name.lower(), unit=unit, total_cells=total,
+                    metric_label=kpi_name.lower(), unit=unit, total_cells=drive_route_total_cells,
                 )
                 html_to_png(str(html_path), str(png_path), width=1200, height=900, device_scale_factor=1)
                 print(f"[map] generated {png_path.name} ({tech_label}, GRID: {populated}/{total} cells)")
