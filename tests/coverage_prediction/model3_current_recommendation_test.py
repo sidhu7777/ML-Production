@@ -43,6 +43,7 @@ class CurrentModel3Config:
     rrc_sector_capacity: float = future_builder.DEFAULT_RRC_SECTOR_CAPACITY
     sector_split_local_radius_m: float = 900.0
     max_sectors: int | None = None
+    carrier_reselection_hysteresis_db: float = 3.0
 
 
 def _timestamp() -> str:
@@ -191,11 +192,27 @@ def _load_current_context(config: CurrentModel3Config, logger) -> dict[str, Any]
     current_df = pd.read_csv(config.dataset_path)
     current_df["time_bucket"] = current_df["time_bucket"].astype(str)
     current_df["grid_id"] = pd.to_numeric(current_df["grid_id"], errors="coerce").astype("Int64")
+
+    # Every identity string a PRE-EXISTING cell is known by, across all naming layers
+    # (site table vs prediction surface use different formats for the same cell).
+    # A cell seen in a local rerun whose ID is NOT in this universe must be a synthetic
+    # action candidate (carrier addition / new site / sector split child), no matter how
+    # the prediction tooling mangled its name.
+    original_topology_cell_ids: set[str] = set()
+    for col in ["Node_Cell_ID", "cell_id"]:
+        if col in part3_site_df.columns:
+            original_topology_cell_ids.update(part3_site_df[col].dropna().astype(str).str.strip())
+    for col in ["Node_Cell_ID", "original_node_cell_id", "original_cell_id"]:
+        if col in corrected_pred_df.columns:
+            original_topology_cell_ids.update(corrected_pred_df[col].dropna().astype(str).str.strip())
+    original_topology_cell_ids.discard("")
+
     logger.info(
-        "current_context archive=%s part3_sites=%d current_rows=%d",
+        "current_context archive=%s part3_sites=%d current_rows=%d original_cell_id_universe=%d",
         archive_path,
         len(part3_site_df),
         len(current_df),
+        len(original_topology_cell_ids),
     )
     return {
         "archive_path": archive_path,
@@ -209,6 +226,8 @@ def _load_current_context(config: CurrentModel3Config, logger) -> dict[str, Any]
         "part3_site_df": part3_site_df,
         "building_df": pd.DataFrame(columns=["geometry_wkt"]),
         "current_base_df": _current_dataset_base_context(current_df),
+        "current_df": current_df,
+        "original_topology_cell_ids": original_topology_cell_ids,
     }
 
 
@@ -284,6 +303,63 @@ def _build_current_cell_inventory(df: pd.DataFrame, config: CurrentModel3Config)
     return out, summary
 
 
+def _select_serving_cell_with_hysteresis(
+    topo_work: pd.DataFrame, hysteresis_db: float, original_cell_ids: set[str]
+) -> pd.DataFrame:
+    """Pick one serving cell per grid/time_bucket, but require a synthetic action
+    candidate (carrier addition / new site / sector split child) to beat the grid's
+    currently-serving original cell by more than `hysteresis_db` before the grid is
+    allowed to reselect onto it.
+
+    Synthetic-vs-original is decided by ID-universe membership, not name patterns:
+    the prediction tooling mangles cell names between layers (site table
+    '901053_1__ADD900' comes back as '1_ADD900'; pre-existing multiband cells
+    '364_1__MB850' come back as '1_MB850'), so a suffix regex silently matches
+    nothing. A candidate is original iff ANY of its identity columns (Node_Cell_ID,
+    original_node_cell_id, original_cell_id) appears in `original_cell_ids` - the set
+    of every identity string the pre-action network is known by.
+
+    Without this gate, a colocated synthetic candidate (same site/power/height as the
+    original, only a different band or a few hundred meters away) can win the plain
+    best-RSRP comparison for every grid in the local resimulation footprint at once,
+    causing the original cell to drop from ~95% PRB to 0% and dumping the entire load
+    onto the new cell in one all-or-nothing swing instead of a realistic partial
+    reselection.
+    """
+    work = topo_work.copy()
+    is_original = pd.Series(False, index=work.index)
+    for col in ["Node_Cell_ID", "original_node_cell_id", "original_cell_id"]:
+        if col in work.columns:
+            is_original = is_original | work[col].astype(str).str.strip().isin(original_cell_ids)
+    work["_is_synthetic_candidate"] = ~is_original
+    ranked = work.sort_values(["grid_id", "time_bucket", "_rank_rsrp"], ascending=[True, True, False])
+
+    best_overall = ranked.drop_duplicates(subset=["grid_id", "time_bucket"], keep="first")
+    best_original = ranked.loc[~ranked["_is_synthetic_candidate"]].drop_duplicates(
+        subset=["grid_id", "time_bucket"], keep="first"
+    )
+    if best_original.empty:
+        return best_overall.drop(columns=["_is_synthetic_candidate"], errors="ignore")
+
+    prior_rsrp = best_original.set_index(["grid_id", "time_bucket"])["_rank_rsrp"]
+    overall_keys = pd.MultiIndex.from_frame(best_overall[["grid_id", "time_bucket"]])
+    prior_for_overall = prior_rsrp.reindex(overall_keys).to_numpy()
+
+    stick_to_original = (
+        best_overall["_is_synthetic_candidate"].to_numpy()
+        & ~pd.isna(prior_for_overall)
+        & (pd.to_numeric(best_overall["_rank_rsrp"], errors="coerce").to_numpy() < (prior_for_overall + hysteresis_db))
+    )
+
+    if stick_to_original.any():
+        switch_keys = best_overall.loc[stick_to_original, ["grid_id", "time_bucket"]]
+        fallback_rows = best_original.merge(switch_keys, on=["grid_id", "time_bucket"], how="inner")
+        best_overall = pd.concat(
+            [best_overall.loc[~stick_to_original], fallback_rows], ignore_index=True, sort=False
+        )
+    return best_overall.drop(columns=["_is_synthetic_candidate"], errors="ignore")
+
+
 def _build_current_inventory_from_surface(
     *,
     baseline_local: pd.DataFrame,
@@ -319,7 +395,9 @@ def _build_current_inventory_from_surface(
     topo_work = corrected_local.copy()
     topo_work["grid_id"] = pd.to_numeric(topo_work["grid_id"], errors="coerce").astype("Int64")
     topo_work["_rank_rsrp"] = pd.to_numeric(topo_work.get("pred_rsrp"), errors="coerce")
-    topo_best = topo_work.sort_values(["grid_id", "time_bucket", "_rank_rsrp"], ascending=[True, True, False]).drop_duplicates(subset=["grid_id", "time_bucket"], keep="first")
+    topo_best = _select_serving_cell_with_hysteresis(
+        topo_work, config.carrier_reselection_hysteresis_db, context.get("original_topology_cell_ids", set())
+    )
     topo_keep = [
         col
         for col in topo_best.columns
@@ -384,6 +462,9 @@ def _build_current_inventory_from_surface(
     enriched["estimated_dl_capacity_mbps"] = (
         bandwidth_mhz * spectral * max(1.0, float(future_builder.DEFAULT_MIMO_LAYERS)) * max(0.1, 1.0 - float(future_builder.DEFAULT_CONTROL_OVERHEAD))
     ).clip(lower=0.1).round(3)
+    # Grids with no serving candidate in the corrected surface have no Node_Cell_ID;
+    # keeping them would pool all their demand into a single phantom NaN "cell".
+    enriched = enriched.loc[enriched["Node_Cell_ID"].notna()].copy()
     enriched = _assign_current_grid_load_to_cells(enriched, config)
     cell_inventory, _ = _build_current_cell_inventory(enriched, config)
     return enriched, cell_inventory
@@ -520,6 +601,400 @@ def _run_load_balance_current(
     }
 
 
+_LOCAL_GRID_IDENTITY_COLS = ["grid_id", "grid_row", "grid_col", "grid_centroid_lat", "grid_centroid_lon"]
+_EARTH_RADIUS_M = 6371000.0
+
+
+def _force_master_grid_identity(pred_df: pd.DataFrame, point_map: pd.DataFrame, tolerance_m: float) -> pd.DataFrame:
+    """Give a locally-resimulated prediction surface the MASTER archive's grid numbering.
+
+    The RF rerun (and `_ensure_grid_group_columns`) number grids by factorizing the
+    run's own lat/lon pairs into sequential codes, so "grid 2600" in a local rerun is
+    a different physical place than the master archive's grid 2600 - yet the codes
+    overlap numerically. Downstream joins (demand attach, lineage lookup, before/after
+    comparison) all key on grid_id, so without this the master demand lands on the
+    wrong locations and every derived PRB number is physically meaningless.
+
+    Exact lat/lon joins cannot align the two surfaces either: the RF engine lays out
+    its own sampling lattice per run with a run-specific origin, so local prediction
+    points never coincide exactly with master points. Instead, snap each local point
+    to its nearest master point within `tolerance_m` (about half a grid cell) and
+    adopt that master point's full grid identity. Points with no master point within
+    tolerance are discarded - the master surface doesn't know them, no demand exists
+    for them, and they only served as interference context during the RF run.
+    """
+    from sklearn.neighbors import BallTree
+
+    if pred_df.empty or point_map.empty:
+        return future_rules._ensure_grid_group_columns(pred_df.copy())
+    work = pred_df.drop(columns=_LOCAL_GRID_IDENTITY_COLS, errors="ignore").copy()
+    if not {"lat", "lon"}.issubset(work.columns):
+        return future_rules._ensure_grid_group_columns(work)
+
+    pm = point_map.dropna(subset=["lat", "lon"]).drop_duplicates(subset=["lat", "lon"]).reset_index(drop=True)
+    work_lat = pd.to_numeric(work["lat"], errors="coerce")
+    work_lon = pd.to_numeric(work["lon"], errors="coerce")
+    valid = work_lat.notna() & work_lon.notna()
+    work = work.loc[valid].copy()
+    if work.empty:
+        return future_rules._ensure_grid_group_columns(work)
+
+    tree = BallTree(np.radians(pm[["lat", "lon"]].astype(float).to_numpy()), metric="haversine")
+    dist_rad, nearest_idx = tree.query(np.radians(work[["lat", "lon"]].astype(float).to_numpy()), k=1)
+    dist_m = dist_rad[:, 0] * _EARTH_RADIUS_M
+    within = dist_m <= float(tolerance_m)
+    work = work.loc[within].copy()
+    if work.empty:
+        return future_rules._ensure_grid_group_columns(work)
+    matched = pm.iloc[nearest_idx[within, 0]].reset_index(drop=True)
+
+    identity_cols = [c for c in _LOCAL_GRID_IDENTITY_COLS if c in matched.columns]
+    work = work.reset_index(drop=True)
+    for col in identity_cols:
+        work[col] = matched[col].to_numpy()
+    return future_rules._ensure_grid_group_columns(work)
+
+
+def _affected_lineage_grid_ids(sector_cells: pd.DataFrame, current_df: pd.DataFrame) -> list[int]:
+    """Grid ids that the archive's full-network surface actually assigned to the
+    cells being acted on, independent of distance from the site coordinate."""
+    lineage_ids: set[str] = set()
+    for col in ["Node_Cell_ID", "topology_original_cell_id", "topology_original_node_cell_id"]:
+        if col in sector_cells.columns:
+            lineage_ids.update(
+                str(v).strip() for v in sector_cells[col].dropna().astype(str).tolist() if str(v).strip()
+            )
+    if not lineage_ids or current_df.empty:
+        return []
+    mask = pd.Series(False, index=current_df.index)
+    for col in ["Node_Cell_ID", "topology_original_cell_id", "topology_original_node_cell_id"]:
+        if col in current_df.columns:
+            mask = mask | current_df[col].astype(str).isin(lineage_ids)
+    return pd.to_numeric(current_df.loc[mask, "grid_id"], errors="coerce").dropna().astype(int).unique().tolist()
+
+
+def _prepare_local_action_context_current(
+    *,
+    sector_cells: pd.DataFrame,
+    site_df: pd.DataFrame,
+    context: dict[str, Any],
+    config: CurrentModel3Config,
+    logger,
+    action_label: str,
+    source_rows: pd.DataFrame,
+) -> dict[str, Any] | None:
+    """Model 3 current-recommendation variant of `future_rules._prepare_local_action_context`.
+
+    The shared helper caps candidate interferers at the 25 nearest sites and grid
+    coverage at a fixed radius, which makes the resimulated "after" PRB incomparable
+    to the "before" PRB (computed from the full-network archive): the same physical
+    cell gets a different SINR/capacity purely from interferers being dropped, and
+    grids outside the radius silently disappear from the aggregation. This variant
+    widens the interferer pool to match the original run's `max_interference_sites`
+    cap and force-includes every grid the full-network surface actually assigned to
+    the affected cells, so the local rerun stays apples-to-apples with "before".
+    """
+    baseline_all = context["baseline_pred_df"]
+    corrected_all = context["corrected_pred_df"]
+    detail_all = context["coverage_rows_df"]
+    kpi_all = context["kpi_df"]
+    geo_all = context["geo_df"]
+
+    part3_baseline = baseline_all.loc[baseline_all["time_bucket"].astype(str) == "PART_3"].copy()
+    part3_corrected = corrected_all.loc[corrected_all["time_bucket"].astype(str) == "PART_3"].copy()
+    part3_detail = detail_all.loc[detail_all["time_bucket"].astype(str) == "PART_3"].copy()
+    part3_kpi = kpi_all.loc[kpi_all["time_bucket"].astype(str) == "PART_3"].copy()
+    part3_geo = geo_all.loc[geo_all["time_bucket"].astype(str) == "PART_3"].copy()
+
+    if source_rows is None or source_rows.empty:
+        source_rows = future_rules._extract_source_site_rows(sector_cells, site_df)
+    if source_rows.empty:
+        logger.info("%s_prepare_failed reason=no_source_rows", action_label)
+        return None
+
+    site_lat = pd.to_numeric(source_rows["lat"], errors="coerce").mean()
+    site_lon = pd.to_numeric(source_rows["lon"], errors="coerce").mean()
+    site_work = site_df.copy()
+    site_work["_site_distance_m"] = future_rules._haversine_distance_m_series(site_work["lat"], site_work["lon"], site_lat, site_lon)
+    site_distance_df = (
+        site_work.groupby("Site ID", as_index=False)
+        .agg(site_distance_m=("_site_distance_m", "min"))
+        .sort_values("site_distance_m", ascending=True)
+    )
+    max_interference_sites = int(context["summary"].get("max_interference_sites", 50))
+    nearest_site_count = max(60, max_interference_sites + 15)
+    nearest_site_ids = site_distance_df["Site ID"].head(nearest_site_count).astype(str).tolist()
+    local_site_df = site_work.loc[site_work["Site ID"].astype(str).isin(nearest_site_ids)].copy()
+    if local_site_df.empty:
+        local_site_df = site_work.copy()
+
+    local_point_map = future_rules._make_local_point_map(part3_baseline)
+    if local_point_map.empty:
+        logger.info("%s_prepare_failed reason=no_point_map", action_label)
+        return None
+    local_point_map["_site_distance_m"] = future_rules._haversine_distance_m_series(local_point_map["lat"], local_point_map["lon"], site_lat, site_lon)
+
+    lineage_grid_ids = _affected_lineage_grid_ids(sector_cells, context.get("current_df", pd.DataFrame()))
+    radius_mask = local_point_map["_site_distance_m"] <= float(config.sector_split_local_radius_m)
+    lineage_mask = pd.to_numeric(local_point_map["grid_id"], errors="coerce").astype("Int64").isin(lineage_grid_ids)
+    local_point_map = local_point_map.loc[radius_mask | lineage_mask].copy()
+    if local_point_map.empty:
+        local_point_map = future_rules._make_local_point_map(
+            part3_baseline.loc[part3_baseline["Node_Cell_ID"].astype(str).isin(sector_cells["Node_Cell_ID"].astype(str))]
+        )
+    if local_point_map.empty:
+        logger.info("%s_prepare_failed reason=no_local_points", action_label)
+        return None
+
+    affected_grid_ids = pd.to_numeric(local_point_map["grid_id"], errors="coerce").dropna().astype("Int64").unique().tolist()
+    local_detail = pd.DataFrame()
+    if affected_grid_ids and "grid_id" in part3_detail.columns:
+        detail_grid_ids = pd.to_numeric(part3_detail["grid_id"], errors="coerce").astype("Int64")
+        local_detail = part3_detail.loc[detail_grid_ids.isin(affected_grid_ids)].copy()
+    if local_detail.empty:
+        local_detail = part3_detail.merge(local_point_map[["lat", "lon"]].drop_duplicates(), on=["lat", "lon"], how="inner")
+    if local_detail.empty:
+        local_detail = local_point_map[["lat", "lon", "grid_id", "grid_row", "grid_col", "grid_centroid_lat", "grid_centroid_lon"]].drop_duplicates().copy()
+        local_detail["time_bucket"] = "PART_3"
+
+    local_kpi = part3_kpi.loc[pd.to_numeric(part3_kpi["grid_id"], errors="coerce").astype("Int64").isin(affected_grid_ids)].copy()
+    local_geo = part3_geo.loc[pd.to_numeric(part3_geo["grid_id"], errors="coerce").astype("Int64").isin(affected_grid_ids)].copy()
+    logger.info(
+        "%s_prepare local_points=%d local_detail_rows=%d local_sites=%d lineage_grid_ids=%d",
+        action_label,
+        len(local_point_map),
+        len(local_detail),
+        len(local_site_df),
+        len(lineage_grid_ids),
+    )
+    return {
+        "part3_baseline": part3_baseline,
+        "part3_corrected": part3_corrected,
+        "local_site_df": local_site_df,
+        "local_point_map": local_point_map,
+        "local_detail": local_detail,
+        "local_kpi": local_kpi,
+        "local_geo": local_geo,
+    }
+
+
+def _evaluate_action_inventory_current(
+    *,
+    sector_cells: pd.DataFrame,
+    after_inventory: pd.DataFrame,
+    candidate_node_cell_ids: set[str],
+    demand_serving_cell_ids: set[str],
+    config: CurrentModel3Config,
+    logger,
+    action_label: str,
+) -> dict[str, Any]:
+    """Model 3 current-recommendation variant of `future_rules._evaluate_action_inventory`.
+
+    The shared function's same-site fallback widens the after-scope to ANY cell at the
+    site with nonzero load whenever the matched scope's PRB reads <= 0. That conflates
+    two very different situations: (a) lineage matching genuinely failed to find the
+    acted-on cell(s) in the after-surface, vs (b) the cell(s) were found and correctly
+    show ~0 load because the action successfully evacuated them. Case (b) is exactly what
+    a working carrier addition looks like, but the shared logic then substitutes an
+    unrelated sibling cell's independent PRB as if it were this action's outcome -
+    producing "before=96%, after=115%" results that describe two different physical
+    cells, not a before/after of the same one.
+
+    A cell that wins zero grids never gets a row in the collapsed `after_inventory` at
+    all (`_build_current_cell_inventory` only emits rows for cells present in at least
+    one grid's winning assignment) - so "absent from after_inventory" alone can't tell
+    apart "genuinely evacuated to 0%" from "never a valid candidate in this rerun".
+    `candidate_node_cell_ids` (the RF-predicted candidate surface, before winner
+    selection collapses it) resolves that: if the acted-on cell was a real candidate,
+    trust the 0% reading; only fall back to the site-wide search if it wasn't even a
+    candidate here (e.g. removed by sector split, or dropped by the local topology).
+    """
+    before_cells = sector_cells["Node_Cell_ID"].astype(str).tolist()
+    source_sector_id = str(future_rules._first_non_empty(sector_cells["sector_id"])).strip()
+    source_site_id = future_rules._normalize_identity_text(future_rules._first_non_empty(sector_cells["site_id"]))
+    source_frontend_sector_keys = {source_sector_id} if source_sector_id else set()
+    source_topology_sector_keys: set[str] = set()
+    for col in [
+        "topology_frontend_site_sector_key",
+        "topology_node_cell_sector_key",
+        "topology_sector_identity_key",
+        "topology_canonical_sector_id",
+        "topology_site_sector_band_key",
+        "sector_id",
+    ]:
+        if col in sector_cells.columns:
+            source_topology_sector_keys.update(
+                str(value).strip()
+                for value in sector_cells[col].dropna().astype(str).tolist()
+                if str(value).strip()
+            )
+    source_frontend_sector_keys.update(source_topology_sector_keys)
+    original_lineage_ids = set(value for value in before_cells if str(value).strip())
+    for col in ["topology_original_cell_id", "topology_original_node_cell_id"]:
+        if col in sector_cells.columns:
+            original_lineage_ids.update(
+                str(value).strip()
+                for value in sector_cells[col].dropna().astype(str).tolist()
+                if str(value).strip()
+            )
+
+    def _scope_mask(df: pd.DataFrame, *, sector_keys: set[str], lineage_ids: set[str], site_id: str) -> pd.Series:
+        mask = pd.Series(False, index=df.index)
+        if source_sector_id and "sector_id" in df.columns:
+            mask = mask | df["sector_id"].astype(str).eq(source_sector_id)
+        for col in [
+            "sector_id",
+            "topology_frontend_site_sector_key",
+            "topology_node_cell_sector_key",
+            "topology_sector_identity_key",
+            "topology_canonical_sector_id",
+            "topology_site_sector_band_key",
+        ]:
+            if col in df.columns and sector_keys:
+                mask = mask | df[col].astype(str).isin(sector_keys)
+        for col in ["Node_Cell_ID", "topology_original_cell_id", "topology_original_node_cell_id"]:
+            if col in df.columns and lineage_ids:
+                mask = mask | df[col].astype(str).isin(lineage_ids)
+        if site_id and "site_id" in df.columns:
+            mask = mask | df["site_id"].map(future_rules._normalize_identity_text).eq(site_id)
+        return mask
+
+    primary_mask = _scope_mask(after_inventory, sector_keys=source_frontend_sector_keys, lineage_ids=original_lineage_ids, site_id="")
+    primary_matches = after_inventory.loc[primary_mask].copy()
+
+    affected_sector_keys = set(source_frontend_sector_keys)
+    if not primary_matches.empty:
+        for col in [
+            "sector_id",
+            "topology_frontend_site_sector_key",
+            "topology_node_cell_sector_key",
+            "topology_sector_identity_key",
+            "topology_canonical_sector_id",
+            "topology_site_sector_band_key",
+        ]:
+            if col in primary_matches.columns:
+                affected_sector_keys.update(
+                    str(value).strip()
+                    for value in primary_matches[col].dropna().astype(str).tolist()
+                    if str(value).strip()
+                )
+        for col in ["Node_Cell_ID", "topology_original_cell_id", "topology_original_node_cell_id"]:
+            if col in primary_matches.columns:
+                original_lineage_ids.update(
+                    str(value).strip()
+                    for value in primary_matches[col].dropna().astype(str).tolist()
+                    if str(value).strip()
+                )
+
+    final_mask = _scope_mask(after_inventory, sector_keys=affected_sector_keys, lineage_ids=original_lineage_ids, site_id="")
+    # Follow the demand: cells that now serve the congested lineage grids decide the
+    # outcome, whether they are the original cell, the synthetic candidate, or a sibling.
+    if demand_serving_cell_ids and "Node_Cell_ID" in after_inventory.columns:
+        final_mask = final_mask | after_inventory["Node_Cell_ID"].astype(str).str.strip().isin(demand_serving_cell_ids)
+    after_candidates = after_inventory.loc[final_mask].copy()
+
+    after_lineage_ids: set[str] = set()
+    for col in ["Node_Cell_ID", "topology_original_cell_id", "topology_original_node_cell_id"]:
+        if col in after_inventory.columns:
+            after_lineage_ids.update(after_inventory[col].dropna().astype(str))
+    before_cells_found_in_after = bool(original_lineage_ids & after_lineage_ids)
+    before_cells_were_candidates = bool(original_lineage_ids & candidate_node_cell_ids)
+
+    scope_mode = "matched_scope"
+    evacuated_to_zero = False
+
+    if after_candidates.empty and not before_cells_found_in_after and before_cells_were_candidates:
+        # The acted-on cell(s) were legitimate RF candidates in this rerun (they had
+        # predicted RSRP for at least one grid) but won zero grids after reselection -
+        # `_build_current_cell_inventory` never emits a row for a cell with 0 assigned
+        # grids, so this is a real "evacuated to 0%" outcome, not a matching gap. Trust
+        # it directly instead of substituting an unrelated cell's independent load.
+        evacuated_to_zero = True
+        scope_mode = "evacuated_zero"
+    elif after_candidates.empty and source_site_id:
+        after_site_ids = after_inventory["site_id"].map(future_rules._normalize_identity_text) if "site_id" in after_inventory.columns else pd.Series("", index=after_inventory.index)
+        after_candidates = after_inventory.loc[after_site_ids == source_site_id].copy()
+
+    def _summarize_scope(df: pd.DataFrame) -> tuple[float, float, float]:
+        prb = future_rules._to_num(df["prb_before_pct"])
+        rrc = future_rules._to_num(df["rrc_before_pct"])
+        users = future_rules._to_num(df["rrc_users_before"]) if "rrc_users_before" in df.columns else pd.Series(dtype=float)
+        return (
+            float(prb.max()) if prb.notna().any() else np.nan,
+            float(rrc.max()) if rrc.notna().any() else np.nan,
+            float(users.max()) if users.notna().any() else np.nan,
+        )
+
+    if evacuated_to_zero:
+        projected_prb, projected_rrc, projected_users = 0.0, 0.0, 0.0
+    else:
+        projected_prb, projected_rrc, projected_users = _summarize_scope(after_candidates)
+    before_prb = float(future_rules._to_num(sector_cells["prb_before_pct"]).max()) if future_rules._to_num(sector_cells["prb_before_pct"]).notna().any() else np.nan
+    before_rrc = float(future_rules._to_num(sector_cells["rrc_before_pct"]).max()) if future_rules._to_num(sector_cells["rrc_before_pct"]).notna().any() else np.nan
+    before_pressure = max(before_prb if pd.notna(before_prb) else 0.0, before_rrc if pd.notna(before_rrc) else 0.0)
+
+    # Only widen scope when the acted-on cell(s) are genuinely absent from the after
+    # surface AND were never even a valid candidate here (a real lineage/topology
+    # failure) - not when they were a legitimate candidate that simply lost every grid.
+    if (
+        not evacuated_to_zero
+        and source_site_id
+        and not before_cells_found_in_after
+        and pd.notna(before_prb)
+        and before_prb > 0
+        and (not pd.notna(projected_prb) or projected_prb <= 0.0)
+        and "site_id" in after_inventory.columns
+    ):
+        site_scope = after_inventory.loc[after_inventory["site_id"].map(future_rules._normalize_identity_text).eq(source_site_id)].copy()
+        site_scope = site_scope.loc[
+            (future_rules._to_num(site_scope.get("prb_before_pct", pd.Series(dtype=float))) > 0.0)
+            | (future_rules._to_num(site_scope.get("rrc_before_pct", pd.Series(dtype=float))) > 0.0)
+            | (future_rules._to_num(site_scope.get("rrc_users_before", pd.Series(dtype=float))) > 0.0)
+        ].copy()
+        if not site_scope.empty:
+            after_candidates = site_scope
+            projected_prb, projected_rrc, projected_users = _summarize_scope(after_candidates)
+            scope_mode = "same_site_nonzero_fallback"
+
+    after_pressure = max(projected_prb if pd.notna(projected_prb) else 0.0, projected_rrc if pd.notna(projected_rrc) else 0.0)
+    resolved = pd.notna(projected_prb) and pd.notna(projected_rrc) and projected_prb <= config.congestion_threshold and projected_rrc <= config.congestion_threshold
+    improved = after_pressure < before_pressure - 0.5
+    worsened = after_pressure > before_pressure + 0.5
+    if resolved:
+        status = "Resolved"
+    elif worsened:
+        status = "Rejected"
+    elif improved:
+        status = "Partially Resolved"
+    else:
+        status = "No Material Change"
+    after_cells = after_candidates["Node_Cell_ID"].astype(str).dropna().tolist() if "Node_Cell_ID" in after_candidates.columns else []
+    logger.info(
+        "%s_done sector=%s before_cells=%s after_cells=%s demand_serving_cells=%s local_after_rows=%d scope_mode=%s before_cells_found_in_after=%s before_prb=%.3f before_rrc=%.3f actual_prb=%.3f actual_rrc=%.3f status=%s",
+        action_label,
+        source_sector_id,
+        before_cells,
+        after_cells,
+        sorted(demand_serving_cell_ids),
+        len(after_candidates),
+        scope_mode,
+        before_cells_found_in_after,
+        before_prb if pd.notna(before_prb) else -1.0,
+        before_rrc if pd.notna(before_rrc) else -1.0,
+        projected_prb if pd.notna(projected_prb) else -1.0,
+        projected_rrc if pd.notna(projected_rrc) else -1.0,
+        status,
+    )
+    return {
+        "status": status,
+        "projected_prb_after_pct": round(projected_prb, 3) if pd.notna(projected_prb) else np.nan,
+        "projected_rrc_after_pct": round(projected_rrc, 3) if pd.notna(projected_rrc) else np.nan,
+        "projected_rrc_users_after": round(projected_users, 3) if pd.notna(projected_users) else np.nan,
+        "next_step": "" if resolved else "New Site",
+        "after_cells": after_cells,
+    }
+
+
 def _rerun_current_topology(
     *,
     sector_cells: pd.DataFrame,
@@ -530,19 +1005,11 @@ def _rerun_current_topology(
     site_df: pd.DataFrame,
     source_rows: pd.DataFrame,
 ) -> dict[str, Any]:
-    local_ctx = future_rules._prepare_local_action_context(
+    local_ctx = _prepare_local_action_context_current(
         sector_cells=sector_cells,
         site_df=site_df,
         context=context,
-        config=future_rules.Model3RecommendationConfig(
-            dataset_path=config.dataset_path,
-            summary_path=config.summary_path,
-            output_root=config.output_root,
-            stable_output_dir=config.stable_output_dir,
-            congestion_threshold=config.congestion_threshold,
-            rrc_sector_capacity=config.rrc_sector_capacity,
-            sector_split_local_radius_m=config.sector_split_local_radius_m,
-        ),
+        config=config,
         logger=logger,
         action_label=action_label,
         source_rows=source_rows,
@@ -585,21 +1052,16 @@ def _rerun_current_topology(
                 buckets=[("PART_3", "2026-02-11 00:00:00", "2026-05-16 23:59:59")],
                 polygon_wkt=str(context["summary"].get("polygon_wkt", "")).strip() or None,
             )
+    point_map = local_ctx["local_point_map"].drop(columns=["_site_distance_m"], errors="ignore")
+    snap_tolerance_m = float(context["summary"].get("grid_size_m", 50.0)) * 0.75
     baseline_local["time_bucket"] = "PART_3"
-    baseline_local = future_rules._merge_point_map_by_coordinates(
-        baseline_local,
-        local_ctx["local_point_map"].drop(columns=["_site_distance_m"], errors="ignore"),
-    )
-    baseline_local = future_rules._ensure_grid_group_columns(baseline_local)
+    baseline_local = _force_master_grid_identity(baseline_local, point_map, snap_tolerance_m)
     if corrected_local.empty:
         corrected_local = baseline_local.copy()
-    corrected_local["time_bucket"] = "PART_3"
-    corrected_local = future_rules._merge_point_map_by_coordinates(
-        corrected_local,
-        local_ctx["local_point_map"].drop(columns=["_site_distance_m"], errors="ignore"),
-    )
-    corrected_local = future_rules._ensure_grid_group_columns(corrected_local)
-    _, local_inventory = _build_current_inventory_from_surface(
+    else:
+        corrected_local["time_bucket"] = "PART_3"
+        corrected_local = _force_master_grid_identity(corrected_local, point_map, snap_tolerance_m)
+    enriched_local, local_inventory = _build_current_inventory_from_surface(
         baseline_local=baseline_local,
         corrected_local=corrected_local,
         local_site_df=local_ctx["local_site_df"],
@@ -608,17 +1070,27 @@ def _rerun_current_topology(
         context=context,
         config=config,
     )
-    outcome = future_rules._evaluate_action_inventory(
+    candidate_node_cell_ids: set[str] = set()
+    for col in ["Node_Cell_ID", "original_node_cell_id", "original_cell_id"]:
+        if col in corrected_local.columns:
+            candidate_node_cell_ids.update(corrected_local[col].dropna().astype(str))
+
+    # The congested demand lives on specific grids. After the action, whichever cells
+    # now serve those grids carry that demand - THEY decide whether congestion is
+    # actually resolved, regardless of how any cell is named across tooling layers.
+    lineage_grid_ids = set(_affected_lineage_grid_ids(sector_cells, context.get("current_df", pd.DataFrame())))
+    en_gid = pd.to_numeric(enriched_local.get("grid_id"), errors="coerce")
+    demand_serving_cell_ids = set(
+        enriched_local.loc[en_gid.isin(lineage_grid_ids), "Node_Cell_ID"].dropna().astype(str).str.strip()
+    )
+    demand_serving_cell_ids.discard("")
+
+    outcome = _evaluate_action_inventory_current(
         sector_cells=sector_cells,
         after_inventory=local_inventory,
-        config=future_rules.Model3RecommendationConfig(
-            dataset_path=config.dataset_path,
-            summary_path=config.summary_path,
-            output_root=config.output_root,
-            stable_output_dir=config.stable_output_dir,
-            congestion_threshold=config.congestion_threshold,
-            rrc_sector_capacity=config.rrc_sector_capacity,
-        ),
+        candidate_node_cell_ids=candidate_node_cell_ids,
+        demand_serving_cell_ids=demand_serving_cell_ids,
+        config=config,
         logger=logger,
         action_label=action_label,
     )

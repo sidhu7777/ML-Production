@@ -1,5 +1,6 @@
 import os
 import math
+import numpy as np
 from numpy import around
 import pandas as pd
 import matplotlib
@@ -1158,31 +1159,102 @@ def _normalize_session_times(session_df: pd.DataFrame | None) -> pd.DataFrame | 
     return normalized
 
 
-def generate_drive_summary_images(session_ids: list, total_samples: int, network_df: pd.DataFrame | None = None):
+_EARTH_RADIUS_KM = 6371.0
+_MAX_PLAUSIBLE_SPEED_KMH = 150.0
+
+
+def _consecutive_haversine_km(lat: np.ndarray, lon: np.ndarray, timestamp: pd.Series | None = None):
+    """
+    Sum of Haversine distances between consecutive (lat, lon) points, in km,
+    rejecting hops that imply a physically-implausible instantaneous speed
+    (GPS glitches: single-second position jumps that aren't real movement).
+    Returns (kept_km, rejected_hop_count, rejected_km).
+    """
+    if len(lat) < 2:
+        return 0.0, 0, 0.0
+
+    lat_r = np.radians(lat)
+    lon_r = np.radians(lon)
+    dlat = np.diff(lat_r)
+    dlon = np.diff(lon_r)
+    a = np.sin(dlat / 2.0) ** 2 + np.cos(lat_r[:-1]) * np.cos(lat_r[1:]) * np.sin(dlon / 2.0) ** 2
+    c = 2 * np.arcsin(np.sqrt(np.clip(a, 0.0, 1.0)))
+    hop_km = _EARTH_RADIUS_KM * c
+
+    if timestamp is not None and len(timestamp) == len(lat):
+        dt_sec = pd.Series(timestamp).diff().dt.total_seconds().to_numpy()[1:]
+        with np.errstate(invalid="ignore", divide="ignore"):
+            dt_hr = np.where(dt_sec > 0, dt_sec / 3600.0, np.nan)
+            implied_speed_kmh = np.where(np.isnan(dt_hr), 0.0, hop_km / dt_hr)
+        valid = implied_speed_kmh <= _MAX_PLAUSIBLE_SPEED_KMH
+        return float(hop_km[valid].sum()), int((~valid).sum()), float(hop_km[~valid].sum())
+
+    return float(hop_km.sum()), 0, 0.0
+
+
+def compute_session_distances_km(gps_df: pd.DataFrame, session_ids: list, verbose: bool = True) -> dict:
+    """
+    Per-session distance computed from consecutive GPS points (lat/lon),
+    sorted by timestamp, with GPS-glitch hops rejected. Computed entirely on
+    the python side from data already in network_df, independent of
+    tbl_session/GetSessions distance values.
+    """
+    required = {"session_id", "lat", "lon"}
+    if gps_df is None or gps_df.empty or not required.issubset(gps_df.columns):
+        return {sid: 0.0 for sid in session_ids}
+
+    df = gps_df.dropna(subset=["lat", "lon"]).copy()
+    if "timestamp" in df.columns:
+        df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
+
+    out = {}
+    for sid in session_ids:
+        sub = df[df["session_id"] == sid]
+        if "timestamp" in sub.columns:
+            sub = sub.dropna(subset=["timestamp"]).sort_values("timestamp")
+        lat = sub["lat"].astype(float).to_numpy()
+        lon = sub["lon"].astype(float).to_numpy()
+        ts = sub["timestamp"] if "timestamp" in sub.columns else None
+        kept_km, rejected_hops, rejected_km = _consecutive_haversine_km(lat, lon, ts)
+        out[sid] = round(kept_km, 2)
+        if verbose and rejected_hops:
+            print(
+                f"[distance] session {sid}: rejected {rejected_hops} GPS-glitch hop(s) "
+                f"(~{rejected_km:.2f} km of implausible movement, >{_MAX_PLAUSIBLE_SPEED_KMH:.0f} km/h implied speed)"
+            )
+    return out
+
+
+def generate_drive_summary_images(
+    session_ids: list,
+    total_samples: int,
+    network_df: pd.DataFrame | None = None,
+    gps_df: pd.DataFrame | None = None,
+):
     """Generate drive summary and session table images"""
-    
+
     # Prefer network log timestamps when available (more reliable than tbl_session)
     session_df = _normalize_session_times(_build_session_df_from_network_logs(network_df))
     if session_df is None:
         session_df = _normalize_session_times(get_session_data_for_drive_summary(session_ids))
-    
+
     if session_df is None or session_df.empty:
         print("WARNING: No session data available for drive summary")
         return None
-    
+
     # Create a copy to avoid SettingWithCopyWarning
     session_df = session_df.copy()
 
-    # Calculate statistics
-    # Ensure distance comes from tbl_session if missing in network logs
-    if "distance" not in session_df.columns or session_df["distance"].isna().all():
-        dist_df = get_session_data_for_drive_summary(session_ids)
-        if dist_df is not None and not dist_df.empty and "distance" in dist_df.columns:
-            dist_df = dist_df[["id", "distance"]].dropna(subset=["id"])
-            session_df = session_df.merge(dist_df, on="id", how="left", suffixes=("", "_session"))
-        else:
-            print("WARNING: distance column not found in session data")
-            session_df["distance"] = 0.0
+    # Distance is computed on the python side from consecutive GPS points
+    # rather than trusted from tbl_session/GetSessions, so it's available
+    # even when that path is missing or unreliable. Prefer gps_df (the
+    # polygon-filtered ALL-CELLS dataframe) over network_df (primary-cell
+    # filtered) so the GPS trail isn't thinned by the primary-cell marker —
+    # distance only depends on the phone's GPS track, not which cell was
+    # serving at that instant.
+    distance_source = gps_df if gps_df is not None and not gps_df.empty else network_df
+    distances_km = compute_session_distances_km(distance_source, session_df["id"].tolist())
+    session_df["distance"] = session_df["id"].map(distances_km).fillna(0.0)
     total_distance = session_df["distance"].sum()
     total_sessions = len(session_df)
     session_df["date"] = session_df["start_time"].dt.date
@@ -1254,7 +1326,7 @@ def generate_drive_summary_images(session_ids: list, total_samples: int, network
 # =====================================================
 # MASTER ENTRY
 # =====================================================
-def run_kpi_analysis(filtered_df, user_id, kpi_config, session_ids=None, image_dir: str | None = None):
+def run_kpi_analysis(filtered_df, user_id, kpi_config, session_ids=None, image_dir: str | None = None, gps_df=None):
     global IMAGE_DIR
     if image_dir:
         IMAGE_DIR = image_dir
@@ -1300,7 +1372,8 @@ def run_kpi_analysis(filtered_df, user_id, kpi_config, session_ids=None, image_d
         drive_summary_metadata = generate_drive_summary_images(
             session_ids,
             len(filtered_df),
-            network_df=filtered_df
+            network_df=filtered_df,
+            gps_df=gps_df,
         )
     
     if kpi_summary:

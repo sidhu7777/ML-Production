@@ -254,7 +254,8 @@ def main(
         user_id,
         KPI_CONFIG,
         session_ids=session_ids,
-        image_dir=f"{images_dir}/kpi_analysis"
+        image_dir=f"{images_dir}/kpi_analysis",
+        gps_df=handover_df,
     )
     metadata = build_metadata(
         report_df,

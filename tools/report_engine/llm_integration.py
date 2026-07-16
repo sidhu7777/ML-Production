@@ -244,8 +244,8 @@ Return JSON with EXACT keys:
 
         llm_output = json.loads(raw_content)
         if verbose:
-            print("✓ LLM response successfully parsed")
-            print(f"✓ LLM generated {len(llm_output)} sections")
+            print("[OK] LLM response successfully parsed")
+            print(f"[OK] LLM generated {len(llm_output)} sections")
         # Merge LLM output with pre-set Area Summary
         report.update(llm_output)
         # Ensure metadata Area Summary is preserved (LLM often outputs placeholders)
@@ -279,7 +279,7 @@ Return JSON with EXACT keys:
                 source_map[k] = "llm"
         if verbose:
             if missing:
-                print(f"⚠️ Missing sections from LLM, synthesized: {missing}")
+                print(f"[WARN] Missing sections from LLM, synthesized: {missing}")
             print("Section sources:")
             for k in REQUIRED_KEYS:
                 print(f"  - {k}: {source_map.get(k, 'unknown')}")

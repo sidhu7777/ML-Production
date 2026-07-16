@@ -150,20 +150,30 @@ def _filter_primary_rows(df: pd.DataFrame) -> pd.DataFrame:
     Keep only primary-serving rows.
 
     The frontend uses the registered-cell marker inside `primary_cell_info_1`
-    (mRegistered=YES). Some datasets also expose an explicit `primary` column,
-    so support both forms here.
+    (mRegistered=YES). Some rows (e.g. NR/5G rows whose `primary_cell_info_1`
+    is a placeholder like "nr_from_signalstrength" rather than structured cell
+    text) never contain that marker even though they are the serving cell, so
+    the explicit `primary` column is checked as well and either signal being
+    true keeps the row.
     """
     if df.empty:
         return df
 
-    if "primary_cell_info_1" in df.columns:
-        primary_info = df["primary_cell_info_1"].fillna("").astype(str)
-        primary_mask = primary_info.str.contains("mRegistered=YES", case=False, na=False)
-    elif "primary" in df.columns:
-        primary_values = df["primary"].fillna("").astype(str).str.strip().str.lower()
-        primary_mask = primary_values.isin({"yes", "y", "true", "1"})
-    else:
+    has_cell_info = "primary_cell_info_1" in df.columns
+    has_primary_col = "primary" in df.columns
+
+    if not has_cell_info and not has_primary_col:
         return df
+
+    primary_mask = pd.Series(False, index=df.index)
+
+    if has_cell_info:
+        primary_info = df["primary_cell_info_1"].fillna("").astype(str)
+        primary_mask |= primary_info.str.contains("mRegistered=YES", case=False, na=False)
+
+    if has_primary_col:
+        primary_values = df["primary"].fillna("").astype(str).str.strip().str.lower()
+        primary_mask |= primary_values.isin({"yes", "y", "true", "1"})
 
     return df.loc[primary_mask].reset_index(drop=True)
 

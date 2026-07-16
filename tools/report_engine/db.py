@@ -2,6 +2,7 @@ import os
 import pandas as pd
 from sqlalchemy import create_engine, text, bindparam
 from dotenv import load_dotenv
+from datetime import datetime
 from utils.python_bridge import get_bridge_client, PythonBridgeError
 
 load_dotenv()
@@ -14,6 +15,37 @@ def _bridge_client():
         return get_bridge_client()
     except PythonBridgeError:
         return None
+
+
+def _coerce_bridge_datetime(value):
+    """
+    The bridge (PythonBridgeController) currently serializes MySQL DATETIME
+    columns as a raw {"IsValidDateTime": .., "Year": .., "Month": .., ...}
+    object instead of an ISO date string (a C#-side MySqlDateTime struct
+    being dumped field-by-field rather than converted first). pandas can't
+    parse that shape, so it's decoded here on the python side before any
+    downstream code sees it.
+    """
+    if not isinstance(value, dict) or "Year" not in value:
+        return value
+    if value.get("IsValidDateTime") is False:
+        return None
+    try:
+        microsecond = int(value.get("Microsecond") or 0) or int(value.get("Millisecond") or 0) * 1000
+        return datetime(
+            int(value["Year"]), int(value["Month"]), int(value["Day"]),
+            int(value.get("Hour") or 0), int(value.get("Minute") or 0), int(value.get("Second") or 0),
+            microsecond,
+        )
+    except (KeyError, ValueError, TypeError):
+        return None
+
+
+def _normalize_bridge_datetime_columns(df: pd.DataFrame, columns: list[str]) -> pd.DataFrame:
+    for col in columns:
+        if col in df.columns:
+            df[col] = df[col].apply(_coerce_bridge_datetime)
+    return df
 
 
 def init_engine(engine):
@@ -113,13 +145,14 @@ def get_network_logs_for_sessions(
 
     bridge = _bridge_client()
     if bridge is not None:
-        return bridge.get_report_network_logs(
+        df = bridge.get_report_network_logs(
             session_ids,
             project_id=project_id,
             provider=provider,
             start_date=start_date,
             end_date=end_date,
         )
+        return _normalize_bridge_datetime_columns(df, ["timestamp"])
 
     close_conn = False
     if conn is None:
@@ -272,7 +305,8 @@ def get_sessions_by_ids(session_ids: list[int]) -> pd.DataFrame:
 
     bridge = _bridge_client()
     if bridge is not None:
-        return bridge.get_sessions(session_ids)
+        df = bridge.get_sessions(session_ids)
+        return _normalize_bridge_datetime_columns(df, ["start_time", "end_time"])
 
     with _connect() as conn:
         query = text("""
