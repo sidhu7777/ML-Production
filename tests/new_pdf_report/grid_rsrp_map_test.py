@@ -334,8 +334,8 @@ def generate_kpi_grid_map(
         summary_html = (
             '<div style="margin-top:10px; padding-top:8px; '
             'border-top:1px solid rgba(0,0,0,0.15); font-size:12px; color:#4b5563;">'
-            f"Total Grid Cells (drive route): {total_cells}<br/>"
-            f"Populated (this technology): {len(cells)}"
+            f"Total Grid Cells: {total_cells}<br/>"
+            f"Populated: {len(cells)}"
             "</div>"
         )
         payload = json.dumps(summary_html)

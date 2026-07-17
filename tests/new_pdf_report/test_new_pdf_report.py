@@ -72,6 +72,15 @@ DEFAULT_PROJECT_ID = 248
 # mapping is available.
 DEFAULT_THRESHOLD_USER_ID = 13
 
+# Grid cell size normally comes from tbl_project.grid_size (see
+# grid_rsrp_map_test.resolve_project_grid_size_meters -- confirmed
+# project 292's own DB value is 100m). This override is a deliberate,
+# explicit test-case choice to render at a finer 50m resolution instead,
+# per direction received -- it does NOT write back to the DB, so
+# tbl_project.grid_size and the live frontend's own grid rendering are
+# untouched; only this test report's own maps use 50m.
+GRID_SIZE_METERS_OVERRIDE = 50
+
 OUTPUT_ROOT = Path(__file__).resolve().parent / "output"
 PDF_NAME = "new_format_report.pdf"  # single evolving artifact, replaced each run
 
@@ -180,15 +189,61 @@ def _load_neighbor_data(project_meta: dict):
     return neighbor_df
 
 
-def _render_base_route_map(report_df, polygon_wkt, out_dir: Path) -> bool:
+def _load_subsession_data(project_meta: dict) -> pd.DataFrame:
     """
-    Base route map like production main.py (folium + Playwright), via the
-    test-case-only generate_base_route_map_polygon_aware (frames the full
-    polygon when the project has one, instead of production's own
-    generate_base_route_map which fits the GPS route only — see that
-    wrapper's docstring in new_report_sections.py).
+    Load PS (data)/CS (voice) call-session records from tbl_sub_session for
+    the project's sessions -- test-case only; grep-confirmed that no
+    existing tools/report_engine pipeline queries this table, so this is
+    new ground, not a duplicate of production logic.
+
+    `type`/`status` semantics are inferred directly from this project's own
+    json_data content (confirmed against project 292's actual rows), NOT
+    from the frontend source (StraceExeFron), which is not present in this
+    environment: type=1 rows carry duration_ms/speed_kbps/file_size_bytes/
+    result_status (PS/data speed-test attempts); type=2 rows carry
+    duration_ms/number/direction/result_status/setup_ms (CS/voice calls).
+    status=1 matches a SUCCESS/CONNECTED result_status, status=2 matches
+    FAILED, for every row checked.
     """
-    from tests.new_pdf_report.new_report_sections import generate_base_route_map_polygon_aware
+    from sqlalchemy import text, bindparam
+    from tools.report_engine.db import get_engine
+
+    session_ids = [
+        int(s.strip())
+        for s in str(project_meta.get("ref_session_id", "")).split(",")
+        if s.strip().isdigit()
+    ]
+    if not session_ids:
+        return pd.DataFrame()
+
+    engine = get_engine()
+    query = text("""
+        SELECT id, session_id, sub_session_id, type, status, start_time, end_time, json_data
+        FROM tbl_sub_session
+        WHERE session_id IN :session_ids
+    """).bindparams(bindparam("session_ids", expanding=True))
+    with engine.connect() as conn:
+        subsession_df = pd.read_sql(query, conn, params={"session_ids": session_ids})
+    print(f"[subsession] tbl_sub_session rows: {len(subsession_df)}")
+    return subsession_df
+
+
+def _render_base_route_map(
+    report_df, polygon_wkt, out_dir: Path, grid_lattice=None, grid_size_meters=None,
+) -> bool:
+    """
+    Base route map like production main.py (folium + Playwright). Grid vs
+    raw-point split matches every other KPI map in this report: when the
+    project has a polygon (grid_lattice populated), renders via the
+    test-case-only generate_base_route_grid_map (solid route-coverage
+    cells on the shared lattice); otherwise falls back to
+    generate_base_route_map_polygon_aware (production's raw per-point
+    circle markers, still framed to the full polygon when present — see
+    that wrapper's docstring in new_report_sections.py).
+    """
+    from tests.new_pdf_report.new_report_sections import (
+        generate_base_route_map_polygon_aware, generate_base_route_grid_map,
+    )
     from tools.report_engine.playwright_utils import html_to_png
 
     html_path = out_dir / "html" / "base_route.html"
@@ -196,13 +251,25 @@ def _render_base_route_map(report_df, polygon_wkt, out_dir: Path) -> bool:
     if _asset_exists(png_path):
         print(f"[map] reused existing base route map: {png_path.name}")
         return True
+
+    use_grid = bool(polygon_wkt) and grid_lattice is not None and not grid_lattice.empty
     try:
-        generate_base_route_map_polygon_aware(report_df, polygon_wkt, str(html_path))
+        if use_grid:
+            from tests.new_pdf_report.google_tiles import use_gray_basemap
+
+            with use_gray_basemap(polygon_wkt):
+                ok = generate_base_route_grid_map(
+                    report_df, grid_lattice, grid_size_meters, polygon_wkt, str(html_path),
+                )
+            if not ok:
+                raise ValueError("no populated grid cells for base route map")
+        else:
+            generate_base_route_map_polygon_aware(report_df, polygon_wkt, str(html_path))
         html_to_png(
             str(html_path), str(png_path),
             width=1200, height=900, device_scale_factor=1,
         )
-        print(f"[map] base route map generated: {png_path.name}")
+        print(f"[map] base route map generated: {png_path.name} ({'GRID' if use_grid else 'raw points'})")
         return True
     except Exception as exc:
         print(f"[map] WARNING: base route map failed (section renders without it): {exc}")
@@ -281,15 +348,18 @@ def _render_kpi_map_per_technology(
                 continue
 
             if use_grid:
+                from tests.new_pdf_report.google_tiles import use_gray_basemap
+
                 cells, total, populated = aggregate_grid_cells(df_kpi, grid_lattice, value_col=col)
                 if cells.empty:
                     print(f"[map] skipped {kpi_name} grid map for {tech_label}: no populated cells")
                     continue
-                generate_kpi_grid_map(
-                    cells, ranges, str(html_path), polygon_wkt=polygon_wkt,
-                    grid_size_meters=grid_size_meters, bounds_df=report_df,
-                    metric_label=kpi_name.lower(), unit=unit, total_cells=drive_route_total_cells,
-                )
+                with use_gray_basemap(polygon_wkt):
+                    generate_kpi_grid_map(
+                        cells, ranges, str(html_path), polygon_wkt=polygon_wkt,
+                        grid_size_meters=grid_size_meters, bounds_df=report_df,
+                        metric_label=kpi_name.lower(), unit=unit, total_cells=drive_route_total_cells,
+                    )
                 html_to_png(str(html_path), str(png_path), width=1200, height=900, device_scale_factor=1)
                 print(f"[map] generated {png_path.name} ({tech_label}, GRID: {populated}/{total} cells)")
             else:
@@ -361,7 +431,7 @@ def _render_coverage_kpi_images(
         except Exception as exc:
             print(f"[map] WARNING: failed to generate band map/pie: {exc}")
 
-    # ---- Poor-region maps (RSRP < -95 dBm / RSRQ < -10 dB, blended —
+    # ---- Poor-region maps (RSRP < -98 dBm / RSRQ < -15 dB, blended —
     # production's generate_poor_region_maps doesn't take a technology
     # filter, and "poor" here is an absolute-threshold breach rather than
     # a per-RAT-range concern, so this stays a single map). Uses the
@@ -370,19 +440,18 @@ def _render_coverage_kpi_images(
     # generate_poor_region_maps — that function has a confirmed legend bug
     # (renders "Poor Samples : 632 : 632", a duplicated count) that we do
     # not fix in tools/report_engine itself. Threshold is the SAME single
-    # -95 dBm / -10 dB acceptance cutoff used everywhere else "poor"
-    # RSRP/RSRQ is shown in this report (Executive KPI Summary, Coverage
-    # KPI Summary "Acceptance" column, PCI distribution table) — per
-    # direction received, not the separate -105/-14 "Poor" classification
-    # band boundary (see classify_coverage/_band_rsrq in
-    # new_report_sections.py, which is left unchanged: that's the overall
-    # Good/Fair/Poor STATUS classifier, a different concern from this
-    # "which points fail acceptance" map). ----
+    # CDF_ACCEPTANCE_THRESHOLDS cutoff used everywhere else "poor"
+    # RSRP/RSRQ is shown in this report. Grid-rendered instead of raw
+    # points when the project has a polygon (grid_lattice non-empty),
+    # matching every other KPI map's polygon/no-polygon treatment (see
+    # _render_kpi_map_per_technology) — uses the test-case-only
+    # generate_poor_region_grid_map. ----
     if "rsrp" in report_df.columns:
         from tests.new_pdf_report.new_report_sections import (
-            generate_poor_region_map_fixed, CDF_ACCEPTANCE_THRESHOLDS,
+            generate_poor_region_map_fixed, generate_poor_region_grid_map, CDF_ACCEPTANCE_THRESHOLDS,
         )
 
+        use_grid_poor = bool(polygon_wkt) and grid_lattice is not None and not grid_lattice.empty
         rsrp_threshold = CDF_ACCEPTANCE_THRESHOLDS["RSRP"]
         rsrq_threshold = CDF_ACCEPTANCE_THRESHOLDS["RSRQ"]
         poor_rsrp_png = maps_dir / "rsrp_poor_regions.png"
@@ -391,17 +460,38 @@ def _render_coverage_kpi_images(
             print("[map] reused existing poor-region maps")
         else:
             try:
-                generate_poor_region_map_fixed(
-                    report_df, "rsrp", rsrp_threshold,
-                    str(poor_rsrp_png), str(html_dir / "rsrp_poor_regions.html"),
-                    f"RSRP < {rsrp_threshold:g}", polygon_wkt=polygon_wkt,
-                )
-                generate_poor_region_map_fixed(
-                    report_df, "rsrq", rsrq_threshold,
-                    str(poor_rsrq_png), str(html_dir / "rsrq_poor_regions.html"),
-                    f"RSRQ < {rsrq_threshold:g}", polygon_wkt=polygon_wkt,
-                )
-                print("[map] generated rsrp_poor_regions.png + rsrq_poor_regions.png (legend fixed)")
+                if use_grid_poor:
+                    from tests.new_pdf_report.google_tiles import use_gray_basemap
+
+                    with use_gray_basemap(polygon_wkt):
+                        rsrp_ok = generate_poor_region_grid_map(
+                            report_df, "rsrp", rsrp_threshold,
+                            str(poor_rsrp_png), str(html_dir / "rsrp_poor_regions.html"),
+                            f"RSRP < {rsrp_threshold:g}", grid_lattice=grid_lattice,
+                            grid_size_meters=grid_size_meters, polygon_wkt=polygon_wkt,
+                        )
+                        rsrq_ok = generate_poor_region_grid_map(
+                            report_df, "rsrq", rsrq_threshold,
+                            str(poor_rsrq_png), str(html_dir / "rsrq_poor_regions.html"),
+                            f"RSRQ < {rsrq_threshold:g}", grid_lattice=grid_lattice,
+                            grid_size_meters=grid_size_meters, polygon_wkt=polygon_wkt,
+                        )
+                    print(
+                        f"[map] poor-region grid maps: rsrp={'generated' if rsrp_ok else 'SKIPPED (no cell median below threshold)'}, "
+                        f"rsrq={'generated' if rsrq_ok else 'SKIPPED (no cell median below threshold)'}"
+                    )
+                else:
+                    generate_poor_region_map_fixed(
+                        report_df, "rsrp", rsrp_threshold,
+                        str(poor_rsrp_png), str(html_dir / "rsrp_poor_regions.html"),
+                        f"RSRP < {rsrp_threshold:g}", polygon_wkt=polygon_wkt,
+                    )
+                    generate_poor_region_map_fixed(
+                        report_df, "rsrq", rsrq_threshold,
+                        str(poor_rsrq_png), str(html_dir / "rsrq_poor_regions.html"),
+                        f"RSRQ < {rsrq_threshold:g}", polygon_wkt=polygon_wkt,
+                    )
+                    print("[map] generated rsrp_poor_regions.png + rsrq_poor_regions.png (raw points, legend fixed)")
             except Exception as exc:
                 print(f"[map] WARNING: failed to generate poor-region maps: {exc}")
 
@@ -544,6 +634,44 @@ def _render_handover_kpi_images(handover_df, band_events, tech_events, polygon_w
             print(f"[map] WARNING: failed to generate tech handover map: {exc}")
 
 
+def _render_key_findings_map(report_df, polygon_wkt, out_dir: Path) -> None:
+    """
+    Section 8 "Key Findings" map — highlights the same best/worst eNodeB
+    (_nodeb_coverage_extremes) and RSRP acceptance threshold
+    (CDF_ACCEPTANCE_THRESHOLDS) the Overall Network Performance /
+    Optimization Opportunities bullets above it already use, so the map
+    and the bullet text can never name a different "best"/"worst" site.
+    """
+    from tests.new_pdf_report.new_report_sections import (
+        generate_key_findings_map, _nodeb_coverage_extremes, CDF_ACCEPTANCE_THRESHOLDS,
+    )
+
+    html_dir = out_dir / "html"
+    maps_dir = out_dir / "images" / "kpi_maps"
+
+    png_path = maps_dir / "key_findings_map.png"
+    if _asset_exists(png_path):
+        print("[map] reused existing key_findings_map.png")
+        return
+    try:
+        best_nodeb, worst_nodeb = _nodeb_coverage_extremes(report_df)
+        html_path = html_dir / "key_findings_map.html"
+        ok = generate_key_findings_map(
+            report_df, best_nodeb, worst_nodeb, str(html_path), str(png_path),
+            polygon_wkt=polygon_wkt, rsrp_threshold=CDF_ACCEPTANCE_THRESHOLDS["RSRP"],
+        )
+        if ok:
+            print(
+                f"[map] generated key_findings_map.png "
+                f"(best={best_nodeb['nodeb_id'] if best_nodeb else None}, "
+                f"worst={worst_nodeb['nodeb_id'] if worst_nodeb else None})"
+            )
+        else:
+            print("[map] skipped key_findings_map.png: no best/worst eNodeB or below-threshold samples")
+    except Exception as exc:
+        print(f"[map] WARNING: failed to generate key findings map: {exc}")
+
+
 def _render_service_kpi_images(
     report_df, polygon_wkt, out_dir: Path, user_id=None,
     grid_lattice=None, grid_size_meters=None,
@@ -628,6 +756,7 @@ def run_report(project_id: int = DEFAULT_PROJECT_ID, use_llm: bool = True) -> Pa
     _, report_df, handover_df, project_meta = _load_report_data(project_id)
     assert not report_df.empty, f"Project {project_id} produced no report rows"
     neighbor_df = _load_neighbor_data(project_meta)
+    subsession_df = _load_subsession_data(project_meta)
 
     # ---------- 1b. HANDOVER ANALYSIS (Section 6 data; computed early so both
     #             the image rendering step and the Executive Summary's
@@ -681,32 +810,22 @@ def run_report(project_id: int = DEFAULT_PROJECT_ID, use_llm: bool = True) -> Pa
     assert isinstance(area_summary, dict) and area_summary.get("Major Areas Covered"), \
         "Production area summary was not built"
 
-    # ---------- 3b. POOR RSRP / RSRQ LOCATION SUMMARY (same grid +
-    #             reverse-geocode pipeline as the Area Summary above,
-    #             scoped to only the samples that fail each KPI's
-    #             acceptance threshold -- same single -95 dBm / -10 dB
-    #             cutoff the rsrp_poor_regions.png / rsrq_poor_regions.png
-    #             maps and the Executive/Coverage KPI Summary use, per
-    #             direction received (report-wide, not the separate -105/
-    #             -14 Poor-band boundary) ----------
-    print("[meta] building poor-region summaries (geocoding via Nominatim)...")
-    poor_rsrp_summary = build_poor_region_summary(report_df, "rsrp", CDF_ACCEPTANCE_THRESHOLDS["RSRP"])
-    poor_rsrq_summary = build_poor_region_summary(report_df, "rsrq", CDF_ACCEPTANCE_THRESHOLDS["RSRQ"])
-
-    # ---------- 4. BASE ROUTE MAP (production folium + Playwright) ----------
-    _render_base_route_map(report_df, project_meta.get("region"), out_dir)
-
-    # ---------- 4a. GRID LATTICE (polygon projects only) — built ONCE here
+    # ---------- 3a. GRID LATTICE (polygon projects only) — built ONCE here
     #             and shared by every numeric per-technology KPI map in
-    #             Sections 4 and 7 below, exactly like the frontend's own
-    #             grid view: it only ever renders as a grid when the
-    #             project has a filtering polygon (canEnableUnifiedGridView
-    #             in UnifiedMapView.jsx), and that lattice is anchored to
-    #             the polygon's own bounding box, not any one map's data —
-    #             see grid_rsrp_map_test.py's module docstring for the full
-    #             ground-truth trail (lattice origin, median aggregation,
-    #             tbl_project.grid_size). No polygon -> grid_lattice stays
-    #             None and every map below renders raw points, unchanged. ----------
+    #             Sections 4 and 7 below (plus the base route map and the
+    #             poor-region summary right after it), exactly like the
+    #             frontend's own grid view: it only ever renders as a grid
+    #             when the project has a filtering polygon
+    #             (canEnableUnifiedGridView in UnifiedMapView.jsx), and
+    #             that lattice is anchored to the polygon's own bounding
+    #             box, not any one map's data — see grid_rsrp_map_test.py's
+    #             module docstring for the full ground-truth trail (lattice
+    #             origin, median aggregation, tbl_project.grid_size). No
+    #             polygon -> grid_lattice stays None and every map/summary
+    #             below renders/computes from raw points, unchanged.
+    #             Built BEFORE the poor-region summary and base route map
+    #             (moved ahead of its old "4a." slot) so both can branch
+    #             grid-vs-raw too. ----------
     polygon_wkt = project_meta.get("region")
     grid_lattice = None
     grid_size_meters = None
@@ -714,14 +833,46 @@ def run_report(project_id: int = DEFAULT_PROJECT_ID, use_llm: bool = True) -> Pa
         from tests.new_pdf_report.grid_rsrp_map_test import (
             resolve_project_grid_size_meters, build_polygon_lattice,
         )
-        grid_size_meters = resolve_project_grid_size_meters(project_meta)
+        db_grid_size_meters = resolve_project_grid_size_meters(project_meta)
+        grid_size_meters = GRID_SIZE_METERS_OVERRIDE
         grid_lattice = build_polygon_lattice(polygon_wkt, grid_size_meters)
         print(
             f"[grid] project {project_id} has a polygon -> rendering coverage/service maps "
-            f"as a grid ({grid_size_meters}m cells, {len(grid_lattice)} lattice cells inside the polygon)"
+            f"as a grid ({grid_size_meters}m cells, overriding DB's own {db_grid_size_meters}m; "
+            f"{len(grid_lattice)} lattice cells inside the polygon)"
         )
     else:
         print(f"[grid] project {project_id} has no polygon -> rendering coverage/service maps as raw points")
+
+    # ---------- 3b. POOR RSRP / RSRQ LOCATION SUMMARY (same grid +
+    #             reverse-geocode pipeline as the Area Summary above,
+    #             scoped to only the GRID CELLS whose own median fails each
+    #             KPI's acceptance threshold when the project has a polygon
+    #             (same cell-median definition the rsrp_poor_regions.png /
+    #             rsrq_poor_regions.png grid maps use -- per direction
+    #             received, a single poor sample inside an otherwise-fine
+    #             cell should not count, so this narrative must agree with
+    #             what the map actually shows); falls back to raw poor
+    #             SAMPLES when there's no polygon, same as the poor-region
+    #             map's own raw/grid split. Same single acceptance cutoff
+    #             the rsrp_poor_regions.png / rsrq_poor_regions.png maps
+    #             and the Executive/Coverage KPI Summary use, per direction
+    #             received (report-wide, not the separate Fair/Poor-band
+    #             boundary). ----------
+    print("[meta] building poor-region summaries (geocoding via Nominatim)...")
+    poor_rsrp_summary = build_poor_region_summary(
+        report_df, "rsrp", CDF_ACCEPTANCE_THRESHOLDS["RSRP"], grid_lattice=grid_lattice,
+    )
+    poor_rsrq_summary = build_poor_region_summary(
+        report_df, "rsrq", CDF_ACCEPTANCE_THRESHOLDS["RSRQ"], grid_lattice=grid_lattice,
+    )
+
+    # ---------- 4. BASE ROUTE MAP (grid when the project has a polygon,
+    #             else production's raw-point folium + Playwright map) ----------
+    _render_base_route_map(
+        report_df, polygon_wkt, out_dir,
+        grid_lattice=grid_lattice, grid_size_meters=grid_size_meters,
+    )
 
     # ---------- 4b. COVERAGE KPI IMAGES (Section 4: Band/RSRP/RSRQ/SINR
     #             maps + CDF charts, production's own map/CDF generators).
@@ -755,6 +906,10 @@ def run_report(project_id: int = DEFAULT_PROJECT_ID, use_llm: bool = True) -> Pa
         grid_lattice=grid_lattice, grid_size_meters=grid_size_meters,
     )
 
+    # ---------- 4e. KEY FINDINGS MAP (Section 8: best/worst eNodeB +
+    #             below-threshold samples, test-case only) ----------
+    _render_key_findings_map(report_df, polygon_wkt, out_dir)
+
     # ---------- 5. INTRODUCTION (LLM, minimal prompt; synth fallback) ----------
     if use_llm:
         intro_text, intro_source = generate_introduction_text(metadata, report_df)
@@ -779,7 +934,9 @@ def run_report(project_id: int = DEFAULT_PROJECT_ID, use_llm: bool = True) -> Pa
     # its own top-PCI share/unique-PCI already match the frontend directly
     # (129 unique / 40.76% vs. frontend's 129 / 40.8%), so there is no
     # more reason to special-case Mobility onto a different dataframe.
-    exec_summary = derive_executive_summary(report_df, handover_count, mobility_df=report_df)
+    exec_summary = derive_executive_summary(
+        report_df, handover_count, mobility_df=report_df, grid_lattice=grid_lattice,
+    )
     # Coverage + Mobility + Handover (1 row each) + one Radio Quality row per
     # technology present in `network` (2G/3G/4G/5G are never blended together).
     assert len(exec_summary["kpi_rows"]) >= 4
@@ -823,12 +980,14 @@ def run_report(project_id: int = DEFAULT_PROJECT_ID, use_llm: bool = True) -> Pa
     report.add_coverage_kpi_analysis(
         report_df, exec_summary, band_summary,
         poor_rsrp_summary=poor_rsrp_summary, poor_rsrq_summary=poor_rsrq_summary,
+        grid_lattice=grid_lattice,
     )
     report.add_mobility_kpi_analysis(report_df, neighbor_df=neighbor_df)
-    report.add_handover_kpi_analysis(handover_data)
+    report.add_handover_kpi_analysis(handover_data, subsession_df=subsession_df)
     report.add_service_kpi_analysis(
         report_df, exec_summary=exec_summary, drive_summary=drive_summary,
         handover_data=handover_data, metadata=metadata,
+        grid_lattice=grid_lattice,
     )
     report.add_key_findings_section(
         report_df, exec_summary=exec_summary, drive_summary=drive_summary,

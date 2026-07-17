@@ -95,7 +95,7 @@ from tools.report_engine.metadata_generator import (
     reverse_geocode_area,
     haversine,
 )
-from tests.new_pdf_report.grid_rsrp_map_test import fit_bounds_including_polygon
+from tests.new_pdf_report.grid_rsrp_map_test import fit_bounds_including_polygon, aggregate_grid_cells
 from tools.report_engine.kpi_config import KPI_CONFIG
 
 
@@ -371,6 +371,150 @@ def generate_poor_region_map_fixed(
                 os.remove(tmp_html)
         except Exception:
             pass
+
+
+def generate_poor_region_grid_map(
+    filtered_df: pd.DataFrame,
+    value_col: str,
+    threshold: float,
+    output_png: str,
+    tmp_html: str,
+    title: str,
+    grid_lattice: pd.DataFrame,
+    grid_size_meters: float,
+    polygon_wkt: str | None = None,
+) -> bool:
+    """
+    Grid-rendered counterpart to generate_poor_region_map_fixed, used
+    instead of raw per-point markers when the project has a polygon (the
+    same shared lattice every other KPI map in this report uses -- see
+    grid_rsrp_map_test.aggregate_grid_cells). A cell is colored "poor" red
+    only when its own MEDIAN across ALL samples that landed in it falls
+    below `threshold` -- the same median-per-cell aggregation
+    generate_kpi_grid_map uses for its Good/Fair/Poor gradient, just
+    collapsed to a binary poor/not-poor cutoff instead of a 3-way one.
+
+    Deliberately NOT "does this cell contain at least one poor sample":
+    that would flag a cell red off a single low reading even if most of
+    its samples are fine, which doesn't match how every other KPI map in
+    this report aggregates (and reads as one bad sample smearing an
+    entire 50m cell poor, which is misleading at cell granularity).
+    """
+    import folium
+    from tools.report_engine.map_generator import (
+        new_report_map, add_fullscreen_css, add_legend, draw_polygon_overlay,
+    )
+    from tools.report_engine.playwright_utils import html_to_png
+
+    if value_col not in filtered_df.columns:
+        print(f" Missing column: {value_col}")
+        return False
+
+    df = filtered_df[["lat", "lon", value_col]].copy()
+    df[value_col] = pd.to_numeric(df[value_col], errors="coerce")
+    df = df.dropna(subset=["lat", "lon", value_col])
+
+    all_cells, total, populated_all = aggregate_grid_cells(df, grid_lattice, value_col=value_col)
+    if all_cells.empty:
+        print(f" No populated grid cells for {value_col}")
+        return False
+
+    cells = all_cells[all_cells["value_agg"] < threshold]
+    if cells.empty:
+        print(f" No poor grid cells (by cell median) for {value_col}")
+        return False
+    populated = len(cells)
+
+    fmap = new_report_map()
+    add_fullscreen_css(fmap)
+    for _, cell in cells.iterrows():
+        folium.Rectangle(
+            bounds=[(cell["south"], cell["west"]), (cell["north"], cell["east"])],
+            color="#e31a1c", weight=0, fill=True, fill_color="#e31a1c", fill_opacity=0.75,
+            tooltip=f"{value_col.upper()} median: {cell['value_agg']:.1f} ({int(cell['sample_count'])} samples)",
+        ).add_to(fmap)
+
+    add_legend(fmap, f"{title} (grid, {int(grid_size_meters)}m cells)", [
+        ("Poor Grid Cells", "#e31a1c", int(populated)),
+    ])
+    draw_polygon_overlay(fmap, polygon_wkt)
+    fit_bounds_including_polygon(fmap, df, polygon_wkt, reserve_legend_space=True)
+    fmap.save(tmp_html)
+
+    try:
+        html_to_png(tmp_html, output_png, width=1200, height=900, device_scale_factor=1)
+        return True
+    except Exception as exc:
+        print(f" Warning: failed to convert poor region grid html to png: {exc}")
+        return False
+    finally:
+        try:
+            if os.path.exists(tmp_html):
+                os.remove(tmp_html)
+        except Exception:
+            pass
+
+
+def generate_base_route_grid_map(
+    df: pd.DataFrame,
+    grid_lattice: pd.DataFrame,
+    grid_size_meters: float,
+    polygon_wkt: str | None,
+    output_html: str,
+) -> bool:
+    """
+    Grid-rendered counterpart to production's generate_base_route_map
+    (map_generator.py, NOT modified -- that one draws a raw #2b8cbe
+    CircleMarker per GPS sample). Used instead when the project has a
+    polygon, for the same reason every other KPI map in this report
+    switches to the shared lattice then (grid_rsrp_map_test.
+    aggregate_grid_cells): a scatter of thousands of individual points
+    doesn't read as cleanly as solid grid cells, and every other map in
+    the report (RSRP/RSRQ/SINR/DL/UL/MOS, Poor RSRP/RSRQ) already makes
+    that switch, so leaving this one overview map as raw points was the
+    odd one out.
+
+    There's no per-sample KPI value to color by here (this is the plain
+    drive-route overview, not a per-KPI map), so every POPULATED cell (one
+    the drive route touched at least once) is colored uniformly in the
+    same blue production's raw route dots use, the same "binary" treatment
+    generate_poor_region_grid_map above uses for its red poor-cells. `df`
+    only needs a "lat"/"lon" pair per sample -- aggregate_grid_cells is
+    passed value_col="lat" purely so its dropna/groupby machinery has a
+    non-null numeric column to key off; the resulting per-cell median is
+    never read, only which cells are populated and their sample counts.
+    """
+    import folium
+    from tools.report_engine.map_generator import (
+        new_report_map, add_fullscreen_css, add_legend, draw_polygon_overlay,
+    )
+
+    data = df.dropna(subset=["lat", "lon"]).copy()
+    if data.empty:
+        print(" No GPS data to plot for base route grid map")
+        return False
+
+    cells, total, populated = aggregate_grid_cells(data, grid_lattice, value_col="lat")
+    if cells.empty:
+        print(" No populated grid cells for base route map")
+        return False
+
+    fmap = new_report_map()
+    add_fullscreen_css(fmap)
+    for _, cell in cells.iterrows():
+        folium.Rectangle(
+            bounds=[(cell["south"], cell["west"]), (cell["north"], cell["east"])],
+            color="#2b8cbe", weight=0, fill=True, fill_color="#2b8cbe", fill_opacity=0.85,
+            tooltip=f"{int(cell['sample_count'])} samples",
+        ).add_to(fmap)
+
+    add_legend(fmap, f"Drive Route (grid, {int(grid_size_meters)}m cells)", [
+        ("Route Coverage", "#2b8cbe", int(populated)),
+    ])
+    draw_polygon_overlay(fmap, polygon_wkt, color="red", weight=4, opacity=1.0, dash_array="")
+    fit_bounds_including_polygon(fmap, data, polygon_wkt, reserve_legend_space=True)
+    fmap.save(output_html)
+    return True
 
 
 # ------------------------------------------------------------------
@@ -910,6 +1054,35 @@ def _series(report_df: pd.DataFrame, col: str) -> pd.Series:
     return pd.to_numeric(report_df[col], errors="coerce").dropna()
 
 
+def _kpi_stat_series(df: pd.DataFrame, value_col: str, grid_lattice: pd.DataFrame | None) -> tuple[pd.Series, str]:
+    """
+    The array to run KPI statistics (average/best/worst/% above-or-below a
+    cutoff, Good/Fair/Poor classification) over, for Coverage/Quality/
+    Service KPIs (RSRP/RSRQ/SINR/DL/UL/MOS) ONLY -- NOT Band/PCI/Handover,
+    which stay sample-based, per direction received.
+
+    Returns the array of per-GRID-CELL medians (aggregate_grid_cells'
+    "value_agg" column) when `grid_lattice` is available and produces at
+    least one populated cell, so every KPI stat in this report agrees with
+    what the grid maps and Poor RSRP/RSRQ narrative already show (a single
+    extreme sample no longer moves "Best"/"Worst" or a % figure -- the
+    50m cell it landed in has to have that same value as its own median).
+    Falls back to the raw per-sample series otherwise (no polygon, or a
+    subset with no populated cells at all -- e.g. a technology with too
+    few samples to fill any lattice cell).
+
+    Returns (values, unit_word) where unit_word is "grid cells" or
+    "samples", so callers can phrase their own remarks/column headers
+    correctly without re-deriving which mode was used.
+    """
+    raw_series = _series(df, value_col)
+    if grid_lattice is not None and not grid_lattice.empty and not raw_series.empty:
+        cells, _total, _populated = aggregate_grid_cells(df, grid_lattice, value_col=value_col)
+        if not cells.empty:
+            return cells["value_agg"].reset_index(drop=True), "grid cells"
+    return raw_series, "samples"
+
+
 # ------------------------------------------------------------------
 # Coverage / Quality / Mobility classification — the EXACT thresholds
 # supplied for the Executive KPI Summary (and reused as-is by the
@@ -971,22 +1144,28 @@ def _worst_status(statuses) -> str:
 # ------------------------------------------------------------------
 
 # Acceptance threshold per KPI, all higher-is-better: a sample fails
-# acceptance when its value is BELOW this cutoff. RSRP/RSRQ/SINR use the
-# POOR-band boundary (not the Good-band boundary) per direction received:
-# Fair is also considered acceptable, so only truly Poor samples should
-# count as failing -- e.g. RSRP Good >-95 dBm, Fair -95 to -105 dBm, Poor
-# <-105 dBm (see classify_coverage/_band_rsrq/_band_sinr above), so the
-# acceptance cutoff here is -105 dBm, not -95. Same reasoning for RSRQ
-# (-15 dB, not -10) and SINR (13 dB, not 20). This single dict is the ONE
-# source of truth for every "poor"/"acceptance" reference in this report
-# (Executive KPI Summary, Coverage KPI Summary "Acceptance" column, Poor
-# RSRP/RSRQ maps + location text, PCI Good/Poor % columns, Poor PCI
-# Analysis tables, CDF acceptance crosshairs) so they can never disagree.
+# acceptance when its value is BELOW this cutoff. RSRQ/SINR use the
+# POOR-band boundary (not the Good-band boundary) per earlier direction
+# received: Fair is also considered acceptable, so only truly Poor samples
+# should count as failing. RSRP's own cutoff is a further, explicit
+# override -- originally -105 dBm, tightened to -100 dBm, then -99 dBm,
+# then -98 dBm (per direction received, so the acceptance cutoff stays
+# uniform report-wide even as it's revised) -- still below the -95 dBm
+# Good/Fair boundary, so Fair RSRP still counts as acceptable, just with
+# a stricter Poor cutoff
+# than classify_coverage's own -105 dBm Fair/Poor boundary (see
+# classify_coverage above, which is NOT changed by this -- that function's
+# own Good/Fair/Poor status bands are a different concern from this
+# acceptance cutoff). This single dict is the ONE source of truth for
+# every "poor"/"acceptance" reference in this report (Executive KPI
+# Summary, Coverage KPI Summary "Acceptance" column, Poor RSRP/RSRQ maps +
+# location text, PCI Good/Poor % columns, Poor PCI Analysis tables, CDF
+# acceptance crosshairs, Key Findings map) so they can never disagree.
 # DL/UL/MOS reuse tools/report_engine/kpi_config.py's
 # FIXED_THRESHOLD_CONFIG (DL excellent_threshold, UL/MOS poor_threshold)
 # as their single acceptance cutoff, per direction received.
 CDF_ACCEPTANCE_THRESHOLDS = {
-    "RSRP": -105.0,
+    "RSRP": -98.0,
     "RSRQ": -15.0,
     "SINR": 13.0,
     "DL": 15.0,
@@ -1114,7 +1293,13 @@ def generate_all_cdf_plots_from_df(report_df: pd.DataFrame, output_dir: str):
             print(f"  cdf_pci.png: rows={count}, min={min_value:.2f}, max={max_value:.2f}")
 
 
-def classify_coverage(rsrp: pd.Series) -> tuple[str, str]:
+def classify_coverage(rsrp: pd.Series, unit_word: str = "samples") -> tuple[str, str]:
+    """
+    `rsrp` is whatever the caller decided to classify over -- raw samples,
+    or (per direction received) the array of per-GRID-CELL medians via
+    _kpi_stat_series, in which case pass unit_word="grid cells" so the
+    remarks sentence says what it's actually counting.
+    """
     if rsrp.empty:
         return "N/A", "No RSRP samples available."
 
@@ -1130,7 +1315,7 @@ def classify_coverage(rsrp: pd.Series) -> tuple[str, str]:
     else:
         status = "Fair"
 
-    remarks = f"Average RSRP {avg_rsrp:.1f} dBm; {pct_above_95:.0f}% of samples above -95 dBm."
+    remarks = f"Average RSRP {avg_rsrp:.1f} dBm; {pct_above_95:.0f}% of {unit_word} above -95 dBm."
     return status, remarks
 
 
@@ -1150,7 +1335,7 @@ def _band_rsrq(avg_rsrq: float) -> str:
     return "Poor"
 
 
-def classify_quality(sinr: pd.Series, rsrq: pd.Series) -> tuple[str, str]:
+def classify_quality(sinr: pd.Series, rsrq: pd.Series, unit_word: str = "samples") -> tuple[str, str]:
     """
     Quality status from Average SINR and Average RSRQ only (CQI/BLER are
     not part of this decision — see module notes above). Each metric is
@@ -1160,6 +1345,10 @@ def classify_quality(sinr: pd.Series, rsrq: pd.Series) -> tuple[str, str]:
     both SINR and RSRQ, mirroring Coverage's "% of samples above -95 dBm"
     (Good SINR > 20 dB, Good RSRQ > -10 dB — see module notes above) so all
     Executive KPI Summary rows carry a percentage, not just Coverage.
+
+    `sinr`/`rsrq` are whatever the caller decided to classify over -- raw
+    samples, or (per direction received) per-GRID-CELL medians via
+    _kpi_stat_series, in which case pass unit_word="grid cells".
     """
     if sinr.empty:
         return "N/A", "No SINR samples available."
@@ -1171,7 +1360,7 @@ def classify_quality(sinr: pd.Series, rsrq: pd.Series) -> tuple[str, str]:
     if rsrq.empty:
         status = sinr_band
         remarks = (
-            f"Average SINR {avg_sinr:.1f} dB ({pct_sinr_good:.0f}% of samples above 20 dB). "
+            f"Average SINR {avg_sinr:.1f} dB ({pct_sinr_good:.0f}% of {unit_word} above 20 dB). "
             f"No RSRQ samples available."
         )
         return status, remarks
@@ -1182,8 +1371,8 @@ def classify_quality(sinr: pd.Series, rsrq: pd.Series) -> tuple[str, str]:
     status = max([sinr_band, rsrq_band], key=lambda b: _STATUS_RANK[b])
 
     remarks = (
-        f"Average SINR {avg_sinr:.1f} dB ({pct_sinr_good:.0f}% of samples above 20 dB); "
-        f"Average RSRQ {avg_rsrq:.1f} dB ({pct_rsrq_good:.0f}% of samples above -10 dB)."
+        f"Average SINR {avg_sinr:.1f} dB ({pct_sinr_good:.0f}% of {unit_word} above 20 dB); "
+        f"Average RSRQ {avg_rsrq:.1f} dB ({pct_rsrq_good:.0f}% of {unit_word} above -10 dB)."
     )
     return status, remarks
 
@@ -1215,11 +1404,13 @@ def classify_mobility(mobility_df: pd.DataFrame) -> tuple[str, str]:
 
     pci_series = mobility_df["pci"].dropna()
     unique_pci = int(pci_series.nunique())
-    top_pci_share = float(pci_series.value_counts(normalize=True).iloc[0] * 100)
+    pci_value_counts = pci_series.value_counts(normalize=True)
+    top_pci = int(pci_value_counts.index[0])
+    top_pci_share = float(pci_value_counts.iloc[0] * 100)
     pci_ok = top_pci_share < DOMINANT_PCI_SHARE_THRESHOLD
 
     status = "Good" if pci_ok else "Fair"
-    remarks = f"{unique_pci} unique serving PCIs (top PCI {top_pci_share:.0f}% of samples)."
+    remarks = f"{unique_pci} unique serving PCIs (PCI {top_pci} has {top_pci_share:.0f}% of the samples)."
     return status, remarks
 
 
@@ -1253,7 +1444,7 @@ def _tech_slug(tech: str) -> str:
     return slug or "unknown"
 
 
-def classify_quality_by_technology(report_df: pd.DataFrame) -> list[dict]:
+def classify_quality_by_technology(report_df: pd.DataFrame, grid_lattice: pd.DataFrame | None = None) -> list[dict]:
     """
     Radio Quality is classified PER TECHNOLOGY, never blended across RATs:
     SINR/RSRQ have different characteristic ranges depending on whether the
@@ -1265,6 +1456,16 @@ def classify_quality_by_technology(report_df: pd.DataFrame) -> list[dict]:
     Returns one {"technology", "status", "remarks"} entry per technology
     present in the `network` column; if that column is absent, falls back
     to a single ungrouped entry.
+
+    When `grid_lattice` is supplied (polygon projects), SINR/RSRQ are each
+    resolved to per-GRID-CELL medians via _kpi_stat_series before
+    classifying (per direction received — Coverage/Quality/Service KPIs
+    should read off the same grid the maps and Poor RSRP/RSRQ narrative
+    already use, not a mix of grid maps and sample-based tables). Both
+    metrics have to resolve to grid cells for the technology's remarks to
+    say "grid cells" — if either falls back to raw samples (e.g. too few
+    points to fill a lattice cell), both report as "samples" so one
+    sentence never mixes units.
 
     KNOWN GAP (production behaviour, confirmed, left as-is — NOT a bug in
     this test case, and tools/report_engine is not modified to work around
@@ -1278,20 +1479,22 @@ def classify_quality_by_technology(report_df: pd.DataFrame) -> list[dict]:
     this function. Only the technologies that survive that filter (here:
     "4G" and "4G (LTE Anchor - NSA)") can appear below.
     """
+    def _classify(sub: pd.DataFrame) -> tuple[str, str]:
+        sinr, sinr_unit = _kpi_stat_series(sub, "sinr", grid_lattice)
+        rsrq, rsrq_unit = _kpi_stat_series(sub, "rsrq", grid_lattice)
+        unit_word = sinr_unit if sinr_unit == rsrq_unit else "samples"
+        return classify_quality(sinr, rsrq, unit_word=unit_word)
+
     tech_list = _technology_groups(report_df)
     if not tech_list:
-        sinr = _series(report_df, "sinr")
-        rsrq = _series(report_df, "rsrq")
-        status, remarks = classify_quality(sinr, rsrq)
+        status, remarks = _classify(report_df)
         return [{"technology": None, "status": status, "remarks": remarks}]
 
     results = []
     network_col = report_df["network"].fillna("").astype(str).str.strip()
     for tech in tech_list:
         sub = report_df.loc[network_col == tech]
-        sinr = _series(sub, "sinr")
-        rsrq = _series(sub, "rsrq")
-        status, remarks = classify_quality(sinr, rsrq)
+        status, remarks = _classify(sub)
         results.append({
             "technology": tech,
             "status": status,
@@ -1302,19 +1505,31 @@ def classify_quality_by_technology(report_df: pd.DataFrame) -> list[dict]:
 
 def build_poor_region_summary(
     filtered_df: pd.DataFrame, value_col: str, threshold: float,
+    grid_lattice: pd.DataFrame | None = None,
     top_n: int = 3, sleep_sec: float = 1.0,
 ) -> dict | None:
     """
-    % of samples below `threshold` for `value_col`, plus up to `top_n`
-    named locations (reverse-geocoded, spatially separated) where those
-    poor samples concentrate. Test-case only — reuses production's own
+    Poor-location summary for the narrative placed above the "Poor
+    RSRP"/"Poor RSRQ" maps. Test-case only — reuses production's own
     build_spatial_grid / select_spatially_separated_cells /
     reverse_geocode_area (tools.report_engine.metadata_generator, NOT
     modified) with the exact same grid + reverse-geocode pipeline
-    build_area_summary() already uses for the whole drive, just scoped to
-    the samples that fail this KPI's poor threshold. Fully driven by
-    `filtered_df`, so it is dynamic per project/drive — no hardcoded
-    project data.
+    build_area_summary() already uses for the whole drive.
+
+    When `grid_lattice` is supplied (polygon projects), this counts GRID
+    CELLS, not raw samples -- the same cell-MEDIAN definition
+    generate_poor_region_grid_map uses for the map itself (a cell only
+    counts as poor if its own median across every sample that landed in
+    it fails `threshold`; see that function's docstring for why a single
+    poor sample inside an otherwise-fine cell must not count). This
+    narrative HAS to agree with what the map actually shows, so it uses
+    the identical aggregate_grid_cells() call and the identical `<
+    threshold` cutoff on `value_agg`, not a fresh per-sample calculation.
+    `result["unit_type"]` records which mode produced the numbers so
+    build_poor_region_text() below can phrase it correctly ("grid cells"
+    vs "samples"). Falls back to raw per-sample counting when there's no
+    grid_lattice (no polygon), matching generate_poor_region_map_fixed's
+    own raw-point treatment for that case.
     """
     if value_col not in filtered_df.columns or not {"lat", "lon"}.issubset(filtered_df.columns):
         return None
@@ -1322,22 +1537,50 @@ def build_poor_region_summary(
     values = pd.to_numeric(filtered_df[value_col], errors="coerce")
     valid = filtered_df.loc[values.notna()].copy()
     valid[value_col] = values.dropna()
-    total = len(valid)
-    if total == 0:
+    if valid.empty:
         return None
 
-    poor_df = valid[valid[value_col] < threshold]
-    poor_count = len(poor_df)
-    result = {
-        "column": value_col,
-        "threshold": threshold,
-        "total_samples": total,
-        "poor_samples": poor_count,
-        "poor_percentage": round(poor_count / total * 100, 1),
-        "locations": [],
-    }
-    if poor_df.empty:
-        return result
+    use_grid = grid_lattice is not None and not grid_lattice.empty
+    if use_grid:
+        all_cells, _total_lattice, _populated = aggregate_grid_cells(valid, grid_lattice, value_col=value_col)
+        if all_cells.empty:
+            return None
+        total = len(all_cells)
+        poor_cells = all_cells[all_cells["value_agg"] < threshold]
+        poor_count = len(poor_cells)
+        result = {
+            "column": value_col,
+            "threshold": threshold,
+            "unit_type": "grid_cells",
+            "total_samples": total,
+            "poor_samples": poor_count,
+            "poor_percentage": round(poor_count / total * 100, 1) if total else 0.0,
+            "locations": [],
+        }
+        if poor_cells.empty:
+            return result
+        # One row per poor CELL (at its centroid) so build_spatial_grid's
+        # own row-count aggregation below counts poor CELLS per named
+        # area, not raw samples.
+        poor_df = pd.DataFrame({
+            "lat": (poor_cells["south"] + poor_cells["north"]) / 2,
+            "lon": (poor_cells["west"] + poor_cells["east"]) / 2,
+        })
+    else:
+        total = len(valid)
+        poor_df = valid[valid[value_col] < threshold]
+        poor_count = len(poor_df)
+        result = {
+            "column": value_col,
+            "threshold": threshold,
+            "unit_type": "samples",
+            "total_samples": total,
+            "poor_samples": poor_count,
+            "poor_percentage": round(poor_count / total * 100, 1) if total else 0.0,
+            "locations": [],
+        }
+        if poor_df.empty:
+            return result
 
     grid = build_spatial_grid(poor_df)
     if grid.empty:
@@ -1360,31 +1603,35 @@ def build_poor_region_summary(
 def build_poor_region_text(summary: dict | None, label: str, unit: str) -> str:
     """
     Turn a build_poor_region_summary() dict into the observation sentence
-    placed above the "Poor RSRP"/"Poor RSRQ" maps — % of poor samples plus
-    the named locations where they concentrate (reverse-geocoded per
-    project, same as the Area Summary section).
+    placed above the "Poor RSRP"/"Poor RSRQ" maps. Phrased in GRID CELLS
+    (matching what the map itself shows) when summary["unit_type"] ==
+    "grid_cells" -- i.e. whenever the project has a polygon -- otherwise
+    falls back to the raw-sample phrasing for no-polygon projects.
     """
     if not summary:
         return f"Poor {label} location analysis is not available (missing lat/lon or {label} data)."
 
-    poor_samples = summary.get("poor_samples", 0)
-    total_samples = summary.get("total_samples", 0)
+    poor_count = summary.get("poor_samples", 0)
+    total_count = summary.get("total_samples", 0)
     pct = summary.get("poor_percentage", 0.0)
     threshold = summary.get("threshold")
+    is_grid = summary.get("unit_type") == "grid_cells"
+    unit_word = "grid cells" if is_grid else "samples"
+    metric_word = "median" if is_grid else "value"
 
-    if not poor_samples:
+    if not poor_count:
         return (
-            f"No samples fell below the poor {label} threshold "
-            f"({threshold:g} {unit}) out of {total_samples:,} samples analyzed."
+            f"No {unit_word} recorded a poor {label} {metric_word} below the poor {label} threshold "
+            f"({threshold:g} {unit}) out of {total_count:,} {unit_word} analyzed."
         )
 
     text = (
-        f"{pct:.1f}% of samples ({poor_samples:,} of {total_samples:,}) recorded poor "
-        f"{label} (&lt; {threshold:g} {unit})"
+        f"{pct:.1f}% of {unit_word} ({poor_count:,} of {total_count:,}) recorded a poor "
+        f"{label} {metric_word} (&lt; {threshold:g} {unit})"
     )
     locations = summary.get("locations") or []
     if locations:
-        named = ", ".join(f"{loc['name']} ({loc['samples']:,} samples)" for loc in locations)
+        named = ", ".join(f"{loc['name']} ({loc['samples']:,} {unit_word})" for loc in locations)
         text += f", concentrated primarily around {named}."
     else:
         text += "; no named locations could be resolved for these coordinates."
@@ -1704,7 +1951,7 @@ def build_handover_kpi_summary_table(handover_data: dict) -> pd.DataFrame:
     return pd.DataFrame(rows, columns=["KPI", "Observed Count"])
 
 
-def build_handover_kpi_summary_observation(handover_data: dict) -> str:
+def build_handover_kpi_summary_observation(handover_data: dict, has_call_data: bool = False) -> str:
     band_count = len(handover_data["band_events"])
     intra_freq_count = len(handover_data["intra_freq_events"])
     tech_count = len(handover_data["tech_events"])
@@ -1718,14 +1965,155 @@ def build_handover_kpi_summary_observation(handover_data: dict) -> str:
     dominant_label, dominant_count = max(categories, key=lambda c: c[1])
     dominant_share = (dominant_count / total * 100) if total else 0.0
 
+    # has_call_data reflects whether tbl_sub_session had any PS/CS rows for
+    # this project (see 6.6 Call Success Rate) -- project 248 genuinely had
+    # none (verified directly against the DB), but project 292 does, so
+    # this sentence must not claim "no call-level data exists" universally.
+    call_data_note = (
+        "Radio-link-failure and disconnect-cause data are not available for this project, "
+        "so handover-triggered drop rates could not be computed; see Section 6.6 for voice "
+        "and data call outcomes, which are available."
+        if has_call_data else
+        "No call-level, radio-link-failure or disconnect-cause data is available for this "
+        "project, so drop or failure rates could not be computed."
+    )
     return (
         f"Observation: {total:,} total handover events were detected across the drive route "
         f"({tech_count:,} inter-RAT, {band_count:,} inter-frequency/band, {intra_freq_count:,} "
         f"intra-frequency/PCI); {dominant_label} transitions were the largest share "
-        f"({dominant_share:.1f}%). No call-level, radio-link-failure or disconnect-cause data "
-        f"exists in this project's dataset (verified directly against the DB), so drop/failure "
-        f"rates could not be computed."
+        f"({dominant_share:.1f}%). {call_data_note}"
     )
+
+
+# ------------------------------------------------------------------
+# Section 6.6 "Call Success Rate" (test-case only) -- PS (data) / CS
+# (voice) call-session results from tbl_sub_session
+# (test_new_pdf_report._load_subsession_data). tools/report_engine never
+# queries this table (grep-confirmed), so there is no production logic to
+# reuse here.
+#
+# `type`/`status` semantics are inferred directly from this project's own
+# json_data content (confirmed against project 292's actual rows), NOT
+# from the frontend source (StraceExeFron), which is not present in this
+# environment: type=1 rows carry duration_ms/speed_kbps/file_size_bytes/
+# result_status (PS/data speed-test attempts); type=2 rows carry
+# duration_ms/number/direction/result_status/setup_ms (CS/voice calls).
+# status=1 matches a SUCCESS/CONNECTED result_status, status=2 matches
+# FAILED, for every row checked. Duration is computed from tbl_sub_session's
+# own start_time/end_time columns rather than json_data's duration_ms, since
+# those are native DB columns rather than embedded text.
+# ------------------------------------------------------------------
+
+def _subsession_json_field(raw_json, key):
+    try:
+        return json.loads(raw_json or "{}").get(key)
+    except (TypeError, ValueError):
+        return None
+
+
+def build_call_event_tables(subsession_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, dict, dict]:
+    """
+    PS (Data) and CS (Voice) call-event summary tables plus the raw stats
+    dicts they were built from (so the Observation text below the tables
+    can state this project's own actual numbers instead of a generic
+    description of what the metric means). Returns (ps_df, cs_df, ps_stats,
+    cs_stats) — df is empty (0 rows) and stats is {} when that event type
+    has no rows for this project.
+    """
+    columns = ["Metric", "Value"]
+    empty = pd.DataFrame(columns=columns)
+    if subsession_df is None or subsession_df.empty or "type" not in subsession_df.columns:
+        return empty, empty, {}, {}
+
+    df = subsession_df.copy()
+    df["duration_s"] = (pd.to_datetime(df["end_time"]) - pd.to_datetime(df["start_time"])).dt.total_seconds()
+
+    ps = df[df["type"] == 1].copy()
+    ps_rows, ps_stats = [], {}
+    if not ps.empty:
+        ps["speed_kbps"] = pd.to_numeric(ps["json_data"].apply(lambda r: _subsession_json_field(r, "speed_kbps")), errors="coerce")
+        total = len(ps)
+        success = int((ps["status"] == 1).sum())
+        avg_speed_mbps = ps["speed_kbps"].mean() / 1000 if ps["speed_kbps"].notna().any() else None
+        avg_duration_s = float(ps["duration_s"].mean())
+        success_rate = success / total * 100
+        ps_stats = {
+            "total": total, "success": success, "failed": total - success,
+            "success_rate": success_rate, "avg_duration_s": avg_duration_s,
+            "avg_speed_mbps": avg_speed_mbps,
+        }
+        ps_rows = [
+            ("PS (Data) Sessions", f"{total}"),
+            ("Successful", f"{success}"),
+            ("Failed", f"{total - success}"),
+            ("Success Rate", f"{success_rate:.0f}%"),
+            ("Average Duration", f"{avg_duration_s:.0f} sec"),
+            ("Average Speed", f"{avg_speed_mbps:.2f} Mbps" if avg_speed_mbps is not None else "N/A"),
+        ]
+
+    cs = df[df["type"] == 2].copy()
+    cs_rows, cs_stats = [], {}
+    if not cs.empty:
+        cs["direction"] = cs["json_data"].apply(lambda r: _subsession_json_field(r, "direction"))
+        cs["setup_ms"] = pd.to_numeric(cs["json_data"].apply(lambda r: _subsession_json_field(r, "setup_ms")), errors="coerce")
+        total = len(cs)
+        success = int((cs["status"] == 1).sum())
+        incoming = int((cs["direction"] == "incoming").sum())
+        outgoing = int((cs["direction"] == "outgoing").sum())
+        setup_vals = cs["setup_ms"].dropna()
+        avg_duration_s = float(cs["duration_s"].mean())
+        success_rate = success / total * 100
+        cs_stats = {
+            "total": total, "success": success, "failed": total - success,
+            "success_rate": success_rate, "avg_duration_s": avg_duration_s,
+            "avg_setup_ms": float(setup_vals.mean()) if not setup_vals.empty else None,
+            "incoming": incoming, "outgoing": outgoing,
+        }
+        cs_rows = [
+            ("CS (Voice) Calls", f"{total}"),
+            ("Connected", f"{success}"),
+            ("Failed", f"{total - success}"),
+            ("Call Success Rate", f"{success_rate:.0f}%"),
+            ("Average Duration", f"{avg_duration_s:.0f} sec"),
+            (
+                "Average Setup Time",
+                f"{cs_stats['avg_setup_ms']:.0f} ms" if cs_stats["avg_setup_ms"] is not None else "Not reported for these calls",
+            ),
+            ("Incoming / Outgoing", f"{incoming} / {outgoing}"),
+        ]
+
+    return (
+        pd.DataFrame(ps_rows, columns=columns) if ps_rows else empty,
+        pd.DataFrame(cs_rows, columns=columns) if cs_rows else empty,
+        ps_stats, cs_stats,
+    )
+
+
+def build_call_success_observation(ps_stats: dict, cs_stats: dict) -> str:
+    """Observation sentence stating this project's own actual PS/CS numbers,
+    not a generic description of what success rate means."""
+    parts = []
+    if ps_stats:
+        speed_part = (
+            f", averaging {ps_stats['avg_speed_mbps']:.2f} Mbps"
+            if ps_stats.get("avg_speed_mbps") is not None else ""
+        )
+        parts.append(
+            f"PS (data) sessions completed at a {ps_stats['success_rate']:.0f}% success rate "
+            f"({ps_stats['success']} of {ps_stats['total']} sessions){speed_part}"
+        )
+    if cs_stats:
+        setup_part = (
+            f", with an average call setup time of {cs_stats['avg_setup_ms']:.0f} ms"
+            if cs_stats.get("avg_setup_ms") is not None else ""
+        )
+        parts.append(
+            f"CS (voice) calls connected at a {cs_stats['success_rate']:.0f}% success rate "
+            f"({cs_stats['success']} of {cs_stats['total']} calls){setup_part}"
+        )
+    if not parts:
+        return "Observation: no PS or CS call-session results are available for this project."
+    return "Observation: " + "; ".join(parts) + "."
 
 
 def generate_tech_handover_map(tech_events: list[dict], output_html: str, output_png: str, polygon_wkt: str | None = None) -> bool:
@@ -1835,10 +2223,125 @@ def generate_tech_handover_map(tech_events: list[dict], output_html: str, output
         return False
 
 
+# ------------------------------------------------------------------
+# Section 8 "Key Findings" map (test-case only) -- visually closes out
+# the Overall Network Performance / Optimization Opportunities bullets
+# above it using the SAME data those bullets already name
+# (_nodeb_coverage_extremes' best/worst eNodeB, CDF_ACCEPTANCE_THRESHOLDS'
+# RSRP cutoff), rather than a fresh, unrelated computation.
+# ------------------------------------------------------------------
+
+def generate_key_findings_map(
+    report_df: pd.DataFrame,
+    best_nodeb: dict | None,
+    worst_nodeb: dict | None,
+    output_html: str,
+    output_png: str,
+    polygon_wkt: str | None = None,
+    rsrp_threshold: float | None = None,
+) -> bool:
+    """
+    Green = the best eNodeB's own samples (the one named in "Overall
+    Network Performance"). Red = the worst eNodeB's own samples (the one
+    named in "Optimization Opportunities"). Amber = every OTHER sample
+    below the RSRP acceptance threshold, not already covered by the worst
+    eNodeB, so the map reflects the "X% of samples were below threshold"
+    bullet too, not just the single worst site. Returns False (nothing
+    drawn, caller should skip the section) when none of the three groups
+    has any points.
+    """
+    import folium
+    from tools.report_engine.map_generator import (
+        new_report_map, add_fullscreen_css, add_legend, draw_polygon_overlay,
+    )
+    from tools.report_engine.playwright_utils import html_to_png
+
+    required = {"nodeb_id", "lat", "lon"}
+    if not required.issubset(report_df.columns):
+        return False
+
+    nodeb_col = report_df["nodeb_id"].apply(_clean_transition_text)
+    lat_numeric = pd.to_numeric(report_df["lat"], errors="coerce")
+    lon_numeric = pd.to_numeric(report_df["lon"], errors="coerce")
+    rsrp_numeric = (
+        pd.to_numeric(report_df["rsrp"], errors="coerce")
+        if "rsrp" in report_df.columns else pd.Series(dtype=float, index=report_df.index)
+    )
+    valid = lat_numeric.notna() & lon_numeric.notna()
+
+    best_mask = (valid & (nodeb_col == best_nodeb["nodeb_id"])) if best_nodeb else pd.Series(False, index=report_df.index)
+    worst_mask = (valid & (nodeb_col == worst_nodeb["nodeb_id"])) if worst_nodeb else pd.Series(False, index=report_df.index)
+    poor_mask = pd.Series(False, index=report_df.index)
+    if rsrp_threshold is not None:
+        poor_mask = valid & rsrp_numeric.notna() & (rsrp_numeric < rsrp_threshold) & ~best_mask & ~worst_mask
+
+    if not (best_mask.any() or worst_mask.any() or poor_mask.any()):
+        return False
+
+    def _points(mask):
+        idx = report_df.index[mask]
+        return [{"lat": float(lat_numeric[i]), "lon": float(lon_numeric[i])} for i in idx]
+
+    fmap = new_report_map()
+    add_fullscreen_css(fmap)
+
+    payload = json.dumps({"poor": _points(poor_mask), "best": _points(best_mask), "worst": _points(worst_mask)})
+    map_name = fmap.get_name()
+    render_js = f"""
+    <script>
+        (function() {{
+            var groups = {payload};
+            var colors = {{ poor: "#f59e0b", best: "#22c55e", worst: "#ef4444" }};
+            var radii = {{ poor: 3, best: 4, worst: 4 }};
+            function drawKeyFindingsPoints() {{
+                var map = window["{map_name}"];
+                if (!map || !window.L) {{
+                    window.setTimeout(drawKeyFindingsPoints, 50);
+                    return;
+                }}
+                var canvasRenderer = L.canvas();
+                ["poor", "best", "worst"].forEach(function(key) {{
+                    groups[key].forEach(function(p) {{
+                        L.circleMarker([p.lat, p.lon], {{
+                            radius: radii[key], color: colors[key], fill: true,
+                            fillColor: colors[key], fillOpacity: 0.85, weight: 1,
+                            renderer: canvasRenderer
+                        }}).addTo(map);
+                    }});
+                }});
+            }}
+            drawKeyFindingsPoints();
+        }})();
+    </script>
+    """
+    fmap.get_root().html.add_child(folium.Element(render_js))
+
+    legend_items = []
+    if best_mask.any():
+        legend_items.append((f"Best Coverage - eNodeB {best_nodeb['nodeb_id']}", "#22c55e", int(best_mask.sum())))
+    if worst_mask.any():
+        legend_items.append((f"Weakest Coverage - eNodeB {worst_nodeb['nodeb_id']}", "#ef4444", int(worst_mask.sum())))
+    if poor_mask.any():
+        legend_items.append((f"Other samples below {rsrp_threshold:g} dBm", "#f59e0b", int(poor_mask.sum())))
+    add_legend(fmap, "Key Findings: Coverage Extremes", legend_items)
+
+    draw_polygon_overlay(fmap, polygon_wkt)
+    fit_bounds_including_polygon(fmap, report_df.dropna(subset=["lat", "lon"]), polygon_wkt, reserve_legend_space=True)
+    fmap.save(output_html)
+
+    try:
+        html_to_png(output_html, output_png, width=1200, height=900, device_scale_factor=1)
+        return True
+    except Exception as exc:
+        print(f" Warning: failed to convert key findings map html to png: {exc}")
+        return False
+
+
 def derive_executive_summary(
     report_df: pd.DataFrame,
     handover_count: int | None = None,
     mobility_df: pd.DataFrame | None = None,
+    grid_lattice: pd.DataFrame | None = None,
 ) -> dict:
     """
     Build the Executive Summary content (report_VI.pdf, section 3).
@@ -1852,14 +2355,19 @@ def derive_executive_summary(
     docstring for why mixing the primary-cell-restricted population into
     this one metric is wrong. Falls back to report_df only if the caller
     doesn't have the all-cells dataframe available.
+
+    `grid_lattice` (polygon projects) makes Coverage/Radio Quality read off
+    per-GRID-CELL medians instead of raw samples, via _kpi_stat_series —
+    per direction received, KPI stats have to agree with the grid maps and
+    Poor RSRP/RSRQ narrative, which already classify by cell median.
+    Mobility/Handover are NOT affected (PCI/event-based, out of this
+    scope).
     """
 
-    rsrp = _series(report_df, "rsrp")
-    rsrq = _series(report_df, "rsrq")
-    sinr = _series(report_df, "sinr")
+    rsrp, rsrp_unit = _kpi_stat_series(report_df, "rsrp", grid_lattice)
 
-    coverage_status, coverage_remarks = classify_coverage(rsrp)
-    quality_entries = classify_quality_by_technology(report_df)
+    coverage_status, coverage_remarks = classify_coverage(rsrp, unit_word=rsrp_unit)
+    quality_entries = classify_quality_by_technology(report_df, grid_lattice=grid_lattice)
     mobility_status, mobility_remarks = classify_mobility(
         mobility_df if mobility_df is not None else report_df
     )
@@ -1887,7 +2395,7 @@ def derive_executive_summary(
         pct_above_95 = float((rsrp > -95).mean() * 100)
         observations.append(
             f"Coverage classified as {coverage_status} "
-            f"({pct_above_95:.0f}% of RSRP samples above -95 dBm, average {float(rsrp.mean()):.1f} dBm)."
+            f"({pct_above_95:.0f}% of RSRP {rsrp_unit} above -95 dBm, average {float(rsrp.mean()):.1f} dBm)."
         )
     for entry in quality_entries:
         tech_label = entry["technology"] or "overall"
@@ -1986,14 +2494,22 @@ def build_drive_summary_text(drive_summary: dict) -> str:
 # averaged together). All content here is rule-based/templated — no LLM.
 # ------------------------------------------------------------------
 
-def build_rsrp_metric_table(rsrp: pd.Series) -> pd.DataFrame:
-    """4.2 RSRP Analysis metric table (Average / Best / Worst / % > -95 dBm)."""
+def build_rsrp_metric_table(rsrp: pd.Series, unit_word: str = "samples") -> pd.DataFrame:
+    """
+    4.2 RSRP Analysis metric table (Average / Best / Worst / % > -95 dBm).
+    `rsrp` is whatever the caller resolved via _kpi_stat_series -- raw
+    samples, or per-GRID-CELL medians when the project has a polygon, in
+    which case "Best"/"Worst" become the best/worst CELL median rather
+    than a single outlier sample, matching every other grid-based figure
+    in this report (pass unit_word="grid cells" to label the % row
+    correctly).
+    """
     if rsrp.empty:
-        return pd.DataFrame({"Metric": ["Average RSRP"], "Sample Value": ["No data available"]})
+        return pd.DataFrame({"Metric": ["Average RSRP"], "Value": ["No data available"]})
     pct_above_95 = float((rsrp > -95).mean() * 100)
     return pd.DataFrame({
-        "Metric": ["Average RSRP", "Best RSRP", "Worst RSRP", "Samples > -95 dBm"],
-        "Sample Value": [
+        "Metric": ["Average RSRP", "Best RSRP", "Worst RSRP", f"{unit_word.title()} > -95 dBm"],
+        "Value": [
             f"{rsrp.mean():.1f} dBm",
             f"{rsrp.max():.1f} dBm",
             f"{rsrp.min():.1f} dBm",
@@ -2002,26 +2518,35 @@ def build_rsrp_metric_table(rsrp: pd.Series) -> pd.DataFrame:
     })
 
 
-def build_rsrq_technology_table(report_df: pd.DataFrame) -> pd.DataFrame:
+def build_rsrq_technology_table(report_df: pd.DataFrame, grid_lattice: pd.DataFrame | None = None) -> pd.DataFrame:
     """4.3 RSRQ Analysis — one row per technology (never blended)."""
     return _build_per_technology_metric_table(
         report_df, column="rsrq", unit="dB", band_fn=_band_rsrq, metric_label="RSRQ",
+        grid_lattice=grid_lattice,
     )
 
 
-def build_sinr_technology_table(report_df: pd.DataFrame) -> pd.DataFrame:
+def build_sinr_technology_table(report_df: pd.DataFrame, grid_lattice: pd.DataFrame | None = None) -> pd.DataFrame:
     """4.4 SINR Analysis — one row per technology (never blended)."""
     return _build_per_technology_metric_table(
         report_df, column="sinr", unit="dB", band_fn=_band_sinr, metric_label="SINR",
+        grid_lattice=grid_lattice,
     )
 
 
-def _build_per_technology_metric_table(report_df, column, unit, band_fn, metric_label) -> pd.DataFrame:
+def _build_per_technology_metric_table(report_df, column, unit, band_fn, metric_label, grid_lattice=None) -> pd.DataFrame:
+    """
+    `grid_lattice` (polygon projects) resolves each technology's series to
+    per-GRID-CELL medians via _kpi_stat_series before computing
+    Average/Worst/Status, per direction received -- so "Worst RSRQ"/"Worst
+    SINR" is the worst CELL median, not a single outlier sample, matching
+    every other grid-based figure in this report.
+    """
     tech_list = _technology_groups(report_df)
     columns = ["Technology", f"Average {metric_label}", f"Worst {metric_label}", "Status"]
 
     if not tech_list:
-        series = _series(report_df, column)
+        series, _unit_word = _kpi_stat_series(report_df, column, grid_lattice)
         if series.empty:
             return pd.DataFrame(columns=columns)
         avg = float(series.mean())
@@ -2034,7 +2559,7 @@ def _build_per_technology_metric_table(report_df, column, unit, band_fn, metric_
     network_col = report_df["network"].fillna("").astype(str).str.strip()
     for tech in tech_list:
         sub = report_df.loc[network_col == tech]
-        series = _series(sub, column)
+        series, _unit_word = _kpi_stat_series(sub, column, grid_lattice)
         if series.empty:
             continue
         avg = float(series.mean())
@@ -2043,7 +2568,8 @@ def _build_per_technology_metric_table(report_df, column, unit, band_fn, metric_
 
 
 def build_coverage_kpi_summary_table(
-    report_df: pd.DataFrame, rsrp: pd.Series, coverage_status: str
+    report_df: pd.DataFrame, coverage_status: str,
+    grid_lattice: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     """
     4.5 Coverage KPI Summary — report_VI.pdf's own layout
@@ -2053,12 +2579,23 @@ def build_coverage_kpi_summary_table(
     acceptance-vs-observed form, same as report_VI.pdf does.
 
     Adds two columns beyond report_VI's own layout, per direction
-    received: "% Within Acceptance" / "% Outside Acceptance" — the % of
-    THAT KPI's own individual samples that clear the acceptance cutoff.
-    Acceptance uses the POOR-band boundary, not the Good-band boundary
+    received: "% Within Acceptance" / "% Outside Acceptance". Acceptance
+    uses the POOR-band boundary, not the Good-band boundary
     (CDF_ACCEPTANCE_THRESHOLDS — see that dict's comment above), per
     direction received: Fair is also considered acceptable, so PASS means
     Good OR Fair, and only truly Poor samples count as FAIL.
+
+    When `grid_lattice` is supplied (polygon projects), EVERY figure in
+    this table — Observed average, % Within/Outside Acceptance, and the
+    per-technology Status calls — is resolved via _kpi_stat_series to
+    per-GRID-CELL medians instead of raw samples, per direction received:
+    this table has to agree with what the grid maps
+    (generate_kpi_grid_map), the poor-region maps
+    (generate_poor_region_grid_map), and Section 3's Executive KPI Summary
+    already show, all of which classify by cell median rather than by
+    individual sample. Falls back to raw per-sample stats for no-polygon
+    projects (matching every other KPI map's raw/grid split), or if a
+    given subset has no populated cells at all.
     """
     rows = []
     rsrp_threshold = CDF_ACCEPTANCE_THRESHOLDS["RSRP"]
@@ -2086,6 +2623,7 @@ def build_coverage_kpi_summary_table(
     # RSRQ/SINR below — each technology's own row is its own independent
     # Good/Fair/Poor call via classify_coverage on that technology's
     # samples only, not a shared blended threshold). ----
+    rsrp, _rsrp_unit = _kpi_stat_series(report_df, "rsrp", grid_lattice)
     if not rsrp.empty:
         avg_rsrp = float(rsrp.mean())
         pct_within = float((rsrp > rsrp_threshold).mean() * 100)
@@ -2096,7 +2634,7 @@ def build_coverage_kpi_summary_table(
         ))
 
     for tech, sub in _tech_subsets():
-        rsrp_sub = _series(sub, "rsrp")
+        rsrp_sub, _unit = _kpi_stat_series(sub, "rsrp", grid_lattice)
         if rsrp_sub.empty:
             continue
         avg_rsrp_tech = float(rsrp_sub.mean())
@@ -2110,7 +2648,7 @@ def build_coverage_kpi_summary_table(
 
     # ---- RSRQ / SINR (per technology, never blended) ----
     for tech, sub in _tech_subsets():
-        rsrq = _series(sub, "rsrq")
+        rsrq, _unit = _kpi_stat_series(sub, "rsrq", grid_lattice)
         if rsrq.empty:
             continue
         avg_rsrq = float(rsrq.mean())
@@ -2122,7 +2660,7 @@ def build_coverage_kpi_summary_table(
         ))
 
     for tech, sub in _tech_subsets():
-        sinr = _series(sub, "sinr")
+        sinr, _unit = _kpi_stat_series(sub, "sinr", grid_lattice)
         if sinr.empty:
             continue
         avg_sinr = float(sinr.mean())
@@ -2266,7 +2804,7 @@ def build_top_pci_table(report_df: pd.DataFrame, limit: int = 15) -> pd.DataFram
     return pd.DataFrame(rows, columns=columns)
 
 
-def build_pci_spread_table(report_df: pd.DataFrame, limit: int = 15) -> pd.DataFrame:
+def build_pci_spread_table(report_df: pd.DataFrame, limit: int = 15) -> tuple[pd.DataFrame, list[dict]]:
     """
     PCI | Sample Count | < 2 km | 2-5 km | > 5 km
 
@@ -2278,12 +2816,17 @@ def build_pci_spread_table(report_df: pd.DataFrame, limit: int = 15) -> pd.DataF
     production's own haversine() (tools/report_engine/metadata_generator.py,
     unchanged). The three distance columns are disjoint bands (every
     sample falls into exactly one), per direction received.
+
+    Returns (df, pci_stats) — pci_stats is a list of {"pci", "count",
+    "pct_beyond_5km"} dicts (one per row, in the same order as the table),
+    so the Observation text can name the actual worst-overshoot PCI for
+    this project instead of a generic description of the columns.
     """
     stats = build_pci_distribution_stats(report_df)
     counts = stats["counts"]
     columns = ["PCI", "Sample Count", "< 2 km", "2-5 km", "> 5 km"]
     if counts.empty or not {"lat", "lon"}.issubset(report_df.columns):
-        return pd.DataFrame(columns=columns)
+        return pd.DataFrame(columns=columns), []
 
     pci_numeric = pd.to_numeric(report_df["pci"], errors="coerce")
     lat_numeric = pd.to_numeric(report_df["lat"], errors="coerce")
@@ -2293,9 +2836,10 @@ def build_pci_spread_table(report_df: pd.DataFrame, limit: int = 15) -> pd.DataF
         mask = (distances_km >= lo) if hi is None else ((distances_km >= lo) & (distances_km < hi))
         n = int(mask.sum())
         pct = (n / len(distances_km) * 100) if len(distances_km) else 0.0
-        return f"{n} ({pct:.1f}%)"
+        return f"{n} ({pct:.1f}%)", pct
 
     rows = []
+    pci_stats = []
     for pci, count in counts.head(limit).items():
         count = int(count)
         mask = (pci_numeric == pci) & lat_numeric.notna() & lon_numeric.notna()
@@ -2308,11 +2852,12 @@ def build_pci_spread_table(report_df: pd.DataFrame, limit: int = 15) -> pd.DataF
             haversine(center_lat, center_lon, lat, lon) / 1000.0
             for lat, lon in zip(lats, lons)
         ])
-        rows.append((
-            int(pci), f"{count:,}",
-            _band(distances_km, 0, 2), _band(distances_km, 2, 5), _band(distances_km, 5, None),
-        ))
-    return pd.DataFrame(rows, columns=columns)
+        near_str, _ = _band(distances_km, 0, 2)
+        mid_str, _ = _band(distances_km, 2, 5)
+        far_str, far_pct = _band(distances_km, 5, None)
+        rows.append((int(pci), f"{count:,}", near_str, mid_str, far_str))
+        pci_stats.append({"pci": int(pci), "count": count, "pct_beyond_5km": far_pct})
+    return pd.DataFrame(rows, columns=columns), pci_stats
 
 
 def build_top_pci_analysis_table(report_df: pd.DataFrame, limit: int = 8) -> pd.DataFrame:
@@ -2627,11 +3172,21 @@ def build_packet_loss_table(report_df: pd.DataFrame) -> pd.DataFrame:
     })
 
 
-def build_service_kpi_summary_table(report_df: pd.DataFrame) -> pd.DataFrame:
+def build_service_kpi_summary_table(report_df: pd.DataFrame, grid_lattice: pd.DataFrame | None = None) -> pd.DataFrame:
+    """
+    7.9 Service KPI Summary. DL/UL/MOS — the three service KPIs that also
+    have their own CDF_ACCEPTANCE_THRESHOLDS entries — resolve to
+    per-GRID-CELL medians via _kpi_stat_series when `grid_lattice` is
+    supplied (polygon projects), per direction received: this table has
+    to agree with the grid maps and the rest of the Coverage/Quality/
+    Service KPI stats, not stay sample-based while everything else moved
+    to grid. Latency/Packet Loss stay raw-sample (they have no grid maps
+    or CDF_ACCEPTANCE_THRESHOLDS entry of their own — out of this scope).
+    """
     rows = []
-    dl = _series(report_df, "dl_tpt")
-    ul = _series(report_df, "ul_tpt")
-    mos = _series(report_df, "mos")
+    dl, _dl_unit = _kpi_stat_series(report_df, "dl_tpt", grid_lattice)
+    ul, _ul_unit = _kpi_stat_series(report_df, "ul_tpt", grid_lattice)
+    mos, _mos_unit = _kpi_stat_series(report_df, "mos", grid_lattice)
     latency = _series(report_df, "latency")
     packet_loss = _series(report_df, "packet_loss")
 
@@ -2762,6 +3317,7 @@ def build_conclusion_paragraphs(
     drive_summary: dict,
     handover_data: dict,
     metadata: dict,
+    grid_lattice: pd.DataFrame | None = None,
 ) -> list[str]:
     """
     Section 7.10 "Conclusion" -- a short, data-driven wrap-up of Section 7's
@@ -2771,13 +3327,19 @@ def build_conclusion_paragraphs(
     report-wide narrative (coverage, mobility, and which eNodeB performed
     best/worst) lives in Section 8 "Key Findings" instead, so the two
     sections don't repeat each other.
-    """
-    mos = _series(report_df, "mos")
-    packet_loss = _series(report_df, "packet_loss")
-    dl = _series(report_df, "dl_tpt")
-    ul = _series(report_df, "ul_tpt")
 
-    service_kpi_df = build_service_kpi_summary_table(report_df)
+    `grid_lattice` resolves DL/UL/MOS to per-GRID-CELL medians (same as
+    build_service_kpi_summary_table below), so this narrative's own "data
+    throughput averaged X Mbps..." / "voice quality... at a MOS of X"
+    figures can never disagree with 7.9's table. Packet Loss stays
+    raw-sample (no grid map/CDF_ACCEPTANCE_THRESHOLDS entry of its own).
+    """
+    mos, _mos_unit = _kpi_stat_series(report_df, "mos", grid_lattice)
+    packet_loss = _series(report_df, "packet_loss")
+    dl, _dl_unit = _kpi_stat_series(report_df, "dl_tpt", grid_lattice)
+    ul, _ul_unit = _kpi_stat_series(report_df, "ul_tpt", grid_lattice)
+
+    service_kpi_df = build_service_kpi_summary_table(report_df, grid_lattice=grid_lattice)
     fail_kpis = (
         service_kpi_df.loc[service_kpi_df["Status"] == "FAIL", "KPI"].tolist()
         if not service_kpi_df.empty else []
@@ -2871,13 +3433,17 @@ def build_key_findings_bullets(
     metadata: dict,
 ) -> tuple[list[str], list[str]]:
     """
-    Section 8 "Key Findings" -- one Outcome bullet list and one Areas-for-
-    Improvement bullet list giving a report-wide, at-a-glance read of the
-    drive, each grounded in this project's own numbers rather than fixed
-    text: the KPI groups the Executive Summary already scored
-    Good/Fair/Poor, plus the best- and worst-covered eNodeB by average
-    RSRP (see _nodeb_coverage_extremes), so the bullets change from
-    project to project.
+    Section 8 "Key Findings" -- "Overall Network Performance" and
+    "Optimization Opportunities" bullet lists giving a report-wide,
+    at-a-glance read of the drive, each grounded in this project's own
+    numbers rather than fixed/templatey filler text: the KPI groups the
+    Executive Summary already scored Good/Fair/Poor, plus the best- and
+    worst-covered eNodeB by average RSRP (see _nodeb_coverage_extremes),
+    so the bullets change from project to project. Radio Quality entries
+    (which the Executive KPI Summary lists per-technology, e.g.
+    "Radio Quality - 5G NSA") are consolidated into one
+    "Radio Quality (tech1, tech2, ...)" bullet instead of repeating the
+    "Radio Quality" phrase once per technology.
 
     Independent of whether this project has a polygon: eNodeB coverage
     here is computed directly from report_df's own nodeb_id/rsrp columns
@@ -2886,9 +3452,6 @@ def build_key_findings_bullets(
     bullets render identically regardless of which map-rendering mode
     (grid vs raw points) this report used above.
     """
-    location = metadata.get("location") or {}
-    place = location.get("city") or "the surveyed area"
-
     kpi_rows = exec_summary.get("kpi_rows", [])
     strengths = [label for label, status, _ in kpi_rows if status == "Good"]
     weaknesses = [label for label, status, _ in kpi_rows if status not in ("Good", "N/A")]
@@ -2898,62 +3461,74 @@ def build_key_findings_bullets(
     rsrp = _series(report_df, "rsrp")
     mos = _series(report_df, "mos")
     dl = _series(report_df, "dl_tpt")
+    rsrp_threshold = CDF_ACCEPTANCE_THRESHOLDS["RSRP"]
 
-    # ---- Outcome bullets ----
-    outcome_bullets = []
+    # ---- Overall Network Performance ----
+    performance_bullets = []
     if strengths:
-        outcome_bullets.append(
-            f"Solid performance in {_join_list(strengths)} across {place}, with no "
-            f"corrective action required in those areas."
+        performance_bullets.append(
+            f"{_join_list(strengths)} KPIs met the defined acceptance criteria, indicating "
+            f"stable network performance across the evaluated route."
         )
     else:
-        outcome_bullets.append(
-            f"The drive test across {place} completed with usable coverage across the "
-            f"majority of the route."
+        performance_bullets.append(
+            "The drive test completed with usable coverage across the majority of the route, "
+            "though no KPI group cleared the defined acceptance criteria outright."
         )
     if best_nodeb:
-        outcome_bullets.append(
-            f"eNodeB {best_nodeb['nodeb_id']} delivered the strongest coverage on this drive, "
-            f"averaging {best_nodeb['avg_rsrp']:.1f} dBm RSRP over {best_nodeb['samples']:,} "
-            f"samples, and can serve as a coverage benchmark for neighboring sectors."
+        performance_bullets.append(
+            f"eNodeB {best_nodeb['nodeb_id']} delivered the strongest coverage, with an average "
+            f"RSRP of {best_nodeb['avg_rsrp']:.1f} dBm across {best_nodeb['samples']:,} samples, "
+            f"representing the best-performing serving cell."
+        )
+    if not dl.empty:
+        performance_bullets.append(
+            f"Average downlink throughput of {float(dl.mean()):.1f} Mbps provided satisfactory "
+            f"performance for common data applications."
         )
     if not mos.empty and float(mos.mean()) >= 3.5:
-        outcome_bullets.append(f"Voice quality also held up well, averaging a MOS of {float(mos.mean()):.2f}.")
-    elif not dl.empty:
-        outcome_bullets.append(
-            f"Data throughput remained usable for common applications, averaging "
-            f"{float(dl.mean()):.1f} Mbps download."
-        )
+        performance_bullets.append(f"Voice quality also held up well, averaging a MOS of {float(mos.mean()):.2f}.")
 
-    # ---- Areas for improvement bullets ----
+    # ---- Optimization Opportunities ----
     improvement_bullets = []
-    if weaknesses:
+    radio_quality_techs = [
+        label.split("Radio Quality - ", 1)[1] for label in weaknesses if label.startswith("Radio Quality")
+    ]
+    other_weaknesses = [label for label in weaknesses if not label.startswith("Radio Quality")]
+    if radio_quality_techs:
         improvement_bullets.append(
-            f"The main opportunities for improvement are in {_join_list(weaknesses)}, where "
-            f"results fell short of the acceptance criteria applied elsewhere in this report."
+            f"Radio Quality ({_join_list(radio_quality_techs)}) requires optimization, as RSRQ "
+            f"and SINR did not consistently meet the acceptance criteria."
         )
-    else:
+    for label in other_weaknesses:
+        improvement_bullets.append(
+            f"{label} requires optimization, as it did not meet the acceptance criteria applied "
+            f"elsewhere in this report."
+        )
+    if not improvement_bullets:
         improvement_bullets.append(
             "No KPI group was flagged outright, though isolated pockets of weaker "
             "performance were still observed."
         )
     if worst_nodeb:
         improvement_bullets.append(
-            f"eNodeB {worst_nodeb['nodeb_id']} recorded the weakest coverage on this drive, "
-            f"averaging {worst_nodeb['avg_rsrp']:.1f} dBm RSRP over {worst_nodeb['samples']:,} "
-            f"samples, and should be prioritized for a site audit or capacity review."
+            f"eNodeB {worst_nodeb['nodeb_id']} recorded the weakest coverage, with an average "
+            f"RSRP of {worst_nodeb['avg_rsrp']:.1f} dBm across {worst_nodeb['samples']:,} samples, "
+            f"and should be prioritized for RF optimization."
         )
     if not rsrp.empty:
-        pct_below = float((rsrp <= -95).mean() * 100)
+        pct_below = float((rsrp <= rsrp_threshold).mean() * 100)
         if pct_below > 0:
             improvement_bullets.append(
-                f"Roughly {pct_below:.0f}% of samples fell below the -95 dBm acceptance threshold."
+                f"Approximately {pct_below:.0f}% of samples were below the {rsrp_threshold:g} dBm "
+                f"RSRP threshold, indicating localized weak coverage areas."
             )
     improvement_bullets.append(
-        "Addressing these areas will improve consistency of the end-user experience across the route."
+        "Optimizing these areas will improve radio quality and provide a more consistent "
+        "end-user experience."
     )
 
-    return outcome_bullets, improvement_bullets
+    return performance_bullets, improvement_bullets
 
 
 # ------------------------------------------------------------------
@@ -3055,11 +3630,22 @@ class NewFormatPDFReport(PDFReportGenerator):
 
         `extra_text` (e.g. build_poor_region_text()'s output) is rendered
         as a paragraph between the heading and the image when given.
+
+        The image is OPTIONAL: generate_poor_region_grid_map (and its
+        raw-point counterpart) can legitimately produce no file at all --
+        e.g. when a project has zero poor grid cells, there's nothing to
+        draw. That's still a real, reportable finding ("no poor cells"),
+        so the heading + extra_text still render even when `filename`
+        doesn't exist; only the image itself is skipped. Previously this
+        returned [] whenever the image was missing, silently dropping the
+        whole heading/narrative along with it -- which read as the
+        section vanishing rather than as the "no poor regions" result it
+        actually was.
         """
         path = os.path.join(self.images_dir, subdir, filename)
-        if not os.path.exists(path):
+        has_image = os.path.exists(path)
+        if not has_image and not extra_text:
             return []
-        use_path = self._compress_png(path) if subdir == "kpi_maps" else path
         block = [
             Paragraph(f"<b>{label}</b>", self.styles["Body"]),
             Spacer(1, 2),
@@ -3067,7 +3653,9 @@ class NewFormatPDFReport(PDFReportGenerator):
         if extra_text:
             block.append(Paragraph(extra_text, self.styles["Body"]))
             block.append(Spacer(1, 4))
-        block.append(self._sized_image(use_path, max_width, max_height))
+        if has_image:
+            use_path = self._compress_png(path) if subdir == "kpi_maps" else path
+            block.append(self._sized_image(use_path, max_width, max_height))
         return [KeepTogether(block), Spacer(1, 6)]
 
     def _kpi_image_flowables_per_technology(
@@ -3185,6 +3773,7 @@ class NewFormatPDFReport(PDFReportGenerator):
     def add_coverage_kpi_analysis(
         self, report_df: pd.DataFrame, exec_summary: dict, band_summary: list | None,
         poor_rsrp_summary: dict | None = None, poor_rsrq_summary: dict | None = None,
+        grid_lattice: pd.DataFrame | None = None,
     ):
         """
         Section 4 'Coverage KPI Analysis' (report_VI.pdf layout, Step 2).
@@ -3209,7 +3798,11 @@ class NewFormatPDFReport(PDFReportGenerator):
         ))
         self.story.append(Spacer(1, 8))
 
-        rsrp = _series(report_df, "rsrp")
+        # Resolved to per-GRID-CELL medians when the project has a polygon
+        # (same _kpi_stat_series helper derive_executive_summary already
+        # used to build exec_summary["coverage"] above), so 4.2's own table
+        # and Observation text can never disagree with Section 3.
+        rsrp, rsrp_unit = _kpi_stat_series(report_df, "rsrp", grid_lattice)
         coverage_status = exec_summary["coverage"]["status"]
         quality_entries = exec_summary["quality_entries"]
 
@@ -3251,7 +3844,7 @@ class NewFormatPDFReport(PDFReportGenerator):
                 "Poor: Average RSRP &lt; -105 dBm, or coverage (% &gt; -95 dBm) &lt; 75%",
             ]),
             Spacer(1, 4),
-            make_native_table(build_rsrp_metric_table(rsrp)),
+            make_native_table(build_rsrp_metric_table(rsrp, unit_word=rsrp_unit)),
             Spacer(1, 4),
             Paragraph(
                 f"Observation: Coverage classified as <b>{coverage_status}</b>. "
@@ -3274,7 +3867,7 @@ class NewFormatPDFReport(PDFReportGenerator):
         ))
 
         # ---- 4.3 RSRQ Analysis — per technology, never blended ----
-        rsrq_table = build_rsrq_technology_table(report_df)
+        rsrq_table = build_rsrq_technology_table(report_df, grid_lattice=grid_lattice)
         rsrq_worst_status = _worst_status(rsrq_table["Status"]) if not rsrq_table.empty else "N/A"
         rsrq_flowables = [
             Paragraph(
@@ -3314,7 +3907,7 @@ class NewFormatPDFReport(PDFReportGenerator):
         ))
 
         # ---- 4.4 SINR Analysis — per technology, never blended ----
-        sinr_table = build_sinr_technology_table(report_df)
+        sinr_table = build_sinr_technology_table(report_df, grid_lattice=grid_lattice)
         sinr_worst_status = _worst_status(sinr_table["Status"]) if not sinr_table.empty else "N/A"
         sinr_flowables = [
             Paragraph(
@@ -3349,7 +3942,7 @@ class NewFormatPDFReport(PDFReportGenerator):
         # KPI/Acceptance/Observed/PASS-FAIL layout, condensing 4.2-4.4's
         # own findings (NOT a repeat of Section 3's Executive KPI Summary,
         # which uses different columns and is about Mobility/Handover too) ----
-        summary_df = build_coverage_kpi_summary_table(report_df, rsrp, coverage_status)
+        summary_df = build_coverage_kpi_summary_table(report_df, coverage_status, grid_lattice=grid_lattice)
         # Display-only: per direction received, this table shows FAIL rows
         # with a blank Status cell instead of the word "FAIL" for now. The
         # underlying PASS/FAIL classification is untouched -- Section 7.10's
@@ -3402,7 +3995,7 @@ class NewFormatPDFReport(PDFReportGenerator):
         top_pci_analysis_df = build_top_pci_analysis_table(report_df, limit=8)
         poor_rsrp_df = build_poor_pci_analysis_table(report_df, "rsrp")
         poor_rsrq_df = build_poor_pci_analysis_table(report_df, "rsrq")
-        pci_spread_df = build_pci_spread_table(report_df, limit=15)
+        pci_spread_df, pci_spread_stats = build_pci_spread_table(report_df, limit=15)
         neighbor_table_df = build_neighbor_cell_table(neighbor_df)
         # Used below in the Mobility Summary's overall_text logic even
         # though the standalone Neighbor Cell Analysis section (formerly
@@ -3421,10 +4014,7 @@ class NewFormatPDFReport(PDFReportGenerator):
             Spacer(1, 4),
             make_native_table(build_serving_cell_metric_table(report_df)),
             Spacer(1, 4),
-            Paragraph(
-                f"Observation: Serving-cell transitions followed the planned footprint. {mobility_remarks}",
-                self.styles["Body"],
-            ),
+            Paragraph(f"Observation: {mobility_remarks}", self.styles["Body"]),
         ]
         self.add_labeled_block("5.1 Serving Cell Distribution", serving_flowables)
 
@@ -3476,8 +4066,13 @@ class NewFormatPDFReport(PDFReportGenerator):
         if poor_rsrp_df is not None and not poor_rsrp_df.empty:
             poor_rsrp_flowables.append(make_native_table(poor_rsrp_df))
             poor_rsrp_flowables.append(Spacer(1, 4))
+            worst_rsrp_pci = poor_rsrp_df.iloc[0]
+            total_poor_rsrp_pci = int(poor_rsrp_df.attrs.get("total_poor_pci", len(poor_rsrp_df)))
             poor_rsrp_flowables.append(Paragraph(
-                "Observation: Weak PCI performance was localized and primarily associated with cell-edge conditions.",
+                f"Observation: {total_poor_rsrp_pci} PCI{'s' if total_poor_rsrp_pci != 1 else ''} "
+                f"recorded poor RSRP samples. PCI {worst_rsrp_pci['PCI']} had the most, with "
+                f"{worst_rsrp_pci['Poor Samples']} poor samples (average {worst_rsrp_pci['Avg RSRP']} dBm, "
+                f"worst {worst_rsrp_pci['Worst RSRP']} dBm) on band(s) {worst_rsrp_pci['Bands']}.",
                 self.styles["Body"],
             ))
         else:
@@ -3491,8 +4086,13 @@ class NewFormatPDFReport(PDFReportGenerator):
         if poor_rsrq_df is not None and not poor_rsrq_df.empty:
             poor_rsrq_flowables.append(make_native_table(poor_rsrq_df))
             poor_rsrq_flowables.append(Spacer(1, 4))
+            worst_rsrq_pci = poor_rsrq_df.iloc[0]
+            total_poor_rsrq_pci = int(poor_rsrq_df.attrs.get("total_poor_pci", len(poor_rsrq_df)))
             poor_rsrq_flowables.append(Paragraph(
-                "Observation: Low RSRQ values indicate loading or interference rather than pure coverage deficiency.",
+                f"Observation: {total_poor_rsrq_pci} PCI{'s' if total_poor_rsrq_pci != 1 else ''} "
+                f"recorded poor RSRQ samples. PCI {worst_rsrq_pci['PCI']} had the most, with "
+                f"{worst_rsrq_pci['Poor Samples']} poor samples (average {worst_rsrq_pci['Avg RSRQ']} dB, "
+                f"worst {worst_rsrq_pci['Worst RSRQ']} dB) on band(s) {worst_rsrq_pci['Bands']}.",
                 self.styles["Body"],
             ))
         else:
@@ -3515,12 +4115,27 @@ class NewFormatPDFReport(PDFReportGenerator):
         if not pci_spread_df.empty:
             spread_flowables.append(make_native_table(pci_spread_df))
             spread_flowables.append(Spacer(1, 4))
-            spread_flowables.append(Paragraph(
-                "Observation: distance bands are disjoint (each sample falls into exactly one of "
-                "\"&lt; 2 km\", \"2-5 km\" or \"&gt; 5 km\"). PCIs with a large share of samples "
-                "beyond 5 km from their own center are candidates for overshoot review.",
-                self.styles["Body"],
-            ))
+            overshoot_candidates = [s for s in pci_spread_stats if s["pct_beyond_5km"] > 0]
+            if overshoot_candidates:
+                worst = max(overshoot_candidates, key=lambda s: s["pct_beyond_5km"])
+                other_count = len(overshoot_candidates) - 1
+                other_note = (
+                    f" {other_count} other PCI{'s' if other_count != 1 else ''} in this table also "
+                    f"had samples beyond 5 km from their own center."
+                    if other_count else ""
+                )
+                spread_flowables.append(Paragraph(
+                    f"Observation: PCI {worst['pci']} showed the widest spread, with "
+                    f"{worst['pct_beyond_5km']:.1f}% of its {worst['count']:,} samples more than "
+                    f"5 km from its own center — a candidate for overshoot review.{other_note}",
+                    self.styles["Body"],
+                ))
+            else:
+                spread_flowables.append(Paragraph(
+                    "Observation: every listed PCI's samples stayed within 5 km of its own center, "
+                    "consistent with well-contained serving footprints across this drive.",
+                    self.styles["Body"],
+                ))
         else:
             spread_flowables.append(Paragraph("PCI coverage spread data is not available.", self.styles["Body"]))
         self.add_labeled_block("5.6 Top PCI Coverage Spread", spread_flowables)
@@ -3544,13 +4159,16 @@ class NewFormatPDFReport(PDFReportGenerator):
         summary_flowables.append(Paragraph(f"Observation: {overall_text}", self.styles["Body"]))
         self.add_labeled_block("5.7 Mobility Summary", summary_flowables)
 
-    def add_handover_kpi_analysis(self, handover_data: dict):
+    def add_handover_kpi_analysis(self, handover_data: dict, subsession_df: pd.DataFrame | None = None):
         """
-        Section 6 "Handover KPI Analysis" (test-case only). Only KPIs with a
-        real DB-backed signal are included — see compute_handover_analysis
-        docstring for why Radio Link Failure, Call Drop Rate, CSSR and
-        voice-call content are excluded entirely for this project (no
-        attempt/failure signal exists anywhere in the dataset).
+        Section 6 "Handover KPI Analysis" (test-case only). Radio-transition
+        KPIs (6.2-6.5, 6.7) have no attempt/failure signal on tbl_network_log
+        itself — see compute_handover_analysis docstring — so they report
+        detected event COUNTS only. 6.6 Call Success Rate is a separate,
+        genuinely available signal from tbl_sub_session (PS/data and CS/voice
+        call-session outcomes — see build_call_event_tables), included only
+        when `subsession_df` has rows for this project (it doesn't for every
+        project, e.g. project 248 had none).
         """
         self.story.append(PageBreak())
         self.add_toc_heading("6. Handover KPI Analysis", self.styles["Section"], 0, "sec6")
@@ -3569,18 +4187,32 @@ class NewFormatPDFReport(PDFReportGenerator):
         intra_enodeb_events = handover_data["intra_enodeb_events"]
         inter_enodeb_events = handover_data["inter_enodeb_events"]
 
+        ps_call_df, cs_call_df, ps_call_stats, cs_call_stats = build_call_event_tables(subsession_df)
+        has_call_data = not ps_call_df.empty or not cs_call_df.empty
+
         scope_flowables = [
             Paragraph(
-                "Objective: define the handover event types detected for this drive route and the "
-                "data scope used to detect them.",
+                "Objective: identify the handover event types detected across this drive route "
+                "and the population used to detect them.",
                 self.styles["Body"],
             ),
             Spacer(1, 4),
             Paragraph(
-                "This project's dataset has no handover attempt/failure signal (no Radio Link "
-                "Failure, call-state or disconnect-cause data was found on tbl_network_log or its "
-                "linked sub-sessions for this project), so the sections below (6.2-6.6) report "
-                "detected event COUNTS only, never a success or failure percentage.",
+                (
+                    "Four handover event types were evaluated for this drive: inter-frequency "
+                    "(band), intra-frequency (PCI, same band), inter-RAT (technology) and Node-B "
+                    "(eNodeB) level transitions, each detected from session- and timestamp-ordered "
+                    "comparisons of consecutive network samples. Voice and data call outcomes are "
+                    "evaluated separately in Section 6.6, using call-session records."
+                    if has_call_data else
+                    "Four handover event types were evaluated for this drive: inter-frequency "
+                    "(band), intra-frequency (PCI, same band), inter-RAT (technology) and Node-B "
+                    "(eNodeB) level transitions, each detected from session- and timestamp-ordered "
+                    "comparisons of consecutive network samples. No call-level attempt or failure "
+                    "signal (radio link failure, call state or disconnect cause) is available for "
+                    "this project, so results are reported as detected transition counts rather "
+                    "than success or failure rates."
+                ),
                 self.styles["Body"],
             ),
         ]
@@ -3682,12 +4314,42 @@ class NewFormatPDFReport(PDFReportGenerator):
         ]
         self.add_labeled_block("6.5 Node-B (eNodeB) Level Handover", nodeb_flowables)
 
+        call_flowables = [
+            Paragraph(
+                "Definition: Packet-Switched (PS) sessions represent data service attempts "
+                "(e.g. throughput tests); Circuit-Switched (CS) sessions represent voice call "
+                "attempts. Success rate measures the share of each that completed or connected "
+                "without failure, independent of the radio-layer handover activity reported "
+                "elsewhere in this section.",
+                self.styles["Body"],
+            ),
+            Spacer(1, 4),
+        ]
+        if has_call_data:
+            if not ps_call_df.empty:
+                call_flowables.append(make_native_table(ps_call_df))
+                call_flowables.append(Spacer(1, 4))
+            if not cs_call_df.empty:
+                call_flowables.append(make_native_table(cs_call_df))
+                call_flowables.append(Spacer(1, 4))
+            call_flowables.append(Paragraph(
+                build_call_success_observation(ps_call_stats, cs_call_stats),
+                self.styles["Body"],
+            ))
+        else:
+            call_flowables.append(Paragraph(
+                "No voice or data call-session records are available for this project, so call "
+                "success rate could not be evaluated.",
+                self.styles["Body"],
+            ))
+        self.add_labeled_block("6.6 Call Success Rate", call_flowables)
+
         summary_flowables = [
             make_native_table(build_handover_kpi_summary_table(handover_data)),
             Spacer(1, 4),
-            Paragraph(build_handover_kpi_summary_observation(handover_data), self.styles["Body"]),
+            Paragraph(build_handover_kpi_summary_observation(handover_data, has_call_data=has_call_data), self.styles["Body"]),
         ]
-        self.add_labeled_block("6.6 Handover KPI Summary", summary_flowables)
+        self.add_labeled_block("6.7 Handover KPI Summary", summary_flowables)
 
     def add_service_kpi_analysis(
         self,
@@ -3696,6 +4358,7 @@ class NewFormatPDFReport(PDFReportGenerator):
         drive_summary: dict,
         handover_data: dict,
         metadata: dict,
+        grid_lattice: pd.DataFrame | None = None,
     ):
         self.story.append(PageBreak())
         self.add_toc_heading("7. Service KPI Analysis", self.styles["Section"], 0, "sec7")
@@ -3769,17 +4432,19 @@ class NewFormatPDFReport(PDFReportGenerator):
         )
 
         mos = _series(report_df, "mos")
-        mos_table = (
-            build_two_metric_table("Average MOS", f"{float(mos.mean()):.2f}", "Minimum MOS", f"{float(mos.min()):.2f}")
-            if not mos.empty else pd.DataFrame({"Metric": ["MOS"], "Sample Value": ["No data available"]})
-        )
+        if not mos.empty:
+            mos_table = build_two_metric_table("Average MOS", f"{float(mos.mean()):.2f}", "Minimum MOS", f"{float(mos.min()):.2f}")
+            mos_observation = (
+                f"Observation: Average MOS was {float(mos.mean()):.2f} (minimum {float(mos.min()):.2f}) "
+                f"across {len(mos):,} samples."
+            )
+        else:
+            mos_table = pd.DataFrame({"Metric": ["MOS"], "Sample Value": ["No data available"]})
+            mos_observation = "Observation: No MOS samples are available for this project."
         mos_flowables = [
             make_native_table(mos_table),
             Spacer(1, 4),
-            Paragraph(
-                "Observation: Voice quality remained acceptable with no perceptible degradation during successful calls.",
-                self.styles["Body"],
-            ),
+            Paragraph(mos_observation, self.styles["Body"]),
         ]
         self.add_labeled_block("7.3 Voice Quality (MOS)", mos_flowables)
         self.story.extend(
@@ -3787,44 +4452,52 @@ class NewFormatPDFReport(PDFReportGenerator):
         )
 
         latency = _series(report_df, "latency")
-        latency_table = (
-            build_two_metric_table("Average Latency", f"{float(latency.mean()):.1f} ms", "Maximum Latency", f"{float(latency.max()):.1f} ms")
-            if not latency.empty else pd.DataFrame({"Metric": ["Latency"], "Sample Value": ["No data available"]})
-        )
+        if not latency.empty:
+            latency_table = build_two_metric_table("Average Latency", f"{float(latency.mean()):.1f} ms", "Maximum Latency", f"{float(latency.max()):.1f} ms")
+            latency_observation = (
+                f"Observation: Average latency was {float(latency.mean()):.1f} ms (maximum "
+                f"{float(latency.max()):.1f} ms) across {len(latency):,} samples."
+            )
+        else:
+            latency_table = pd.DataFrame({"Metric": ["Latency"], "Sample Value": ["No data available"]})
+            latency_observation = "Observation: No latency samples are available for this project."
         latency_flowables = [
             make_native_table(latency_table),
             Spacer(1, 4),
-            Paragraph(
-                "Observation: Latency values support satisfactory web browsing and real-time applications.",
-                self.styles["Body"],
-            ),
+            Paragraph(latency_observation, self.styles["Body"]),
         ]
         self.add_labeled_block("7.4 Latency Analysis", latency_flowables)
         self.story.extend(self._optional_image_flowables(["latency_hist.png"], subdir="kpi_analysis", max_width=TABLE_MAX_WIDTH, max_height=4.5 * inch))
 
         jitter = _series(report_df, "jitter")
-        jitter_table = (
-            build_two_metric_table("Average Jitter", f"{float(jitter.mean()):.1f} ms", "Maximum Jitter", f"{float(jitter.max()):.1f} ms")
-            if not jitter.empty else pd.DataFrame({"Metric": ["Jitter"], "Sample Value": ["No data available"]})
-        )
+        if not jitter.empty:
+            jitter_table = build_two_metric_table("Average Jitter", f"{float(jitter.mean()):.1f} ms", "Maximum Jitter", f"{float(jitter.max()):.1f} ms")
+            jitter_observation = (
+                f"Observation: Average jitter was {float(jitter.mean()):.1f} ms (maximum "
+                f"{float(jitter.max()):.1f} ms) across {len(jitter):,} samples."
+            )
+        else:
+            jitter_table = pd.DataFrame({"Metric": ["Jitter"], "Sample Value": ["No data available"]})
+            jitter_observation = "Observation: No jitter samples are available for this project."
         jitter_flowables = [
             make_native_table(jitter_table),
             Spacer(1, 4),
-            Paragraph(
-                "Observation: Jitter remained within acceptable limits for voice and video services.",
-                self.styles["Body"],
-            ),
+            Paragraph(jitter_observation, self.styles["Body"]),
         ]
         self.add_labeled_block("7.5 Jitter Analysis", jitter_flowables)
         self.story.extend(self._optional_image_flowables(["jitter_hist.png"], subdir="kpi_analysis", max_width=TABLE_MAX_WIDTH, max_height=4.5 * inch))
 
+        packet_loss = _series(report_df, "packet_loss")
+        packet_loss_observation = (
+            f"Observation: Average packet loss was {float(packet_loss.mean()):.2f}% across "
+            f"{len(packet_loss):,} samples."
+            if not packet_loss.empty else
+            "Observation: No packet loss samples are available for this project."
+        )
         packet_flowables = [
             make_native_table(build_packet_loss_table(report_df)),
             Spacer(1, 4),
-            Paragraph(
-                "Observation: Negligible packet loss was recorded during the drive test.",
-                self.styles["Body"],
-            ),
+            Paragraph(packet_loss_observation, self.styles["Body"]),
         ]
         self.add_labeled_block("7.6 Packet Loss", packet_flowables)
 
@@ -3857,12 +4530,13 @@ class NewFormatPDFReport(PDFReportGenerator):
             }
             self.add_labeled_block("7.8 Speed Test Summary", [make_native_table(pd.DataFrame(speed_rows))])
 
-        summary_df = build_service_kpi_summary_table(report_df)
+        summary_df = build_service_kpi_summary_table(report_df, grid_lattice=grid_lattice)
         if not summary_df.empty:
             self.add_labeled_block("7.9 Service KPI Summary", [make_native_table(summary_df)])
 
         conclusion_paragraphs = build_conclusion_paragraphs(
             report_df, exec_summary, drive_summary, handover_data, metadata,
+            grid_lattice=grid_lattice,
         )
         conclusion_flowables = []
         for para in conclusion_paragraphs:
@@ -3896,15 +4570,27 @@ class NewFormatPDFReport(PDFReportGenerator):
         ))
         self.story.append(Spacer(1, 8))
 
-        outcome_bullets, improvement_bullets = build_key_findings_bullets(
+        performance_bullets, improvement_bullets = build_key_findings_bullets(
             report_df, exec_summary, drive_summary, handover_data, metadata,
         )
-        self.story.append(Paragraph("<b>Outcome</b>", self.styles["Body"]))
-        self.story.extend(self._bullet_flowables(outcome_bullets))
+        self.story.append(Paragraph("<b>Overall Network Performance</b>", self.styles["Body"]))
+        self.story.extend(self._bullet_flowables(performance_bullets))
         self.story.append(Spacer(1, 8))
-        self.story.append(Paragraph("<b>Areas for Improvement</b>", self.styles["Body"]))
+        self.story.append(Paragraph("<b>Optimization Opportunities</b>", self.styles["Body"]))
         self.story.extend(self._bullet_flowables(improvement_bullets))
         self.story.append(Spacer(1, 6))
+
+        # Map generated in run_report() via generate_key_findings_map (needs
+        # a DB query + Playwright screenshot, so it happens once up front
+        # like every other map, not inline here) -- highlights the same
+        # best/worst eNodeB and RSRP-below-threshold samples the two bullet
+        # lists above just named, so this map visually closes out this
+        # section instead of re-plotting the whole drive route.
+        key_findings_map_path = os.path.join(self.images_dir, "kpi_maps", "key_findings_map.png")
+        if os.path.exists(key_findings_map_path):
+            self.story.append(Paragraph("<b>Coverage Extremes Map</b>", self.styles["Body"]))
+            self.story.append(Spacer(1, 4))
+            self.story.append(self._sized_image(self._compress_png(key_findings_map_path), 5.8 * inch, 4.5 * inch))
 
     def build(self):
         self.doc.multiBuild(self.story, canvasmaker=PageNumCanvas)
