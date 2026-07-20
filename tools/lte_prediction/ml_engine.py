@@ -25,7 +25,7 @@ from .grid_sampling import (
     fetch_frontend_grid_cells,
 )
 from .Sector_wise_prediction_code_copy import run_prediction_from_api
-from utils.python_bridge import PythonBridgeError, get_bridge_client
+from utils.python_bridge import PythonBridgeError, _filter_complete_site_prediction_identity, get_bridge_client
 
 
 load_dotenv()
@@ -411,13 +411,17 @@ def fetch_site_data(project_id, region="india", polygon_ids=None, operator=None)
         source = "python_bridge"
     else:
         query = f"""
-        SELECT *
+        SELECT
+            site_prediction.*,
+            cluster AS provider,
+            cluster AS operator_name
         FROM site_prediction
         WHERE tbl_project_id = {project_id}
         {_site_polygon_filter_sql(polygon_id_list)}
         """
         current_engine = _require_engine(current_engine, region, "fetching LTE site data")
         df = pd.read_sql(query, current_engine)
+        df = _filter_complete_site_prediction_identity(df, endpoint="direct:site_prediction")
         source = "database"
 
     if df.empty:
@@ -472,7 +476,18 @@ def fetch_site_data(project_id, region="india", polygon_ids=None, operator=None)
             df["frequency_mhz"] = pd.to_numeric(df["frequency"], errors="coerce").fillna(1800)
         else:
             df["frequency_mhz"] = 1800
-    if "Node_Cell_ID" not in df.columns and "cell_id" in df.columns:
+    identity_col = None
+    for candidate in ("site_prediction_key", "site_cell_sector_band_operator_key"):
+        if candidate in df.columns:
+            identity_col = candidate
+            break
+    if identity_col:
+        if "cell_id" in df.columns and "legacy_nodeb_id_cell_id" not in df.columns:
+            df["legacy_nodeb_id_cell_id"] = df["cell_id"].astype(str).str.strip()
+        strict_identity = df[identity_col].astype(str).str.strip().str.replace("|", "_", regex=False)
+        df["Node_Cell_ID"] = strict_identity
+        df["rf_identity_key"] = strict_identity
+    elif "Node_Cell_ID" not in df.columns and "cell_id" in df.columns:
         df["Node_Cell_ID"] = df["cell_id"].astype(str).str.strip()
 
     if "network" in df.columns:

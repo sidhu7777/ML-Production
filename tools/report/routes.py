@@ -51,6 +51,11 @@ def _status_payload(report_id: str, job: dict):
     return payload
 
 
+def _report_pdf_path(report_id: str) -> str:
+    reports_dir = os.path.join(current_app.root_path, "data", "reports")
+    return os.path.join(reports_dir, report_id, "report.pdf")
+
+
 def _subscribe(report_id: str):
     q = Queue()
     with REPORT_SUBSCRIBERS_LOCK:
@@ -154,6 +159,13 @@ def generate():
 def status(report_id):
     job = _get_job(report_id)
     if not job:
+        if os.path.exists(_report_pdf_path(report_id)):
+            return jsonify({
+                "status": "ready",
+                "report_id": report_id,
+                "download_url": f"/api/report/download/{report_id}",
+            }), 200
+
         return jsonify({
             "status": "not_found",
             "report_id": report_id,
@@ -176,6 +188,13 @@ def status(report_id):
 def events(report_id):
     job = _get_job(report_id)
     if not job:
+        if os.path.exists(_report_pdf_path(report_id)):
+            return jsonify({
+                "status": "ready",
+                "report_id": report_id,
+                "download_url": f"/api/report/download/{report_id}",
+            }), 200
+
         return jsonify({
             "status": "not_found",
             "report_id": report_id,
@@ -210,8 +229,7 @@ def events(report_id):
 
 @report_bp.route("/download/<report_id>", methods=["GET"])
 def download(report_id):
-    reports_dir = os.path.join(current_app.root_path, "data", "reports")
-    pdf_path = os.path.join(reports_dir, report_id, "report.pdf")
+    pdf_path = _report_pdf_path(report_id)
 
     if os.path.exists(pdf_path):
         return send_file(

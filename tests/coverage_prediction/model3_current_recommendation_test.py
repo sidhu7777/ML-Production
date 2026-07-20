@@ -4,6 +4,7 @@ import argparse
 import contextlib
 import json
 import os
+import re
 import shutil
 import sys
 import time
@@ -24,6 +25,12 @@ from tests.coverage_prediction import build_model3_hybrid_load_balancing_dataset
 from tests.coverage_prediction import build_model3_current_recommendation_dataset as current_builder
 from tests.coverage_prediction import lte_coverage_test as coverage_test
 from tests.coverage_prediction import model3_business_rule_recommendation_test as future_rules
+from tools.lte_prediction_optimised.ml_engine import (
+    _compute_affected_cells as production_compute_affected_cells,
+    _normalize_site_df as production_normalize_site_df,
+    compute_k1k2_for_cells as production_compute_k1k2_for_cells,
+    run_prediction_only_optimized as production_run_prediction_only_optimized,
+)
 
 
 DEFAULT_DATASET = current_builder.CURRENT_MODEL3_DATASET_CSV
@@ -102,17 +109,27 @@ def _assign_current_grid_load_to_cells(enriched: pd.DataFrame, config: CurrentMo
     )
     out = out.merge(cell_agg, on=["Node_Cell_ID", "time_bucket"], how="left", validate="many_to_one")
     out["cell_capacity_mbps"] = pd.to_numeric(out["cell_capacity_mbps"], errors="coerce").replace(0.0, np.nan).fillna(0.1)
+
+    # Match the master dataset's own PRB semantics: estimated_prb_utilization_pct is a
+    # PER-GRID ratio (that grid's traffic / the serving cell's capacity), and the cell's
+    # PRB is the MAX over its grids (exactly how `_build_current_cell_inventory` reads
+    # the before-values). Summing all grids' traffic into the numerator - the previous
+    # behavior - inflates utilization by roughly the cell's grid count (5-11x) and is
+    # what produced the impossible 500-2600% "after" figures. Verified directly against
+    # the dataset: max_grid_traffic/capacity reproduces the stored per-cell PRB
+    # (462057_3: 96.84% exactly); sum/capacity gives 510-616%.
     out["estimated_prb_utilization_pct"] = (
-        (pd.to_numeric(out["cell_assigned_traffic_mbps"], errors="coerce").fillna(0.0) / out["cell_capacity_mbps"]) * 100.0
+        (out["grid_assigned_traffic_mbps"] / out["cell_capacity_mbps"]) * 100.0
     ).replace([np.inf, -np.inf], np.nan).fillna(0.0).round(3)
     out["estimated_cell_rrc_connected_users"] = pd.to_numeric(out["cell_assigned_rrc_users"], errors="coerce").fillna(0.0).round(3)
     out["estimated_cell_rrc_utilization_pct"] = (
         (out["estimated_cell_rrc_connected_users"] / float(config.rrc_sector_capacity)) * 100.0
     ).round(3)
 
-    # Preserve grid-level demand while exposing cell-level totals for recommendation logic.
+    # Keep grid-level demand on the row (matching dataset row semantics); cell-level
+    # sums remain available as cell_assigned_traffic_mbps / cell_assigned_rrc_users.
     out["estimated_rrc_connected_users"] = out["grid_assigned_rrc_users"]
-    out["estimated_offered_traffic_mbps"] = pd.to_numeric(out["cell_assigned_traffic_mbps"], errors="coerce").fillna(0.0).round(3)
+    out["estimated_offered_traffic_mbps"] = out["grid_assigned_traffic_mbps"]
     out["estimated_dl_capacity_mbps"] = out["cell_capacity_mbps"].round(3)
     return out
 
@@ -207,6 +224,31 @@ def _load_current_context(config: CurrentModel3Config, logger) -> dict[str, Any]
             original_topology_cell_ids.update(corrected_pred_df[col].dropna().astype(str).str.strip())
     original_topology_cell_ids.discard("")
 
+    # Which cell serves each grid in the MASTER assignment ("grid_id|alias" keys, all
+    # aliases) - the incumbent a local rerun's candidate must beat by the hysteresis
+    # margin before the grid is allowed to reselect away from it.
+    master_serving_keys: set[str] = set()
+    for col in ["Node_Cell_ID", "topology_original_cell_id", "topology_original_node_cell_id"]:
+        if col in current_df.columns:
+            alias = current_df[col].dropna().astype(str).str.strip()
+            alias = alias[alias.ne("")]
+            gid = current_df.loc[alias.index, "grid_id"].astype(str)
+            master_serving_keys.update((gid + "|" + alias).tolist())
+
+    # Dataset-scale DL capacity per cell, keyed by every identity alias. The dataset's
+    # demand (estimated_offered_traffic_mbps) is NOT in physical Mbps - it is only
+    # meaningful relative to the dataset's own capacity column. Any PRB computed from
+    # this demand MUST use this capacity, never a physically re-derived one.
+    master_capacity_by_cell_id: dict[str, float] = {}
+    if "estimated_dl_capacity_mbps" in current_df.columns:
+        master_cap = pd.to_numeric(current_df["estimated_dl_capacity_mbps"], errors="coerce")
+        for col in ["Node_Cell_ID", "topology_original_cell_id", "topology_original_node_cell_id"]:
+            if col in current_df.columns:
+                grouped = master_cap.groupby(current_df[col].astype(str).str.strip()).max()
+                for key, value in grouped.items():
+                    if key and key != "nan" and pd.notna(value) and value > 0:
+                        master_capacity_by_cell_id.setdefault(key, float(value))
+
     logger.info(
         "current_context archive=%s part3_sites=%d current_rows=%d original_cell_id_universe=%d",
         archive_path,
@@ -228,6 +270,8 @@ def _load_current_context(config: CurrentModel3Config, logger) -> dict[str, Any]
         "current_base_df": _current_dataset_base_context(current_df),
         "current_df": current_df,
         "original_topology_cell_ids": original_topology_cell_ids,
+        "master_serving_keys": master_serving_keys,
+        "master_capacity_by_cell_id": master_capacity_by_cell_id,
     }
 
 
@@ -303,61 +347,217 @@ def _build_current_cell_inventory(df: pd.DataFrame, config: CurrentModel3Config)
     return out, summary
 
 
+def _build_cell_inventory_from_excel_input(df: pd.DataFrame, config: CurrentModel3Config) -> tuple[pd.DataFrame, dict[str, Any]]:
+    work = df.copy()
+    rename_map = {
+        "input_prb_utilization_pct": "prb_before_pct",
+        "input_rrc_utilization_pct": "rrc_before_pct",
+        "input_rrc_connected_users": "rrc_users_before",
+        "input_estimated_offered_traffic_mbps": "estimated_offered_traffic_mbps",
+        "input_estimated_dl_capacity_mbps": "estimated_dl_capacity_mbps",
+        "input_available_bands_to_add": "available_bands_to_add",
+        "input_max_supported_carriers": "max_supported_carriers",
+        "input_existing_carrier_count": "existing_carrier_count",
+    }
+    for source, target in rename_map.items():
+        if source in work.columns:
+            work[target] = work[source]
+    if "carrier_addition_options" not in work.columns and "available_bands_to_add" in work.columns:
+        work["carrier_addition_options"] = work["available_bands_to_add"]
+    if "available_earfcns_to_add" not in work.columns and "available_bands_to_add" in work.columns:
+        work["available_earfcns_to_add"] = work["available_bands_to_add"]
+    if "available_earfcn_options" not in work.columns and "available_earfcns_to_add" in work.columns:
+        work["available_earfcn_options"] = work["available_earfcns_to_add"]
+    if "recommended_band_to_add" not in work.columns:
+        work["recommended_band_to_add"] = work.get("available_bands_to_add", "").astype(str).str.split(",").str[0].fillna("")
+    if "carrier_addition_possible" not in work.columns:
+        existing = future_rules._to_num(work.get("existing_carrier_count", pd.Series(0, index=work.index))).fillna(0)
+        limit = future_rules._to_num(work.get("max_supported_carriers", pd.Series(0, index=work.index))).fillna(0)
+        work["carrier_addition_possible"] = (limit > existing) & work.get("available_bands_to_add", "").astype(str).str.strip().ne("")
+    else:
+        possible_text = work["carrier_addition_possible"].astype(str).str.strip().str.lower()
+        possible_num = pd.to_numeric(work["carrier_addition_possible"], errors="coerce")
+        work["carrier_addition_possible"] = possible_text.isin({"true", "yes", "y"}) | (possible_num.fillna(0) > 0)
+    work["carrier_addition_blocked"] = ~work["carrier_addition_possible"].astype(bool)
+    work["carrier_addition_reason"] = np.where(work["carrier_addition_possible"], "EXCEL_AVAILABLE_BAND", "EXCEL_NO_AVAILABLE_BAND_OR_LIMIT")
+    work["sector_has_alternate_carrier"] = work.get("existing_carrier_count", 0).astype(float) > 1
+    for col, default in [
+        ("grid_count", 1),
+        ("prb_before_pct", 0.0),
+        ("rrc_before_pct", 0.0),
+        ("rrc_users_before", 0.0),
+        ("estimated_offered_traffic_mbps", 0.0),
+        ("estimated_dl_capacity_mbps", 0.1),
+        ("existing_carrier_count", 0),
+        ("max_supported_carriers", 0),
+    ]:
+        work[col] = future_rules._to_num(work.get(col, pd.Series(default, index=work.index))).fillna(default)
+    work["sector_capacity_limit"] = work["max_supported_carriers"].fillna(0).astype(int)
+    work["congested_grid_count"] = np.where(
+        (work["prb_before_pct"] > config.congestion_threshold) | (work["rrc_before_pct"] > config.congestion_threshold),
+        work["grid_count"],
+        0,
+    ).astype(int)
+    work["prb_p90_pct"] = work["prb_before_pct"]
+    work["prb_rrc_pressure"] = work[["prb_before_pct", "rrc_before_pct"]].max(axis=1)
+    work["congested"] = work["prb_rrc_pressure"] > float(config.congestion_threshold)
+    sector_counts = work.groupby("sector_id")["Node_Cell_ID"].nunique(dropna=True)
+    sector_congested_counts = work.groupby("sector_id")["congested"].sum()
+    work["sector_cell_count"] = work["sector_id"].map(sector_counts).fillna(0).astype(int)
+    work["sector_congested_count"] = work["sector_id"].map(sector_congested_counts).fillna(0).astype(int)
+    summary = {
+        "cell_count": int(len(work)),
+        "sector_count": int(work["sector_id"].nunique(dropna=True)),
+        "congested_cell_count": int(work["congested"].sum()),
+        "carrier_addition_candidate_count": int(work["carrier_addition_possible"].sum()),
+        "source": "excel_model3_cell_input",
+    }
+    required = [
+        "Node_Cell_ID",
+        "canonical_physical_cell_id",
+        "site_id",
+        "sector_id",
+        "band",
+        "earfcn",
+        "grid_count",
+        "congested_grid_count",
+        "prb_before_pct",
+        "prb_p90_pct",
+        "rrc_before_pct",
+        "rrc_users_before",
+        "estimated_offered_traffic_mbps",
+        "estimated_dl_capacity_mbps",
+        "existing_carriers",
+        "existing_carrier_count",
+        "available_bands_to_add",
+        "carrier_addition_options",
+        "available_earfcns_to_add",
+        "available_earfcn_options",
+        "recommended_band_to_add",
+        "max_supported_carriers",
+        "carrier_addition_possible",
+        "carrier_addition_blocked",
+        "carrier_addition_reason",
+        "sector_has_alternate_carrier",
+        "sector_capacity_limit",
+        "prb_rrc_pressure",
+        "congested",
+        "sector_cell_count",
+        "sector_congested_count",
+    ]
+    for col in required:
+        if col not in work.columns:
+            work[col] = ""
+    return work[required].copy(), summary
+
+
 def _select_serving_cell_with_hysteresis(
-    topo_work: pd.DataFrame, hysteresis_db: float, original_cell_ids: set[str]
+    topo_work: pd.DataFrame,
+    hysteresis_db: float,
+    original_cell_ids: set[str],
+    master_serving_keys: set[str],
+    lineage_grid_ids: set[int] | None = None,
 ) -> pd.DataFrame:
-    """Pick one serving cell per grid/time_bucket, but require a synthetic action
-    candidate (carrier addition / new site / sector split child) to beat the grid's
-    currently-serving original cell by more than `hysteresis_db` before the grid is
-    allowed to reselect onto it.
+    """Pick one serving cell per grid/time_bucket with stickiness to the incumbent.
 
-    Synthetic-vs-original is decided by ID-universe membership, not name patterns:
-    the prediction tooling mangles cell names between layers (site table
-    '901053_1__ADD900' comes back as '1_ADD900'; pre-existing multiband cells
-    '364_1__MB850' come back as '1_MB850'), so a suffix regex silently matches
-    nothing. A candidate is original iff ANY of its identity columns (Node_Cell_ID,
-    original_node_cell_id, original_cell_id) appears in `original_cell_ids` - the set
-    of every identity string the pre-action network is known by.
+    Primary rule - incumbent stickiness: each grid's MASTER assignment (the cell that
+    serves it in the full-network archive, `master_serving_keys` as "grid_id|alias")
+    is the incumbent, and ONLY a synthetic action cell may take the grid from it - by
+    beating the incumbent's locally-predicted RSRP by more than `hysteresis_db`.
+    Pre-existing neighbors may never take an incumbent's grid here: the master
+    full-network run already settled every neighbor-vs-incumbent comparison at higher
+    fidelity, and the local rerun's only genuinely NEW information is the synthetic
+    cell's RSRP. Allowing neighbors to win on locally-resimulated RSRP re-litigates a
+    settled comparison with noisier data - in practice the same neighbor "stole" the
+    same lineage grids in every action scenario, printing the identical bogus
+    overload for carrier addition and new site alike.
 
-    Without this gate, a colocated synthetic candidate (same site/power/height as the
-    original, only a different band or a few hundred meters away) can win the plain
-    best-RSRP comparison for every grid in the local resimulation footprint at once,
-    causing the original cell to drop from ~95% PRB to 0% and dumping the entire load
-    onto the new cell in one all-or-nothing swing instead of a realistic partial
-    reselection.
+    Grids with no incumbent candidate in this rerun (the master server was removed by
+    a sector split, or isn't predicted locally) reselect by plain best RSRP: the
+    reselection is forced and there is nothing to stick to.
+    Original-vs-synthetic is decided by ID-universe membership (`original_cell_ids`),
+    never name patterns - the tooling mangles names between layers ('901053_1__ADD900'
+    comes back as '1_ADD900', pre-existing '364_1__MB850' as '1_MB850').
     """
     work = topo_work.copy()
+    id_cols = [c for c in ["Node_Cell_ID", "original_node_cell_id", "original_cell_id"] if c in work.columns]
+
     is_original = pd.Series(False, index=work.index)
-    for col in ["Node_Cell_ID", "original_node_cell_id", "original_cell_id"]:
-        if col in work.columns:
-            is_original = is_original | work[col].astype(str).str.strip().isin(original_cell_ids)
+    for col in id_cols:
+        is_original = is_original | work[col].astype(str).str.strip().isin(original_cell_ids)
     work["_is_synthetic_candidate"] = ~is_original
+
+    gid_str = work["grid_id"].astype(str)
+    is_incumbent = pd.Series(False, index=work.index)
+    for col in id_cols:
+        keys = gid_str + "|" + work[col].astype(str).str.strip()
+        is_incumbent = is_incumbent | keys.isin(master_serving_keys)
+    work["_is_incumbent"] = is_incumbent
+
     ranked = work.sort_values(["grid_id", "time_bucket", "_rank_rsrp"], ascending=[True, True, False])
-
     best_overall = ranked.drop_duplicates(subset=["grid_id", "time_bucket"], keep="first")
-    best_original = ranked.loc[~ranked["_is_synthetic_candidate"]].drop_duplicates(
-        subset=["grid_id", "time_bucket"], keep="first"
-    )
-    if best_original.empty:
-        return best_overall.drop(columns=["_is_synthetic_candidate"], errors="ignore")
-
-    prior_rsrp = best_original.set_index(["grid_id", "time_bucket"])["_rank_rsrp"]
+    best_incumbent = ranked.loc[ranked["_is_incumbent"]].drop_duplicates(subset=["grid_id", "time_bucket"], keep="first")
+    best_synthetic = ranked.loc[ranked["_is_synthetic_candidate"]].drop_duplicates(subset=["grid_id", "time_bucket"], keep="first")
     overall_keys = pd.MultiIndex.from_frame(best_overall[["grid_id", "time_bucket"]])
-    prior_for_overall = prior_rsrp.reindex(overall_keys).to_numpy()
 
-    stick_to_original = (
-        best_overall["_is_synthetic_candidate"].to_numpy()
-        & ~pd.isna(prior_for_overall)
-        & (pd.to_numeric(best_overall["_rank_rsrp"], errors="coerce").to_numpy() < (prior_for_overall + hysteresis_db))
+    inc_rsrp = (
+        best_incumbent.set_index(["grid_id", "time_bucket"])["_rank_rsrp"].reindex(overall_keys).to_numpy()
+        if not best_incumbent.empty
+        else np.full(len(best_overall), np.nan)
     )
+    syn_rsrp = (
+        best_synthetic.set_index(["grid_id", "time_bucket"])["_rank_rsrp"].reindex(overall_keys).to_numpy()
+        if not best_synthetic.empty
+        else np.full(len(best_overall), np.nan)
+    )
+    has_incumbent = ~pd.isna(inc_rsrp)
+    has_synthetic = ~pd.isna(syn_rsrp)
+    # The synthetic action cell may only take grids belonging to the acted-on sector
+    # (lineage). Without this, a new low-band carrier "wins" dozens of other sectors'
+    # grids across the whole local scope, hoovering their users (400%+ RRC) and
+    # inheriting demand calibrated against much larger capacities (170%+ PRB) - the
+    # evaluation's question is whether THIS sector's congestion is fixed.
+    in_lineage = (
+        pd.to_numeric(best_overall["grid_id"], errors="coerce").isin(lineage_grid_ids).to_numpy()
+        if lineage_grid_ids
+        else np.zeros(len(best_overall), dtype=bool)
+    )
+    synthetic_takes = has_incumbent & in_lineage & has_synthetic & (syn_rsrp >= (inc_rsrp + hysteresis_db))
+    incumbent_keeps = has_incumbent & ~synthetic_takes
+    # Forced reselection (incumbent removed): the synthetic replacement inherits when
+    # it covers the grid; unrelated neighbors only when no synthetic candidate exists.
+    no_incumbent_synthetic = ~has_incumbent & has_synthetic
+    no_incumbent_plain = ~has_incumbent & ~has_synthetic
 
-    if stick_to_original.any():
-        switch_keys = best_overall.loc[stick_to_original, ["grid_id", "time_bucket"]]
-        fallback_rows = best_original.merge(switch_keys, on=["grid_id", "time_bucket"], how="inner")
-        best_overall = pd.concat(
-            [best_overall.loc[~stick_to_original], fallback_rows], ignore_index=True, sort=False
-        )
-    return best_overall.drop(columns=["_is_synthetic_candidate"], errors="ignore")
+    parts = [best_overall.loc[no_incumbent_plain]]
+    for mask, source in [
+        (incumbent_keeps, best_incumbent),
+        (synthetic_takes, best_synthetic),
+        (no_incumbent_synthetic, best_synthetic),
+    ]:
+        if mask.any():
+            parts.append(
+                source.merge(
+                    best_overall.loc[mask, ["grid_id", "time_bucket"]],
+                    on=["grid_id", "time_bucket"], how="inner",
+                )
+            )
+    out = pd.concat(parts, ignore_index=True, sort=False)
+
+    # Expose whether each grid's master server was even present as a local candidate.
+    # A grid whose incumbent is absent (server outside the local site pool) cannot be
+    # reasoned about here: its demand belongs to an out-of-scope cell the action never
+    # touched, and letting best-RSRP hand it to some nearby cell piles foreign demand
+    # onto that cell and fabricates 1000%+ utilizations.
+    incumbent_flags = pd.DataFrame(
+        {
+            "grid_id": best_overall["grid_id"].to_numpy(),
+            "time_bucket": best_overall["time_bucket"].to_numpy(),
+            "_grid_has_incumbent": has_incumbent,
+        }
+    ).drop_duplicates(subset=["grid_id", "time_bucket"])
+    out = out.merge(incumbent_flags, on=["grid_id", "time_bucket"], how="left")
+    return out.drop(columns=["_is_synthetic_candidate", "_is_incumbent"], errors="ignore")
 
 
 def _build_current_inventory_from_surface(
@@ -369,7 +569,12 @@ def _build_current_inventory_from_surface(
     local_geo: pd.DataFrame,
     context: dict[str, Any],
     config: CurrentModel3Config,
+    lineage_grid_ids: set[int] | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
+    for frame in [baseline_local, corrected_local]:
+        for col in ["serving_distance_m", "nearest_site_distance_m", "site_count_250m", "site_count_500m", "azimuth_delta_deg"]:
+            if col in frame.columns:
+                frame.drop(columns=[col], inplace=True)
     dense_part3 = future_rules._build_dense_part3_features(
         baseline_pred_df=baseline_local,
         corrected_pred_df=corrected_local,
@@ -396,8 +601,24 @@ def _build_current_inventory_from_surface(
     topo_work["grid_id"] = pd.to_numeric(topo_work["grid_id"], errors="coerce").astype("Int64")
     topo_work["_rank_rsrp"] = pd.to_numeric(topo_work.get("pred_rsrp"), errors="coerce")
     topo_best = _select_serving_cell_with_hysteresis(
-        topo_work, config.carrier_reselection_hysteresis_db, context.get("original_topology_cell_ids", set())
+        topo_work,
+        config.carrier_reselection_hysteresis_db,
+        context.get("original_topology_cell_ids", set()),
+        context.get("master_serving_keys", set()),
+        lineage_grid_ids,
     )
+    # Keep only grids whose master serving cell participates in this local rerun,
+    # plus the lineage grids under evaluation (always kept - for sector split the
+    # incumbent is intentionally removed and its grids MUST reselect). Grids whose
+    # incumbent is out of scope carry demand belonging to an untouched, out-of-scope
+    # cell; aggregating them here fabricates load on whichever cell happens to be
+    # nearby.
+    if lineage_grid_ids is not None:
+        keep_grid = topo_best["_grid_has_incumbent"].fillna(False).astype(bool) | pd.to_numeric(
+            topo_best["grid_id"], errors="coerce"
+        ).isin(lineage_grid_ids)
+        topo_best = topo_best.loc[keep_grid]
+    topo_best = topo_best.drop(columns=["_grid_has_incumbent"], errors="ignore")
     topo_keep = [
         col
         for col in topo_best.columns
@@ -462,6 +683,43 @@ def _build_current_inventory_from_surface(
     enriched["estimated_dl_capacity_mbps"] = (
         bandwidth_mhz * spectral * max(1.0, float(future_builder.DEFAULT_MIMO_LAYERS)) * max(0.1, 1.0 - float(future_builder.DEFAULT_CONTROL_OVERHEAD))
     ).clip(lower=0.1).round(3)
+
+    # PRB = demand / capacity is only meaningful when both sides share one scale.
+    # The dataset's demand is not physical Mbps - it is calibrated against the
+    # dataset's own capacity column. Mixing it with the physically re-derived
+    # capacity above yields impossible 1000%+ utilizations, so for every cell known
+    # to the master dataset, override with the dataset-scale capacity; for synthetic
+    # action cells, inherit the parent cell's dataset capacity (suffix-stripped
+    # lineage); as a last resort use the median dataset capacity.
+    capacity_lookup: dict[str, float] = context.get("master_capacity_by_cell_id", {})
+    if capacity_lookup:
+        cap_id_cols = [
+            c for c in ["Node_Cell_ID", "topology_original_cell_id", "topology_original_node_cell_id"]
+            if c in enriched.columns
+        ]
+        median_capacity = float(np.median(list(capacity_lookup.values())))
+
+        def _dataset_scale_capacity(row: pd.Series) -> float:
+            values = []
+            for col in cap_id_cols:
+                raw = row.get(col)
+                values.append("" if pd.isna(raw) else str(raw).strip())
+            for value in values:
+                if value in capacity_lookup:
+                    return capacity_lookup[value]
+            for value in values:
+                parent = re.sub(r"__(ADD\d+|NS|SS[AB])$", "", value)
+                if parent and parent in capacity_lookup:
+                    return capacity_lookup[parent]
+            return median_capacity
+
+        enriched["estimated_dl_capacity_mbps"] = (
+            pd.to_numeric(enriched.apply(_dataset_scale_capacity, axis=1), errors="coerce")
+            .fillna(median_capacity)
+            .clip(lower=0.1)
+            .round(3)
+        )
+
     # Grids with no serving candidate in the corrected surface have no Node_Cell_ID;
     # keeping them would pool all their demand into a single phantom NaN "cell".
     enriched = enriched.loc[enriched["Node_Cell_ID"].notna()].copy()
@@ -476,6 +734,16 @@ def _choose_load_balance_candidate_current(sector_cells: pd.DataFrame, threshold
     ordered = sector_cells.sort_values(["prb_rrc_pressure", "grid_count"], ascending=[False, False], na_position="last").reset_index(drop=True)
     source = ordered.iloc[0]
     peers = ordered.iloc[1:].copy()
+    if "canonical_physical_cell_id" in peers.columns and "canonical_physical_cell_id" in source.index:
+        source_canonical = str(source.get("canonical_physical_cell_id") or "").strip()
+        if source_canonical:
+            peers = peers.loc[peers["canonical_physical_cell_id"].astype(str).str.strip().ne(source_canonical)].copy()
+    if "band" in peers.columns and "band" in source.index:
+        source_band = str(source.get("band") or "").strip()
+        if source_band:
+            peers = peers.loc[peers["band"].astype(str).str.strip().ne(source_band)].copy()
+    if peers.empty:
+        return None
     source_prb = float(source["prb_before_pct"]) if pd.notna(source["prb_before_pct"]) else np.nan
     source_rrc = float(source["rrc_before_pct"]) if pd.notna(source["rrc_before_pct"]) else np.nan
     source_prb_bad = bool(pd.notna(source_prb) and source_prb > threshold)
@@ -583,9 +851,22 @@ def _run_load_balance_current(
     target_rrc_after = ((target_users + moved_users) / float(config.rrc_sector_capacity)) * 100.0
     projected_prb = max(source_prb_after, target_prb_after)
     projected_rrc = max(source_rrc_after, target_rrc_after)
-    status = "Resolved" if projected_prb <= threshold and projected_rrc <= threshold else "Partially Resolved"
-    if projected_prb >= max(float(source["prb_before_pct"]), float(target["prb_before_pct"])) and projected_rrc >= max(float(source["rrc_before_pct"]), float(target["rrc_before_pct"])):
+
+    before_prb_worst = max(float(source["prb_before_pct"]), float(target["prb_before_pct"]))
+    before_rrc_worst = max(float(source["rrc_before_pct"]), float(target["rrc_before_pct"]))
+    before_pressure = max(before_prb_worst, before_rrc_worst)
+    after_pressure = max(projected_prb, projected_rrc)
+    worsened_any_metric = projected_prb > before_prb_worst + 0.5 or projected_rrc > before_rrc_worst + 0.5
+    improved_pressure = after_pressure < before_pressure - 0.5
+
+    if projected_prb <= threshold and projected_rrc <= threshold and not worsened_any_metric:
+        status = "Resolved"
+    elif worsened_any_metric:
         status = "Rejected"
+    elif improved_pressure:
+        status = "Partially Resolved"
+    else:
+        status = "No Material Change"
     return {
         "status": status,
         "selected_peer_node_cell_id": str(target["Node_Cell_ID"]),
@@ -593,7 +874,10 @@ def _run_load_balance_current(
         "projected_prb_after_pct": round(projected_prb, 3),
         "projected_rrc_after_pct": round(projected_rrc, 3),
         "projected_rrc_users_after": round(max(source_users - moved_users, target_users + moved_users), 3),
-        "action_reason": f"Current-state load balancing used a metric-aware {congestion_mode} move share of {move_share:.3f}.",
+        "action_reason": (
+            f"Current-state load balancing used a metric-aware {congestion_mode} move share of {move_share:.3f}; "
+            f"rejected if either PRB or RRC becomes worse."
+        ),
         "next_step": "" if status == "Resolved" else "Add Carrier",
         "resimulation_required": False,
         "resimulation_flow": "Deterministic current-state load redistribution only",
@@ -653,6 +937,178 @@ def _force_master_grid_identity(pred_df: pd.DataFrame, point_map: pd.DataFrame, 
     for col in identity_cols:
         work[col] = matched[col].to_numpy()
     return future_rules._ensure_grid_group_columns(work)
+
+
+def _fix_synthetic_frequency(site_df: pd.DataFrame) -> pd.DataFrame:
+    """Make synthetic topology rows radiate at their own band's frequency.
+
+    The topology builders copy the parent row and overwrite `band`/`earfcn` only, but
+    the RF engine's propagation model reads `frequency_mhz` - which stays at the
+    parent's value. A "900MHz" carrier addition therefore simulates with 1800MHz path
+    loss: RSRP identical to the parent, never beats the reselection hysteresis, and
+    the new carrier never attracts a single grid. Only synthetic rows are touched;
+    original rows keep the archive's values.
+    """
+    out = site_df.copy()
+    if "carrier_variant" not in out.columns or "band" not in out.columns:
+        return out
+    synthetic = out["carrier_variant"].astype(str).str.startswith(("carrier_add", "new_site", "sector_split"))
+    if not synthetic.any():
+        return out
+    band = pd.to_numeric(out.loc[synthetic, "band"], errors="coerce")
+    for col in ["frequency_mhz", "frequency"]:
+        if col in out.columns:
+            out.loc[synthetic, col] = band.fillna(pd.to_numeric(out.loc[synthetic, col], errors="coerce"))
+    return out
+
+
+def _prepare_production_scope_site_frames(
+    *,
+    original_site_df: pd.DataFrame,
+    action_site_df: pd.DataFrame,
+    source_rows: pd.DataFrame,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Build original/modified site frames in the same shape production expects."""
+    original = production_normalize_site_df(original_site_df, log_stage="MODEL3_TEST_ORIGINAL_SITE")
+    modified = production_normalize_site_df(action_site_df, log_stage="MODEL3_TEST_ACTION_SITE")
+
+    for col in [
+        "lat",
+        "lon",
+        "azimuth",
+        "electrical_tilt",
+        "mechanical_tilt",
+        "tx_power",
+        "antenna_height",
+        "frequency_mhz",
+    ]:
+        modified[f"orig_{col}"] = pd.to_numeric(modified[col], errors="coerce")
+
+    if source_rows is None or source_rows.empty or "carrier_variant" not in modified.columns:
+        return original, modified
+
+    source = production_normalize_site_df(source_rows, log_stage="MODEL3_TEST_SOURCE_SITE")
+    source_numeric = {}
+    for col in [
+        "lat",
+        "lon",
+        "azimuth",
+        "electrical_tilt",
+        "mechanical_tilt",
+        "tx_power",
+        "antenna_height",
+        "frequency_mhz",
+    ]:
+        values = pd.to_numeric(source.get(col), errors="coerce")
+        source_numeric[col] = float(values.dropna().iloc[0]) if values.notna().any() else np.nan
+
+    synthetic_mask = modified["carrier_variant"].astype(str).str.startswith(("carrier_add", "new_site", "sector_split"), na=False)
+    for col, value in source_numeric.items():
+        if pd.notna(value):
+            modified.loc[synthetic_mask, f"orig_{col}"] = value
+    return original, modified
+
+
+def _vectorized_identity_point_mask(points: pd.DataFrame, identities: list[str]) -> pd.Series:
+    wanted = {str(value).strip() for value in identities if str(value).strip()}
+    wanted.update(future_rules._normalize_identity_text(value) for value in list(wanted))
+    wanted = {value for value in wanted if value}
+    mask = pd.Series(False, index=points.index)
+    for col in [
+        "Node_Cell_ID",
+        "rf_identity_key",
+        "site_sector_band_key",
+        "sector_identity_key",
+        "frontend_site_sector_key",
+        "node_cell_sector_key",
+        "canonical_cell_id",
+        "cell_id",
+        "original_node_cell_id",
+        "original_cell_id",
+    ]:
+        if col not in points.columns:
+            continue
+        values = points[col].astype(str).str.strip()
+        mask = mask | values.isin(wanted) | values.map(future_rules._normalize_identity_text).isin(wanted)
+    return mask
+
+
+def _attach_site_topology_to_prediction(pred_df: pd.DataFrame, site_df: pd.DataFrame) -> pd.DataFrame:
+    if pred_df.empty or site_df.empty or "Node_Cell_ID" not in pred_df.columns:
+        return pred_df
+    topo_cols = [
+        col
+        for col in [
+            "Node_Cell_ID",
+            "Site ID",
+            "site_identity_key",
+            "sector_identity",
+            "frontend_site_sector_key",
+            "node_cell_sector_key",
+            "sector_identity_key",
+            "site_sector_band_key",
+            "rf_identity_key",
+            "sector",
+            "band",
+            "earfcn",
+            "nodeb_id",
+            "PCI",
+            "azimuth",
+            "canonical_sector_id",
+            "original_node_cell_id",
+            "original_cell_id",
+            "carrier_load_share",
+        ]
+        if col in site_df.columns
+    ]
+    if len(topo_cols) <= 1:
+        return pred_df
+    topo = site_df[topo_cols].drop_duplicates(subset=["Node_Cell_ID"], keep="first").copy()
+    out = pred_df.drop(columns=[col for col in topo.columns if col != "Node_Cell_ID" and col in pred_df.columns], errors="ignore").copy()
+    out["Node_Cell_ID"] = out["Node_Cell_ID"].astype(str)
+    topo["Node_Cell_ID"] = topo["Node_Cell_ID"].astype(str)
+    return out.merge(topo, on="Node_Cell_ID", how="left", validate="many_to_one")
+
+
+def _append_synthetic_prediction_points(
+    *,
+    scoped_points: pd.DataFrame,
+    baseline_points: pd.DataFrame,
+    sector_cells: pd.DataFrame,
+    changed_rows: pd.DataFrame,
+    original_cell_ids: set[str],
+) -> pd.DataFrame:
+    if changed_rows.empty or "Node_Cell_ID" not in changed_rows.columns:
+        return scoped_points
+    synthetic_ids = [
+        str(value).strip()
+        for value in changed_rows["Node_Cell_ID"].dropna().astype(str).unique().tolist()
+        if str(value).strip() and str(value).strip() not in original_cell_ids
+    ]
+    if not synthetic_ids:
+        return scoped_points
+
+    lineage_ids: list[str] = []
+    for col in ["Node_Cell_ID", "topology_original_cell_id", "topology_original_node_cell_id"]:
+        if col in sector_cells.columns:
+            lineage_ids.extend(str(value).strip() for value in sector_cells[col].dropna().astype(str).tolist() if str(value).strip())
+    lineage_mask = _vectorized_identity_point_mask(baseline_points, lineage_ids)
+    lineage_points = baseline_points.loc[lineage_mask].copy()
+    if lineage_points.empty:
+        lineage_points = scoped_points.copy()
+    synthetic_parts = []
+    for synthetic_id in synthetic_ids:
+        dup = lineage_points.copy()
+        dup["Node_Cell_ID"] = synthetic_id
+        dup["nodeb_id_cell_id"] = synthetic_id
+        dup["canonical_cell_id"] = future_rules._normalize_identity_text(synthetic_id)
+        for col in ["rf_identity_key", "site_sector_band_key", "sector_identity_key"]:
+            if col in dup.columns:
+                dup[col] = synthetic_id
+        synthetic_parts.append(dup)
+    combined = pd.concat([scoped_points, *synthetic_parts], ignore_index=True, sort=False)
+    dedupe_cols = [col for col in ["Node_Cell_ID", "lat", "lon", "grid_id", "time_bucket"] if col in combined.columns]
+    return combined.drop_duplicates(subset=dedupe_cols, keep="first") if dedupe_cols else combined
 
 
 def _affected_lineage_grid_ids(sector_cells: pd.DataFrame, current_df: pd.DataFrame) -> list[int]:
@@ -959,10 +1415,13 @@ def _evaluate_action_inventory_current(
     after_pressure = max(projected_prb if pd.notna(projected_prb) else 0.0, projected_rrc if pd.notna(projected_rrc) else 0.0)
     resolved = pd.notna(projected_prb) and pd.notna(projected_rrc) and projected_prb <= config.congestion_threshold and projected_rrc <= config.congestion_threshold
     improved = after_pressure < before_pressure - 0.5
-    worsened = after_pressure > before_pressure + 0.5
-    if resolved:
+    worsened_any_metric = (
+        (pd.notna(projected_prb) and pd.notna(before_prb) and projected_prb > before_prb + 0.5)
+        or (pd.notna(projected_rrc) and pd.notna(before_rrc) and projected_rrc > before_rrc + 0.5)
+    )
+    if resolved and not worsened_any_metric:
         status = "Resolved"
-    elif worsened:
+    elif worsened_any_metric:
         status = "Rejected"
     elif improved:
         status = "Partially Resolved"
@@ -970,7 +1429,7 @@ def _evaluate_action_inventory_current(
         status = "No Material Change"
     after_cells = after_candidates["Node_Cell_ID"].astype(str).dropna().tolist() if "Node_Cell_ID" in after_candidates.columns else []
     logger.info(
-        "%s_done sector=%s before_cells=%s after_cells=%s demand_serving_cells=%s local_after_rows=%d scope_mode=%s before_cells_found_in_after=%s before_prb=%.3f before_rrc=%.3f actual_prb=%.3f actual_rrc=%.3f status=%s",
+        "%s_done sector=%s before_cells=%s after_cells=%s demand_serving_cells=%s local_after_rows=%d scope_mode=%s before_cells_found_in_after=%s before_prb=%.3f before_rrc=%.3f actual_prb=%.3f actual_rrc=%.3f worsened_any_metric=%s status=%s",
         action_label,
         source_sector_id,
         before_cells,
@@ -983,6 +1442,7 @@ def _evaluate_action_inventory_current(
         before_rrc if pd.notna(before_rrc) else -1.0,
         projected_prb if pd.notna(projected_prb) else -1.0,
         projected_rrc if pd.notna(projected_rrc) else -1.0,
+        worsened_any_metric,
         status,
     )
     return {
@@ -1005,70 +1465,134 @@ def _rerun_current_topology(
     site_df: pd.DataFrame,
     source_rows: pd.DataFrame,
 ) -> dict[str, Any]:
-    local_ctx = _prepare_local_action_context_current(
-        sector_cells=sector_cells,
-        site_df=site_df,
-        context=context,
-        config=config,
-        logger=logger,
-        action_label=action_label,
+    original_site_df, modified_site_df = _prepare_production_scope_site_frames(
+        original_site_df=context["part3_site_df"],
+        action_site_df=site_df,
         source_rows=source_rows,
     )
-    if local_ctx is None:
+    baseline_points = context["corrected_pred_df"].loc[
+        context["corrected_pred_df"]["time_bucket"].astype(str) == "PART_3"
+    ].copy()
+    baseline_points["time_bucket"] = "PART_3"
+    if baseline_points.empty:
         return {
             "status": "Recommended",
-            "action_reason": f"{action_label} local context could not be prepared from PART_3 artifacts.",
+            "action_reason": f"{action_label} could not load PART_3 baseline points.",
             "projected_prb_after_pct": np.nan,
             "projected_rrc_after_pct": np.nan,
             "projected_rrc_users_after": np.nan,
             "next_step": "New Site",
             "resimulation_required": True,
-            "resimulation_flow": f"{action_label} baseline rerun failed during local context preparation",
+            "resimulation_flow": f"{action_label} production affected-cell rerun failed during baseline-point preparation",
         }
+
+    try:
+        affected_cells, affected_sites, changed_rows = production_compute_affected_cells(
+            modified_site_df,
+            float(context["summary"].get("baseline_radius_m", 500.0)),
+            2,
+            baseline_df=baseline_points,
+            max_neighbors_per_update_cell=2,
+        )
+    except Exception as exc:
+        logger.info("%s_production_scope_failed reason=%s", action_label, exc)
+        return {
+            "status": "Recommended",
+            "action_reason": f"{action_label} could not compute the production affected-cell scope: {exc}",
+            "projected_prb_after_pct": np.nan,
+            "projected_rrc_after_pct": np.nan,
+            "projected_rrc_users_after": np.nan,
+            "next_step": "New Site",
+            "resimulation_required": True,
+            "resimulation_flow": f"{action_label} production affected-cell scope failed",
+        }
+
+    point_mask = _vectorized_identity_point_mask(baseline_points, affected_cells)
+    scoped_points = baseline_points.loc[point_mask].copy()
+    if scoped_points.empty:
+        logger.info(
+            "%s_production_scope_failed reason=no_prediction_points affected_cells=%s",
+            action_label,
+            affected_cells,
+        )
+        return {
+            "status": "Recommended",
+            "action_reason": f"{action_label} production affected cells had no matching saved PART_3 prediction points.",
+            "projected_prb_after_pct": np.nan,
+            "projected_rrc_after_pct": np.nan,
+            "projected_rrc_users_after": np.nan,
+            "next_step": "New Site",
+            "resimulation_required": True,
+            "resimulation_flow": f"{action_label} production affected-cell rerun skipped because saved points did not match affected cells",
+        }
+    matched_point_count = len(scoped_points)
+    scoped_points = _append_synthetic_prediction_points(
+        scoped_points=scoped_points,
+        baseline_points=baseline_points,
+        sector_cells=sector_cells,
+        changed_rows=changed_rows,
+        original_cell_ids=context.get("original_topology_cell_ids", set()),
+    )
+
+    local_grid_ids = pd.to_numeric(scoped_points.get("grid_id"), errors="coerce").dropna().astype("Int64").unique().tolist()
+    part3_kpi = context["kpi_df"].loc[context["kpi_df"]["time_bucket"].astype(str) == "PART_3"].copy()
+    part3_geo = context["geo_df"].loc[context["geo_df"]["time_bucket"].astype(str) == "PART_3"].copy()
+    local_kpi = part3_kpi.loc[pd.to_numeric(part3_kpi["grid_id"], errors="coerce").astype("Int64").isin(local_grid_ids)].copy()
+    local_geo = part3_geo.loc[pd.to_numeric(part3_geo["grid_id"], errors="coerce").astype("Int64").isin(local_grid_ids)].copy()
+    point_map = future_rules._make_local_point_map(scoped_points)
+
+    snap_tolerance_m = float(context["summary"].get("grid_size_m", 50.0)) * 0.75
+    run_params = {
+        "radius": float(context["summary"].get("baseline_radius_m", 500.0)),
+        "grid_resolution": float(context["summary"].get("grid_size_m", 50.0)),
+        "n_workers": 1,
+        "antenna_gain": 18,
+        "cable_loss": 2,
+        "ue_height": 1.5,
+        "frequency_mhz": 1800,
+        "bandwidth_mhz": 10,
+        "project_id": int(context["summary"].get("project_id", 196)),
+        "region": str(context["summary"].get("region", "india")).lower(),
+        "baseline_df": scoped_points,
+        "prediction_points_df": scoped_points,
+        "strict_prediction_points": True,
+        "impact_radius_m": float(context["summary"].get("baseline_radius_m", 500.0)),
+        "neighbor_site_count": 2,
+        "max_interference_sites": int(context["summary"].get("max_interference_sites", 50)),
+        "max_neighbors_per_update_cell": 2,
+        "recompute_cells": affected_cells,
+    }
+    logger.info(
+        "%s_production_scope affected_cells=%d affected_sites=%d changed_cells=%d scoped_points=%d",
+        action_label,
+        len(affected_cells),
+        len(affected_sites),
+        int(changed_rows["Node_Cell_ID"].nunique()) if "Node_Cell_ID" in changed_rows.columns else len(changed_rows),
+        len(scoped_points),
+    )
+    if len(scoped_points) != matched_point_count:
+        logger.info("%s_synthetic_points matched_points=%d final_points=%d", action_label, matched_point_count, len(scoped_points))
     with open(logger.handlers[0].baseFilename, "a", encoding="utf-8") as log_stream:
         with contextlib.redirect_stdout(log_stream), contextlib.redirect_stderr(log_stream):
-            baseline_local = coverage_test._run_project_baseline_prediction(
-                project_id=int(context["summary"].get("project_id", 196)),
-                region=str(context["summary"].get("region", "india")).lower(),
-                site_df=local_ctx["local_site_df"].drop(columns=["_site_distance_m"], errors="ignore"),
-                drive_df=local_ctx["local_detail"],
-                building_df=context["building_df"],
-                baseline_radius_m=float(context["summary"].get("baseline_radius_m", 500.0)),
-                grid_size_m=float(context["summary"].get("grid_size_m", 50.0)),
-                workers=1,
-                max_interference_sites=int(context["summary"].get("max_interference_sites", 50)),
-                polygon_wkt=str(context["summary"].get("polygon_wkt", "")).strip() or None,
-                use_frontend_grid_sampling=False,
-                grid_analytics_scenario_id=context["summary"].get("grid_analytics_scenario_id"),
-            )
-            corrected_local = coverage_test._run_bucket_corrected_predictions(
-                baseline_pred_df=baseline_local,
-                detail_df=local_ctx["local_detail"].assign(time_bucket="PART_3"),
-                site_df_by_bucket={"PART_3": local_ctx["local_site_df"].drop(columns=["_site_distance_m"], errors="ignore")},
-                building_df=context["building_df"],
-                project_id=int(context["summary"].get("project_id", 196)),
-                region=str(context["summary"].get("region", "india")).lower(),
-                grid_size_m=float(context["summary"].get("grid_size_m", 50.0)),
-                buckets=[("PART_3", "2026-02-11 00:00:00", "2026-05-16 23:59:59")],
-                polygon_wkt=str(context["summary"].get("polygon_wkt", "")).strip() or None,
-            )
-    point_map = local_ctx["local_point_map"].drop(columns=["_site_distance_m"], errors="ignore")
-    snap_tolerance_m = float(context["summary"].get("grid_size_m", 50.0)) * 0.75
+            k1k2_map = production_compute_k1k2_for_cells(scoped_points, modified_site_df, affected_cells)
+            corrected_local = production_run_prediction_only_optimized(modified_site_df, k1k2_map, run_params)
+    baseline_local = scoped_points.copy()
     baseline_local["time_bucket"] = "PART_3"
+    corrected_local["time_bucket"] = "PART_3"
     baseline_local = _force_master_grid_identity(baseline_local, point_map, snap_tolerance_m)
-    if corrected_local.empty:
-        corrected_local = baseline_local.copy()
-    else:
-        corrected_local["time_bucket"] = "PART_3"
-        corrected_local = _force_master_grid_identity(corrected_local, point_map, snap_tolerance_m)
+    corrected_local = _force_master_grid_identity(corrected_local, point_map, snap_tolerance_m)
+    baseline_local = _attach_site_topology_to_prediction(baseline_local, original_site_df)
+    corrected_local = _attach_site_topology_to_prediction(corrected_local, modified_site_df)
+    lineage_grid_ids = set(_affected_lineage_grid_ids(sector_cells, context.get("current_df", pd.DataFrame())))
     enriched_local, local_inventory = _build_current_inventory_from_surface(
         baseline_local=baseline_local,
         corrected_local=corrected_local,
-        local_site_df=local_ctx["local_site_df"],
-        local_kpi=local_ctx["local_kpi"],
-        local_geo=local_ctx["local_geo"],
+        local_site_df=modified_site_df,
+        local_kpi=local_kpi,
+        local_geo=local_geo,
         context=context,
         config=config,
+        lineage_grid_ids=lineage_grid_ids,
     )
     candidate_node_cell_ids: set[str] = set()
     for col in ["Node_Cell_ID", "original_node_cell_id", "original_cell_id"]:
@@ -1078,7 +1602,6 @@ def _rerun_current_topology(
     # The congested demand lives on specific grids. After the action, whichever cells
     # now serve those grids carry that demand - THEY decide whether congestion is
     # actually resolved, regardless of how any cell is named across tooling layers.
-    lineage_grid_ids = set(_affected_lineage_grid_ids(sector_cells, context.get("current_df", pd.DataFrame())))
     en_gid = pd.to_numeric(enriched_local.get("grid_id"), errors="coerce")
     demand_serving_cell_ids = set(
         enriched_local.loc[en_gid.isin(lineage_grid_ids), "Node_Cell_ID"].dropna().astype(str).str.strip()
@@ -1096,13 +1619,13 @@ def _rerun_current_topology(
     )
     return {
         "status": outcome["status"],
-        "action_reason": f"{action_label} reran PART_3 baseline and recalculated current-state KPIs deterministically.",
+        "action_reason": f"{action_label} used the production optimized affected-cell rerun and recalculated current-state KPIs deterministically.",
         "projected_prb_after_pct": outcome["projected_prb_after_pct"],
         "projected_rrc_after_pct": outcome["projected_rrc_after_pct"],
         "projected_rrc_users_after": outcome["projected_rrc_users_after"],
         "next_step": outcome["next_step"] or "New Site",
         "resimulation_required": True,
-        "resimulation_flow": f"{action_label} topology -> baseline rerun -> deterministic current KPI rebuild -> Model 3 reevaluation",
+        "resimulation_flow": f"{action_label} topology -> production affected cells ({len(affected_cells)} cells/{len(affected_sites)} sites; changed={changed_rows['Node_Cell_ID'].nunique()}) -> baseline/optimized RF rerun on saved PART_3 points -> deterministic current KPI rebuild -> Model 3 reevaluation",
     }
 
 
@@ -1150,6 +1673,45 @@ def _simulate_current_recommendation(
         }
 
     can_add = bool(sector_cells["carrier_addition_possible"].any()) and not bool(sector_cells["carrier_addition_blocked"].all())
+    if context.get("excel_input_mode"):
+        if can_add:
+            add_row = sector_cells.loc[
+                sector_cells["carrier_addition_possible"] & ~sector_cells["carrier_addition_blocked"]
+            ].sort_values(["prb_rrc_pressure", "grid_count"], ascending=[False, False], na_position="last")
+            band = str(add_row.iloc[0]["recommended_band_to_add"]).strip() if not add_row.empty else ""
+            return {
+                "action": f"Add Carrier -> {band} MHz" if band else "Add Carrier",
+                "status": "Recommended",
+                "decision_path": "Congested | Excel input carrier addition branch",
+                "attempted_actions": " -> ".join(attempted_actions + [f"Add Carrier {band}[Recommended]"]),
+                "load_balance_possible": False,
+                "selected_peer_node_cell_id": str(source_row["Node_Cell_ID"]),
+                "selected_peer_band": "",
+                "projected_prb_after_pct": np.nan,
+                "projected_rrc_after_pct": np.nan,
+                "projected_rrc_users_after": np.nan,
+                "action_reason": "Excel input mode has no RF rerun; carrier addition is recommended for planner validation.",
+                "next_step": "",
+                "resimulation_required": False,
+                "resimulation_flow": "Excel input mode: no RF rerun",
+            }
+        return {
+            "action": "New Site",
+            "status": "Recommended",
+            "decision_path": "Congested | Excel input new-site branch",
+            "attempted_actions": " -> ".join(attempted_actions + ["New Site[Recommended]"]),
+            "load_balance_possible": False,
+            "selected_peer_node_cell_id": str(source_row["Node_Cell_ID"]),
+            "selected_peer_band": "",
+            "projected_prb_after_pct": np.nan,
+            "projected_rrc_after_pct": np.nan,
+            "projected_rrc_users_after": np.nan,
+            "action_reason": "Excel input mode has no RF rerun and no carrier addition option; new site is recommended for planner validation.",
+            "next_step": "",
+            "resimulation_required": False,
+            "resimulation_flow": "Excel input mode: no RF rerun",
+        }
+
     carrier_add_attempted = False
     add_row = sector_cells.loc[sector_cells["carrier_addition_possible"] & ~sector_cells["carrier_addition_blocked"]].sort_values(
         ["prb_rrc_pressure", "grid_count"], ascending=[False, False], na_position="last"
@@ -1158,6 +1720,7 @@ def _simulate_current_recommendation(
         band = str(add_row.iloc[0]["recommended_band_to_add"]).strip()
         carrier_add_attempted = True
         site_df, source_rows = future_rules._build_carrier_addition_topology(sector_cells, context["part3_site_df"], band, logger)
+        site_df = _fix_synthetic_frequency(site_df)
         resim = _rerun_current_topology(
             sector_cells=sector_cells,
             config=config,
@@ -1193,6 +1756,7 @@ def _simulate_current_recommendation(
     )
     if sector_split_possible:
         site_df, source_rows = future_rules._build_sector_split_topology(sector_cells, context["part3_site_df"], logger)
+        site_df = _fix_synthetic_frequency(site_df)
         resim = _rerun_current_topology(
             sector_cells=sector_cells,
             config=config,
@@ -1219,6 +1783,7 @@ def _simulate_current_recommendation(
             }
 
     site_df, source_rows = future_rules._build_new_site_topology(sector_cells, context["part3_site_df"], logger)
+    site_df = _fix_synthetic_frequency(site_df)
     resim = _rerun_current_topology(
         sector_cells=sector_cells,
         config=config,
@@ -1336,9 +1901,19 @@ def run_model3_current_recommendation_test(config: CurrentModel3Config) -> Path:
     log_path = run_dir / "log.txt"
     logger = _setup_logger(log_path)
     logger.info("start dataset=%s summary=%s", config.dataset_path, config.summary_path)
-    source_df = pd.read_csv(config.dataset_path)
-    cell_inventory, inventory_summary = _build_current_cell_inventory(source_df, config)
-    context = _load_current_context(config, logger)
+    if config.dataset_path.suffix.lower() in {".xlsx", ".xlsm", ".xls"}:
+        source_df = pd.read_excel(config.dataset_path, sheet_name="Model3_Cell_Input")
+        cell_inventory, inventory_summary = _build_cell_inventory_from_excel_input(source_df, config)
+        context = {
+            "excel_input_mode": True,
+            "current_df": pd.DataFrame(),
+            "part3_site_df": pd.DataFrame(),
+        }
+        logger.info("excel_input_mode rows=%d sectors=%d", len(cell_inventory), cell_inventory["sector_id"].nunique(dropna=True))
+    else:
+        source_df = pd.read_csv(config.dataset_path)
+        cell_inventory, inventory_summary = _build_current_cell_inventory(source_df, config)
+        context = _load_current_context(config, logger)
     recommendations = _build_recommendations(cell_inventory, config, logger, context)
     sector_inventory = future_rules._build_sector_inventory(cell_inventory)
     runtime_sec = time.perf_counter() - start

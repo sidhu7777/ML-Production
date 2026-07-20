@@ -27,7 +27,7 @@ from ..lte_tilt_recommandation.cell_identity import (
     canonical_cell_id,
     canonical_pair,
 )
-from utils.python_bridge import get_bridge_client
+from utils.python_bridge import _filter_complete_site_prediction_identity, get_bridge_client
 
 
 load_dotenv()
@@ -305,8 +305,11 @@ def _normalize_site_df(site_df, log_stage="SITE_INPUT"):
     if source_site_id is None:
         source_site_id = pd.Series(pd.NA, index=work.index, dtype="object")
 
+    strict_identity_col = _pick_col(work, ["site_prediction_key", "site_cell_sector_band_operator_key"])
     if "cell_id" in work.columns:
-        if "Node_Cell_ID" in work.columns:
+        if strict_identity_col:
+            work["Node_Cell_ID"] = work[strict_identity_col].map(_rf_cell_id)
+        elif "Node_Cell_ID" in work.columns:
             work["Node_Cell_ID"] = work["Node_Cell_ID"].map(_rf_cell_id)
         elif "nodeb_id_cell_id" in work.columns:
             work["Node_Cell_ID"] = work["nodeb_id_cell_id"].map(_rf_cell_id)
@@ -328,7 +331,11 @@ def _normalize_site_df(site_df, log_stage="SITE_INPUT"):
         work["local_cell_id"] = work["Node_Cell_ID"].map(canonical_cell_id)
     else:
         raise ValueError("Missing cell_id/Node_Cell_ID in optimized site input")
-    work["legacy_nodeb_id_cell_id"] = work["Node_Cell_ID"].map(_rf_cell_id)
+    if strict_identity_col and "cell_id" in work.columns:
+        work["legacy_nodeb_id_cell_id"] = work["cell_id"].map(_rf_cell_id)
+        work["rf_identity_key"] = work["Node_Cell_ID"].map(_rf_cell_id)
+    else:
+        work["legacy_nodeb_id_cell_id"] = work["Node_Cell_ID"].map(_rf_cell_id)
     work["canonical_cell_id"] = work["legacy_nodeb_id_cell_id"].map(canonical_cell_id)
 
     defaults = {
@@ -792,13 +799,17 @@ def fetch_site_data(project_id, region="india", operator=None, allowed_cells=Non
         return df
     current_engine = engine.get(region.lower(), engine["india"])
     query = f"""
-    SELECT *
+    SELECT
+        site_prediction.*,
+        cluster AS provider,
+        cluster AS operator_name
     FROM site_prediction
     WHERE tbl_project_id = {project_id}
     {_site_polygon_filter_sql("site_prediction", polygon_id_list)}
     """
 
     raw_df = pd.read_sql(query, current_engine)
+    raw_df = _filter_complete_site_prediction_identity(raw_df, endpoint="direct:site_prediction")
     df = _normalize_site_df(raw_df, log_stage="SITE_FETCH")
     if operator:
         operator_norm = str(operator).strip().lower()
@@ -1057,7 +1068,10 @@ def fetch_optimized_sites(project_id, operator, region="india", polygon_ids=None
         safe_operator = str(operator).replace("'", "''")
         operator_filter_sql = f"AND LOWER(TRIM(cluster)) = LOWER(TRIM('{safe_operator}'))"
     query = f"""
-    SELECT *
+    SELECT
+        site_prediction_optimized.*,
+        cluster AS provider,
+        cluster AS operator_name
     FROM site_prediction_optimized
     WHERE tbl_project_id = {project_id}
     {operator_filter_sql}
@@ -1066,6 +1080,7 @@ def fetch_optimized_sites(project_id, operator, region="india", polygon_ids=None
     """
 
     opt_raw = pd.read_sql(query, current_engine)
+    opt_raw = _filter_complete_site_prediction_identity(opt_raw, endpoint="direct:site_prediction_optimized")
     if opt_raw.empty:
         _print_fetch_summary(
             "OPTIMIZED_SITE_FETCH",

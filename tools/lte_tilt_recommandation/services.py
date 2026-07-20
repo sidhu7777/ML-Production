@@ -18,7 +18,7 @@ from tools.lte_tilt_recommandation.candidate_validation import (
     prepare_scope_export,
 )
 from tools.lte_tilt_recommandation.cell_identity import canonical_cell_id
-from utils.python_bridge import PythonBridgeError, get_bridge_client
+from utils.python_bridge import PythonBridgeError, _filter_complete_site_prediction_identity, get_bridge_client
 
 # Global dictionary to track job status
 JOBS = {}
@@ -171,7 +171,13 @@ def _prepare_tilt_antenna_df(antenna_df: pd.DataFrame) -> pd.DataFrame:
     out = out.loc[:, ~out.columns.duplicated()].copy()
     if "cell_id" in out.columns and "local_cell_id" not in out.columns:
         out["local_cell_id"] = _clean_id_series(out["cell_id"])
-    if "Node_Cell_ID" not in out.columns and {"site", "cell_id"}.issubset(out.columns):
+    strict_identity_col = next(
+        (col for col in ["site_prediction_key", "site_cell_sector_band_operator_key"] if col in out.columns),
+        None,
+    )
+    if strict_identity_col:
+        out["Node_Cell_ID"] = _rf_identity_series(out[strict_identity_col])
+    elif "Node_Cell_ID" not in out.columns and {"site", "cell_id"}.issubset(out.columns):
         if "nodeb_id" in out.columns:
             nodeb_available = ~_clean_id_series(out["nodeb_id"]).isin(["", "None", "none", "nan", "NaN", "<NA>"])
             out["Node_Cell_ID"] = _build_node_cell_id(out["nodeb_id"], out["cell_id"])
@@ -770,9 +776,17 @@ class RFOptimizationService:
                 antenna_df = bridge.get_rows("GetLteTiltAntennaRows", {"projectId": int(project_id)}, limit=50000)
                 print(f"[TILT][ANTENNA_FETCH] source=python_bridge rows={len(antenna_df)}")
             else:
-                ant_query = text("SELECT * FROM site_prediction WHERE tbl_project_id = :pid")
+                ant_query = text("""
+                    SELECT
+                        site_prediction.*,
+                        cluster AS provider,
+                        cluster AS operator_name
+                    FROM site_prediction
+                    WHERE tbl_project_id = :pid
+                """)
                 with current_engine.connect() as conn:
                     antenna_df = pd.read_sql(ant_query, conn, params={"pid": project_id})
+                antenna_df = _filter_complete_site_prediction_identity(antenna_df, endpoint="direct:site_prediction_tilt")
             antenna_df = _prepare_tilt_antenna_df(antenna_df)
             _log_df("ANTENNA_FETCH", antenna_df)
 

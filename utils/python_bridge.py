@@ -19,9 +19,13 @@ def bridge_enabled() -> bool:
     return bool(os.getenv("PYTHON_BRIDGE_BASE_URL") or os.getenv("SIGNAL_TRACKERS_BRIDGE_URL"))
 
 
+def _normalize_url(value: Any) -> str:
+    return str(value or "").strip().lstrip("=").strip().rstrip("/")
+
+
 def _base_url() -> str:
     raw = os.getenv("PYTHON_BRIDGE_BASE_URL") or os.getenv("SIGNAL_TRACKERS_BRIDGE_URL") or ""
-    return raw.rstrip("/")
+    return _normalize_url(raw)
 
 
 def _headers() -> dict[str, str]:
@@ -44,7 +48,7 @@ def _mapview_headers() -> dict[str, str]:
 
 
 def _service_root_url() -> str:
-    base = (os.getenv("BASE_URL") or _base_url() or "").rstrip("/")
+    base = _normalize_url(os.getenv("BASE_URL") or _base_url() or "")
     if base.lower().endswith("/api/pythonbridge"):
         return base[: -len("/api/PythonBridge")]
     return base
@@ -78,6 +82,99 @@ def _records(df: pd.DataFrame) -> list[dict[str, Any]]:
             {key: _json_safe(value) for key, value in row.items()}
             for row in safe_df.to_dict(orient="records")
         ]
+
+
+_SITE_PREDICTION_ENDPOINTS = {
+    "getltesitepredictionrows",
+    "getltetiltantennarows",
+    "getsitepredictionoptimized",
+    "getsitepredictionoptimised",
+    "getsiteprediction",
+}
+
+
+def _clean_identity_text(series: pd.Series) -> pd.Series:
+    text = series.astype("string").str.strip()
+    lowered = text.str.lower()
+    invalid = text.isna() | text.eq("") | lowered.isin({"nan", "none", "null", "undefined", "unknown", "n/a", "na"})
+    return text.mask(invalid, "")
+
+
+def _first_existing_column(df: pd.DataFrame, candidates: Iterable[str]) -> str | None:
+    lower_to_original = {str(col).lower(): col for col in df.columns}
+    for candidate in candidates:
+        column = lower_to_original.get(str(candidate).lower())
+        if column is not None:
+            return column
+    return None
+
+
+def _filter_complete_site_prediction_identity(df: pd.DataFrame, endpoint: str | None = None) -> pd.DataFrame:
+    if df.empty:
+        return df
+
+    site_col = _first_existing_column(df, ["site", "site_id", "siteId"])
+    cell_col = _first_existing_column(df, ["cell_id", "cellId"])
+    sector_col = _first_existing_column(df, ["sector", "sector_id", "sectorId"])
+    band_col = _first_existing_column(df, ["band", "frequency_band", "Band"])
+    operator_col = _first_existing_column(df, ["operator", "operator_name", "operatorName", "provider", "cluster", "network", "Network"])
+    required = [site_col, cell_col, sector_col, band_col, operator_col]
+    if any(col is None for col in required):
+        missing = [
+            name
+            for name, col in [
+                ("site", site_col),
+                ("cell_id", cell_col),
+                ("sector", sector_col),
+                ("band", band_col),
+                ("operator", operator_col),
+            ]
+            if col is None
+        ]
+        print(
+            f"[PYTHON_BRIDGE_SITE_IDENTITY_FILTER] endpoint={endpoint or 'unknown'} "
+            f"rows_in={len(df)} rows_out=0 missing_columns={','.join(missing)}",
+            flush=True,
+        )
+        return df.iloc[0:0].copy()
+
+    work = df.copy()
+    site = _clean_identity_text(work[site_col])
+    cell = _clean_identity_text(work[cell_col])
+    sector = _clean_identity_text(work[sector_col])
+    band = _clean_identity_text(work[band_col])
+    operator = _clean_identity_text(work[operator_col])
+    keep = site.ne("") & cell.ne("") & sector.ne("") & band.ne("") & operator.ne("")
+    filtered = work.loc[keep].copy()
+    if not filtered.empty:
+        filtered["site_prediction_key"] = (
+            site.loc[keep]
+            + "|"
+            + cell.loc[keep]
+            + "|"
+            + sector.loc[keep]
+            + "|"
+            + band.loc[keep]
+            + "|"
+            + operator.loc[keep]
+        )
+        filtered["site_cell_sector_band_operator_key"] = filtered["site_prediction_key"]
+        if "operator" not in filtered.columns:
+            filtered["operator"] = operator.loc[keep]
+        if "operator_name" not in filtered.columns:
+            filtered["operator_name"] = operator.loc[keep]
+        if "provider" not in filtered.columns:
+            filtered["provider"] = operator.loc[keep]
+
+    removed = int(len(work) - len(filtered))
+    if removed:
+        print(
+            f"[PYTHON_BRIDGE_SITE_IDENTITY_FILTER] endpoint={endpoint or 'unknown'} "
+            f"rows_in={len(work)} rows_out={len(filtered)} removed={removed} "
+            "required=site,cell_id,sector,band,operator",
+            flush=True,
+        )
+    return filtered
 
 
 class PythonBridgeClient:
@@ -169,7 +266,11 @@ class PythonBridgeClient:
                 offset = next_offset
             else:
                 offset += page_limit
-        return pd.DataFrame(rows)
+        df = pd.DataFrame(rows)
+        endpoint_key = str(endpoint or "").strip("/").split("/")[-1].lower()
+        if endpoint_key in _SITE_PREDICTION_ENDPOINTS:
+            df = _filter_complete_site_prediction_identity(df, endpoint=endpoint)
+        return df
 
     def post_rows(self, endpoint: str, body: dict[str, Any], limit: int = 50000) -> pd.DataFrame:
         rows: list[dict[str, Any]] = []
@@ -189,7 +290,11 @@ class PythonBridgeClient:
             if count < page_limit or not page_rows:
                 break
             offset += page_limit
-        return pd.DataFrame(rows)
+        df = pd.DataFrame(rows)
+        endpoint_key = str(endpoint or "").strip("/").split("/")[-1].lower()
+        if endpoint_key in _SITE_PREDICTION_ENDPOINTS:
+            df = _filter_complete_site_prediction_identity(df, endpoint=endpoint)
+        return df
 
     def get_project(self, project_id: int) -> dict[str, Any] | None:
         payload = self._request("GET", "GetProject", params={"projectId": int(project_id)})
