@@ -1,6 +1,7 @@
 # src/playwright_utils.py
 
 import os
+import tempfile
 
 from playwright.sync_api import sync_playwright
 
@@ -212,3 +213,37 @@ def html_to_png(
             if context is not None:
                 context.close()
             browser.close()
+
+
+def check_chromium_rendering():
+    """Return whether the report renderer can launch Chromium and capture a PNG."""
+    html_fd, html_path = tempfile.mkstemp(prefix="report-render-health.", suffix=".html")
+    png_path = html_path.replace(".html", ".png")
+    try:
+        with os.fdopen(html_fd, "w", encoding="utf-8") as f:
+            f.write(
+                "<!doctype html><html><body>"
+                "<div class='leaflet-container' "
+                "style='width:320px;height:180px;background:#2563eb;color:white'>ok</div>"
+                "</body></html>"
+            )
+        old_timeout = os.environ.get("REPORT_RENDER_TIMEOUT_MS")
+        os.environ["REPORT_RENDER_TIMEOUT_MS"] = "5000"
+        html_to_png(html_path, png_path, width=320, height=180, device_scale_factor=1, clip_to_map=False)
+        if not os.path.exists(png_path) or os.path.getsize(png_path) <= 0:
+            return False, "Chromium launched but screenshot file was not created"
+        return True, "Chromium renderer is working"
+    except Exception as exc:
+        return False, str(exc)
+    finally:
+        for path in (html_path, png_path):
+            try:
+                if path and os.path.exists(path):
+                    os.remove(path)
+            except Exception:
+                pass
+        if "old_timeout" in locals():
+            if old_timeout is None:
+                os.environ.pop("REPORT_RENDER_TIMEOUT_MS", None)
+            else:
+                os.environ["REPORT_RENDER_TIMEOUT_MS"] = old_timeout

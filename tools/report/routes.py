@@ -3,10 +3,12 @@ import os
 import threading
 import uuid
 import json
+import tempfile
 from queue import Queue, Empty
 
 from tools.report_engine.main import main as generate_report
 from tools.report_engine.db import get_project_by_id
+from tools.report_engine.playwright_utils import check_chromium_rendering
 from extensions import db
 
 report_bp = Blueprint("report", __name__)
@@ -23,18 +25,69 @@ def _safe_int(value):
         return None
 
 
+def _reports_root() -> str:
+    root_path = getattr(current_app, "root_path", None)
+    if not root_path:
+        root_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+    return os.path.join(root_path, "data", "reports")
+
+
+def _report_dir(report_id: str) -> str:
+    return os.path.join(_reports_root(), report_id)
+
+
+def _report_status_path(report_id: str) -> str:
+    return os.path.join(_report_dir(report_id), "status.json")
+
+
+def _write_job_status(report_id: str, state: dict):
+    try:
+        report_dir = _report_dir(report_id)
+        os.makedirs(report_dir, exist_ok=True)
+        fd, tmp_path = tempfile.mkstemp(prefix="status.", suffix=".json", dir=report_dir)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(state, f, default=str)
+        os.replace(tmp_path, _report_status_path(report_id))
+    except Exception as exc:
+        current_app.logger.warning("[Report] Failed to persist status for %s: %s", report_id, exc)
+
+
+def _read_job_status(report_id: str):
+    try:
+        path = _report_status_path(report_id)
+        if not os.path.exists(path):
+            return None
+        with open(path, "r", encoding="utf-8") as f:
+            state = json.load(f)
+        return dict(state) if isinstance(state, dict) else None
+    except Exception as exc:
+        current_app.logger.warning("[Report] Failed to read status for %s: %s", report_id, exc)
+        return None
+
+
 def _set_job(report_id: str, **updates):
     with REPORT_JOBS_LOCK:
         state = REPORT_JOBS.get(report_id, {})
         state.update(updates)
         REPORT_JOBS[report_id] = state
-        return dict(state)
+        persisted = dict(state)
+    _write_job_status(report_id, persisted)
+    return persisted
 
 
 def _get_job(report_id: str):
     with REPORT_JOBS_LOCK:
         state = REPORT_JOBS.get(report_id)
-        return dict(state) if state else None
+        if state:
+            return dict(state)
+
+    persisted = _read_job_status(report_id)
+    if persisted:
+        with REPORT_JOBS_LOCK:
+            REPORT_JOBS[report_id] = dict(persisted)
+        return persisted
+
+    return None
 
 
 def _status_payload(report_id: str, job: dict):
@@ -48,12 +101,13 @@ def _status_payload(report_id: str, job: dict):
         payload["download_url"] = job["download_url"]
     if job.get("error"):
         payload["error"] = job["error"]
+    if job.get("message"):
+        payload["message"] = job["message"]
     return payload
 
 
 def _report_pdf_path(report_id: str) -> str:
-    reports_dir = os.path.join(current_app.root_path, "data", "reports")
-    return os.path.join(reports_dir, report_id, "report.pdf")
+    return os.path.join(_report_dir(report_id), "report.pdf")
 
 
 def _subscribe(report_id: str):
@@ -86,7 +140,13 @@ def _publish_status_event(report_id: str):
 def background_report_task(app, project_id, user_id, report_id):
     with app.app_context():
         try:
-            _set_job(report_id, status="processing")
+            _set_job(
+                report_id,
+                status="processing",
+                project_id=project_id,
+                user_id=user_id,
+                message="Report generation is running",
+            )
             _publish_status_event(report_id)
             current_app.logger.info(
                 f"[Report] Starting generation: project_id={project_id}, user_id={user_id}, report_id={report_id}"
@@ -104,13 +164,14 @@ def background_report_task(app, project_id, user_id, report_id):
                 project_id=project_id,
                 user_id=user_id,
                 download_url=download_url,
+                message="Report generation completed",
             )
             _publish_status_event(report_id)
             current_app.logger.info(
                 f"[Report] Completed generation: report_id={report_id}"
             )
         except Exception as e:
-            _set_job(report_id, status="failed", error=str(e))
+            _set_job(report_id, status="failed", error=str(e), message="Report generation failed")
             _publish_status_event(report_id)
             current_app.logger.exception(
                 f"[Report] Failed generation: report_id={report_id}"
@@ -136,6 +197,7 @@ def generate():
         project_id=project_id,
         user_id=user_id,
         download_url=None,
+        message="Report generation queued",
     )
     app = current_app._get_current_object()
 
@@ -153,6 +215,17 @@ def generate():
         "user_id": user_id,
         "report_id": report_id
     }), 202
+
+
+@report_bp.route("/render-health", methods=["GET"])
+def render_health():
+    ok, detail = check_chromium_rendering()
+    status_code = 200 if ok else 503
+    return jsonify({
+        "status": "healthy" if ok else "unhealthy",
+        "chromium_rendering": ok,
+        "detail": detail,
+    }), status_code
 
 
 @report_bp.route("/status/<report_id>", methods=["GET"])
@@ -181,6 +254,8 @@ def status(report_id):
         payload["download_url"] = job["download_url"]
     if job.get("error"):
         payload["error"] = job["error"]
+    if job.get("message"):
+        payload["message"] = job["message"]
     return jsonify(payload), 200
 
 
