@@ -73,7 +73,6 @@ def _apply_current_model3_load_profile(df: pd.DataFrame, rrc_sector_capacity: fl
 
     hotspot_score = hotspot_score.clip(0.0, 1.0).round(6)
     hotspot_rank = future_builder._rank_percentile(hotspot_score)
-    prb_target_pct = future_builder._tiered_target_from_rank(hotspot_rank, future_builder.MODEL3_PRB_TARGET_BANDS)
 
     capacity_mbps = pd.to_numeric(out.get("estimated_dl_capacity_mbps"), errors="coerce").replace([np.inf, -np.inf], np.nan)
     if capacity_mbps.notna().sum() == 0:
@@ -82,64 +81,150 @@ def _apply_current_model3_load_profile(df: pd.DataFrame, rrc_sector_capacity: fl
 
     out["model3_hotspot_score"] = hotspot_score
     out["model3_hotspot_rank"] = hotspot_rank.round(6)
-    out["model3_prb_target_pct"] = prb_target_pct.round(3)
-    out["estimated_offered_traffic_mbps"] = (capacity_mbps * (prb_target_pct / 100.0)).clip(lower=0.0).round(3)
-    out["estimated_prb_utilization_pct"] = prb_target_pct.round(3)
+    out["model3_scenario"] = "healthy_background"
+    out["model3_scenario_reason"] = "Controlled Model 3 demo load; not congested."
 
-    rrc_group_cols = _pick_rrc_group_cols(out)
-    if rrc_group_cols:
-        group_profile = (
-            out.groupby(rrc_group_cols, dropna=False, as_index=False)
-            .agg(
-                group_hotspot_score=("model3_hotspot_score", "mean"),
-                group_grid_count=("grid_id", "nunique"),
-                group_user_weight=("model3_hotspot_score", "sum"),
+    healthy_prb = (38.0 + (18.0 * hotspot_score)).clip(28.0, 58.0)
+    healthy_rrc = (34.0 + (16.0 * hotspot_score)).clip(25.0, 54.0)
+
+    out["model3_prb_target_pct"] = healthy_prb.round(3)
+    out["estimated_prb_utilization_pct"] = healthy_prb.round(3)
+    out["estimated_cell_rrc_utilization_pct"] = healthy_rrc.round(3)
+    out["estimated_cell_rrc_connected_users"] = ((healthy_rrc / 100.0) * float(rrc_sector_capacity)).round(3)
+
+    if "Node_Cell_ID" not in out.columns:
+        out["Node_Cell_ID"] = out.get("nodeb_id_cell_id", out.index.astype(str)).astype(str)
+    if "sector_id" not in out.columns:
+        out["sector_id"] = out.get("topology_frontend_site_sector_key", out["Node_Cell_ID"]).astype(str)
+
+    out["Node_Cell_ID"] = out["Node_Cell_ID"].astype(str)
+    out["sector_id"] = out["sector_id"].astype(str)
+
+    def set_cell_load(node_id: str, prb_pct: float, rrc_pct: float, scenario: str, reason: str) -> None:
+        mask = out["Node_Cell_ID"].astype(str).eq(str(node_id))
+        if not mask.any():
+            return
+        cap = capacity_mbps.loc[mask]
+        out.loc[mask, "estimated_prb_utilization_pct"] = round(float(prb_pct), 3)
+        out.loc[mask, "model3_prb_target_pct"] = round(float(prb_pct), 3)
+        out.loc[mask, "estimated_cell_rrc_utilization_pct"] = round(float(rrc_pct), 3)
+        out.loc[mask, "estimated_cell_rrc_connected_users"] = round((float(rrc_pct) / 100.0) * float(rrc_sector_capacity), 3)
+        out.loc[mask, "estimated_offered_traffic_mbps"] = (cap * (float(prb_pct) / 100.0)).clip(lower=0.0).round(3)
+        out.loc[mask, "model3_scenario"] = scenario
+        out.loc[mask, "model3_scenario_reason"] = reason
+
+    def set_sector_carrier_policy(node_ids: list[str], *, can_add: bool, blocked: bool, band: str = "900") -> None:
+        mask = out["Node_Cell_ID"].astype(str).isin([str(v) for v in node_ids])
+        if not mask.any():
+            return
+        existing = pd.to_numeric(out.loc[mask, "existing_carrier_count"], errors="coerce").fillna(1).astype(int)
+        out.loc[mask, "carrier_addition_possible"] = bool(can_add)
+        out.loc[mask, "carrier_addition_blocked"] = bool(blocked)
+        out.loc[mask, "recommended_band_to_add"] = str(band) if can_add else ""
+        out.loc[mask, "carrier_addition_options"] = str(band) if can_add else ""
+        out.loc[mask, "available_bands_to_add"] = str(band) if can_add else ""
+        out.loc[mask, "max_supported_carriers"] = np.where(can_add, existing + 1, existing)
+
+    sector_stats = (
+        out.groupby("sector_id", dropna=False)
+        .agg(
+            cell_count=("Node_Cell_ID", "nunique"),
+            sector_grid_count=("grid_id", "nunique"),
+            max_score=("model3_hotspot_score", "max"),
+        )
+        .reset_index()
+        .sort_values(["cell_count", "max_score", "sector_grid_count"], ascending=[False, False, False])
+    )
+    multi_sector_ids = sector_stats.loc[sector_stats["cell_count"] >= 2, "sector_id"].astype(str).tolist()
+
+    scenario_cycle = [
+        "load_balance_success",
+        "carrier_addition_required",
+        "sector_split_required",
+        "new_site_required",
+    ]
+    scenario_counts = {name: 0 for name in scenario_cycle}
+    congested_nodes: set[str] = set()
+    target_congested_cells = 18
+
+    for pos, sector_id in enumerate(multi_sector_ids):
+        if len(congested_nodes) >= target_congested_cells:
+            break
+        group = (
+            out.loc[out["sector_id"].astype(str).eq(str(sector_id))]
+            .sort_values(["model3_hotspot_score", "grid_id"], ascending=[False, True])
+        )
+        node_ids = group["Node_Cell_ID"].dropna().astype(str).drop_duplicates().tolist()
+        if len(node_ids) < 2:
+            continue
+        scenario = scenario_cycle[pos % len(scenario_cycle)]
+        selected = node_ids[: min(2, len(node_ids), target_congested_cells - len(congested_nodes))]
+        if not selected:
+            continue
+
+        if scenario == "load_balance_success":
+            set_cell_load(selected[0], 86.0, 84.0, scenario, "One carrier congested; same-sector peer has load-balance headroom.")
+            for peer in node_ids[1:]:
+                set_cell_load(peer, 43.0, 39.0, scenario, "Same-sector peer intentionally kept healthy for load balancing.")
+            set_sector_carrier_policy(node_ids, can_add=False, blocked=True)
+            congested_nodes.add(selected[0])
+            scenario_counts[scenario] += 1
+            continue
+
+        if scenario == "carrier_addition_required":
+            for rank, node_id in enumerate(selected):
+                set_cell_load(node_id, 76.0 + (1.0 * rank), 55.0 + (1.0 * rank), scenario, "PRB-driven congestion; add-carrier path must be tried.")
+                congested_nodes.add(node_id)
+            set_sector_carrier_policy(node_ids, can_add=True, blocked=False, band="900")
+            scenario_counts[scenario] += len(selected)
+            continue
+
+        if scenario == "sector_split_required":
+            for rank, node_id in enumerate(selected):
+                set_cell_load(node_id, 79.0 + (1.0 * rank), 58.0 + (1.0 * rank), scenario, "PRB-driven congestion with carrier limit reached; sector split should be attempted before new site.")
+                congested_nodes.add(node_id)
+            set_sector_carrier_policy(node_ids, can_add=False, blocked=True)
+            scenario_counts[scenario] += len(selected)
+            continue
+
+        for rank, node_id in enumerate(selected):
+            set_cell_load(
+                node_id,
+                158.0 + (2.0 * float(rank)),
+                132.0 + (2.0 * float(rank)),
+                scenario,
+                "Heavy congestion and carrier blocked; load balance and two-way split should not fully clear it before new-site fallback.",
             )
-        )
-        group_profile["group_rank"] = future_builder._rank_percentile(group_profile["group_hotspot_score"])
-        group_profile["group_rrc_target_pct"] = future_builder._tiered_target_from_rank(
-            group_profile["group_rank"],
-            future_builder.MODEL3_RRC_TARGET_BANDS,
-        )
-        group_profile["group_total_users_target"] = (
-            pd.to_numeric(group_profile["group_rrc_target_pct"], errors="coerce").fillna(0.0) / 100.0
-        ) * float(rrc_sector_capacity)
-        group_profile["group_user_weight"] = pd.to_numeric(group_profile["group_user_weight"], errors="coerce").fillna(0.0)
-        group_profile["group_user_weight"] = group_profile["group_user_weight"].where(group_profile["group_user_weight"] > 0, 1.0)
+            congested_nodes.add(node_id)
+        set_sector_carrier_policy(node_ids, can_add=False, blocked=True)
+        scenario_counts[scenario] += len(selected)
 
-        out = out.merge(group_profile, on=rrc_group_cols, how="left", validate="many_to_one")
-        row_weight = (
-            0.65 * future_builder._minmax_norm(out["model3_hotspot_score"])
-            + 0.35 * future_builder._minmax_norm(out["traffic_demand_est"] if "traffic_demand_est" in out.columns else out["model3_hotspot_score"])
-        )
-        row_weight = row_weight.fillna(0.0) + 0.10
-        group_index = out.groupby(rrc_group_cols, sort=False).ngroup()
-        weight_sum = row_weight.groupby(group_index, sort=False).transform("sum").replace(0, np.nan).fillna(1.0)
+    out["estimated_offered_traffic_mbps"] = (
+        capacity_mbps * (pd.to_numeric(out["estimated_prb_utilization_pct"], errors="coerce").fillna(0.0) / 100.0)
+    ).clip(lower=0.0).round(3)
 
-        out["estimated_rrc_connected_users"] = (out["group_total_users_target"] * (row_weight / weight_sum)).clip(lower=0.0).round(3)
-        out["estimated_cell_grid_count"] = pd.to_numeric(out["group_grid_count"], errors="coerce").fillna(1.0).round(3)
-        out["estimated_cell_rrc_connected_users"] = pd.to_numeric(out["group_total_users_target"], errors="coerce").fillna(0.0).round(3)
-        out["estimated_cell_rrc_utilization_pct"] = pd.to_numeric(out["group_rrc_target_pct"], errors="coerce").fillna(0.0).round(3)
+    row_weight = (
+        0.65 * future_builder._minmax_norm(out["model3_hotspot_score"])
+        + 0.35 * future_builder._minmax_norm(out["traffic_demand_est"] if "traffic_demand_est" in out.columns else out["model3_hotspot_score"])
+    ).fillna(0.0) + 0.10
+    group_index = out.groupby("Node_Cell_ID", sort=False).ngroup()
+    weight_sum = row_weight.groupby(group_index, sort=False).transform("sum").replace(0, np.nan).fillna(1.0)
+    out["estimated_rrc_connected_users"] = (
+        pd.to_numeric(out["estimated_cell_rrc_connected_users"], errors="coerce").fillna(0.0)
+        * (row_weight / weight_sum)
+    ).clip(lower=0.0).round(3)
+    out["estimated_cell_grid_count"] = out.groupby("Node_Cell_ID")["grid_id"].transform("nunique").round(3)
 
-        profile_summary = {
-            "rrc_grouping_columns": rrc_group_cols,
-            "rrc_group_count": int(len(group_profile)),
-            "rrc_target_threshold_counts": future_builder._threshold_counts(group_profile["group_rrc_target_pct"]),
-        }
-    else:
-        out["estimated_rrc_connected_users"] = pd.to_numeric(out.get("active_users_est"), errors="coerce").fillna(0.0).round(3)
-        out["estimated_cell_grid_count"] = np.nan
-        out["estimated_cell_rrc_connected_users"] = out["estimated_rrc_connected_users"].round(3)
-        out["estimated_cell_rrc_utilization_pct"] = (
-            (out["estimated_rrc_connected_users"] / float(rrc_sector_capacity)) * 100.0
-        ).round(3)
-        profile_summary = {
-            "rrc_grouping_columns": None,
-            "rrc_group_count": 0,
-            "rrc_target_threshold_counts": {},
-        }
+    profile_summary = {
+        "rrc_grouping_columns": ["time_bucket", "Node_Cell_ID"] if "time_bucket" in out.columns else ["Node_Cell_ID"],
+        "rrc_group_count": int(out["Node_Cell_ID"].nunique(dropna=True)),
+        "target_congested_cells": int(target_congested_cells),
+        "actual_congested_cells": int(len(congested_nodes)),
+        "scenario_congested_cell_counts": {str(k): int(v) for k, v in scenario_counts.items()},
+        "rrc_target_threshold_counts": future_builder._threshold_counts(out.drop_duplicates("Node_Cell_ID")["estimated_cell_rrc_utilization_pct"]),
+    }
 
-    out["model3_profile_source"] = "ranked_hotspot_targeting_on_current_capacity_features"
+    out["model3_profile_source"] = "controlled_current_model3_demo_scenarios"
     return out, profile_summary
 
 

@@ -370,7 +370,20 @@ def load_polygon_file(path):
 
 def load_building_polygons(path):
     import re
-    df = pd.read_csv(path)
+    if not path or not os.path.exists(path) or os.path.getsize(path) == 0:
+        print("[LTE][BUILDING_POLYGONS] skipped=True reason=empty_or_missing_file")
+        return [], []
+
+    try:
+        df = pd.read_csv(path)
+    except pd.errors.EmptyDataError:
+        print("[LTE][BUILDING_POLYGONS] skipped=True reason=empty_csv")
+        return [], []
+
+    if df.empty:
+        print("[LTE][BUILDING_POLYGONS] skipped=True reason=no_rows")
+        return [], []
+
     df.columns = [c.strip().lower() for c in df.columns]
 
     geom_col = None
@@ -379,7 +392,8 @@ def load_building_polygons(path):
             geom_col = candidate
             break
     if geom_col is None:
-        raise ValueError(" No supported geometry column found in building CSV")
+        print("[LTE][BUILDING_POLYGONS] skipped=True reason=no_supported_geometry_column")
+        return [], []
 
     polygons = []
     meta     = []

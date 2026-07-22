@@ -10,6 +10,7 @@ from shapely.ops import transform
 from shapely.wkt import loads as load_wkt
 
 from .geo_correction_pipeline import (
+    _derive_frequency_mhz,
     apply_full_display_correction,
     align_building_geometries_to_project,
     align_project_polygon_to_points,
@@ -471,11 +472,7 @@ def fetch_site_data(project_id, region="india", polygon_ids=None, operator=None)
     df["Mtilt"] = pd.to_numeric(df["Mtilt"], errors="coerce").fillna(0)
     df["Height"] = pd.to_numeric(df["Height"], errors="coerce").fillna(30)
     df["tx_power"] = pd.to_numeric(df["tx_power"], errors="coerce").fillna(46)
-    if "frequency_mhz" not in df.columns:
-        if "frequency" in df.columns:
-            df["frequency_mhz"] = pd.to_numeric(df["frequency"], errors="coerce").fillna(1800)
-        else:
-            df["frequency_mhz"] = 1800
+    df["frequency_mhz"] = _derive_frequency_mhz(df)
     identity_col = None
     for candidate in ("site_prediction_key", "site_cell_sector_band_operator_key"):
         if candidate in df.columns:
@@ -836,12 +833,21 @@ def fetch_polygon_data(project_id):
     }
 
 
+def _has_rf_building_geometry(df):
+    if df is None or df.empty:
+        return False
+    for candidate in ("geometry_wkt", "geometry", "region"):
+        if candidate in df.columns and df[candidate].dropna().astype(str).str.strip().ne("").any():
+            return True
+    return False
+
+
 def run_rf_prediction_fast(site_df, drive_df, building_df, params):
     temp_dir = "temp_rf"
     os.makedirs(temp_dir, exist_ok=True)
 
     site_path = f"{temp_dir}/site.csv"
-    building_path = f"{temp_dir}/building.csv"
+    building_path = None
 
     current_engine = engine.get(params.get("region", "india").lower(), engine["india"])
     polygons = _resolve_prediction_polygons(params, current_engine)
@@ -874,7 +880,11 @@ def run_rf_prediction_fast(site_df, drive_df, building_df, params):
         else _safe_nunique(site_export_df, "cell_id")
     )
     site_export_df.to_csv(site_path, index=False)
-    building_export_df.to_csv(building_path, index=False)
+    if _has_rf_building_geometry(building_export_df):
+        building_path = f"{temp_dir}/building.csv"
+        building_export_df.to_csv(building_path, index=False)
+    else:
+        print("[LTE][RF_INPUT] building_polygon_loss_skipped=True reason=no_building_geometry_rows")
 
     print(
         f"[LTE][RF_INPUT] site_rows={len(site_export_df)} drive_rows={len(drive_df)} "

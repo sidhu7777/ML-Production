@@ -1269,6 +1269,22 @@ def compute_k1k2_for_cells(baseline_df, site_df, target_cells):
     baseline_work = _ensure_canonical_identity(baseline_df)
     site_work = _ensure_canonical_identity(site_df)
     identity_col = _shared_identity_column(baseline_work, site_work)
+    candidate_cols = [
+        "site_sector_band_key",
+        "sector_identity_key",
+        "legacy_nodeb_id_cell_id",
+        "canonical_cell_id",
+        identity_col,
+        "Node_Cell_ID",
+    ]
+    baseline_identity_cache = {}
+    baseline_canonical_cache = {}
+    for candidate_col in dict.fromkeys(candidate_cols):
+        if candidate_col not in baseline_work.columns:
+            continue
+        values = baseline_work[candidate_col].map(_rf_cell_id)
+        baseline_identity_cache[candidate_col] = values
+        baseline_canonical_cache[candidate_col] = values.map(canonical_cell_id)
     for cid in sorted({str(x) for x in target_cells}):
         site_rows = site_work.loc[_identity_match_mask(site_work, cid)].copy()
         dt_rows = pd.DataFrame()
@@ -1277,15 +1293,8 @@ def compute_k1k2_for_cells(baseline_df, site_df, target_cells):
         for _, site_row in site_rows.iterrows():
             site_aliases.update(_row_identity_aliases(site_row))
         site_aliases.update({_rf_cell_id(cid), canonical_cell_id(cid)})
-        for candidate_col in [
-            "site_sector_band_key",
-            "sector_identity_key",
-            "legacy_nodeb_id_cell_id",
-            "canonical_cell_id",
-            identity_col,
-            "Node_Cell_ID",
-        ]:
-            if site_rows.empty or candidate_col not in baseline_work.columns:
+        for candidate_col in candidate_cols:
+            if site_rows.empty or candidate_col not in baseline_identity_cache:
                 continue
             candidate_values = set(site_aliases)
             if candidate_col in site_rows.columns:
@@ -1296,10 +1305,11 @@ def compute_k1k2_for_cells(baseline_df, site_df, target_cells):
                 )
             if not candidate_values:
                 continue
-            baseline_values = baseline_work[candidate_col].map(_rf_cell_id)
+            baseline_values = baseline_identity_cache[candidate_col]
+            baseline_canonical_values = baseline_canonical_cache[candidate_col]
             candidate_dt = baseline_work.loc[
                 baseline_values.isin(candidate_values)
-                | baseline_values.map(canonical_cell_id).isin(candidate_values)
+                | baseline_canonical_values.isin(candidate_values)
             ].copy()
             if not candidate_dt.empty:
                 dt_rows = candidate_dt

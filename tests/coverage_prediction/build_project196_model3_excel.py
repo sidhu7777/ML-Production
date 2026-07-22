@@ -28,6 +28,7 @@ DEFAULT_GRID_SIZE_M = 25.0
 DEFAULT_RRC_SECTOR_CAPACITY = 400.0
 KNOWN_BAND_POOL_MHZ = [700.0, 850.0, 900.0, 1800.0, 2100.0, 2300.0]
 DEFAULT_MAX_SUPPORTED_CARRIERS = len(KNOWN_BAND_POOL_MHZ)
+DEMO_CONGESTION_THRESHOLD = 70.0
 
 
 def _clean_text(value: object) -> str:
@@ -96,6 +97,130 @@ def _format_list(values: list[object]) -> str:
     if not cleaned:
         return ""
     return ",".join(str(int(v)) if float(v).is_integer() else f"{v:g}" for v in sorted(set(cleaned)))
+
+
+def _set_cell_load(
+    cell: pd.DataFrame,
+    row_index: object,
+    prb_pct: float,
+    rrc_pct: float,
+    rrc_sector_capacity: float,
+) -> None:
+    capacity = pd.to_numeric(pd.Series([cell.at[row_index, "estimated_dl_capacity_mbps"]]), errors="coerce").iloc[0]
+    capacity = max(0.1, float(capacity) if pd.notna(capacity) else 0.1)
+    cell.at[row_index, "proxy_prb_utilization_pct"] = round(float(prb_pct), 3)
+    cell.at[row_index, "proxy_rrc_utilization_pct"] = round(float(rrc_pct), 3)
+    cell.at[row_index, "proxy_rrc_connected_users"] = round((float(rrc_pct) / 100.0) * float(rrc_sector_capacity), 3)
+    cell.at[row_index, "estimated_offered_traffic_mbps"] = round(capacity * (float(prb_pct) / 100.0), 3)
+
+
+def _apply_model3_demo_scenarios(cell: pd.DataFrame, rrc_sector_capacity: float) -> pd.DataFrame:
+    out = cell.copy()
+    out["demo_scenario"] = "proxy_load"
+    out["demo_scenario_reason"] = "RF/geo proxy load; editable planner input."
+
+    sector_stats = (
+        out.groupby("sector_id", dropna=False)
+        .agg(
+            cell_count=("Node_Cell_ID", "nunique"),
+            max_pressure=("proxy_prb_utilization_pct", "max"),
+            sector_grid_count=("grid_count", "sum"),
+        )
+        .reset_index()
+        .sort_values(["cell_count", "max_pressure", "sector_grid_count"], ascending=[False, False, False])
+    )
+    multi_sectors = sector_stats.loc[sector_stats["cell_count"] >= 2, "sector_id"].astype(str).tolist()
+    scenario_cycle = [
+        "load_balance_success",
+        "carrier_addition_required",
+        "carrier_blocked_new_site",
+        "sector_split_candidate",
+    ]
+    assignments = {
+        sector_id: scenario_cycle[pos % len(scenario_cycle)]
+        for pos, sector_id in enumerate(multi_sectors[: min(len(multi_sectors), 12)])
+    }
+
+    for sector_id, scenario in assignments.items():
+        group = out.loc[out["sector_id"].astype(str).eq(str(sector_id))].copy()
+        if group.empty:
+            continue
+        group = group.sort_values(["grid_count", "proxy_prb_utilization_pct", "proxy_rrc_utilization_pct"], ascending=[False, False, False])
+        source_idx = group.index[0]
+        peer_indices = list(group.index[1:])
+
+        if scenario == "load_balance_success":
+            _set_cell_load(out, source_idx, 88.0, 86.0, rrc_sector_capacity)
+            for idx in peer_indices:
+                _set_cell_load(out, idx, 42.0, 38.0, rrc_sector_capacity)
+            out.loc[group.index, "demo_scenario_reason"] = "One congested carrier, same-sector peers have safe PRB/RRC headroom."
+
+        elif scenario == "carrier_addition_required":
+            for rank, idx in enumerate(group.index):
+                _set_cell_load(out, idx, 84.0 + min(rank, 2) * 3.0, 82.0 + min(rank, 2) * 2.0, rrc_sector_capacity)
+            existing_count = pd.to_numeric(out.loc[group.index, "existing_carrier_count"], errors="coerce").fillna(0).astype(int)
+            out.loc[group.index, "input_existing_carrier_count"] = existing_count
+            out.loc[group.index, "input_max_supported_carriers"] = np.maximum(existing_count + 1, DEFAULT_MAX_SUPPORTED_CARRIERS)
+            add_options = out.loc[group.index, "available_bands_to_add"].fillna("").astype(str).str.strip()
+            out.loc[group.index, "input_available_bands_to_add"] = add_options.where(add_options.ne(""), "700")
+            out.loc[group.index, "recommended_band_to_add"] = out.loc[group.index, "input_available_bands_to_add"].astype(str).str.split(",").str[0]
+            out.loc[group.index, "carrier_addition_possible"] = True
+            out.loc[group.index, "demo_scenario_reason"] = "All same-sector carriers are congested; no load-balance headroom, add-band is allowed."
+
+        elif scenario == "sector_split_candidate":
+            for rank, idx in enumerate(group.index):
+                _set_cell_load(out, idx, 91.0 + min(rank, 2) * 2.0, 88.0 + min(rank, 2) * 2.0, rrc_sector_capacity)
+            existing_count = pd.to_numeric(out.loc[group.index, "existing_carrier_count"], errors="coerce").fillna(0).astype(int)
+            out.loc[group.index, "input_existing_carrier_count"] = existing_count
+            out.loc[group.index, "input_max_supported_carriers"] = existing_count
+            out.loc[group.index, "input_available_bands_to_add"] = ""
+            out.loc[group.index, "carrier_addition_possible"] = False
+            out.loc[group.index, "demo_scenario_reason"] = "Multiple congested carriers with carrier limit reached; full RF runner should branch to sector split."
+
+        else:
+            for rank, idx in enumerate(group.index):
+                _set_cell_load(out, idx, 94.0 + min(rank, 1), 94.0 + min(rank, 1), rrc_sector_capacity)
+            existing_count = pd.to_numeric(out.loc[group.index, "existing_carrier_count"], errors="coerce").fillna(0).astype(int)
+            out.loc[group.index, "input_existing_carrier_count"] = existing_count
+            out.loc[group.index, "input_max_supported_carriers"] = existing_count
+            out.loc[group.index, "input_available_bands_to_add"] = ""
+            out.loc[group.index, "carrier_addition_possible"] = False
+            out.loc[group.index, "demo_scenario_reason"] = "All same-sector carriers are heavily congested and add-carrier is blocked."
+
+        out.loc[group.index, "demo_scenario"] = scenario
+
+    out["proxy_prb_utilization_pct"] = pd.to_numeric(out["proxy_prb_utilization_pct"], errors="coerce").clip(5.0, 99.0).round(3)
+    out["proxy_rrc_utilization_pct"] = pd.to_numeric(out["proxy_rrc_utilization_pct"], errors="coerce").clip(5.0, 99.0).round(3)
+    out["proxy_rrc_connected_users"] = ((out["proxy_rrc_utilization_pct"] / 100.0) * float(rrc_sector_capacity)).round(3)
+    out["estimated_offered_traffic_mbps"] = (
+        pd.to_numeric(out["estimated_dl_capacity_mbps"], errors="coerce").fillna(0.1).clip(lower=0.1)
+        * (out["proxy_prb_utilization_pct"] / 100.0)
+    ).round(3)
+    return out
+
+
+def _first_existing_column(df: pd.DataFrame, candidates: list[str], default: object = "") -> pd.Series:
+    for col in candidates:
+        if col in df.columns:
+            return df[col]
+    return pd.Series(default, index=df.index)
+
+
+def _strict_identity_key(
+    site: pd.Series,
+    cell_id: pd.Series,
+    sector: pd.Series,
+    band: pd.Series,
+    operator: pd.Series,
+) -> pd.Series:
+    parts = [
+        site.map(_clean_text),
+        cell_id.map(_clean_cell_id),
+        sector.map(_clean_text),
+        band.map(_format_band).map(_clean_text),
+        operator.map(_clean_text),
+    ]
+    return parts[0] + "|" + parts[1] + "|" + parts[2] + "|" + parts[3] + "|" + parts[4]
 
 
 def _latest_baseline_job(conn, project_id: int) -> str:
@@ -232,21 +357,40 @@ def _prepare_baseline_geo(baseline_df: pd.DataFrame, geo_df: pd.DataFrame) -> pd
 
 def _prepare_site(site_df: pd.DataFrame) -> pd.DataFrame:
     site = site_df.copy()
-    site["site"] = site.get("site", site.get("nodeb_id", "")).map(_clean_text)
-    site["cell_id"] = site.get("cell_id", "").map(_clean_cell_id)
-    site["Node_Cell_ID"] = [
-        _clean_cell_id(f"{site_value}_{cell_value}") if site_value and cell_value and not str(cell_value).startswith(f"{site_value}_") else _clean_cell_id(cell_value)
-        for site_value, cell_value in zip(site["site"], site["cell_id"])
-    ]
-    site["topology_match_id"] = site["Node_Cell_ID"].map(_canonical_site_cell_id)
-    sector_num = _to_num(site.get("sector", pd.Series(np.nan, index=site.index)))
-    cell_suffix = site["cell_id"].astype(str).str.extract(r"_(\d+)(?:$|_)")[0]
-    sector_text = sector_num.astype("Int64").astype(str).replace("<NA>", pd.NA).fillna(cell_suffix).fillna("")
-    site["sector_id"] = site["site"].astype(str) + "|" + sector_text.astype(str)
-    site["band_num"] = pd.to_numeric(site.get("band", site.get("frequency", np.nan)), errors="coerce")
+    site["site"] = _first_existing_column(site, ["site", "nodeb_id", "site_id"]).map(_clean_text)
+    site["cell_id"] = _first_existing_column(site, ["cell_id", "cell"]).map(_clean_cell_id)
+    site["sector"] = _first_existing_column(site, ["sector", "sector_id"]).map(_clean_text)
+    site["operator"] = _first_existing_column(site, ["operator", "provider", "operator_name", "cluster"]).map(_clean_text)
+    site["band_num"] = pd.to_numeric(_first_existing_column(site, ["band", "frequency"]), errors="coerce")
+    site["band"] = site["band_num"].map(_format_band).map(_clean_text)
+    complete_mask = (
+        site["site"].ne("")
+        & site["cell_id"].ne("")
+        & site["sector"].ne("")
+        & site["band"].ne("")
+        & site["operator"].ne("")
+    )
+    site = site.loc[complete_mask].copy()
+    if "site_cell_sector_band_operator_key" in site.columns:
+        strict_from_db = site["site_cell_sector_band_operator_key"].map(_clean_text)
+    elif "site_prediction_key" in site.columns:
+        strict_from_db = site["site_prediction_key"].map(_clean_text)
+    else:
+        strict_from_db = pd.Series("", index=site.index, dtype="object")
+    constructed_key = _strict_identity_key(
+        site["site"],
+        site["cell_id"],
+        site["sector"],
+        site["band"],
+        site["operator"],
+    )
+    site["Node_Cell_ID"] = strict_from_db.where(strict_from_db.ne(""), constructed_key)
+    site["canonical_physical_cell_id"] = site["cell_id"].map(_canonical_site_cell_id)
+    site["topology_match_id"] = site["canonical_physical_cell_id"]
+    site["sector_id"] = site["site"].astype(str) + "|" + site["sector"].astype(str)
     site["earfcn_num"] = pd.to_numeric(site.get("earfcn", np.nan), errors="coerce")
     site["bw_mhz"] = pd.to_numeric(site.get("bw", np.nan), errors="coerce").fillna(10.0).clip(lower=1.4)
-    return site
+    return site.drop_duplicates(subset=["Node_Cell_ID"], keep="first").reset_index(drop=True)
 
 
 def _build_cell_input(
@@ -293,6 +437,8 @@ def _build_cell_input(
             "site_name",
             "sector_id",
             "sector",
+            "operator",
+            "band",
             "earfcn_num",
             "bw_mhz",
             "latitude",
@@ -307,21 +453,21 @@ def _build_cell_input(
         if col in site.columns
     ]
     cell["topology_match_id"] = cell["Node_Cell_ID"].map(_canonical_site_cell_id)
-    site_dedup = site[site_keep].drop_duplicates(subset=["topology_match_id"], keep="first")
-    cell = cell.merge(site_dedup, on="topology_match_id", how="left", validate="many_to_one")
+    site_dedup = site[site_keep + ["Node_Cell_ID"] if "Node_Cell_ID" not in site_keep else site_keep].drop_duplicates(subset=["Node_Cell_ID"], keep="first")
+    cell = cell.merge(site_dedup, on="Node_Cell_ID", how="left", validate="many_to_one")
     cell["site_id"] = cell["site"].fillna(cell["Node_Cell_ID"].astype(str).str.split("_").str[0])
     cell["sector_id"] = cell["sector_id"].fillna(cell["site_id"].astype(str) + "|" + cell.get("sector", pd.Series("", index=cell.index)).astype(str))
     cell["earfcn"] = cell["earfcn_num"].map(_format_band)
 
     cell_band = (
-        site.groupby("topology_match_id", dropna=False)
+        site.groupby("Node_Cell_ID", dropna=False)
         .agg(
             site_bands_for_cell=("band_num", lambda s: _format_list(s.dropna().tolist())),
             site_band_count_for_cell=("band_num", lambda s: int(pd.to_numeric(s, errors="coerce").dropna().nunique())),
         )
         .reset_index()
     )
-    cell = cell.merge(cell_band, on="topology_match_id", how="left", validate="many_to_one")
+    cell = cell.merge(cell_band, on="Node_Cell_ID", how="left", validate="many_to_one")
     cell["band"] = cell["baseline_band"].fillna("").astype(str).str.strip()
     fallback_band = cell["site_bands_for_cell"].fillna("").astype(str).str.strip()
     cell["band"] = cell["band"].where(cell["band"].ne(""), fallback_band)
@@ -378,9 +524,15 @@ def _build_cell_input(
     cell["input_estimated_dl_capacity_mbps"] = cell["estimated_dl_capacity_mbps"]
     cell["input_estimated_offered_traffic_mbps"] = cell["estimated_offered_traffic_mbps"]
     cell["input_available_bands_to_add"] = cell["available_bands_to_add"]
+    cell["recommended_band_to_add"] = cell["input_available_bands_to_add"].fillna("").astype(str).str.split(",").str[0].replace("nan", "")
     cell["input_max_supported_carriers"] = cell["max_supported_carriers"]
     cell["input_existing_carrier_count"] = cell["existing_carrier_count"]
     cell["input_sector_rrc_capacity"] = float(rrc_sector_capacity)
+    cell = _apply_model3_demo_scenarios(cell, rrc_sector_capacity)
+    cell["input_prb_utilization_pct"] = cell["proxy_prb_utilization_pct"]
+    cell["input_rrc_utilization_pct"] = cell["proxy_rrc_utilization_pct"]
+    cell["input_rrc_connected_users"] = cell["proxy_rrc_connected_users"]
+    cell["input_estimated_offered_traffic_mbps"] = cell["estimated_offered_traffic_mbps"]
     cell["input_notes"] = ""
     cell["metric_source"] = "proxy_from_project196_baseline_geo_editable_in_excel"
     cell["project_id"] = int(project_id)
@@ -405,9 +557,12 @@ def _build_cell_input(
         "input_estimated_dl_capacity_mbps",
         "input_estimated_offered_traffic_mbps",
         "input_available_bands_to_add",
+        "recommended_band_to_add",
         "input_max_supported_carriers",
         "input_existing_carrier_count",
         "input_sector_rrc_capacity",
+        "demo_scenario",
+        "demo_scenario_reason",
         "proxy_prb_utilization_pct",
         "proxy_rrc_utilization_pct",
         "proxy_rrc_connected_users",

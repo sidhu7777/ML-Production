@@ -284,6 +284,16 @@ def load_geo_weights(project_id: Optional[int] = None, weights_path: Optional[st
     return weights, summary
 
 
+def _derive_frequency_mhz(df: pd.DataFrame, default: float = 1800.0) -> pd.Series:
+    frequency = pd.Series(pd.NA, index=df.index, dtype="Float64")
+    for col in ("frequency_mhz", "frequency", "band"):
+        if col not in df.columns:
+            continue
+        candidate = pd.to_numeric(df[col], errors="coerce")
+        frequency = frequency.where(frequency.notna(), candidate)
+    return frequency.fillna(float(default)).astype(float)
+
+
 def normalize_site_for_geo(site_df: pd.DataFrame) -> pd.DataFrame:
     out = site_df.copy()
     out = out.loc[:, ~out.columns.duplicated()].copy()
@@ -312,7 +322,6 @@ def normalize_site_for_geo(site_df: pd.DataFrame) -> pd.DataFrame:
         "mechanical_tilt": 0,
         "antenna_height": 30,
         "tx_power": 46,
-        "frequency_mhz": 1800,
     }
     for col, default in numeric_defaults.items():
         if col in out.columns:
@@ -322,11 +331,7 @@ def normalize_site_for_geo(site_df: pd.DataFrame) -> pd.DataFrame:
         elif default is not None:
             out[col] = default
 
-    if "frequency_mhz" not in out.columns:
-        if "frequency" in out.columns:
-            out["frequency_mhz"] = pd.to_numeric(out["frequency"], errors="coerce").fillna(1800)
-        else:
-            out["frequency_mhz"] = 1800
+    out["frequency_mhz"] = _derive_frequency_mhz(out)
 
     required_cols = [
         "lat",

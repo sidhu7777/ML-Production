@@ -476,8 +476,12 @@ def compute_predictions_parallel(test_pts, serving_site_rows, params, n_workers=
         effective_workers = 1
     elif total_points <= 1800:
         effective_workers = min(2, requested_workers)
-    else:
+    elif total_points <= 6000:
         effective_workers = min(3, requested_workers)
+    elif total_points <= 20000:
+        effective_workers = min(4, requested_workers)
+    else:
+        effective_workers = min(6, requested_workers)
 
     print(
         f" Using {effective_workers} CPU cores for {len(test_pts)} points"

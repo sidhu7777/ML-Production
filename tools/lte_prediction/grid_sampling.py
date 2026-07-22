@@ -199,14 +199,41 @@ def assign_samples_to_relevant_cells(
     site_work["Node_Cell_ID"] = site_work["Node_Cell_ID"].astype(str)
     site_work["lat"] = pd.to_numeric(site_work["lat"], errors="coerce")
     site_work["lon"] = pd.to_numeric(site_work["lon"], errors="coerce")
-    site_centers = (
-        site_work.dropna(subset=["lat", "lon"])
-        .groupby("Node_Cell_ID", dropna=False)
+    valid_sites = site_work.dropna(subset=["lat", "lon", "Node_Cell_ID"]).copy()
+    if valid_sites.empty:
+        return pd.DataFrame()
+
+    if "canonical_sector_id" in valid_sites.columns:
+        sector_key = valid_sites["canonical_sector_id"].astype(str).str.strip()
+    elif "frontend_site_sector_key" in valid_sites.columns:
+        sector_key = valid_sites["frontend_site_sector_key"].astype(str).str.strip()
+    elif {"site_identity_key", "sector_identity"}.issubset(valid_sites.columns):
+        sector_key = valid_sites["site_identity_key"].astype(str).str.strip() + "|" + valid_sites["sector_identity"].astype(str).str.strip()
+    elif {"site", "sector"}.issubset(valid_sites.columns):
+        sector_key = valid_sites["site"].astype(str).str.strip() + "|" + valid_sites["sector"].astype(str).str.strip()
+    elif {"Site ID", "sector"}.issubset(valid_sites.columns):
+        sector_key = valid_sites["Site ID"].astype(str).str.strip() + "|" + valid_sites["sector"].astype(str).str.strip()
+    else:
+        sector_key = valid_sites["Node_Cell_ID"].astype(str)
+    invalid_sector = sector_key.isna() | sector_key.eq("") | sector_key.str.lower().isin({"nan", "none", "<na>"})
+    valid_sites["_assignment_sector_key"] = sector_key.mask(invalid_sector, valid_sites["Node_Cell_ID"].astype(str))
+
+    sector_centers = (
+        valid_sites
+        .groupby("_assignment_sector_key", dropna=False)
         .agg(site_lat=("lat", "mean"), site_lon=("lon", "mean"))
         .reset_index()
     )
-    if site_centers.empty:
+    if sector_centers.empty:
         return pd.DataFrame()
+
+    sector_to_cells = (
+        valid_sites[["_assignment_sector_key", "Node_Cell_ID"]]
+        .drop_duplicates()
+        .groupby("_assignment_sector_key")["Node_Cell_ID"]
+        .apply(lambda s: sorted(set(s.astype(str))))
+        .to_dict()
+    )
 
     grid_centers = (
         samples_df[["frontend_grid_id", "grid_center_lat", "grid_center_lon"]]
@@ -218,34 +245,40 @@ def assign_samples_to_relevant_cells(
     radius_m = float(radius_m or 0.0)
 
     assignments = []
-    site_lat = site_centers["site_lat"].to_numpy(dtype=float)
-    site_lon = site_centers["site_lon"].to_numpy(dtype=float)
-    site_ids = site_centers["Node_Cell_ID"].astype(str).to_numpy()
+    site_lat = sector_centers["site_lat"].to_numpy(dtype=float)
+    site_lon = sector_centers["site_lon"].to_numpy(dtype=float)
+    sector_ids = sector_centers["_assignment_sector_key"].astype(str).to_numpy()
     for grid in grid_centers.itertuples(index=False):
         dist = haversine_m(float(grid.grid_center_lat), float(grid.grid_center_lon), site_lat, site_lon)
         within = np.where(dist <= radius_m)[0] if radius_m > 0 else np.array([], dtype=int)
         if within.size:
             selected = within[np.argsort(dist[within])[:max_cells_per_grid]]
-            source = "within_radius"
+            source = "within_radius_sector_all_bands"
         else:
-            nearest_count = min(min_cells_per_grid, len(site_ids))
+            nearest_count = min(min_cells_per_grid, len(sector_ids))
             selected = np.argsort(dist)[:nearest_count]
-            source = "nearest_fallback"
+            source = "nearest_sector_fallback_all_bands"
         for idx in selected:
-            assignments.append(
-                {
-                    "frontend_grid_id": str(grid.frontend_grid_id),
-                    "Node_Cell_ID": str(site_ids[idx]),
-                    "distance_m": float(dist[idx]),
-                    "assignment_source": source,
-                }
-            )
+            for node_cell_id in sector_to_cells.get(str(sector_ids[idx]), []):
+                assignments.append(
+                    {
+                        "frontend_grid_id": str(grid.frontend_grid_id),
+                        "Node_Cell_ID": str(node_cell_id),
+                        "distance_m": float(dist[idx]),
+                        "assignment_source": source,
+                    }
+                )
 
     assignment_df = pd.DataFrame(assignments)
     if ensure_all_cells and not assignment_df.empty:
         min_grids_per_cell = max(1, int(min_grids_per_cell or 1))
         assigned_cells = set(assignment_df["Node_Cell_ID"].astype(str))
-        missing_sites = site_centers.loc[~site_centers["Node_Cell_ID"].astype(str).isin(assigned_cells)].copy()
+        cell_centers = (
+            valid_sites.groupby("Node_Cell_ID", dropna=False)
+            .agg(site_lat=("lat", "mean"), site_lon=("lon", "mean"))
+            .reset_index()
+        )
+        missing_sites = cell_centers.loc[~cell_centers["Node_Cell_ID"].astype(str).isin(assigned_cells)].copy()
         if not missing_sites.empty:
             grid_lat = pd.to_numeric(grid_centers["grid_center_lat"], errors="coerce").to_numpy(dtype=float)
             grid_lon = pd.to_numeric(grid_centers["grid_center_lon"], errors="coerce").to_numpy(dtype=float)
@@ -281,6 +314,7 @@ def assign_samples_to_relevant_cells(
         f"[LTE][FRONTEND_GRID_ASSIGN] grids={grid_centers['frontend_grid_id'].nunique()} "
         f"assigned_grids={assignment_df['frontend_grid_id'].nunique()} "
         f"cells={assignment_df['Node_Cell_ID'].nunique()} rows={len(out)} "
-        f"fallback_grids={int((assignment_df['assignment_source'] == 'nearest_fallback').sum())}"
+        f"fallback_grids={int((assignment_df['assignment_source'] == 'nearest_sector_fallback_all_bands').sum())} "
+        f"sector_expansion=True"
     )
     return out.reset_index(drop=True)

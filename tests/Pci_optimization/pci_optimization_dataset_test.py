@@ -12,11 +12,12 @@ import numpy as np
 import pandas as pd
 from sqlalchemy import bindparam, text
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from tools.lte_prediction import ml_engine
+from tests.new_pdf_report.new_report_sections import _detect_column_transitions
 
 
 DEFAULT_PROJECT_ID = 193
@@ -292,96 +293,61 @@ def _bearing_deg(lat1, lon1, lat2, lon2) -> np.ndarray:
 
 
 def _detect_pci_transitions(log_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Per-session, time-ordered PCI change detector. Delegates to
+    `_detect_column_transitions` (tests/new_pdf_report/new_report_sections.py)
+    instead of this file's own former groupby/shift implementation, so PCI
+    transitions are detected with the exact same logic already verified
+    against the frontend's buildHandoverTransitions() (UnifiedMapView.jsx)
+    and already used for pci_events in compute_handover_analysis there.
+    That module's docstring documents why: production's own
+    detect_handover_events() (map_generator.py) dedupes by
+    (session_id, rounded lat/lon, from_value, to_value) WITHOUT timestamp,
+    which collapses genuinely repeated transitions at one GPS fix into one
+    event (confirmed 685 vs 6,678 band-transition undercount on project
+    248). _detect_column_transitions has no such dedup.
+    """
     if log_df.empty:
         return pd.DataFrame()
 
-    work = log_df.copy()
-    work["_original_index"] = np.arange(len(work))
-    for col in ["lat", "lon", "rsrp", "rsrq", "sinr"]:
-        if col in work.columns:
-            work[col] = pd.to_numeric(work[col], errors="coerce")
-    if "timestamp" in work.columns:
-        work["_timestamp_sort"] = pd.to_datetime(work["timestamp"], errors="coerce")
-    else:
-        work["_timestamp_sort"] = pd.NaT
-        work["timestamp"] = pd.NaT
-    if "log_id" in work.columns:
-        work["_log_id_sort"] = pd.to_numeric(work["log_id"], errors="coerce")
-    else:
-        work["log_id"] = pd.NA
-        work["_log_id_sort"] = np.nan
-
-    work["_session_key"] = _norm_key(work["session_id"])
-    work["_pci_key"] = _norm_key(work["pci"])
-    work = work.sort_values(
-        ["_session_key", "_log_id_sort", "_timestamp_sort", "_original_index"],
-        na_position="last",
-    ).reset_index(drop=True)
-
-    group = work.groupby("_session_key", dropna=False)
-    prev_cols = [
-        "log_id",
-        "timestamp",
-        "lat",
-        "lon",
+    raw_events = _detect_column_transitions(
+        log_df,
         "pci",
-        "_pci_key",
-        "rsrp",
-        "rsrq",
-        "sinr",
-        "nodeb_id",
-        "cell_id",
-        "earfcn",
-        "band",
-        "network",
-    ]
-    for col in prev_cols:
-        if col not in work.columns:
-            work[col] = pd.NA
-        work[f"prev_{col}"] = group[col].shift(1)
-
-    valid = (
-        work["lat"].notna()
-        & work["lon"].notna()
-        & work["_pci_key"].notna()
-        & work["prev__pci_key"].notna()
-        & (work["_pci_key"] != work["prev__pci_key"])
+        meta_cols=("timestamp", "nodeb_id", "cell_id", "earfcn", "band", "network"),
+        numeric_meta_cols=("lat", "lon", "rsrp", "rsrq", "sinr"),
     )
-    events = work.loc[valid].copy()
-    if events.empty:
+    if not raw_events:
         return pd.DataFrame()
 
     out = pd.DataFrame(
         {
-            "session_id": events["session_id"],
-            "from_log_id": events["prev_log_id"],
-            "to_log_id": events["log_id"],
-            "from_timestamp": events["prev_timestamp"],
-            "to_timestamp": events["timestamp"],
-            "from_pci": events["prev_pci"],
-            "to_pci": events["pci"],
-            "from_lat": events["prev_lat"],
-            "from_lon": events["prev_lon"],
-            "to_lat": events["lat"],
-            "to_lon": events["lon"],
-            "event_lat": events["lat"],
-            "event_lon": events["lon"],
-            "from_nodeb_id_observed": events["prev_nodeb_id"],
-            "to_nodeb_id_observed": events["nodeb_id"],
-            "from_cell_id_observed": events["prev_cell_id"],
-            "to_cell_id_observed": events["cell_id"],
-            "from_earfcn": events["prev_earfcn"],
-            "to_earfcn": events["earfcn"],
-            "from_band": events["prev_band"],
-            "to_band": events["band"],
-            "from_network": events["prev_network"],
-            "to_network": events["network"],
-            "rsrp_before": events["prev_rsrp"],
-            "rsrp_after": events["rsrp"],
-            "rsrq_before": events["prev_rsrq"],
-            "rsrq_after": events["rsrq"],
-            "sinr_before": events["prev_sinr"],
-            "sinr_after": events["sinr"],
+            "session_id": [e["session_id"] for e in raw_events],
+            "from_timestamp": [e.get("from_timestamp") for e in raw_events],
+            "to_timestamp": [e.get("to_timestamp") for e in raw_events],
+            "from_pci": [e["from"] for e in raw_events],
+            "to_pci": [e["to"] for e in raw_events],
+            "from_lat": [e.get("from_lat") for e in raw_events],
+            "from_lon": [e.get("from_lon") for e in raw_events],
+            "to_lat": [e.get("to_lat") for e in raw_events],
+            "to_lon": [e.get("to_lon") for e in raw_events],
+            "event_lat": [e.get("to_lat") for e in raw_events],
+            "event_lon": [e.get("to_lon") for e in raw_events],
+            "from_nodeb_id_observed": [e.get("from_nodeb_id") for e in raw_events],
+            "to_nodeb_id_observed": [e.get("to_nodeb_id") for e in raw_events],
+            "from_cell_id_observed": [e.get("from_cell_id") for e in raw_events],
+            "to_cell_id_observed": [e.get("to_cell_id") for e in raw_events],
+            "from_earfcn": [e.get("from_earfcn") for e in raw_events],
+            "to_earfcn": [e.get("to_earfcn") for e in raw_events],
+            "from_band": [e.get("from_band") for e in raw_events],
+            "to_band": [e.get("to_band") for e in raw_events],
+            "from_network": [e.get("from_network") for e in raw_events],
+            "to_network": [e.get("to_network") for e in raw_events],
+            "rsrp_before": [e.get("from_rsrp") for e in raw_events],
+            "rsrp_after": [e.get("to_rsrp") for e in raw_events],
+            "rsrq_before": [e.get("from_rsrq") for e in raw_events],
+            "rsrq_after": [e.get("to_rsrq") for e in raw_events],
+            "sinr_before": [e.get("from_sinr") for e in raw_events],
+            "sinr_after": [e.get("to_sinr") for e in raw_events],
         }
     )
     out["segment_distance_m"] = _haversine_m(out["from_lat"], out["from_lon"], out["to_lat"], out["to_lon"])
@@ -429,7 +395,8 @@ def _prepare_site_lookup(site_df: pd.DataFrame) -> pd.DataFrame:
 def _merge_site_side(events_df: pd.DataFrame, site_lookup: pd.DataFrame, side: str) -> pd.DataFrame:
     if events_df.empty or site_lookup.empty:
         return events_df
-    out = events_df.copy()
+    out = events_df.reset_index(drop=True).copy()
+    out["_merge_row_id"] = np.arange(len(out))
     out[f"_{side}_pci_key"] = _norm_number_key(out[f"{side}_pci"])
     out[f"_{side}_earfcn_key"] = _norm_number_key(out[f"{side}_earfcn"]) if f"{side}_earfcn" in out.columns else np.nan
     out[f"_{side}_network_key"] = _norm_key(out[f"{side}_network"]) if f"{side}_network" in out.columns else np.nan
@@ -468,6 +435,14 @@ def _merge_site_side(events_df: pd.DataFrame, site_lookup: pd.DataFrame, side: s
             how="left",
             suffixes=("", "_site"),
         )
+        # site_lookup carries multiple lookup "levels" (network+earfcn+pci,
+        # earfcn+pci, pci-only) concatenated together, so a loose key (e.g.
+        # pci-only) can match more than one site_lookup row per event and
+        # explode row count here. Collapse back to exactly one row per
+        # original event (first/best match) so `candidate` always stays
+        # aligned with `out`/`merged` for the boolean-mask fill-in below.
+        candidate = candidate.drop_duplicates(subset="_merge_row_id", keep="first")
+        candidate = candidate.set_index("_merge_row_id").reindex(out["_merge_row_id"]).reset_index()
         if merged is None:
             merged = candidate
         else:
@@ -478,8 +453,13 @@ def _merge_site_side(events_df: pd.DataFrame, site_lookup: pd.DataFrame, side: s
 
     if merged is None:
         return out
+    # "network" is special-cased to "{side}_site_network" (not "{side}_network"):
+    # events_df already has from_network/to_network holding the OBSERVED
+    # network type from the drive log at that transition point. Renaming
+    # the merged-in site record's own "network" field to the same name
+    # would silently collide into a duplicate column.
     rename_map = {
-        col: f"{side}_{col}"
+        col: (f"{side}_site_network" if col == "network" else f"{side}_{col}")
         for col in [
             "site_pci",
             "site_earfcn",
@@ -499,7 +479,7 @@ def _merge_site_side(events_df: pd.DataFrame, site_lookup: pd.DataFrame, side: s
         if col in merged.columns
     }
     merged = merged.rename(columns=rename_map)
-    drop_cols = [col for col in merged.columns if col.startswith("_site_") or col in [f"_{side}_pci_key", f"_{side}_earfcn_key", f"_{side}_network_key"]]
+    drop_cols = [col for col in merged.columns if col.startswith("_site_") or col in [f"_{side}_pci_key", f"_{side}_earfcn_key", f"_{side}_network_key", "_merge_row_id"]]
     return merged.drop(columns=drop_cols, errors="ignore")
 
 
