@@ -228,10 +228,11 @@ def build_model4_future_dataset_from_excel(
     max_congested_cells: int | None = 18,
     congestion_threshold: float = future_rules.DEFAULT_CONGESTION_THRESHOLD,
 ) -> tuple[Path, Path, dict[str, Any]]:
-    if not excel_path.exists():
-        raise FileNotFoundError(f"Project 196 Excel input not found: {excel_path}")
-    cell_input = pd.read_excel(excel_path, sheet_name="Model3_Cell_Input", dtype=str)
-    base_grid = pd.read_excel(excel_path, sheet_name="Baseline_Grid_Input", dtype=str)
+    project_grid_dataset = DEFAULT_PROJECT196_GRID_DATASET
+    if not project_grid_dataset.exists():
+        raise FileNotFoundError(f"Scoped Model 3 dataset not found: {project_grid_dataset}")
+    base_grid = pd.read_csv(project_grid_dataset, low_memory=False)
+    cell_input = base_grid.drop_duplicates("Node_Cell_ID", keep="first").copy()
     if "project_id" in cell_input.columns:
         cell_input = cell_input.loc[cell_input["project_id"].map(_clean_text).eq("196")].copy()
     if "site_id" in cell_input.columns:
@@ -251,19 +252,23 @@ def build_model4_future_dataset_from_excel(
         if future_row is not None:
             matched += 1
         site_id = _clean_text(row.get("site_id"))
-        sector_id = _canonical_sector(site_id, row.get("sector_id"), row.get("Node_Cell_ID"), row.get("canonical_physical_cell_id"))
-        band = _band_text(row.get("band"))
-        current_prb = float(pd.to_numeric(pd.Series([row.get("input_prb_utilization_pct")]), errors="coerce").fillna(0.0).iloc[0])
-        current_rrc = float(pd.to_numeric(pd.Series([row.get("input_rrc_utilization_pct")]), errors="coerce").fillna(0.0).iloc[0])
+        sector_id = _canonical_sector(
+            site_id,
+            row.get("sector_id", row.get("topology_frontend_site_sector_key")),
+            row.get("Node_Cell_ID"),
+            row.get("canonical_physical_cell_id", row.get("topology_original_node_cell_id")),
+        )
+        band = _band_text(row.get("band", row.get("topology_band")))
+        current_prb = float(pd.to_numeric(pd.Series([row.get("input_prb_utilization_pct", row.get("estimated_prb_utilization_pct"))]), errors="coerce").fillna(0.0).iloc[0])
+        current_rrc = float(pd.to_numeric(pd.Series([row.get("input_rrc_utilization_pct", row.get("estimated_cell_rrc_utilization_pct"))]), errors="coerce").fillna(0.0).iloc[0])
         future_prb = float(future_row.get("estimated_prb_utilization_pct")) if future_row is not None and pd.notna(future_row.get("estimated_prb_utilization_pct")) else min(180.0, current_prb * 1.12)
         future_rrc = float(future_row.get("estimated_cell_rrc_utilization_pct")) if future_row is not None and pd.notna(future_row.get("estimated_cell_rrc_utilization_pct")) else min(180.0, current_rrc * 1.12)
         raw_future_prb = future_prb
         raw_future_rrc = future_rrc
-        future_prb = max(current_prb, future_prb)
-        future_rrc = max(current_rrc, future_rrc)
-        users = float(future_row.get("estimated_cell_rrc_connected_users")) if future_row is not None and pd.notna(future_row.get("estimated_cell_rrc_connected_users")) else float(pd.to_numeric(pd.Series([row.get("input_rrc_connected_users")]), errors="coerce").fillna(0.0).iloc[0]) * 1.12
-        traffic = float(future_row.get("estimated_offered_traffic_mbps")) if future_row is not None and pd.notna(future_row.get("estimated_offered_traffic_mbps")) else float(pd.to_numeric(pd.Series([row.get("input_estimated_offered_traffic_mbps")]), errors="coerce").fillna(0.0).iloc[0]) * 1.12
-        capacity = float(future_row.get("estimated_dl_capacity_mbps")) if future_row is not None and pd.notna(future_row.get("estimated_dl_capacity_mbps")) else float(pd.to_numeric(pd.Series([row.get("input_estimated_dl_capacity_mbps")]), errors="coerce").replace(0, np.nan).fillna(0.1).iloc[0])
+        future_source = "model1_model2_future_match" if future_row is not None else "excel_current_uplift_fallback"
+        users = float(future_row.get("estimated_cell_rrc_connected_users")) if future_row is not None and pd.notna(future_row.get("estimated_cell_rrc_connected_users")) else float(pd.to_numeric(pd.Series([row.get("input_rrc_connected_users", row.get("estimated_cell_rrc_connected_users", row.get("estimated_rrc_connected_users")))]), errors="coerce").fillna(0.0).iloc[0]) * 1.12
+        traffic = float(future_row.get("estimated_offered_traffic_mbps")) if future_row is not None and pd.notna(future_row.get("estimated_offered_traffic_mbps")) else float(pd.to_numeric(pd.Series([row.get("input_estimated_offered_traffic_mbps", row.get("estimated_offered_traffic_mbps"))]), errors="coerce").fillna(0.0).iloc[0]) * 1.12
+        capacity = float(future_row.get("estimated_dl_capacity_mbps")) if future_row is not None and pd.notna(future_row.get("estimated_dl_capacity_mbps")) else float(pd.to_numeric(pd.Series([row.get("input_estimated_dl_capacity_mbps", row.get("estimated_dl_capacity_mbps"))]), errors="coerce").replace(0, np.nan).fillna(0.1).iloc[0])
         existing_count = int(float(pd.to_numeric(pd.Series([row.get("input_existing_carrier_count", row.get("existing_carrier_count", 0))]), errors="coerce").fillna(0).iloc[0]))
         max_supported = int(float(pd.to_numeric(pd.Series([row.get("input_max_supported_carriers", max(existing_count, 1))]), errors="coerce").fillna(max(existing_count, 1)).iloc[0]))
         available = _clean_text(row.get("input_available_bands_to_add", row.get("available_bands_to_add", "")))
@@ -296,6 +301,7 @@ def build_model4_future_dataset_from_excel(
                 "model3_scenario_reason": _clean_text(row.get("demo_scenario_reason")),
                 "model4_current_prb": round(current_prb, 3),
                 "model4_current_rrc": round(current_rrc, 3),
+                "model4_current_scope_cell": max(current_prb, current_rrc) > float(congestion_threshold),
                 "model4_raw_future_prb": round(raw_future_prb, 3),
                 "model4_raw_future_rrc": round(raw_future_rrc, 3),
                 "existing_carriers": _clean_text(row.get("existing_carriers")),
@@ -312,7 +318,7 @@ def build_model4_future_dataset_from_excel(
                 "carrier_addition_possible": bool(can_add and max_supported > existing_count),
                 "carrier_addition_blocked": not bool(can_add and max_supported > existing_count),
                 "carrier_addition_reason": "PROJECT196_EXCEL_AVAILABLE_BAND" if bool(can_add and max_supported > existing_count) else "PROJECT196_EXCEL_NO_AVAILABLE_BAND_OR_LIMIT",
-                "model4_future_source": "model1_model2_future_match" if future_row is not None else "excel_current_uplift_fallback",
+                "model4_future_source": future_source,
                 "model4_excel_source_path": str(excel_path),
             }
         )
@@ -320,40 +326,19 @@ def build_model4_future_dataset_from_excel(
     cell_out = pd.DataFrame(cell_rows)
     cell_out["model4_pressure"] = cell_out[["estimated_prb_utilization_pct", "estimated_cell_rrc_utilization_pct"]].max(axis=1)
 
-    selected_model3_ids = _model3_selected_cell_ids(max_congested_cells)
     scope_source = "model4_future_pressure"
-    selected_model3_found = 0
-    if selected_model3_ids:
-        selected_set = set(selected_model3_ids)
-        scoped = cell_out.loc[cell_out["Node_Cell_ID"].astype(str).isin(selected_set)].copy()
-        selected_model3_found = int(scoped["Node_Cell_ID"].nunique(dropna=True))
-        if selected_model3_found == len(selected_model3_ids):
-            cell_out = scoped.copy()
-            scope_source = "model3_current_selected_congested_cells"
-    if scope_source != "model3_current_selected_congested_cells":
-        selected_model3_ids = _project196_selected_cell_ids(cell_out, max_congested_cells, congestion_threshold)
-        selected_set = set(selected_model3_ids)
-        scoped = cell_out.loc[cell_out["Node_Cell_ID"].astype(str).isin(selected_set)].copy()
-        selected_model3_found = int(scoped["Node_Cell_ID"].nunique(dropna=True))
-        if selected_model3_found:
-            cell_out = scoped.copy()
-            scope_source = "project196_excel_model3_selected_congested_cells"
-    selected_model3_missing = [
-        cell_id for cell_id in selected_model3_ids if cell_id not in set(cell_out["Node_Cell_ID"].astype(str).tolist())
-    ]
+    selected_future_ids: list[str] = []
 
+    current_scope = cell_out.loc[cell_out["model4_current_scope_cell"].fillna(False).astype(bool)].copy()
     if max_congested_cells is not None and int(max_congested_cells) > 0:
-        if scope_source == "model4_future_pressure":
-            congested = cell_out.loc[cell_out["model4_pressure"] > float(congestion_threshold)].copy()
-            selected_sectors: list[str] = []
-            covered = 0
-            for sector_id, group in congested.sort_values("model4_pressure", ascending=False).groupby("topology_frontend_site_sector_key", sort=False):
-                selected_sectors.append(str(sector_id))
-                covered += int(group["Node_Cell_ID"].nunique())
-                if covered >= int(max_congested_cells):
-                    break
-            if selected_sectors:
-                cell_out = cell_out.loc[cell_out["topology_frontend_site_sector_key"].astype(str).isin(selected_sectors)].copy()
+        current_scope = current_scope.sort_values("model4_pressure", ascending=False).head(int(max_congested_cells)).copy()
+    selected_future_ids = current_scope["Node_Cell_ID"].dropna().astype(str).tolist()
+    selected_sectors = current_scope["topology_frontend_site_sector_key"].dropna().astype(str).unique().tolist()
+    if selected_future_ids:
+        cell_out = cell_out.loc[cell_out["topology_frontend_site_sector_key"].astype(str).isin(selected_sectors)].copy()
+    else:
+        cell_out = cell_out.iloc[0:0].copy()
+    cell_out["recommendation_scope_cell"] = cell_out["Node_Cell_ID"].astype(str).isin(set(selected_future_ids)) if selected_future_ids else cell_out["model4_pressure"] > float(congestion_threshold)
 
     overlay_cols = [
         "Node_Cell_ID",
@@ -369,6 +354,7 @@ def build_model4_future_dataset_from_excel(
         "model3_scenario_reason",
         "model4_current_prb",
         "model4_current_rrc",
+        "model4_current_scope_cell",
         "model4_raw_future_prb",
         "model4_raw_future_rrc",
         "available_bands_to_add",
@@ -385,6 +371,7 @@ def build_model4_future_dataset_from_excel(
         "carrier_addition_reason",
         "model4_future_source",
         "model4_excel_source_path",
+        "recommendation_scope_cell",
     ]
     overlay = cell_out[overlay_cols].drop_duplicates("Node_Cell_ID", keep="first").copy()
     out = base_grid.merge(overlay, on="Node_Cell_ID", how="inner", suffixes=("", "__future"))
@@ -394,8 +381,8 @@ def build_model4_future_dataset_from_excel(
             out[col] = out[future_col].combine_first(out[col]) if col in out.columns else out[future_col]
             out = out.drop(columns=[future_col])
 
-    out["lat_6dp"] = pd.to_numeric(out.get("lat_6dp", out.get("lat")), errors="coerce").round(6)
-    out["lon_6dp"] = pd.to_numeric(out.get("lon_6dp", out.get("lon")), errors="coerce").round(6)
+    out["lat_6dp"] = pd.to_numeric(out.get("lat_6dp", out.get("lat", out.get("grid_centroid_lat"))), errors="coerce").round(6)
+    out["lon_6dp"] = pd.to_numeric(out.get("lon_6dp", out.get("lon", out.get("grid_centroid_lon"))), errors="coerce").round(6)
     out["grid_label"] = out["grid_id"].map(_clean_text)
     coord_label = out["lat_6dp"].astype(str) + "_" + out["lon_6dp"].astype(str)
     out["grid_label"] = out["grid_label"].where(out["grid_label"].ne(""), coord_label)
@@ -409,8 +396,8 @@ def build_model4_future_dataset_from_excel(
     grid_col_src = out["grid_col"] if "grid_col" in out.columns else pd.Series(np.nan, index=out.index)
     out["grid_row"] = pd.to_numeric(grid_row_src, errors="coerce").fillna(out["grid_id"]).astype(int)
     out["grid_col"] = pd.to_numeric(grid_col_src, errors="coerce").fillna(1).astype(int)
-    out["grid_centroid_lat"] = pd.to_numeric(out.get("lat"), errors="coerce")
-    out["grid_centroid_lon"] = pd.to_numeric(out.get("lon"), errors="coerce")
+    out["grid_centroid_lat"] = pd.to_numeric(out.get("lat", out.get("grid_centroid_lat")), errors="coerce")
+    out["grid_centroid_lon"] = pd.to_numeric(out.get("lon", out.get("grid_centroid_lon")), errors="coerce")
     out["rsrp_mean"] = pd.to_numeric(out.get("pred_rsrp"), errors="coerce")
     out["rsrq_mean"] = pd.to_numeric(out.get("pred_rsrq"), errors="coerce")
     out["sinr_mean"] = pd.to_numeric(out.get("pred_sinr"), errors="coerce")
@@ -420,16 +407,29 @@ def build_model4_future_dataset_from_excel(
     out["site_id"] = out["site_id"].map(lambda value: _clean_text(value).removeprefix("s-"))
     out["topology_site_id"] = out["site_id"]
     out["sector_id"] = out.apply(
-        lambda row: _canonical_sector(row.get("site_id"), row.get("sector"), row.get("Node_Cell_ID"), row.get("topology_match_id")),
+        lambda row: _canonical_sector(
+            row.get("site_id"),
+            row.get("sector_id", row.get("topology_frontend_site_sector_key", row.get("sector"))),
+            row.get("Node_Cell_ID"),
+            row.get("topology_original_node_cell_id", row.get("topology_match_id")),
+        ),
         axis=1,
     )
     out["topology_frontend_site_sector_key"] = out["sector_id"]
-    out["topology_original_node_cell_id"] = out["cell_id"].map(_clean_text)
-    out["topology_original_cell_id"] = out["cell_id"].map(_clean_text)
-    out["topology_band"] = pd.to_numeric(out.get("band"), errors="coerce")
-    out["topology_earfcn"] = pd.to_numeric(out.get("earfcn"), errors="coerce") if "earfcn" in out.columns else np.nan
+    cell_identity_src = out["cell_id"] if "cell_id" in out.columns else out["Node_Cell_ID"]
+    original_node_src = out["topology_original_node_cell_id"] if "topology_original_node_cell_id" in out.columns else cell_identity_src
+    original_cell_src = out["topology_original_cell_id"] if "topology_original_cell_id" in out.columns else cell_identity_src
+    out["topology_original_node_cell_id"] = original_node_src.map(_clean_text)
+    out["topology_original_cell_id"] = original_cell_src.map(_clean_text)
+    band_src = out["band"] if "band" in out.columns else out.get("topology_band")
+    earfcn_src = out["earfcn"] if "earfcn" in out.columns else out.get("topology_earfcn")
+    out["band"] = pd.to_numeric(band_src, errors="coerce")
+    out["earfcn"] = pd.to_numeric(earfcn_src, errors="coerce") if earfcn_src is not None else np.nan
+    out["topology_band"] = pd.to_numeric(out["band"], errors="coerce")
+    out["topology_earfcn"] = pd.to_numeric(out["earfcn"], errors="coerce") if "earfcn" in out.columns else np.nan
     out["topology_sector"] = out["sector"].map(_clean_text) if "sector" in out.columns else ""
-    out["topology_rf_identity_key"] = out["cell_id"].map(_clean_text)
+    rf_identity_src = out["topology_rf_identity_key"] if "topology_rf_identity_key" in out.columns else cell_identity_src
+    out["topology_rf_identity_key"] = rf_identity_src.map(_clean_text)
     out["topology_site_sector_band_key"] = out["sector_id"].astype(str) + "_" + out["topology_band"].fillna("").astype(str)
     sample_src = out["sample_count"] if "sample_count" in out.columns else pd.Series(1, index=out.index)
     grid_size_src = out["grid_size_m"] if "grid_size_m" in out.columns else pd.Series(25.0, index=out.index)
@@ -458,16 +458,15 @@ def build_model4_future_dataset_from_excel(
     summary = {
         "mode": "model4_project196_excel_future_dataset",
         "excel_path": str(excel_path),
-        "source_grid_dataset_path": f"{excel_path}::Baseline_Grid_Input",
+        "source_grid_dataset_path": str(project_grid_dataset),
         "future_dataset_path": str(future_dataset_path),
         "rows": int(len(out)),
         "cell_count": int(out["Node_Cell_ID"].nunique(dropna=True)),
         "sector_count": int(out["topology_frontend_site_sector_key"].nunique(dropna=True)),
         "future_matched_rows_before_scope": int(matched),
         "scope_source": scope_source,
-        "model3_selected_cell_count": int(len(selected_model3_ids)),
-        "model3_selected_cells_found": int(selected_model3_found),
-        "model3_selected_cells_missing": selected_model3_missing,
+        "future_selected_cell_count": int(len(set(selected_future_ids))),
+        "future_selected_cells": sorted(set(selected_future_ids)),
         "max_congested_cells_scope": int(max_congested_cells) if max_congested_cells is not None else None,
         "threshold": float(congestion_threshold),
         "congested_cell_count": int(
@@ -512,7 +511,8 @@ def run_model4_future_recommendation(
         rf_workers=3,
         max_interference_sites=10,
         action_neighbor_cells=2,
-        sector_parallelism=3,
+        sector_parallelism=1,
+        dashboard_model_label="Model 4",
     )
     run_dir = current_rules.run_model3_current_recommendation_test(run_config)
 
@@ -521,6 +521,10 @@ def run_model4_future_recommendation(
         ("model3_current_recommendations.csv", "model4_future_recommendations.csv"),
         ("summary.json", "model4_future_recommendation_summary.json"),
         ("log.txt", "model4_future_recommendation.log"),
+        ("after_rf_surfaces/after_rf_surface_combined.csv", "model4_after_rf_surface_combined.csv"),
+        ("after_rf_surfaces/before_rf_surface_combined.csv", "model4_before_rf_surface_combined.csv"),
+        ("after_rf_surfaces/after_cell_inventory_combined.csv", "model4_after_cell_inventory_combined.csv"),
+        ("after_rf_surfaces/manifest.json", "model4_after_rf_manifest.json"),
     ]
     for src_name, dest_name in rename_pairs:
         src = run_dir / src_name

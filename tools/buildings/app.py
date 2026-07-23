@@ -314,11 +314,11 @@ def test():
 # --- 7. Run the Application ---
 if __name__ == '__main__':
     print("\n" + "=" * 60)
-    print("🚀 Building Extraction Service (OPTIMIZED)")
-    print(f"📍 Running on: http://localhost:5001")
+    print(" Building Extraction Service (OPTIMIZED)")
+    print(f" Running on: http://localhost:5001")
     if not engine:
-        print("⚠️  Warning: Database connection failed or not configured.")
+        print(" Warning: Database connection failed or not configured.")
     else:
-        print("💾 Database saving is ON (BULK INSERT MODE).")
+        print(" Database saving is ON (BULK INSERT MODE).")
     print("=" * 60 + "\n")
     app.run(host='0.0.0.0', port=5001, debug=True)

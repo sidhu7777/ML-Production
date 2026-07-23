@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import json
 import math
+import random
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -37,6 +38,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 import folium
+import networkx as nx
 import pandas as pd
 import streamlit as st
 from streamlit_folium import st_folium
@@ -454,6 +456,132 @@ def inject_synthetic_mod_conflict(
     return site_df, description
 
 
+def detect_pci_group_conflicts(selected_sites_df: pd.DataFrame) -> list[dict]:
+    """
+    Grouped PCI (3GPP PCI group, N_ID_1): the 504 PCIs (0-503) are divided
+    into 168 groups of 3 consecutive values each. The group number is
+    `PCI // 3` (integer division), 0-167 — NOT "PCI % 30", which is what
+    the Site PCI table's earlier "Mod30 (SSS group)" column actually
+    computed. That was a rough approximation, not the real 3GPP formula;
+    this is the correct one. Two sites sharing a PCI group on the same
+    EARFCN means they share the same underlying SSS-derived group even
+    though their exact PCI (and PSS) differ.
+    """
+    df = selected_sites_df.dropna(subset=["site_pci", "site_earfcn", "site_id_inferred"]).copy()
+    if df.empty:
+        return []
+    df["site_pci"] = pd.to_numeric(df["site_pci"], errors="coerce")
+    df["site_earfcn"] = pd.to_numeric(df["site_earfcn"], errors="coerce")
+    df = df.dropna(subset=["site_pci", "site_earfcn"])
+    df["_group"] = df["site_pci"].astype(int) // 3
+
+    conflicts: list[dict] = []
+    for (group_val, earfcn_val), grp in df.groupby(["_group", "site_earfcn"]):
+        if grp["site_id_inferred"].nunique() < 2:
+            continue
+        members = sorted({(row.site_id_inferred, int(row.site_pci)) for row in grp.itertuples()})
+        conflicts.append(
+            {"type": "Grouped", "group_value": int(group_val), "earfcn": earfcn_val, "members": members}
+        )
+    conflicts.sort(key=lambda c: len(c["members"]), reverse=True)
+    return conflicts
+
+
+def inject_synthetic_group_conflict(site_df: pd.DataFrame, selected_site_ids: list, used_pcis: set) -> tuple[pd.DataFrame, str]:
+    """Fallback only (Grouped PCI conflicts occur naturally, like Mod-N) —
+    same approach as inject_synthetic_mod_conflict but bucketed by PCI//3
+    instead of PCI%N."""
+    candidates = site_df[site_df["site_id_inferred"].isin(selected_site_ids)].dropna(subset=["site_pci", "site_earfcn"]).copy()
+    candidates["site_pci"] = pd.to_numeric(candidates["site_pci"], errors="coerce")
+    candidates["site_earfcn"] = pd.to_numeric(candidates["site_earfcn"], errors="coerce")
+    candidates = candidates.dropna(subset=["site_pci", "site_earfcn"])
+    if len(candidates) < 2:
+        raise ValueError("Not enough sector data among selected sites to synthesize a Grouped PCI example.")
+
+    anchor = candidates.iloc[0]
+    target_site = candidates.iloc[1]["site_id_inferred"]
+    if target_site == anchor["site_id_inferred"] and len(candidates["site_id_inferred"].unique()) > 1:
+        target_site = candidates[candidates["site_id_inferred"] != anchor["site_id_inferred"]].iloc[0]["site_id_inferred"]
+
+    earfcn = anchor["site_earfcn"]
+    group_val = int(anchor["site_pci"]) // 3
+    new_pci = group_val * 3
+    while new_pci in used_pcis or new_pci == int(anchor["site_pci"]):
+        new_pci += 1
+        if new_pci >= group_val * 3 + 3:
+            raise ValueError("No free PCI value in that group available to synthesize a Grouped PCI example.")
+
+    site_df = site_df.copy()
+    if "is_synthetic" not in site_df.columns:
+        site_df["is_synthetic"] = False
+    new_row = {
+        "project_id": anchor.get("project_id"),
+        "network": anchor.get("network"),
+        "site_earfcn": earfcn,
+        "site_pci": new_pci,
+        "samples": 30,
+        "site_lat": anchor.get("site_lat"),
+        "site_lon": anchor.get("site_lon"),
+        "site_azimuth_deg": 0.0,
+        "site_azimuth_soft_deg": None,
+        "beamwidth_deg_est": 30.0,
+        "median_sample_distance_m": 150.0,
+        "site_id_inferred": target_site,
+        "site_source_table": SYNTHETIC_SOURCE_TABLE,
+        "is_synthetic": True,
+    }
+    site_df = pd.concat([site_df, pd.DataFrame([new_row])], ignore_index=True)
+    description = (
+        f"Synthetic (Grouped PCI): real site {target_site} given a synthetic PCI {new_pci} on EARFCN {int(earfcn)} "
+        f"(PCI group {group_val}, i.e. PCI//3), matching real site {anchor['site_id_inferred']}'s real PCI "
+        f"{int(anchor['site_pci'])}'s group — no natural Grouped PCI conflict existed among the selected sites."
+    )
+    return site_df, description
+
+
+def detect_co_centric_groups(selected_sites_df: pd.DataFrame, azimuth_tolerance_deg: float = 15.0) -> list[dict]:
+    """
+    Co-centric: sectors at the SAME physical site pointing in the SAME
+    direction (within azimuth_tolerance_deg) but on DIFFERENT EARFCNs —
+    same antenna location and coverage beam, different frequency layer/
+    technology (e.g. one site/sector broadcasting both LTE1800 and
+    LTE2100). This is structural/informational, not a fault by itself —
+    operators typically want a *consistent, predictable* PCI relationship
+    across a site's co-centric cells so they stay easy to identify and
+    manage; shown here to make that structure visible on the map (drawn
+    with a distinct color, not the red "conflict" border the other rules
+    use), not flagged as wrong.
+    """
+    df = selected_sites_df.dropna(subset=["site_pci", "site_earfcn", "site_id_inferred"]).copy()
+    if df.empty:
+        return []
+    df["site_pci"] = pd.to_numeric(df["site_pci"], errors="coerce")
+    df["site_earfcn"] = pd.to_numeric(df["site_earfcn"], errors="coerce")
+    df["_az"] = df.apply(
+        lambda r: r["site_azimuth_soft_deg"] if pd.notna(r.get("site_azimuth_soft_deg")) else r.get("site_azimuth_deg", 0.0),
+        axis=1,
+    )
+    df["_az"] = pd.to_numeric(df["_az"], errors="coerce")
+    df = df.dropna(subset=["site_pci", "site_earfcn", "_az"])
+    df["_az_bucket"] = (df["_az"] / azimuth_tolerance_deg).round().astype(int)
+
+    groups: list[dict] = []
+    for (site_id, az_bucket), grp in df.groupby(["site_id_inferred", "_az_bucket"]):
+        if grp["site_earfcn"].nunique() < 2:
+            continue
+        members = sorted({(int(row.site_earfcn), int(row.site_pci)) for row in grp.itertuples()})
+        groups.append(
+            {
+                "type": "Co-centric",
+                "site": site_id,
+                "azimuth_deg": float(grp["_az"].mean()),
+                "members": members,  # (earfcn, pci) pairs
+            }
+        )
+    groups.sort(key=lambda g: len(g["members"]), reverse=True)
+    return groups
+
+
 SYNTHETIC_SOURCE_TABLE = "synthetic"
 
 
@@ -717,6 +845,10 @@ def build_demo_selection(site_df: pd.DataFrame, events_df: pd.DataFrame, num_sit
 
 
 CONFLICT_BORDER_COLOR = "#DC2626"
+# Co-centric is structural/informational, not a fault -- distinct violet,
+# not the red used for every genuine conflict type (Collision, Confusion,
+# Mod-N, Grouped).
+CO_CENTRIC_BORDER_COLOR = "#7C3AED"
 
 
 def assign_site_labels(site_ids: list) -> dict:
@@ -739,21 +871,37 @@ def assign_site_labels(site_ids: list) -> dict:
 
 
 def build_conflict_summary_table(conflicts: list, site_labels: dict) -> pd.DataFrame:
-    """Handles three conflict shapes — Confusion (serving_site + neighbor_sites),
-    Collision (flat sites list, no serving-site concept), and Mod-N
-    (members: list of (site, pci) pairs sharing a PCI%N remainder, not an
-    exact PCI) — kept as genuinely distinct rows/types, never merged."""
+    """Handles five conflict shapes — Confusion (serving_site + neighbor_sites),
+    Collision (flat sites list), Mod-N (members: (site, pci) pairs sharing
+    a PCI%N remainder), Grouped (members: (site, pci) pairs sharing a
+    PCI//3 group), and Co-centric (single site + azimuth, members:
+    (earfcn, pci) pairs — no single EARFCN, that's the whole point) — kept
+    as genuinely distinct rows/types, never merged. PCI/EARFCN columns are
+    always strings across every row (mixed int/"" in one column breaks
+    Streamlit's Arrow serialization)."""
     rows = []
     for c in conflicts:
         detail = ""
+        earfcn = str(int(c["earfcn"])) if c.get("earfcn") is not None and pd.notna(c.get("earfcn")) else ""
         if c["type"] == "Confusion":
             serving_label = site_labels.get(c["serving_site"], c["serving_site"])
             involved = ", ".join(site_labels.get(s, s) for s in c["neighbor_sites"])
-            pci = str(c["pci"])  # kept as str across all rows -- Mod-N rows have no single PCI (mixed int/"" breaks Arrow)
+            pci = str(c["pci"])
         elif c["type"] == "Collision":
             serving_label = ""
             involved = ", ".join(site_labels.get(s, s) for s in c["sites"])
             pci = str(c["pci"])
+        elif c["type"] == "Grouped":
+            serving_label = ""
+            involved = ", ".join(f"{site_labels.get(s, s)} (PCI {p})" for s, p in c["members"])
+            pci = ""
+            detail = f"PCI Group {c['group_value']} (PCI // 3)"
+        elif c["type"] == "Co-centric":
+            serving_label = site_labels.get(c["site"], c["site"])
+            involved = ", ".join(f"EARFCN {ef} (PCI {p})" for ef, p in c["members"])
+            pci = ""
+            earfcn = ""  # deliberately blank -- Co-centric spans multiple EARFCNs by definition
+            detail = f"Azimuth ~{c['azimuth_deg']:.0f}°"
         else:  # Mod-N
             serving_label = ""
             involved = ", ".join(f"{site_labels.get(s, s)} (PCI {p})" for s, p in c["members"])
@@ -763,7 +911,7 @@ def build_conflict_summary_table(conflicts: list, site_labels: dict) -> pd.DataF
             {
                 "Type": c["type"],
                 "PCI": pci,
-                "EARFCN": c["earfcn"],
+                "EARFCN": earfcn,
                 "Serving Site": serving_label,
                 "Sites Involved": involved,
                 "Detail": detail,
@@ -789,7 +937,6 @@ def render_map(
     """
     site_labels = site_labels or {}
     conflict_types = conflict_types or {}
-    conflict_keys = set(conflict_types.keys())
     center_lat = pd.to_numeric(selected_sites_df["site_lat"], errors="coerce").mean()
     center_lon = pd.to_numeric(selected_sites_df["site_lon"], errors="coerce").mean()
     fmap = folium.Map(location=[center_lat, center_lon], zoom_start=17, tiles="CartoDB positron", control_scale=True)
@@ -851,7 +998,12 @@ def render_map(
             earfcn = sector.get("site_earfcn")
             pci_int = int(pci)
             key = (pci_int, int(earfcn)) if pd.notna(earfcn) else None
-            is_conflict = key in conflict_keys
+            types_here = conflict_types.get(key, set()) if key is not None else set()
+            is_conflict = bool(types_here)
+            # Co-centric-only is structural, not a fault -- violet, not red.
+            highlight_color = (
+                CO_CENTRIC_BORDER_COLOR if types_here and types_here == {"Co-centric"} else CONFLICT_BORDER_COLOR
+            )
             if filter_to_conflicts and not is_conflict:
                 continue
 
@@ -865,12 +1017,12 @@ def render_map(
                 f"Az {azimuth:.0f}° | Beamwidth {beamwidth:.0f}° | Samples {samples}"
             )
             if is_conflict:
-                tooltip += f" | {'/'.join(sorted(conflict_types[key]))}"
+                tooltip += f" | {'/'.join(sorted(types_here))}"
             if is_synthetic:
                 tooltip += " | SYNTHETIC (not real data)"
             folium.Polygon(
                 locations=triangle,
-                color=CONFLICT_BORDER_COLOR if is_conflict else color,
+                color=highlight_color if is_conflict else color,
                 weight=4 if is_conflict else 3,
                 fill=True,
                 fill_color=color,
@@ -888,7 +1040,7 @@ def render_map(
             label_distance = radius * (0.45 + 0.15 * (sector_idx % 3))
             label_lat, label_lon = compute_offset(site_lat, site_lon, label_distance, azimuth)
             border_style = "dashed" if is_synthetic else "solid"
-            border_color = CONFLICT_BORDER_COLOR if is_conflict else color
+            border_color = highlight_color if is_conflict else color
             border_width = "3px" if is_conflict else "2px"
             folium.Marker(
                 location=[label_lat, label_lon],
@@ -920,19 +1072,25 @@ def render_map(
 
 def conflict_types_by_key(conflicts: list) -> dict:
     """(pci, earfcn) -> set of type strings ("Collision", "Confusion",
-    "Mod1"/"Mod3"/"Mod7"/"Mod9") found for it among the given conflicts —
-    a key can carry several independently. Mod-N conflicts have no single
-    PCI (their members can have different real PCIs sharing one
-    remainder), so they contribute one key per (member site's real PCI,
-    EARFCN) instead of a single shared one."""
+    "Mod1"/"Mod3"/"Mod7"/"Mod9", "Grouped", "Co-centric") found for it
+    among the given conflicts — a key can carry several independently.
+    Mod-N/Grouped conflicts have no single PCI (their members can have
+    different real PCIs sharing one remainder/group), so they contribute
+    one key per (member site's real PCI, EARFCN). Co-centric has no
+    single EARFCN either (that's the whole point), so it contributes one
+    key per (member PCI, member EARFCN) pair directly."""
     out: dict = {}
     for c in conflicts:
+        if c["type"] == "Co-centric":
+            for earfcn, pci in c["members"]:
+                out.setdefault((pci, earfcn), set()).add(c["type"])
+            continue
         if pd.isna(c.get("earfcn")):
             continue
         earfcn = int(c["earfcn"])
         if c["type"] in ("Collision", "Confusion"):
             out.setdefault((c["pci"], earfcn), set()).add(c["type"])
-        else:  # Mod-N
+        else:  # Mod-N or Grouped
             for _site, pci in c["members"]:
                 out.setdefault((pci, earfcn), set()).add(c["type"])
     return out
@@ -1000,6 +1158,294 @@ def build_neighbor_table(selected_site_ids: list, pair_summary_df: pd.DataFrame,
     cols = ["Site", "From PCI", "Neighbor Site", "Neighbor PCI", "Handover Count", "Unique Sessions"]
     cols = [c for c in cols if c in neighbors.columns]
     return neighbors[cols].sort_values("Handover Count", ascending=False).reset_index(drop=True)
+
+
+# ============================================================
+# Graph-based PCI recommendation (v1 heuristic, pre-NSGA-II)
+#
+# Everything above this point DETECTS problems. This section
+# RECOMMENDS fixes: builds the real observed neighbor graph and
+# proposes new PCI values that reduce conflict cost against real
+# neighbors. Recommend-only — never mutates selected_sites_df, the
+# map, or the artifact. A later phase can swap this greedy solver
+# for a proper multi-objective one (e.g. NSGA-II via pymoo), reusing
+# the same graph and the same per-candidate cost function as one of
+# several competing fitness terms.
+# ============================================================
+
+PCI_MIN, PCI_MAX = 0, 503  # full 3GPP PCI range (504 values)
+
+
+def _candidates_by_distance(current_pci: int) -> list[int]:
+    """
+    Search order: nearest-to-current-PCI first (current+1, current-1,
+    current+2, current-2, ...), not ascending from 0. Real PCI replanning
+    wants the smallest possible change, not the lowest free number
+    anywhere in 0-503 — e.g. fixing PCI 100 should try 99/101 (same
+    group of 3, {99,100,101} — already a different PCI%3 by construction,
+    since a group's 3 members always have distinct remainders 0/1/2) and
+    only reach further, different groups (98, 102, 97, 103, ...) if
+    those don't clear the conflict. Falls back to the full 0-503 range
+    only if nothing within it works (defensive; every value gets tried
+    exactly once by construction, so this never actually happens).
+    """
+    candidates = []
+    for delta in range(1, PCI_MAX - PCI_MIN + 1):
+        up, down = current_pci + delta, current_pci - delta
+        if up <= PCI_MAX:
+            candidates.append(up)
+        if down >= PCI_MIN:
+            candidates.append(down)
+    return candidates
+
+
+def build_neighbor_graph(selected_sites_df: pd.DataFrame, events_df: pd.DataFrame) -> nx.Graph:
+    """
+    Nodes = every real (site, pci, earfcn) sector in the current
+    selection. Edges = REAL observed adjacency from events_df (the same
+    corrected, frequency-layer-aware handover data used by
+    detect_pci_confusion), weighted by handover count — "who actually
+    needs to avoid whom," independent of whether they currently conflict.
+    A literal networkx.Graph, not an ad hoc dict, so later graph-theoretic
+    work (centrality, formal coloring, NSGA-II's neighbor lookups) doesn't
+    need a rewrite.
+    """
+    df = selected_sites_df.dropna(subset=["site_pci", "site_earfcn", "site_id_inferred"]).copy()
+    df["site_pci"] = pd.to_numeric(df["site_pci"], errors="coerce")
+    df["site_earfcn"] = pd.to_numeric(df["site_earfcn"], errors="coerce")
+    df = df.dropna(subset=["site_pci", "site_earfcn"])
+
+    graph = nx.Graph()
+    node_by_site_pci: dict[tuple, tuple] = {}
+    for row in df.itertuples():
+        node = (row.site_id_inferred, int(row.site_pci), int(row.site_earfcn))
+        graph.add_node(node)
+        node_by_site_pci[(row.site_id_inferred, int(row.site_pci))] = node
+
+    required = {"from_site_id_inferred", "to_site_id_inferred", "from_pci", "to_pci"}
+    if not events_df.empty and required.issubset(events_df.columns):
+        events = events_df.dropna(subset=list(required)).copy()
+        for row in events.itertuples():
+            try:
+                from_pci, to_pci = int(float(row.from_pci)), int(float(row.to_pci))
+            except (TypeError, ValueError):
+                continue
+            u = node_by_site_pci.get((row.from_site_id_inferred, from_pci))
+            v = node_by_site_pci.get((row.to_site_id_inferred, to_pci))
+            if u is None or v is None or u == v:
+                continue
+            if graph.has_edge(u, v):
+                graph[u][v]["weight"] += 1
+            else:
+                graph.add_edge(u, v, weight=1)
+    return graph
+
+
+def _make_pci_pair_cost(check_exact: bool, mod_values: list, check_grouped: bool):
+    """
+    Builds the cost function for exactly the rules currently checked in
+    the sidebar — nothing else. 100 = exact PCI clash (only counted if
+    Collision or Confusion is checked), +10 per checked Mod-N whose
+    remainder also matches (only for the specific Mod values checked —
+    Mod3 checked doesn't imply Mod7 is also being avoided), +1 = same
+    PCI//3 (only if Grouped is checked). If a rule isn't checked, this
+    function doesn't penalize matching it at all — the optimizer must not
+    silently keep optimizing for a rule the user turned off.
+    """
+    def cost(pci_a: int, pci_b: int) -> int:
+        total = 0
+        if check_exact and pci_a == pci_b:
+            total += 100
+        for n in mod_values:
+            if pci_a % n == pci_b % n:
+                total += 10
+        if check_grouped and pci_a // 3 == pci_b // 3:
+            total += 1
+        return total
+
+    return cost
+
+
+def recommend_pci_reassignment(
+    graph: nx.Graph,
+    collision_conflicts: list,
+    confusion_conflicts: list,
+    mod_conflicts_by_n: dict,
+    grouped_conflicts: list,
+    check_collision: bool,
+    check_confusion: bool,
+    mod_values: list,
+    check_grouped: bool,
+) -> pd.DataFrame:
+    """
+    v1 graph-based heuristic — explicitly not NSGA-II.
+
+    Only optimizes for rules actually checked in the sidebar: pass an
+    empty list for any conflict type that's unchecked, and False/empty
+    for the matching check_*/mod_values flag. A sector never flagged by
+    any CHECKED rule is left alone entirely, and the candidate search
+    itself only penalizes matching whatever's checked — e.g. with only
+    Collision checked, it won't avoid a Mod3 match at all, and may well
+    land on a PCI that still shares Mod3 with something (expected: that
+    rule isn't active). `mod_conflicts_by_n` is {mod_n: conflicts} for
+    each checked Mod value only (a sector can be touched by more than one
+    checked Mod rule at once, e.g. Mod3 and Mod7 both checked).
+
+    Collision/Mod-N/Grouped conflicts are defined by detect_pci_collisions/
+    detect_pci_mod_conflicts/detect_pci_group_conflicts as EARFCN-scoped
+    across the WHOLE selection, among DIFFERENT sites only (site_id_inferred.
+    nunique() >= 2) — any two different sites sharing a PCI/remainder/group
+    on the same EARFCN, with no requirement of a real observed handover
+    between them. The candidate search matches this exactly: cost is
+    computed against every OTHER sector in the selection sharing the same
+    EARFCN AND a different site (confirmed bug, now fixed: a site's own
+    other sectors were previously being counted too) — not graph edges,
+    which missed conflict partners with no real handover between them
+    (e.g. two sites that are each only a neighbor of a common third site).
+    The graph is used only to decide processing ORDER (highest-degree
+    touched node first — standard greedy-coloring heuristic).
+    """
+    # Track WHICH conflict type(s) flagged each node, not just a flat
+    # touched set — the table needs to say "Collision" / "Mod3" / etc by
+    # name, not just a cost number, and severity comes directly from this.
+    touched_types: dict[tuple, set] = {}
+    for c in collision_conflicts:
+        for s in c["sites"]:
+            touched_types.setdefault((s, c["pci"]), set()).add("Collision")
+    for c in confusion_conflicts:
+        for s in c["neighbor_sites"]:
+            touched_types.setdefault((s, c["pci"]), set()).add("Confusion")
+    for n, conflicts in mod_conflicts_by_n.items():
+        for c in conflicts:
+            for s, p in c["members"]:
+                touched_types.setdefault((s, p), set()).add(f"Mod{n}")
+    for c in grouped_conflicts:
+        for s, p in c["members"]:
+            touched_types.setdefault((s, p), set()).add("Grouped")
+
+    if not touched_types:
+        return pd.DataFrame()
+
+    pair_cost = _make_pci_pair_cost(check_collision or check_confusion, mod_values, check_grouped)
+
+    node_by_site_pci = {(n[0], n[1]): n for n in graph.nodes}
+    target_nodes = [node_by_site_pci[k] for k in touched_types if k in node_by_site_pci]
+    target_nodes.sort(key=lambda n: graph.degree(n), reverse=True)
+
+    nodes_by_earfcn: dict[int, list] = {}
+    for n in graph.nodes:
+        nodes_by_earfcn.setdefault(n[2], []).append(n)
+
+    assignments: dict = {}
+    rows = []
+    for node in target_nodes:
+        site_id, current_pci, earfcn = node
+        # Only DIFFERENT sites count — matches detect_pci_collisions/
+        # detect_pci_mod_conflicts/detect_pci_group_conflicts, which all
+        # require site_id_inferred.nunique() >= 2 before flagging anything.
+        others = [n for n in nodes_by_earfcn.get(earfcn, []) if n[0] != site_id]
+        other_pcis = [assignments.get(n, n[1]) for n in others]
+
+        before_cost = sum(pair_cost(current_pci, npci) for npci in other_pcis)
+
+        # Search order depends on whether Grouped is checked:
+        #   - Grouped checked: nearest-to-current first (see
+        #     _candidates_by_distance) — smallest possible change that
+        #     clears every checked conflict, not the lowest free number
+        #     anywhere in 0-503.
+        #   - Grouped unchecked: a fully random candidate order. Nearest-
+        #     first would land in the same/adjacent 3GPP group far more
+        #     often than chance (groups are 3 consecutive PCIs), which
+        #     looks like group-preserving behavior even when Grouped was
+        #     never checked. Random order removes that coincidence
+        #     entirely when group isn't an active rule.
+        if check_grouped:
+            search_order = _candidates_by_distance(current_pci)
+        else:
+            search_order = [p for p in range(PCI_MIN, PCI_MAX + 1) if p != current_pci]
+            random.shuffle(search_order)
+
+        best_pci, best_cost = current_pci, before_cost
+        for candidate in search_order:
+            cost = sum(pair_cost(candidate, npci) for npci in other_pcis)
+            if cost < best_cost:
+                best_cost, best_pci = cost, candidate
+            if cost == 0:
+                break
+        assignments[node] = best_pci
+
+        rows.append(
+            {
+                "site": site_id,
+                "current_pci": current_pci,
+                "suggested_pci": best_pci,
+                "earfcn": earfcn,
+                "before_cost": before_cost,
+                "after_cost": best_cost,
+                "num_same_earfcn_sectors": len(other_pcis),
+                "conflict_types": touched_types.get((site_id, current_pci), set()),
+            }
+        )
+
+    return pd.DataFrame(rows)
+
+
+# Highest severity wins when a sector is flagged by more than one rule.
+# Any "Mod<n>" type (Mod1/Mod3/Mod7/Mod9, not just Mod3) -> Medium.
+_SEVERITY_BY_TYPE = {"Collision": "Severe", "Confusion": "Severe", "Grouped": "Low"}
+_SEVERITY_RANK = {"Severe": 3, "Medium": 2, "Low": 1}
+
+
+def _severity_for_type(t: str) -> str:
+    if t in _SEVERITY_BY_TYPE:
+        return _SEVERITY_BY_TYPE[t]
+    return "Medium" if t.startswith("Mod") else "Low"
+
+
+def _severity_label(types_here: set) -> str:
+    if not types_here:
+        return ""
+    return max((_severity_for_type(t) for t in types_here), key=lambda s: _SEVERITY_RANK[s])
+
+
+def build_recommendation_table(recs: pd.DataFrame, site_labels: dict) -> pd.DataFrame:
+    """Human-readable version: which rule(s) flagged this sector, how
+    severe (Severe = Collision/Confusion, Medium = Mod3/PSS, Low =
+    Grouped/SSS — same severity scale _pci_pair_cost uses: 100/10/1), and
+    exactly what to change it to."""
+    if recs.empty:
+        return recs
+    out = recs.copy()
+    out["Site"] = out["site"].map(lambda s: site_labels.get(s, s))
+    out["Issue Type"] = out["conflict_types"].map(lambda types: ", ".join(sorted(types)))
+    out["Severity"] = out["conflict_types"].map(_severity_label)
+    out["Changed"] = out["current_pci"] != out["suggested_pci"]
+    out["Recommendation"] = out.apply(
+        lambda r: (
+            f"Change PCI {r['current_pci']} -> {r['suggested_pci']}"
+            if r["Changed"]
+            else f"Keep PCI {r['current_pci']} (already best option)"
+        ),
+        axis=1,
+    )
+    out = out.rename(
+        columns={
+            "current_pci": "Current PCI",
+            "suggested_pci": "Suggested PCI",
+            "earfcn": "EARFCN",
+            "before_cost": "Conflict Cost Before",
+            "after_cost": "Conflict Cost After",
+            "num_same_earfcn_sectors": "Same-EARFCN Sectors Considered",
+        }
+    )
+    cols = [
+        "Site", "Issue Type", "Severity", "Recommendation", "Current PCI", "Suggested PCI", "EARFCN",
+        "Changed", "Conflict Cost Before", "Conflict Cost After", "Same-EARFCN Sectors Considered",
+    ]
+    return out[cols].sort_values(
+        by=["Severity", "Conflict Cost Before"], key=lambda s: s.map(_SEVERITY_RANK) if s.name == "Severity" else s,
+        ascending=False,
+    ).reset_index(drop=True)
 
 
 def main() -> None:
@@ -1071,6 +1517,43 @@ def main() -> None:
                 key=f"mod_remainder_{n}",
                 help=f"Only PCIs where PCI % {n} equals this value.",
             )
+    show_grouped = st.sidebar.checkbox(
+        "Grouped PCI",
+        value=False,
+        help="2+ shown sites whose PCI falls in the same 3GPP PCI group (PCI // 3, 168 groups of 3) on the same EARFCN.",
+    )
+    show_co_centric = st.sidebar.checkbox(
+        "Co-centric",
+        value=False,
+        help=(
+            "Sectors at the SAME site pointing the SAME direction but on DIFFERENT EARFCNs "
+            "(e.g. LTE1800 + LTE2100 on one sector) — informational, not a fault; shown in violet, not red."
+        ),
+    )
+
+    st.sidebar.header("Optimizer (beta)")
+    run_optimizer_clicked = st.sidebar.button(
+        "Run graph-based PCI optimizer",
+        help=(
+            "Builds the real observed neighbor graph (networkx) and proposes new PCI values "
+            "for conflicted sectors via a greedy multi-constraint heuristic. Recommend-only — "
+            "never changes the map or the sites shown above."
+        ),
+    )
+    # st.button() only returns True on the exact rerun where it was
+    # clicked -- any other widget interaction afterward (a rule checkbox,
+    # anything) triggers a fresh rerun where it silently reverts to False
+    # and the whole recommendation section vanishes, even though it was
+    # run. Persist it in session_state (same pattern as pci_map_loaded)
+    # so it stays visible until you reload the page.
+    if "show_optimizer" not in st.session_state:
+        st.session_state["show_optimizer"] = False
+    if run_optimizer_clicked:
+        st.session_state["show_optimizer"] = True
+    if st.session_state["show_optimizer"]:
+        hide_optimizer = st.sidebar.button("Hide recommendation")
+        if hide_optimizer:
+            st.session_state["show_optimizer"] = False
 
     if "pci_map_loaded" not in st.session_state:
         st.session_state["pci_map_loaded"] = False
@@ -1135,6 +1618,19 @@ def main() -> None:
                 st.error(f"Could not find or synthesize a Mod{mod_n} example: {exc}")
         mod_conflicts[mod_n] = found
 
+    # Grouped PCI (PCI // 3, the correct 3GPP formula) — same
+    # naturally-occurring pattern as Mod-N, synthetic fallback rarely fires.
+    grouped_conflicts = detect_pci_group_conflicts(selected_sites_df)
+    if show_grouped and not grouped_conflicts:
+        try:
+            selected_sites_df, grouped_note = inject_synthetic_group_conflict(selected_sites_df, selected_site_ids, used_pcis)
+            st.warning(grouped_note)
+            grouped_conflicts = detect_pci_group_conflicts(selected_sites_df)
+        except Exception as exc:  # noqa: BLE001
+            st.error(f"Could not find or synthesize a Grouped PCI example: {exc}")
+
+    co_centric_groups = detect_co_centric_groups(selected_sites_df)
+
     # site_id_inferred is an internal join key, not a display name — ~46% of
     # real sites in this project have it partly asterisked because the
     # Android OS itself redacts the Tracking Area Code for privacy
@@ -1161,12 +1657,16 @@ def main() -> None:
         (collision_conflicts if show_collision else [])
         + (confusion_conflicts if show_confusion else [])
         + active_mod_conflicts
+        + (grouped_conflicts if show_grouped else [])
+        + (co_centric_groups if show_co_centric else [])
     )
     conflict_types = conflict_types_by_key(active_conflicts)
     active_labels = (
         (["Collision"] if show_collision else [])
         + (["Confusion"] if show_confusion else [])
         + [f"Mod{n}={mod_remainder[n]}" for n in MOD_RULE_VALUES if show_mod[n]]
+        + (["Grouped PCI"] if show_grouped else [])
+        + (["Co-centric"] if show_co_centric else [])
     )
 
     if not active_labels:
@@ -1204,6 +1704,48 @@ def main() -> None:
             st.info("No observed handovers involving these sites in the filtered log data.")
         else:
             st.dataframe(neighbor_table, use_container_width=True)
+
+    if st.session_state["show_optimizer"]:
+        st.markdown("---")
+        st.markdown("### Graph-based PCI recommendation (beta)")
+        mod_values_checked = [n for n in MOD_RULE_VALUES if show_mod[n]]
+        active_rule_labels = (
+            (["Collision"] if show_collision else [])
+            + (["Confusion"] if show_confusion else [])
+            + [f"Mod{n}" for n in mod_values_checked]
+            + (["Grouped"] if show_grouped else [])
+        )
+        st.caption(
+            "Only optimizes for the rule(s) currently checked above: "
+            + (", ".join(active_rule_labels) if active_rule_labels else "none — check a rule first")
+            + ". Real observed neighbor graph (networkx) sets processing order only; each candidate PCI is "
+            "scored against every OTHER SITE's sector on the same EARFCN (not same-site sectors, not just "
+            "real neighbors — that's how Collision/Mod-N/Grouped are actually defined) — a first-pass greedy "
+            "heuristic, not the eventual NSGA-II solver. Recommend-only: nothing above (map/tables) changes."
+        )
+        if not active_rule_labels:
+            st.warning("No PCI rule is checked above — check at least one (Collision, Confusion, a Mod, or Grouped) to run the optimizer.")
+        else:
+            graph = build_neighbor_graph(selected_sites_df, events_df)
+            mod_conflicts_checked = {n: mod_conflicts.get(n, []) for n in mod_values_checked}
+            recs = recommend_pci_reassignment(
+                graph,
+                collision_conflicts if show_collision else [],
+                confusion_conflicts if show_confusion else [],
+                mod_conflicts_checked,
+                grouped_conflicts if show_grouped else [],
+                check_collision=show_collision,
+                check_confusion=show_confusion,
+                mod_values=mod_values_checked,
+                check_grouped=show_grouped,
+            )
+            if recs.empty:
+                st.info("No conflicts found for the currently checked rule(s) among the selected sites — nothing to recommend.")
+            else:
+                st.dataframe(build_recommendation_table(recs, site_labels), use_container_width=True)
+                total_before = int(recs["before_cost"].sum())
+                total_after = int(recs["after_cost"].sum())
+                st.caption(f"Total conflict cost across recommended sectors: {total_before} -> {total_after}.")
 
 
 if __name__ == "__main__":

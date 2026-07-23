@@ -691,6 +691,7 @@ class LTEPredictionService:
                 """
                 SELECT
                     project_id,
+                    baseline_job_id,
                     region,
                     lat,
                     lon,
@@ -732,8 +733,14 @@ class LTEPredictionService:
             conn,
             params={"project_id": int(project_id), "region": str(region).lower()},
         )
+        if "baseline_job_id" in out.columns and "baseline_job_id" in existing.columns:
+            target_jobs = set(_clean_text_series(out["baseline_job_id"]).dropna().astype(str))
+            if target_jobs:
+                existing = existing.loc[
+                    _clean_text_series(existing["baseline_job_id"]).astype(str).isin(target_jobs)
+                ].copy()
 
-        key_cols = ["project_id", "region", "nodeb_id_cell_id", "lat", "lon"]
+        key_cols = ["project_id", "baseline_job_id", "region", "nodeb_id_cell_id", "lat", "lon"]
         compare_cols = [
             "operator",
             "grid_id",
@@ -898,6 +905,7 @@ class LTEPredictionService:
                         FROM {table_name} AS tgt
                         INNER JOIN {staging_table} AS src
                             ON tgt.project_id = src.project_id
+                           AND tgt.baseline_job_id = src.baseline_job_id
                            AND tgt.region = src.region
                            AND tgt.nodeb_id_cell_id = src.nodeb_id_cell_id
                            AND tgt.lat = src.lat
@@ -996,6 +1004,7 @@ class LTEPredictionService:
                         f"""
                         CREATE TEMPORARY TABLE {staging_key_table} (
                             project_id BIGINT NOT NULL,
+                            baseline_job_id VARCHAR(100) NOT NULL,
                             region VARCHAR(50) NOT NULL,
                             nodeb_id_cell_id VARCHAR(100) NOT NULL,
                             lat DOUBLE NOT NULL,
@@ -1021,6 +1030,7 @@ class LTEPredictionService:
                         FROM {table_name} AS tgt
                         INNER JOIN {staging_key_table} AS stale
                             ON tgt.project_id = stale.project_id
+                           AND tgt.baseline_job_id = stale.baseline_job_id
                            AND tgt.region = stale.region
                            AND tgt.nodeb_id_cell_id = stale.nodeb_id_cell_id
                            AND tgt.lat = stale.lat
@@ -1424,7 +1434,7 @@ class LTEPredictionService:
 
         geo_out = geo_out.dropna(subset=["lat", "lon", "nodeb_id_cell_id"]).copy()
         geo_out = geo_out[schema_cols].drop_duplicates(
-            subset=["project_id", "nodeb_id_cell_id", "lat", "lon"],
+            subset=["project_id", "baseline_job_id", "nodeb_id_cell_id", "lat", "lon"],
             keep="last",
         )
 

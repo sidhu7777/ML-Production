@@ -8,6 +8,7 @@ import os
 import re
 import shutil
 import sys
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -59,6 +60,7 @@ class CurrentModel3Config:
     action_neighbor_cells: int = 2
     sector_parallelism: int = 1
     stop_on_partial: bool = False
+    dashboard_model_label: str = "Model 3"
 
 
 def _timestamp() -> str:
@@ -73,6 +75,12 @@ def _ensure_dir(path: Path) -> Path:
 def _save_json(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, indent=2, default=str), encoding="utf-8")
+
+
+def _safe_name(value: Any) -> str:
+    text = str(value or "").strip()
+    text = re.sub(r"[^A-Za-z0-9_.-]+", "_", text)
+    return text.strip("_") or "unknown"
 
 
 def _pick_rrc_group_cols(df: pd.DataFrame) -> list[str] | None:
@@ -745,12 +753,24 @@ def _build_current_inventory_from_surface(
     return enriched, cell_inventory
 
 
-def _choose_load_balance_candidate_current(sector_cells: pd.DataFrame, threshold: float) -> dict[str, Any] | None:
+def _choose_load_balance_candidate_current(
+    sector_cells: pd.DataFrame,
+    threshold: float,
+    source_node_cell_id: str | None = None,
+) -> dict[str, Any] | None:
     if len(sector_cells) < 2:
         return None
     ordered = sector_cells.sort_values(["prb_rrc_pressure", "grid_count"], ascending=[False, False], na_position="last").reset_index(drop=True)
-    source = ordered.iloc[0]
-    peers = ordered.iloc[1:].copy()
+    source_key = str(source_node_cell_id or "").strip()
+    if source_key:
+        source_mask = ordered["Node_Cell_ID"].astype(str).str.strip().eq(source_key)
+        if not bool(source_mask.any()):
+            return None
+        source = ordered.loc[source_mask].iloc[0]
+        peers = ordered.loc[~source_mask].copy()
+    else:
+        source = ordered.iloc[0]
+        peers = ordered.iloc[1:].copy()
     if "canonical_physical_cell_id" in peers.columns and "canonical_physical_cell_id" in source.index:
         source_canonical = str(source.get("canonical_physical_cell_id") or "").strip()
         if source_canonical:
@@ -797,8 +817,9 @@ def _choose_load_balance_candidate_current(sector_cells: pd.DataFrame, threshold
 def _run_load_balance_current(
     sector_cells: pd.DataFrame,
     config: CurrentModel3Config,
+    source_node_cell_id: str | None = None,
 ) -> dict[str, Any]:
-    candidate = _choose_load_balance_candidate_current(sector_cells, config.congestion_threshold)
+    candidate = _choose_load_balance_candidate_current(sector_cells, config.congestion_threshold, source_node_cell_id)
     if candidate is None:
         return {
             "status": "No Material Change",
@@ -969,7 +990,7 @@ def _fix_synthetic_frequency(site_df: pd.DataFrame) -> pd.DataFrame:
     out = site_df.loc[:, ~site_df.columns.duplicated()].copy()
     if "carrier_variant" not in out.columns or "band" not in out.columns:
         return out
-    synthetic = out["carrier_variant"].astype(str).str.startswith(("carrier_add", "new_site", "sector_split"))
+    synthetic = out["carrier_variant"].astype(str).str.startswith(("carrier_add", "new_site", "sector_split", "add_sector"))
     if not synthetic.any():
         return out
     band = pd.to_numeric(out.loc[synthetic, "band"], errors="coerce")
@@ -1027,7 +1048,7 @@ def _prepare_production_scope_site_frames(
         values = pd.to_numeric(source.get(col), errors="coerce")
         source_numeric[col] = float(values.dropna().iloc[0]) if values.notna().any() else np.nan
 
-    synthetic_mask = modified["carrier_variant"].astype(str).str.startswith(("carrier_add", "new_site", "sector_split"), na=False)
+    synthetic_mask = modified["carrier_variant"].astype(str).str.startswith(("carrier_add", "new_site", "sector_split", "add_sector"), na=False)
     for col, value in source_numeric.items():
         if pd.notna(value):
             modified.loc[synthetic_mask, f"orig_{col}"] = value
@@ -1506,6 +1527,9 @@ def _evaluate_action_inventory_current(
             # existing sector carriers plus the added carrier.
             source_carriers = max(1, int(len(sector_cells)))
             share_factor = float(max(2, source_carriers + 1))
+        elif action_label == "current_sector_add" and after_ids.str.contains(r"(^|_)AS\d+$", regex=True).any():
+            added_count = int(after_ids.str.contains(r"(^|_)AS\d+$", regex=True).sum())
+            share_factor = float(max(2, added_count + 1))
         elif action_label == "current_sector_split" and after_ids.str.contains(r"(_|__)SS[AB]$", regex=True).any():
             share_factor = 2.0
         elif action_label == "current_new_site":
@@ -1822,6 +1846,60 @@ def _build_current_sector_split_topology(
         future_rules._first_non_empty(sector_cells["sector_id"]),
         len(source_rows),
         len(split_df),
+        demand_lat,
+        demand_lon,
+        bearing,
+    )
+    return combined, source_rows
+
+
+def _build_current_add_sector_topology(
+    sector_cells: pd.DataFrame,
+    part3_site_df: pd.DataFrame,
+    context: dict[str, Any],
+    logger,
+    carrier_count: int = 1,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    work = part3_site_df.copy()
+    source_rows = future_rules._extract_source_site_rows(sector_cells, part3_site_df)
+    if source_rows.empty:
+        return work, source_rows
+
+    carrier_count = max(1, int(carrier_count or 1))
+    demand_lat, demand_lon, bearing = _demand_centroid_for_sector(sector_cells, context, source_rows)
+    template = source_rows.copy()
+    if "band" in template.columns:
+        template["_band_priority"] = pd.to_numeric(template["band"], errors="coerce").map(
+            lambda value: future_rules.BAND_PRIORITY.get(float(value), 0) if pd.notna(value) else 0
+        )
+        template = template.sort_values("_band_priority", ascending=False).drop(columns=["_band_priority"], errors="ignore")
+    selected = template.head(min(carrier_count, len(template))).copy()
+    base_sector = str(future_rules._first_non_empty(sector_cells.get("sector_id", pd.Series(dtype=object))) or "")
+    sector_num = base_sector.split("|", 1)[1] if "|" in base_sector else str(selected.iloc[0].get("sector") or "1")
+    add_rows: list[pd.DataFrame] = []
+    for idx, (_, row) in enumerate(selected.iterrows(), start=1):
+        child = row.copy()
+        base_cell = str(row.get("cell_id") or row.get("Node_Cell_ID") or "CELL").strip()
+        band_num = future_rules._scalar_to_int(row.get("band"), 1800)
+        child["cell_id"] = f"{base_cell}__AS{idx}"
+        child["Node_Cell_ID"] = str(child["cell_id"])
+        child["sector"] = f"{sector_num}A"
+        child["azimuth"] = float(bearing % 360.0)
+        child["carrier_variant"] = f"add_sector_{idx}"
+        child["frequency_mhz"] = float(band_num)
+        child["frequency"] = float(band_num)
+        child["earfcn"] = float(future_rules.SYNTHETIC_BAND_TO_EARFCN.get(band_num, band_num))
+        if "PCI" in child.index:
+            child["PCI"] = int((future_rules._scalar_to_int(child.get("PCI"), 0) + 53 + idx * 17) % 504)
+        add_rows.append(pd.DataFrame([child]))
+    add_df = pd.concat(add_rows, ignore_index=True) if add_rows else pd.DataFrame(columns=work.columns)
+    combined = pd.concat([work, add_df], ignore_index=True, sort=False)
+    combined = combined.loc[:, ~combined.columns.duplicated()].copy()
+    logger.info(
+        "current_add_sector_topology sector=%s source_rows=%d add_rows=%d demand_lat=%.7f demand_lon=%.7f bearing=%.1f",
+        future_rules._first_non_empty(sector_cells["sector_id"]),
+        len(source_rows),
+        len(add_df),
         demand_lat,
         demand_lon,
         bearing,
@@ -2151,6 +2229,24 @@ def _rerun_current_topology(
         corrected_gid = pd.to_numeric(corrected_local.get("grid_id"), errors="coerce")
         baseline_local = baseline_local.loc[baseline_gid.isin(lineage_grid_ids)].copy()
         corrected_local = corrected_local.loc[corrected_gid.isin(lineage_grid_ids)].copy()
+    if baseline_local.empty or corrected_local.empty:
+        logger.info(
+            "%s_production_scope_failed reason=empty_lineage_surface before_rows=%d after_rows=%d lineage_grids=%d",
+            action_label,
+            len(baseline_local),
+            len(corrected_local),
+            len(lineage_grid_ids),
+        )
+        return {
+            "status": "Recommended",
+            "action_reason": f"{action_label} RF rerun produced no usable lineage prediction points for this action.",
+            "projected_prb_after_pct": np.nan,
+            "projected_rrc_after_pct": np.nan,
+            "projected_rrc_users_after": np.nan,
+            "next_step": "New Site",
+            "resimulation_required": True,
+            "resimulation_flow": f"{action_label} topology -> production affected cells -> empty lineage RF surface",
+        }
     source_capacity_values = pd.to_numeric(sector_cells.get("estimated_dl_capacity_mbps"), errors="coerce")
     source_capacity_fallback = float(source_capacity_values.median()) if source_capacity_values.notna().any() else None
     enriched_local, local_inventory = _build_current_inventory_from_surface(
@@ -2164,6 +2260,41 @@ def _rerun_current_topology(
         lineage_grid_ids=lineage_grid_ids,
         source_capacity_fallback=source_capacity_fallback,
     )
+    after_rf_dir = context.get("after_rf_dir")
+    if after_rf_dir:
+        try:
+            after_rf_dir = Path(after_rf_dir)
+            after_rf_dir.mkdir(parents=True, exist_ok=True)
+            sector_key = _safe_name(future_rules._first_non_empty(sector_cells.get("sector_id", pd.Series(dtype=object))))
+            file_key = f"{_safe_name(action_label)}_{sector_key}_{threading.get_ident()}_{int(time.time() * 1000)}"
+            baseline_path = after_rf_dir / f"{file_key}_before_rf_surface.csv"
+            corrected_path = after_rf_dir / f"{file_key}_after_rf_surface.csv"
+            inventory_path = after_rf_dir / f"{file_key}_after_cell_inventory.csv"
+            baseline_local.to_csv(baseline_path, index=False)
+            corrected_local.to_csv(corrected_path, index=False)
+            local_inventory.to_csv(inventory_path, index=False)
+            context.setdefault("after_rf_records", []).append(
+                {
+                    "action_label": action_label,
+                    "sector_id": future_rules._first_non_empty(sector_cells.get("sector_id", pd.Series(dtype=object))),
+                    "before_rf_surface_csv": str(baseline_path),
+                    "after_rf_surface_csv": str(corrected_path),
+                    "after_cell_inventory_csv": str(inventory_path),
+                    "rows_before": int(len(baseline_local)),
+                    "rows_after": int(len(corrected_local)),
+                    "cells_after": int(corrected_local.get("Node_Cell_ID", pd.Series(dtype=object)).nunique(dropna=True)),
+                }
+            )
+            logger.info(
+                "%s_after_rf_artifacts sector=%s before_rows=%d after_rows=%d path=%s",
+                action_label,
+                future_rules._first_non_empty(sector_cells.get("sector_id", pd.Series(dtype=object))),
+                len(baseline_local),
+                len(corrected_local),
+                corrected_path,
+            )
+        except Exception as exc:
+            logger.info("%s_after_rf_artifact_save_failed reason=%s", action_label, exc)
     candidate_node_cell_ids: set[str] = set()
     for col in ["Node_Cell_ID", "original_node_cell_id", "original_cell_id"]:
         if col in corrected_local.columns:
@@ -2204,8 +2335,38 @@ def _simulate_current_recommendation(
     config: CurrentModel3Config,
     logger,
     context: dict[str, Any],
+    source_node_cell_id: str | None = None,
 ) -> dict[str, Any]:
-    source_row = sector_cells.sort_values(["prb_rrc_pressure", "grid_count"], ascending=[False, False], na_position="last").iloc[0]
+    ordered_sector_cells = sector_cells.sort_values(["prb_rrc_pressure", "grid_count"], ascending=[False, False], na_position="last").copy()
+    source_key = str(source_node_cell_id or "").strip()
+    if source_key:
+        source_match = ordered_sector_cells.loc[ordered_sector_cells["Node_Cell_ID"].astype(str).str.strip().eq(source_key)]
+        if source_match.empty:
+            return {
+                "action": "Skipped",
+                "status": "Skipped",
+                "decision_path": "Missing source cell",
+                "attempted_actions": "",
+                "load_balance_possible": False,
+                "selected_peer_node_cell_id": "",
+                "selected_peer_band": "",
+                "projected_prb_after_pct": np.nan,
+                "projected_rrc_after_pct": np.nan,
+                "projected_rrc_users_after": np.nan,
+                "action_reason": f"Requested congested source cell was not present in sector scope: {source_key}",
+                "next_step": "",
+                "resimulation_required": False,
+                "resimulation_flow": "",
+            }
+        source_row = source_match.iloc[0]
+        ordered_sector_cells = pd.concat(
+            [source_match, ordered_sector_cells.loc[~ordered_sector_cells["Node_Cell_ID"].astype(str).str.strip().eq(source_key)]],
+            ignore_index=True,
+            sort=False,
+        )
+    else:
+        source_row = ordered_sector_cells.iloc[0]
+    sector_cells = ordered_sector_cells
     source_prb = float(source_row["prb_before_pct"]) if pd.notna(source_row["prb_before_pct"]) else np.nan
     source_rrc = float(source_row["rrc_before_pct"]) if pd.notna(source_row["rrc_before_pct"]) else np.nan
     pressure = max(source_prb if pd.notna(source_prb) else 0.0, source_rrc if pd.notna(source_rrc) else 0.0)
@@ -2230,7 +2391,7 @@ def _simulate_current_recommendation(
 
     attempted_actions: list[str] = []
 
-    load_result = _run_load_balance_current(sector_cells, config)
+    load_result = _run_load_balance_current(sector_cells, config, str(source_row["Node_Cell_ID"]))
     if load_result["selected_peer_node_cell_id"]:
         attempted_actions.append(f"Load Balance[{load_result['status']}]")
     if load_result["selected_peer_node_cell_id"] and not bool(load_result.get("should_fallthrough")):
@@ -2256,9 +2417,12 @@ def _simulate_current_recommendation(
 
     can_add = bool(sector_cells["carrier_addition_possible"].any()) and not bool(sector_cells["carrier_addition_blocked"].all())
     if context.get("excel_input_mode"):
-        if can_add:
+        source_can_add = bool(source_row.get("carrier_addition_possible")) and not bool(source_row.get("carrier_addition_blocked"))
+        if source_can_add:
             add_row = sector_cells.loc[
-                sector_cells["carrier_addition_possible"] & ~sector_cells["carrier_addition_blocked"]
+                sector_cells["carrier_addition_possible"]
+                & ~sector_cells["carrier_addition_blocked"]
+                & sector_cells["Node_Cell_ID"].astype(str).str.strip().eq(str(source_row["Node_Cell_ID"]).strip())
             ].sort_values(["prb_rrc_pressure", "grid_count"], ascending=[False, False], na_position="last")
             band = str(add_row.iloc[0]["recommended_band_to_add"]).strip() if not add_row.empty else ""
             return {
@@ -2295,9 +2459,11 @@ def _simulate_current_recommendation(
         }
 
     carrier_add_attempted = False
-    add_row = sector_cells.loc[sector_cells["carrier_addition_possible"] & ~sector_cells["carrier_addition_blocked"]].sort_values(
-        ["prb_rrc_pressure", "grid_count"], ascending=[False, False], na_position="last"
-    )
+    add_row = sector_cells.loc[
+        sector_cells["carrier_addition_possible"]
+        & ~sector_cells["carrier_addition_blocked"]
+        & sector_cells["Node_Cell_ID"].astype(str).str.strip().eq(str(source_row["Node_Cell_ID"]).strip())
+    ].copy()
     if can_add and not add_row.empty and str(add_row.iloc[0]["recommended_band_to_add"]).strip():
         band = str(add_row.iloc[0]["recommended_band_to_add"]).strip()
         carrier_add_attempted = True
@@ -2330,7 +2496,7 @@ def _simulate_current_recommendation(
                 **resim,
             }
 
-    sector_split_possible = bool(
+    add_sector_possible = bool(
         int(source_row["sector_cell_count"]) >= 1
         and (not can_add or carrier_add_attempted)
         and (
@@ -2342,38 +2508,37 @@ def _simulate_current_recommendation(
             or bool(sector_cells["carrier_addition_blocked"].all())
         )
     )
-    if sector_split_possible:
-        site_df, source_rows = _build_current_sector_split_topology(
-            sector_cells,
-            context["part3_site_df"],
-            context,
-            logger,
-        )
-        site_df = _fix_synthetic_frequency(site_df)
-        resim = _rerun_current_topology(
-            sector_cells=sector_cells,
-            config=config,
-            context=context,
-            logger=logger,
-            action_label="current_sector_split",
-            site_df=site_df,
-            source_rows=source_rows,
-        )
-        attempted_actions.append(f"Sector Split[{resim['status']}]")
-        if str(resim["status"]) == "Resolved" or (config.stop_on_partial and str(resim["status"]) == "Partially Resolved"):
-            if resim["status"] == "Rejected":
-                next_step = "New Site"
-            else:
-                next_step = resim["next_step"]
-            return {
-                "action": "Sector Split",
-                "decision_path": "Congested | Sector split branch",
-                "attempted_actions": " -> ".join(attempted_actions),
-                "load_balance_possible": False,
-                "selected_peer_node_cell_id": str(source_row["Node_Cell_ID"]),
-                "selected_peer_band": "",
-                **{**resim, "next_step": next_step},
-            }
+    if add_sector_possible:
+        max_add_sector_carriers = max(1, min(3, int(source_row["sector_cell_count"])))
+        for carrier_count in range(1, max_add_sector_carriers + 1):
+            site_df, source_rows = _build_current_add_sector_topology(
+                sector_cells,
+                context["part3_site_df"],
+                context,
+                logger,
+                carrier_count=carrier_count,
+            )
+            site_df = _fix_synthetic_frequency(site_df)
+            resim = _rerun_current_topology(
+                sector_cells=sector_cells,
+                config=config,
+                context=context,
+                logger=logger,
+                action_label="current_sector_add",
+                site_df=site_df,
+                source_rows=source_rows,
+            )
+            attempted_actions.append(f"Add Sector {carrier_count} cell[{resim['status']}]")
+            if str(resim["status"]) == "Resolved" or (config.stop_on_partial and str(resim["status"]) == "Partially Resolved"):
+                return {
+                    "action": f"Add Sector -> {carrier_count} cell",
+                    "decision_path": "Congested | Progressive add-sector branch",
+                    "attempted_actions": " -> ".join(attempted_actions),
+                    "load_balance_possible": False,
+                    "selected_peer_node_cell_id": str(source_row["Node_Cell_ID"]),
+                    "selected_peer_band": "",
+                    **resim,
+                }
 
     site_df, source_rows = _build_current_new_site_topology(sector_cells, context["part3_site_df"], context, logger)
     site_df = _fix_synthetic_frequency(site_df)
@@ -2451,19 +2616,77 @@ def _build_recommendation_row_for_sector(
     }
 
 
+def _build_recommendation_row_for_cell(
+    sector_id: Any,
+    sector_cells: pd.DataFrame,
+    source_row: pd.Series,
+    config: CurrentModel3Config,
+    logger,
+    context: dict[str, Any],
+) -> dict[str, Any] | None:
+    sector_cells = sector_cells.sort_values(
+        ["congested", "prb_rrc_pressure", "grid_count"],
+        ascending=[False, False, False],
+        na_position="last",
+    ).copy()
+    source_id = str(source_row["Node_Cell_ID"]).strip()
+    if not bool(source_row.get("congested")):
+        return None
+    rec = _simulate_current_recommendation(sector_cells, config, logger, context, source_id)
+    sector_congested_ids = sector_cells.loc[sector_cells["congested"], "Node_Cell_ID"].astype(str).tolist()
+    return {
+        "site_id": source_row["site_id"],
+        "sector_id": sector_id,
+        "Node_Cell_ID": source_row["Node_Cell_ID"],
+        "sector_congested_node_cell_ids": ", ".join(sector_congested_ids),
+        "band": source_row["band"],
+        "earfcn": source_row["earfcn"],
+        "grid_count": int(source_row["grid_count"]) if pd.notna(source_row["grid_count"]) else 0,
+        "congested_grid_count": int(source_row["congested_grid_count"]) if pd.notna(source_row["congested_grid_count"]) else 0,
+        "prb_before_pct": round(float(source_row["prb_before_pct"]), 3) if pd.notna(source_row["prb_before_pct"]) else np.nan,
+        "rrc_before_pct": round(float(source_row["rrc_before_pct"]), 3) if pd.notna(source_row["rrc_before_pct"]) else np.nan,
+        "rrc_users_before": round(float(source_row["rrc_users_before"]), 3) if pd.notna(source_row["rrc_users_before"]) else np.nan,
+        "action": rec["action"],
+        "status": rec["status"],
+        "decision_path": rec["decision_path"],
+        "attempted_actions": rec.get("attempted_actions", ""),
+        "load_balance_possible": bool(rec["load_balance_possible"]),
+        "selected_peer_node_cell_id": rec["selected_peer_node_cell_id"],
+        "selected_peer_band": rec["selected_peer_band"],
+        "recommended_band_to_add": source_row["recommended_band_to_add"],
+        "available_bands_to_add": source_row["available_bands_to_add"],
+        "carrier_addition_possible": bool(source_row["carrier_addition_possible"]),
+        "carrier_addition_blocked": bool(source_row["carrier_addition_blocked"]),
+        "max_supported_carriers": int(source_row["max_supported_carriers"]),
+        "existing_carrier_count": int(source_row["existing_carrier_count"]),
+        "existing_carriers": source_row["existing_carriers"],
+        "projected_prb_after_pct": rec["projected_prb_after_pct"],
+        "projected_rrc_after_pct": rec["projected_rrc_after_pct"],
+        "projected_rrc_users_after": rec["projected_rrc_users_after"],
+        "action_reason": rec["action_reason"],
+        "next_step": rec["next_step"],
+        "resimulation_required": bool(rec["resimulation_required"]),
+        "resimulation_flow": rec["resimulation_flow"],
+    }
+
+
 def _build_recommendations(cell_df: pd.DataFrame, config: CurrentModel3Config, logger, context: dict[str, Any]) -> pd.DataFrame:
     rows = []
-    sector_groups = []
-    for sector_id, sector_cells in cell_df.groupby("sector_id", dropna=False):
-        sector_groups.append((sector_id, sector_cells.copy()))
-    sector_groups.sort(
-        key=lambda item: float(item[1]["prb_rrc_pressure"].max()) if item[1]["prb_rrc_pressure"].notna().any() else -np.inf,
-        reverse=True,
-    )
+    sector_lookup = {sector_id: sector_cells.copy() for sector_id, sector_cells in cell_df.groupby("sector_id", dropna=False)}
+    congested_cells = cell_df.loc[cell_df["congested"].fillna(False).astype(bool)].copy()
+    if "recommendation_scope_cell" in congested_cells.columns:
+        scoped = congested_cells.loc[congested_cells["recommendation_scope_cell"].fillna(False).astype(bool)].copy()
+        if not scoped.empty:
+            congested_cells = scoped
+            logger.info("cell_scope using_explicit_recommendation_scope cells=%d", len(congested_cells))
+    congested_cells = congested_cells.sort_values(["prb_rrc_pressure", "grid_count"], ascending=[False, False], na_position="last")
     if config.max_sectors is not None:
-        sector_groups = sector_groups[: max(0, int(config.max_sectors))]
-        logger.info("sector_scope limited_to_top=%d", len(sector_groups))
-    if config.max_congested_cells is not None:
+        top_sectors = set(
+            congested_cells.groupby("sector_id")["prb_rrc_pressure"].max().sort_values(ascending=False).head(max(0, int(config.max_sectors))).index
+        )
+        congested_cells = congested_cells.loc[congested_cells["sector_id"].isin(top_sectors)].copy()
+        logger.info("sector_scope limited_to_top=%d", len(top_sectors))
+    if config.max_congested_cells is not None and len(congested_cells) > int(config.max_congested_cells):
         scenario_order = [
             "load_balance_success",
             "carrier_addition_required",
@@ -2471,46 +2694,42 @@ def _build_recommendations(cell_df: pd.DataFrame, config: CurrentModel3Config, l
             "new_site_required",
             "",
         ]
-        scenario_groups: dict[str, list[tuple[Any, pd.DataFrame, int]]] = {key: [] for key in scenario_order}
-        for sector_id, sector_cells in sector_groups:
-            congested_rows = sector_cells.loc[sector_cells["congested"].fillna(False).astype(bool)] if "congested" in sector_cells.columns else pd.DataFrame()
-            congested_count = int(len(congested_rows))
-            if congested_count <= 0:
-                continue
-            scenario = ""
-            if "model3_scenario" in congested_rows.columns:
-                scenario = str(future_rules._first_non_empty(congested_rows["model3_scenario"])).strip()
-            scenario_groups.setdefault(scenario, []).append((sector_id, sector_cells, congested_count))
-        for groups in scenario_groups.values():
-            groups.sort(
-                key=lambda item: float(item[1]["prb_rrc_pressure"].max()) if item[1]["prb_rrc_pressure"].notna().any() else -np.inf,
-                reverse=True,
-            )
-        limited_groups: list[tuple[Any, pd.DataFrame]] = []
-        covered_cells = 0
-        while covered_cells < int(config.max_congested_cells):
+        scenario_groups: dict[str, pd.DataFrame] = {}
+        for scenario in scenario_order:
+            if "model3_scenario" in congested_cells.columns:
+                part = congested_cells.loc[congested_cells["model3_scenario"].fillna("").astype(str).str.strip().eq(scenario)].copy()
+            else:
+                part = congested_cells.iloc[0:0].copy()
+            scenario_groups[scenario] = part.sort_values(["prb_rrc_pressure", "grid_count"], ascending=[False, False], na_position="last")
+        if "model3_scenario" in congested_cells.columns:
+            known = set(scenario_order)
+            other = congested_cells.loc[~congested_cells["model3_scenario"].fillna("").astype(str).str.strip().isin(known)].copy()
+            if not other.empty:
+                scenario_groups[""] = pd.concat([scenario_groups[""], other], ignore_index=False, sort=False)
+        selected_rows: list[pd.Series] = []
+        while len(selected_rows) < int(config.max_congested_cells):
             progressed = False
             for scenario in scenario_order:
-                groups = scenario_groups.get(scenario, [])
-                if not groups:
+                group = scenario_groups.get(scenario, pd.DataFrame())
+                if group.empty:
                     continue
-                sector_id, sector_cells, congested_count = groups.pop(0)
-                limited_groups.append((sector_id, sector_cells))
-                covered_cells += congested_count
+                selected_rows.append(group.iloc[0])
+                scenario_groups[scenario] = group.iloc[1:]
                 progressed = True
-                if covered_cells >= int(config.max_congested_cells):
+                if len(selected_rows) >= int(config.max_congested_cells):
                     break
             if not progressed:
                 break
-        sector_groups = limited_groups
-        logger.info("sector_scope limited_to_congested_cells=%d sectors=%d", covered_cells, len(sector_groups))
+        congested_cells = pd.DataFrame(selected_rows)
+        logger.info("cell_scope limited_to_exact_congested_cells=%d", len(congested_cells))
     parallelism = max(1, int(config.sector_parallelism))
-    if parallelism > 1 and len(sector_groups) > 1 and not context.get("excel_input_mode"):
-        logger.info("sector_parallelism enabled workers=%d sectors=%d", parallelism, len(sector_groups))
+    jobs = [(row.get("sector_id"), sector_lookup.get(row.get("sector_id"), pd.DataFrame()), row) for _, row in congested_cells.iterrows()]
+    if parallelism > 1 and len(jobs) > 1 and not context.get("excel_input_mode"):
+        logger.info("cell_parallelism enabled workers=%d cells=%d", parallelism, len(jobs))
         with concurrent.futures.ThreadPoolExecutor(max_workers=parallelism) as executor:
             futures = [
-                executor.submit(_build_recommendation_row_for_sector, sector_id, sector_cells, config, logger, context)
-                for sector_id, sector_cells in sector_groups
+                executor.submit(_build_recommendation_row_for_cell, sector_id, sector_cells, source_row, config, logger, context)
+                for sector_id, sector_cells, source_row in jobs
             ]
             for future in concurrent.futures.as_completed(futures):
                 row = future.result()
@@ -2518,9 +2737,9 @@ def _build_recommendations(cell_df: pd.DataFrame, config: CurrentModel3Config, l
                     rows.append(row)
     else:
         if parallelism > 1:
-            logger.info("sector_parallelism skipped workers=%d sectors=%d excel_input_mode=%s", parallelism, len(sector_groups), bool(context.get("excel_input_mode")))
-        for sector_id, sector_cells in sector_groups:
-            row = _build_recommendation_row_for_sector(sector_id, sector_cells, config, logger, context)
+            logger.info("cell_parallelism skipped workers=%d cells=%d excel_input_mode=%s", parallelism, len(jobs), bool(context.get("excel_input_mode")))
+        for sector_id, sector_cells, source_row in jobs:
+            row = _build_recommendation_row_for_cell(sector_id, sector_cells, source_row, config, logger, context)
             if row is not None:
                 rows.append(row)
     reco_df = pd.DataFrame(rows)
@@ -2530,9 +2749,123 @@ def _build_recommendations(cell_df: pd.DataFrame, config: CurrentModel3Config, l
     return reco_df.sort_values(["priority_score", "congested_grid_count", "grid_count"], ascending=[False, False, False], na_position="last").reset_index(drop=True)
 
 
-def _write_workbook(run_dir: Path, cell_df: pd.DataFrame, reco_df: pd.DataFrame, sector_df: pd.DataFrame, summary: dict[str, Any]) -> Path:
+def _split_node_cell_id(value: Any) -> tuple[str, str]:
+    text = str(value or "").strip()
+    parts = [part for part in re.split(r"[_|]", text) if part and part.lower() != "nan"]
+    site = parts[0] if parts else ""
+    cell = parts[1] if len(parts) > 1 else text
+    return site, cell
+
+
+def _available_band_flag(value: Any) -> bool:
+    text = str(value or "").strip()
+    return bool(text and text.lower() not in {"nan", "none", "null", "<na>", "false", "0"})
+
+
+def _dashboard_congested_cells(cell_df: pd.DataFrame) -> pd.DataFrame:
+    if cell_df.empty:
+        return pd.DataFrame(columns=["site", "cell", "sector", "band", "available_band"])
+    rows = []
+    congested = cell_df.loc[cell_df.get("congested", pd.Series(False, index=cell_df.index)).fillna(False).astype(bool)].copy()
+    for _, row in congested.iterrows():
+        site, cell = _split_node_cell_id(row.get("Node_Cell_ID"))
+        rows.append(
+            {
+                "site": row.get("site_id") or site,
+                "cell": cell,
+                "sector": row.get("sector_id", ""),
+                "band": row.get("band", ""),
+                "available_band": _available_band_flag(row.get("available_bands_to_add")) or bool(row.get("carrier_addition_possible", False)),
+            }
+        )
+    return pd.DataFrame(rows).drop_duplicates().reset_index(drop=True)
+
+
+def _dashboard_recommendations(reco_df: pd.DataFrame) -> pd.DataFrame:
+    columns = [
+        "site",
+        "cell",
+        "sector",
+        "band",
+        "recommended_solution",
+        "prb_before",
+        "rrc_before",
+        "prb_after",
+        "rrc_after",
+        "recommended_band",
+        "new_sector_value",
+        "new_site_value",
+        "baseline_before_avg",
+        "baseline_after_avg",
+        "status",
+    ]
+    if reco_df.empty:
+        return pd.DataFrame(columns=columns)
+    rows = []
+    for _, row in reco_df.iterrows():
+        site, cell = _split_node_cell_id(row.get("Node_Cell_ID"))
+        action = str(row.get("action", "") or "")
+        recommended_band = ""
+        if "Add Carrier" in action:
+            recommended_band = str(row.get("recommended_band_to_add") or "").strip()
+            if not recommended_band and "->" in action:
+                recommended_band = action.split("->", 1)[1].replace("MHz", "").strip()
+        prb_before = future_rules._scalar_to_float(row.get("prb_before_pct"), np.nan)
+        rrc_before = future_rules._scalar_to_float(row.get("rrc_before_pct"), np.nan)
+        prb_after = future_rules._scalar_to_float(row.get("projected_prb_after_pct"), np.nan)
+        rrc_after = future_rules._scalar_to_float(row.get("projected_rrc_after_pct"), np.nan)
+        rows.append(
+            {
+                "site": row.get("site_id") or site,
+                "cell": cell,
+                "sector": row.get("sector_id", ""),
+                "band": row.get("band", ""),
+                "recommended_solution": action,
+                "prb_before": prb_before,
+                "rrc_before": rrc_before,
+                "prb_after": prb_after,
+                "rrc_after": rrc_after,
+                "recommended_band": recommended_band,
+                "new_sector_value": f"after PRB {prb_after:.3f}, RRC {rrc_after:.3f}" if ("Sector Split" in action or "Add Sector" in action) and pd.notna(prb_after) and pd.notna(rrc_after) else "",
+                "new_site_value": f"after PRB {prb_after:.3f}, RRC {rrc_after:.3f}" if "New Site" in action and pd.notna(prb_after) and pd.notna(rrc_after) else "",
+                "baseline_before_avg": np.nanmean([prb_before, rrc_before]),
+                "baseline_after_avg": np.nanmean([prb_after, rrc_after]),
+                "status": row.get("status", ""),
+            }
+        )
+    return pd.DataFrame(rows, columns=columns)
+
+
+def _add_dashboard_sheets(wb: Workbook, cell_df: pd.DataFrame, reco_df: pd.DataFrame, summary: dict[str, Any], model_label: str) -> None:
+    safe_label = "Model4" if "4" in str(model_label) else "Model3"
+    overview = pd.DataFrame(
+        [
+            {"metric": "model", "value": model_label},
+            {"metric": "congested_cells", "value": int(cell_df.get("congested", pd.Series(dtype=bool)).fillna(False).astype(bool).sum()) if not cell_df.empty else 0},
+            {"metric": "recommendations", "value": int(len(reco_df))},
+            {"metric": "sectors", "value": summary.get("sector_rows", "")},
+            {"metric": "runtime_sec", "value": summary.get("runtime_sec", "")},
+        ]
+    )
+    ws_overview = wb.create_sheet(f"{safe_label} Dashboard", 0)
+    future_rules._write_df_sheet(ws_overview, overview)
+    ws_cells = wb.create_sheet(f"{safe_label} Cells")
+    future_rules._write_df_sheet(ws_cells, _dashboard_congested_cells(cell_df))
+    ws_reco = wb.create_sheet(f"{safe_label} Recommendations")
+    future_rules._write_df_sheet(ws_reco, _dashboard_recommendations(reco_df))
+
+
+def _write_workbook(
+    run_dir: Path,
+    cell_df: pd.DataFrame,
+    reco_df: pd.DataFrame,
+    sector_df: pd.DataFrame,
+    summary: dict[str, Any],
+    model_label: str = "Model 3",
+) -> Path:
     wb = Workbook()
     wb.remove(wb.active)
+    _add_dashboard_sheets(wb, cell_df, reco_df, summary, model_label)
     ws_summary = wb.create_sheet("Summary")
     summary_rows = pd.DataFrame(
         [
@@ -2556,6 +2889,64 @@ def _write_workbook(run_dir: Path, cell_df: pd.DataFrame, reco_df: pd.DataFrame,
     return workbook_path
 
 
+def _combine_after_rf_artifacts(context: dict[str, Any], run_dir: Path, logger) -> dict[str, Any]:
+    records = list(context.get("after_rf_records") or [])
+    after_files = [Path(record["after_rf_surface_csv"]) for record in records if record.get("after_rf_surface_csv")]
+    before_files = [Path(record["before_rf_surface_csv"]) for record in records if record.get("before_rf_surface_csv")]
+    inventory_files = [Path(record["after_cell_inventory_csv"]) for record in records if record.get("after_cell_inventory_csv")]
+    payload: dict[str, Any] = {
+        "after_rf_surface_count": len(after_files),
+        "after_rf_surface_combined_csv": "",
+        "before_rf_surface_combined_csv": "",
+        "after_cell_inventory_combined_csv": "",
+        "after_rf_manifest_json": "",
+    }
+    manifest_path = run_dir / "after_rf_surfaces" / "manifest.json"
+    if records:
+        _save_json(manifest_path, {"records": records})
+        payload["after_rf_manifest_json"] = str(manifest_path)
+
+    def _combine(files: list[Path], dest_name: str) -> tuple[str, int]:
+        frames = []
+        for path in files:
+            if path.exists():
+                frame = pd.read_csv(path, low_memory=False)
+                frame["_artifact_file"] = path.name
+                frames.append(frame)
+        if not frames:
+            return "", 0
+        combined = pd.concat(frames, ignore_index=True, sort=False)
+        subset = [col for col in ["grid_id", "lat", "lon", "Node_Cell_ID", "action_label", "sector_id"] if col in combined.columns]
+        if subset:
+            combined = combined.drop_duplicates(subset=subset, keep="last")
+        dest = run_dir / "after_rf_surfaces" / dest_name
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        combined.to_csv(dest, index=False)
+        return str(dest), int(len(combined))
+
+    after_path, after_rows = _combine(after_files, "after_rf_surface_combined.csv")
+    before_path, before_rows = _combine(before_files, "before_rf_surface_combined.csv")
+    inventory_path, inventory_rows = _combine(inventory_files, "after_cell_inventory_combined.csv")
+    payload.update(
+        {
+            "after_rf_surface_combined_csv": after_path,
+            "before_rf_surface_combined_csv": before_path,
+            "after_cell_inventory_combined_csv": inventory_path,
+            "after_rf_rows": after_rows,
+            "before_rf_rows": before_rows,
+            "after_cell_inventory_rows": inventory_rows,
+        }
+    )
+    logger.info(
+        "after_rf_combined surfaces=%d after_rows=%d before_rows=%d inventory_rows=%d",
+        len(after_files),
+        after_rows,
+        before_rows,
+        inventory_rows,
+    )
+    return payload
+
+
 def run_model3_current_recommendation_test(config: CurrentModel3Config) -> Path:
     start = time.perf_counter()
     if not config.dataset_path.exists():
@@ -2577,9 +2968,12 @@ def run_model3_current_recommendation_test(config: CurrentModel3Config) -> Path:
         source_df = pd.read_csv(config.dataset_path)
         cell_inventory, inventory_summary = _build_current_cell_inventory(source_df, config)
         context = _load_current_context(config, logger)
+    context["after_rf_dir"] = run_dir / "after_rf_surfaces"
+    context["after_rf_records"] = []
     recommendations = _build_recommendations(cell_inventory, config, logger, context)
     sector_inventory = future_rules._build_sector_inventory(cell_inventory)
     runtime_sec = time.perf_counter() - start
+    after_rf_artifacts = _combine_after_rf_artifacts(context, run_dir, logger)
     summary = {
         "mode": "current_model3_recommendation",
         "dataset_path": str(config.dataset_path),
@@ -2599,9 +2993,10 @@ def run_model3_current_recommendation_test(config: CurrentModel3Config) -> Path:
             "sector_inventory_csv": str(run_dir / "model3_current_sector_inventory.csv"),
             "summary_json": str(run_dir / "summary.json"),
             "log": str(log_path),
+            **after_rf_artifacts,
         },
     }
-    workbook_path = _write_workbook(run_dir, cell_inventory, recommendations, sector_inventory, summary)
+    workbook_path = _write_workbook(run_dir, cell_inventory, recommendations, sector_inventory, summary, config.dashboard_model_label)
     summary["workbook_path"] = str(workbook_path)
     summary["artifacts"]["workbook"] = str(workbook_path)
     recommendations.to_csv(run_dir / "model3_current_recommendations.csv", index=False)
@@ -2614,9 +3009,14 @@ def run_model3_current_recommendation_test(config: CurrentModel3Config) -> Path:
         (run_dir / "model3_current_recommendations.csv", "model3_current_recommendations.csv"),
         (workbook_path, "model3_current_recommendations.xlsx"),
         (log_path, "model3_current_recommendation.log"),
+        (Path(after_rf_artifacts.get("after_rf_surface_combined_csv") or ""), "model3_after_rf_surface_combined.csv"),
+        (Path(after_rf_artifacts.get("before_rf_surface_combined_csv") or ""), "model3_before_rf_surface_combined.csv"),
+        (Path(after_rf_artifacts.get("after_cell_inventory_combined_csv") or ""), "model3_after_cell_inventory_combined.csv"),
+        (Path(after_rf_artifacts.get("after_rf_manifest_json") or ""), "model3_after_rf_manifest.json"),
     ]:
         try:
-            shutil.copy2(src, config.stable_output_dir / dest_name)
+            if str(src) and src.is_file():
+                shutil.copy2(src, config.stable_output_dir / dest_name)
         except PermissionError:
             pass
     print(json.dumps(summary, indent=2, default=str))
