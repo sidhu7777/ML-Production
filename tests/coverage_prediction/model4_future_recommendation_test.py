@@ -23,8 +23,7 @@ from tests.coverage_prediction import model3_current_recommendation_test as curr
 
 DEFAULT_OUTPUT_ROOT = ML_ROOT / "tests" / "output" / "model4_future_recommendation"
 DEFAULT_STABLE_OUTPUT_DIR = ML_ROOT / "models" / "model4_future_recommendation_experiment"
-DEFAULT_EXCEL_INPUT = ML_ROOT / "models" / "model3_project196_input" / "project_196_model3_input_725dd154_full_grid.xlsx"
-DEFAULT_PROJECT196_GRID_DATASET = current_rules.DEFAULT_DATASET
+DEFAULT_EXCEL_INPUT = ML_ROOT / "models" / "model3_project196_input" / "project_196_model3_input.xlsx"
 DEFAULT_MODEL3_CURRENT_RECOMMENDATIONS = current_rules.DEFAULT_STABLE_OUTPUT_DIR / "model3_current_recommendations.csv"
 DEFAULT_FUTURE_DATASET = future_rules.DEFAULT_MODEL3_DATASET
 DEFAULT_FUTURE_SUMMARY = future_rules.DEFAULT_MODEL3_SUMMARY
@@ -73,6 +72,8 @@ def _canonical_sector(site_id: Any, sector_id: Any, node_cell_id: Any, canonical
         if not text:
             continue
         tokens = [token for token in re.split(r"[_|]", text) if token and token.lower() != "nan"]
+        if len(tokens) >= 3:
+            return f"{site or tokens[0]}|{tokens[2]}"
         if len(tokens) >= 2:
             return f"{site or tokens[0]}|{tokens[1]}"
     return f"{site}|1" if site else "unknown|1"
@@ -228,11 +229,10 @@ def build_model4_future_dataset_from_excel(
     max_congested_cells: int | None = 18,
     congestion_threshold: float = future_rules.DEFAULT_CONGESTION_THRESHOLD,
 ) -> tuple[Path, Path, dict[str, Any]]:
-    project_grid_dataset = DEFAULT_PROJECT196_GRID_DATASET
-    if not project_grid_dataset.exists():
-        raise FileNotFoundError(f"Scoped Model 3 dataset not found: {project_grid_dataset}")
-    base_grid = pd.read_csv(project_grid_dataset, low_memory=False)
-    cell_input = base_grid.drop_duplicates("Node_Cell_ID", keep="first").copy()
+    if not excel_path.exists():
+        raise FileNotFoundError(f"Project 196 Excel input not found: {excel_path}")
+    cell_input = pd.read_excel(excel_path, sheet_name="Model3_Cell_Input")
+    base_grid = pd.read_excel(excel_path, sheet_name="Baseline_Grid_Input")
     if "project_id" in cell_input.columns:
         cell_input = cell_input.loc[cell_input["project_id"].map(_clean_text).eq("196")].copy()
     if "site_id" in cell_input.columns:
@@ -261,10 +261,12 @@ def build_model4_future_dataset_from_excel(
         band = _band_text(row.get("band", row.get("topology_band")))
         current_prb = float(pd.to_numeric(pd.Series([row.get("input_prb_utilization_pct", row.get("estimated_prb_utilization_pct"))]), errors="coerce").fillna(0.0).iloc[0])
         current_rrc = float(pd.to_numeric(pd.Series([row.get("input_rrc_utilization_pct", row.get("estimated_cell_rrc_utilization_pct"))]), errors="coerce").fillna(0.0).iloc[0])
-        future_prb = float(future_row.get("estimated_prb_utilization_pct")) if future_row is not None and pd.notna(future_row.get("estimated_prb_utilization_pct")) else min(180.0, current_prb * 1.12)
-        future_rrc = float(future_row.get("estimated_cell_rrc_utilization_pct")) if future_row is not None and pd.notna(future_row.get("estimated_cell_rrc_utilization_pct")) else min(180.0, current_rrc * 1.12)
-        raw_future_prb = future_prb
-        raw_future_rrc = future_rrc
+        raw_future_prb_value = float(future_row.get("estimated_prb_utilization_pct")) if future_row is not None and pd.notna(future_row.get("estimated_prb_utilization_pct")) else min(180.0, current_prb * 1.12)
+        raw_future_rrc_value = float(future_row.get("estimated_cell_rrc_utilization_pct")) if future_row is not None and pd.notna(future_row.get("estimated_cell_rrc_utilization_pct")) else min(180.0, current_rrc * 1.12)
+        future_prb = max(current_prb, raw_future_prb_value)
+        future_rrc = max(current_rrc, raw_future_rrc_value)
+        raw_future_prb = raw_future_prb_value
+        raw_future_rrc = raw_future_rrc_value
         future_source = "model1_model2_future_match" if future_row is not None else "excel_current_uplift_fallback"
         users = float(future_row.get("estimated_cell_rrc_connected_users")) if future_row is not None and pd.notna(future_row.get("estimated_cell_rrc_connected_users")) else float(pd.to_numeric(pd.Series([row.get("input_rrc_connected_users", row.get("estimated_cell_rrc_connected_users", row.get("estimated_rrc_connected_users")))]), errors="coerce").fillna(0.0).iloc[0]) * 1.12
         traffic = float(future_row.get("estimated_offered_traffic_mbps")) if future_row is not None and pd.notna(future_row.get("estimated_offered_traffic_mbps")) else float(pd.to_numeric(pd.Series([row.get("input_estimated_offered_traffic_mbps", row.get("estimated_offered_traffic_mbps"))]), errors="coerce").fillna(0.0).iloc[0]) * 1.12
@@ -458,7 +460,7 @@ def build_model4_future_dataset_from_excel(
     summary = {
         "mode": "model4_project196_excel_future_dataset",
         "excel_path": str(excel_path),
-        "source_grid_dataset_path": str(project_grid_dataset),
+        "source_grid_dataset_path": f"{excel_path}::Baseline_Grid_Input",
         "future_dataset_path": str(future_dataset_path),
         "rows": int(len(out)),
         "cell_count": int(out["Node_Cell_ID"].nunique(dropna=True)),

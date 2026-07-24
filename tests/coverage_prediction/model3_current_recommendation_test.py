@@ -28,6 +28,7 @@ from tests.coverage_prediction import build_model3_current_recommendation_datase
 from tests.coverage_prediction import lte_coverage_test as coverage_test
 from tests.coverage_prediction import model3_business_rule_recommendation_test as future_rules
 from tools.lte_prediction_optimised.ml_engine import (
+    canonical_cell_id as production_canonical_cell_id,
     _compute_affected_cells as production_compute_affected_cells,
     _normalize_site_df as production_normalize_site_df,
     compute_k1k2_for_cells as production_compute_k1k2_for_cells,
@@ -39,6 +40,7 @@ DEFAULT_DATASET = current_builder.CURRENT_MODEL3_DATASET_CSV
 DEFAULT_SUMMARY = current_builder.CURRENT_MODEL3_SUMMARY_JSON
 DEFAULT_OUTPUT_ROOT = ML_ROOT / "tests" / "output" / "model3_current_recommendation"
 DEFAULT_STABLE_OUTPUT_DIR = ML_ROOT / "models" / "model3_current_recommendation_experiment"
+PROJECT196_ANTENNA_FIXTURE = ML_ROOT / "tests" / "fixtures" / "project_196_rsrp_tilt" / "antenna_input.csv"
 DEFAULT_CONGESTION_THRESHOLD = 80.0
 DEFAULT_RF_WORKERS = max(1, min(3, (os.cpu_count() or 2) - 1))
 
@@ -291,6 +293,274 @@ def _load_current_context(config: CurrentModel3Config, logger) -> dict[str, Any]
     }
 
 
+def _clean_project196_text(value: Any) -> str:
+    if pd.isna(value):
+        return ""
+    text = str(value).strip()
+    if text.endswith(".0"):
+        text = text[:-2]
+    return "" if text.lower() in {"nan", "none", "null", "<na>"} else text
+
+
+def _filter_project196_cell_input(df: pd.DataFrame) -> pd.DataFrame:
+    work = df.copy()
+    required = [col for col in ["site_id", "sector_id", "Node_Cell_ID", "band"] if col in work.columns]
+    for col in required:
+        work = work.loc[work[col].map(_clean_project196_text).str.strip().ne("")].copy()
+    return work.reset_index(drop=True)
+
+
+def _project196_sector_num(value: Any) -> str:
+    text = _clean_project196_text(value)
+    if "|" in text:
+        return text.rsplit("|", 1)[1]
+    tokens = [token for token in re.split(r"[_|]", text) if token and token.lower() != "nan"]
+    if len(tokens) >= 3:
+        return tokens[2]
+    if len(tokens) >= 2:
+        return tokens[1]
+    return text
+
+
+def _load_project196_site_topology(cell_input: pd.DataFrame, logger) -> pd.DataFrame:
+    if not PROJECT196_ANTENNA_FIXTURE.exists():
+        raise FileNotFoundError(f"Missing Project 196 antenna fixture: {PROJECT196_ANTENNA_FIXTURE}")
+    fixture = pd.read_csv(PROJECT196_ANTENNA_FIXTURE)
+    fixture = fixture.loc[:, ~fixture.columns.duplicated()].copy()
+    fixture["_site_key"] = fixture.get("dashboard_site_id", fixture.get("site", "")).map(_clean_project196_text)
+    fixture["_sector_num"] = fixture.get("original_cell_id", fixture.get("rf_source_cell_id", "")).map(_project196_sector_num)
+    fixture["_band_num"] = pd.to_numeric(fixture.get("band"), errors="coerce").round()
+
+    rows: list[pd.Series] = []
+    for _, source in cell_input.iterrows():
+        site = _clean_project196_text(source.get("site_id"))
+        sector_num = _project196_sector_num(source.get("sector_id") or source.get("canonical_physical_cell_id") or source.get("Node_Cell_ID"))
+        band = future_rules._scalar_to_int(source.get("band"), 1800)
+        match = fixture.loc[
+            fixture["_site_key"].eq(site)
+            & fixture["_sector_num"].eq(sector_num)
+            & fixture["_band_num"].eq(float(band))
+        ]
+        if match.empty:
+            match = fixture.loc[fixture["_site_key"].eq(site) & fixture["_sector_num"].eq(sector_num)]
+        if match.empty:
+            logger.info("project196_site_topology_missing site=%s sector=%s band=%s", site, sector_num, band)
+            continue
+        row = match.iloc[0].copy()
+        node_cell_id = _clean_project196_text(source.get("Node_Cell_ID"))
+        canonical = _clean_project196_text(source.get("canonical_physical_cell_id")) or node_cell_id
+        sector_id = _clean_project196_text(source.get("sector_id")) or f"{site}|{sector_num}"
+        row["Node_Cell_ID"] = node_cell_id
+        row["cell_id"] = node_cell_id
+        row["site"] = site
+        row["site_id"] = site
+        row["dashboard_site_id"] = site
+        row["Site ID"] = site
+        row["band"] = float(band)
+        row["frequency_mhz"] = float(band)
+        row["frequency"] = float(band)
+        row["earfcn"] = float(future_rules.SYNTHETIC_BAND_TO_EARFCN.get(band, band))
+        row["original_node_cell_id"] = canonical
+        row["original_cell_id"] = canonical
+        row["rf_source_cell_id"] = canonical
+        row["site_prediction_key"] = node_cell_id
+        row["site_cell_sector_band_operator_key"] = node_cell_id
+        row["sector_identity"] = sector_id
+        row["frontend_site_sector_key"] = sector_id
+        row["node_cell_sector_key"] = f"{canonical}|{sector_num}"
+        row["site_identity_key"] = site
+        rows.append(row)
+
+    if not rows:
+        raise RuntimeError("Project 196 Excel cells could not be matched to antenna topology.")
+    site_df = pd.DataFrame(rows).drop(columns=["_site_key", "_sector_num", "_band_num"], errors="ignore")
+    logger.info("project196_site_topology rows=%d cells=%d", len(site_df), site_df["Node_Cell_ID"].nunique())
+    return site_df.loc[:, ~site_df.columns.duplicated()].copy()
+
+
+def _prepare_project196_prediction_surface(pred_df: pd.DataFrame, cell_input: pd.DataFrame) -> pd.DataFrame:
+    work = pred_df.copy()
+    work["time_bucket"] = "PART_3"
+    work = future_rules._ensure_grid_group_columns(work, default_time_bucket="PART_3")
+    cell_lookup = cell_input.copy()
+    cell_lookup["Node_Cell_ID"] = cell_lookup["Node_Cell_ID"].map(_clean_project196_text)
+    lookup_cols = [
+        col
+        for col in [
+            "Node_Cell_ID",
+            "site_id",
+            "sector_id",
+            "canonical_physical_cell_id",
+            "band",
+            "earfcn",
+            "input_prb_utilization_pct",
+            "input_rrc_utilization_pct",
+            "input_rrc_connected_users",
+            "input_estimated_offered_traffic_mbps",
+            "input_estimated_dl_capacity_mbps",
+            "grid_count",
+            "point_count",
+            "available_bands_to_add",
+            "recommended_band_to_add",
+            "carrier_addition_possible",
+            "demo_scenario",
+            "demo_selected_for_model3",
+        ]
+        if col in cell_lookup.columns
+    ]
+    work["Node_Cell_ID"] = work["Node_Cell_ID"].map(_clean_project196_text)
+    valid_nodes = set(cell_lookup["Node_Cell_ID"].dropna().astype(str))
+    work = work.loc[work["Node_Cell_ID"].isin(valid_nodes)].copy()
+    work = work.merge(cell_lookup[lookup_cols].drop_duplicates("Node_Cell_ID"), on="Node_Cell_ID", how="left", suffixes=("", "_cell"))
+    work["time_bucket"] = "PART_3"
+    work["topology_original_cell_id"] = work.get("canonical_physical_cell_id", work["Node_Cell_ID"]).map(_clean_project196_text)
+    work["topology_original_node_cell_id"] = work["topology_original_cell_id"]
+    work["topology_frontend_site_sector_key"] = work.get("sector_id", "").map(_clean_project196_text)
+    work["topology_node_cell_sector_key"] = work["topology_frontend_site_sector_key"]
+    work["topology_sector_identity_key"] = work["topology_frontend_site_sector_key"]
+    work["topology_site_sector_band_key"] = (
+        work.get("site_id", "").map(_clean_project196_text)
+        + "|"
+        + work.get("sector_id", "").map(_clean_project196_text)
+        + "|"
+        + pd.to_numeric(work.get("band"), errors="coerce").fillna(0).round().astype(int).astype(str)
+    )
+    work["topology_rf_identity_key"] = work["Node_Cell_ID"]
+    work["rf_identity_key"] = work["Node_Cell_ID"]
+    work["site_sector_band_key"] = work["topology_site_sector_band_key"]
+    work["sector_identity_key"] = work["topology_frontend_site_sector_key"]
+    work["frontend_site_sector_key"] = work["topology_frontend_site_sector_key"]
+    work["node_cell_sector_key"] = work["topology_node_cell_sector_key"]
+    work["cell_id"] = work["topology_original_cell_id"]
+    work["original_node_cell_id"] = work["topology_original_node_cell_id"]
+    work["original_cell_id"] = work["topology_original_cell_id"]
+    work["topology_band"] = pd.to_numeric(work.get("band"), errors="coerce")
+    work["topology_earfcn"] = pd.to_numeric(work.get("earfcn"), errors="coerce")
+    work["estimated_prb_utilization_pct"] = pd.to_numeric(work.get("input_prb_utilization_pct"), errors="coerce").fillna(0.0)
+    work["estimated_cell_rrc_utilization_pct"] = pd.to_numeric(work.get("input_rrc_utilization_pct"), errors="coerce").fillna(0.0)
+    cell_rrc_total = pd.to_numeric(work.get("input_rrc_connected_users"), errors="coerce").fillna(0.0)
+    point_count = pd.to_numeric(work.get("point_count"), errors="coerce").replace(0, np.nan)
+    if point_count.notna().sum() == 0:
+        point_count = work.groupby("Node_Cell_ID")["Node_Cell_ID"].transform("count").astype(float).replace(0, np.nan)
+    per_point_rrc = (cell_rrc_total / point_count.fillna(1.0)).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    work["estimated_cell_rrc_connected_users"] = per_point_rrc
+    work["estimated_offered_traffic_mbps"] = pd.to_numeric(work.get("input_estimated_offered_traffic_mbps"), errors="coerce").fillna(0.0)
+    work["raw_estimated_rrc_connected_users"] = cell_rrc_total
+    work["estimated_rrc_connected_users"] = per_point_rrc
+    work["estimated_dl_capacity_mbps"] = pd.to_numeric(work.get("input_estimated_dl_capacity_mbps"), errors="coerce").fillna(0.1)
+    bandwidth_src = work["bandwidth_mhz_est"] if "bandwidth_mhz_est" in work.columns else pd.Series(10.0, index=work.index)
+    work["bandwidth_mhz_est"] = pd.to_numeric(bandwidth_src, errors="coerce").fillna(10.0)
+    return work
+
+
+def _load_project196_excel_context(config: CurrentModel3Config, cell_input: pd.DataFrame, logger) -> dict[str, Any]:
+    baseline_df = pd.read_excel(config.dataset_path, sheet_name="Baseline_Grid_Input")
+    geo_df = pd.read_excel(config.dataset_path, sheet_name="Geo_Features_Input")
+    site_df = _load_project196_site_topology(cell_input, logger)
+    corrected_pred_df = _prepare_project196_prediction_surface(baseline_df, cell_input)
+    baseline_pred_df = corrected_pred_df.copy()
+
+    geo_work = geo_df.copy()
+    geo_work["time_bucket"] = "PART_3"
+    geo_work = future_rules._ensure_grid_group_columns(geo_work, default_time_bucket="PART_3")
+    kpi_cols = [
+        "grid_id",
+        "grid_row",
+        "grid_col",
+        "grid_centroid_lat",
+        "grid_centroid_lon",
+        "time_bucket",
+        "sample_count",
+        "dl_tpt_mean",
+        "ul_tpt_mean",
+        "estimated_prb_mean",
+        "cqi_mean",
+        "green_ratio",
+        "water_ratio",
+        "bandwidth_mhz_est",
+    ]
+    kpi_df = corrected_pred_df[[col for col in kpi_cols if col in corrected_pred_df.columns]].drop_duplicates(
+        subset=["grid_id", "time_bucket"]
+    ).copy()
+    if "sample_count" not in kpi_df.columns:
+        kpi_df["sample_count"] = 1
+    earfcn_lookup = corrected_pred_df.copy()
+    earfcn_lookup["_dominant_earfcn"] = pd.to_numeric(earfcn_lookup.get("topology_earfcn"), errors="coerce")
+    missing_earfcn = earfcn_lookup["_dominant_earfcn"].isna()
+    if missing_earfcn.any():
+        band_values = pd.to_numeric(earfcn_lookup.loc[missing_earfcn, "topology_band"], errors="coerce")
+        earfcn_lookup.loc[missing_earfcn, "_dominant_earfcn"] = band_values.map(
+            lambda value: future_rules.SYNTHETIC_BAND_TO_EARFCN.get(int(value), value) if pd.notna(value) else np.nan
+        )
+    earfcn_lookup = earfcn_lookup.drop_duplicates(subset=["grid_id", "time_bucket"], keep="first")
+    kpi_df = kpi_df.merge(
+        earfcn_lookup[["grid_id", "time_bucket", "_dominant_earfcn"]],
+        on=["grid_id", "time_bucket"],
+        how="left",
+        validate="one_to_one",
+    )
+    kpi_df["dominant_earfcn"] = pd.to_numeric(kpi_df.pop("_dominant_earfcn"), errors="coerce")
+    if "bandwidth_mhz_est" not in kpi_df.columns:
+        kpi_df["bandwidth_mhz_est"] = 10.0
+    coverage_rows_df = corrected_pred_df[
+        ["lat", "lon", "grid_id", "grid_row", "grid_col", "grid_centroid_lat", "grid_centroid_lon", "time_bucket"]
+    ].drop_duplicates().copy()
+
+    current_df = corrected_pred_df.copy()
+    original_topology_cell_ids = set(site_df["Node_Cell_ID"].dropna().astype(str).str.strip())
+    original_topology_cell_ids.update(current_df["Node_Cell_ID"].dropna().astype(str).str.strip())
+    master_serving_keys: set[str] = set()
+    for col in ["Node_Cell_ID", "topology_original_cell_id", "topology_original_node_cell_id"]:
+        alias = current_df[col].dropna().astype(str).str.strip()
+        alias = alias[alias.ne("")]
+        gid = current_df.loc[alias.index, "grid_id"].astype(str)
+        master_serving_keys.update((gid + "|" + alias).tolist())
+
+    master_capacity_by_cell_id: dict[str, float] = {}
+    master_cap = pd.to_numeric(current_df["estimated_dl_capacity_mbps"], errors="coerce")
+    for col in ["Node_Cell_ID", "topology_original_cell_id", "topology_original_node_cell_id"]:
+        grouped = master_cap.groupby(current_df[col].astype(str).str.strip()).max()
+        for key, value in grouped.items():
+            if key and key != "nan" and pd.notna(value) and value > 0:
+                master_capacity_by_cell_id.setdefault(key, float(value))
+
+    summary = {
+        "project_id": 196,
+        "region": "india",
+        "topology_operator": "Airtel",
+        "grid_size_m": float(pd.to_numeric(cell_input.get("grid_size_m"), errors="coerce").dropna().iloc[0])
+        if "grid_size_m" in cell_input.columns and pd.to_numeric(cell_input["grid_size_m"], errors="coerce").notna().any()
+        else 25.0,
+        "baseline_radius_m": 500.0,
+        "max_interference_sites": int(config.max_interference_sites),
+        "source": "project196_excel_rf_context",
+    }
+    logger.info(
+        "project196_excel_rf_context baseline_rows=%d geo_rows=%d site_rows=%d numeric_grids=%d",
+        len(corrected_pred_df),
+        len(geo_work),
+        len(site_df),
+        corrected_pred_df["grid_id"].nunique(dropna=True),
+    )
+    return {
+        "archive_path": "",
+        "summary": summary,
+        "project_sites_df": site_df,
+        "coverage_rows_df": coverage_rows_df,
+        "baseline_pred_df": baseline_pred_df,
+        "corrected_pred_df": corrected_pred_df,
+        "geo_df": geo_work,
+        "kpi_df": kpi_df,
+        "part3_site_df": site_df,
+        "building_df": pd.DataFrame(columns=["geometry_wkt"]),
+        "current_base_df": _current_dataset_base_context(current_df),
+        "current_df": current_df,
+        "original_topology_cell_ids": original_topology_cell_ids,
+        "master_serving_keys": master_serving_keys,
+        "master_capacity_by_cell_id": master_capacity_by_cell_id,
+    }
+
+
 def _build_current_cell_inventory(df: pd.DataFrame, config: CurrentModel3Config) -> tuple[pd.DataFrame, dict[str, Any]]:
     sector_key = future_rules._pick_sector_key(df)
     site_key = future_rules._pick_site_key(df)
@@ -380,6 +650,12 @@ def _build_cell_inventory_from_excel_input(df: pd.DataFrame, config: CurrentMode
     for source, target in rename_map.items():
         if source in work.columns:
             work[target] = work[source]
+    if "model3_scenario" not in work.columns and "demo_scenario" in work.columns:
+        work["model3_scenario"] = work["demo_scenario"]
+    if "recommendation_scope_cell" not in work.columns and "demo_selected_for_model3" in work.columns:
+        selected_text = work["demo_selected_for_model3"].astype(str).str.strip().str.lower()
+        selected_num = pd.to_numeric(work["demo_selected_for_model3"], errors="coerce")
+        work["recommendation_scope_cell"] = selected_text.isin({"true", "yes", "y"}) | (selected_num.fillna(0) > 0)
     if "carrier_addition_options" not in work.columns and "available_bands_to_add" in work.columns:
         work["carrier_addition_options"] = work["available_bands_to_add"]
     if "available_earfcns_to_add" not in work.columns and "available_bands_to_add" in work.columns:
@@ -458,6 +734,8 @@ def _build_cell_inventory_from_excel_input(df: pd.DataFrame, config: CurrentMode
         "carrier_addition_reason",
         "sector_has_alternate_carrier",
         "sector_capacity_limit",
+        "model3_scenario",
+        "recommendation_scope_cell",
         "prb_rrc_pressure",
         "congested",
         "sector_cell_count",
@@ -1015,6 +1293,24 @@ def _prepare_production_scope_site_frames(
     original = production_normalize_site_df(original_input, log_stage="MODEL3_TEST_ORIGINAL_SITE")
     modified = production_normalize_site_df(action_input, log_stage="MODEL3_TEST_ACTION_SITE")
 
+    def _restore_strict_project196_identity(frame: pd.DataFrame) -> pd.DataFrame:
+        if "site_prediction_key" not in frame.columns:
+            return frame
+        out = frame.copy()
+        strict = out["site_prediction_key"].map(_clean_project196_text)
+        mask = strict.ne("")
+        for col in ["Node_Cell_ID", "rf_identity_key"]:
+            out.loc[mask, col] = strict.loc[mask]
+        if "site_cell_sector_band_operator_key" in out.columns:
+            out.loc[mask, "site_cell_sector_band_operator_key"] = strict.loc[mask]
+        if "cell_id" in out.columns:
+            out.loc[mask, "legacy_nodeb_id_cell_id"] = out.loc[mask, "cell_id"].map(_clean_project196_text)
+        out.loc[mask, "canonical_cell_id"] = out.loc[mask, "legacy_nodeb_id_cell_id"].map(production_canonical_cell_id)
+        return out
+
+    original = _restore_strict_project196_identity(original)
+    modified = _restore_strict_project196_identity(modified)
+
     for col in [
         "lat",
         "lon",
@@ -1053,6 +1349,20 @@ def _prepare_production_scope_site_frames(
         if pd.notna(value):
             modified.loc[synthetic_mask, f"orig_{col}"] = value
     return original, modified
+
+
+def _set_synthetic_identity(row: pd.Series | pd.DataFrame, node_cell_id: str) -> pd.Series | pd.DataFrame:
+    for col in ["Node_Cell_ID", "cell_id", "site_prediction_key", "site_cell_sector_band_operator_key", "rf_identity_key"]:
+        has_col = col in row.index if isinstance(row, pd.Series) else col in row.columns
+        if has_col:
+            row[col] = node_cell_id
+    if isinstance(row, pd.Series):
+        row["canonical_cell_id"] = production_canonical_cell_id(node_cell_id)
+        row["legacy_nodeb_id_cell_id"] = node_cell_id
+    else:
+        row["canonical_cell_id"] = production_canonical_cell_id(node_cell_id)
+        row["legacy_nodeb_id_cell_id"] = node_cell_id
+    return row
 
 
 def _vectorized_identity_point_mask(points: pd.DataFrame, identities: list[str]) -> pd.Series:
@@ -1345,6 +1655,7 @@ def _evaluate_action_inventory_current(
     after_inventory: pd.DataFrame,
     candidate_node_cell_ids: set[str],
     demand_serving_cell_ids: set[str],
+    action_node_cell_ids: set[str] | None,
     config: CurrentModel3Config,
     logger,
     action_label: str,
@@ -1565,6 +1876,9 @@ def _evaluate_action_inventory_current(
         (pd.notna(projected_prb) and pd.notna(before_prb) and projected_prb > before_prb + 0.5)
         or (pd.notna(projected_rrc) and pd.notna(before_rrc) and projected_rrc > before_rrc + 0.5)
     )
+    action_ids = {str(value).strip() for value in (action_node_cell_ids or set()) if str(value).strip()}
+    demand_on_action_cell = bool(action_ids & demand_serving_cell_ids)
+    requires_action_cell_capture = action_label in {"current_sector_add", "current_new_site"}
     if resolved and not worsened_any_metric:
         status = "Resolved"
     elif worsened_any_metric:
@@ -1573,14 +1887,18 @@ def _evaluate_action_inventory_current(
         status = "Partially Resolved"
     else:
         status = "No Material Change"
+    if requires_action_cell_capture and not demand_on_action_cell:
+        status = "Rejected" if worsened_any_metric else "No Material Change"
     after_cells = after_candidates["Node_Cell_ID"].astype(str).dropna().tolist() if "Node_Cell_ID" in after_candidates.columns else []
     logger.info(
-        "%s_done sector=%s before_cells=%s after_cells=%s demand_serving_cells=%s local_after_rows=%d scope_mode=%s before_cells_found_in_after=%s share_factor=%.3f before_prb=%.3f before_rrc=%.3f actual_prb=%.3f actual_rrc=%.3f worsened_any_metric=%s status=%s",
+        "%s_done sector=%s before_cells=%s after_cells=%s demand_serving_cells=%s action_cells=%s action_cell_served=%s local_after_rows=%d scope_mode=%s before_cells_found_in_after=%s share_factor=%.3f before_prb=%.3f before_rrc=%.3f actual_prb=%.3f actual_rrc=%.3f worsened_any_metric=%s status=%s",
         action_label,
         source_sector_id,
         before_cells,
         after_cells,
         sorted(demand_serving_cell_ids),
+        sorted(action_ids),
+        demand_on_action_cell,
         len(after_candidates),
         scope_mode,
         before_cells_found_in_after,
@@ -1796,8 +2114,8 @@ def _build_current_carrier_addition_topology(
     add_row["frequency_mhz"] = float(band_num)
     add_row["frequency"] = float(band_num)
     add_row["carrier_variant"] = f"carrier_add_{band_num}"
-    add_row["cell_id"] = f"{base_cell}__ADD{band_num}"
-    add_row["Node_Cell_ID"] = add_row["cell_id"].astype(str)
+    add_id = f"{base_cell}__ADD{band_num}"
+    add_row = _set_synthetic_identity(add_row, add_id)
     if "PCI" in add_row.columns:
         add_row["PCI"] = (pd.to_numeric(add_row["PCI"], errors="coerce").fillna(0).astype(int) + (band_num % 97) + 11) % 504
     combined = pd.concat([work, add_row], ignore_index=True, sort=False)
@@ -1832,8 +2150,8 @@ def _build_current_sector_split_topology(
         base_pci = future_rules._scalar_to_int(row.get("PCI"), 0)
         for suffix, delta_deg, pci_offset in [("A", -30.0, 17), ("B", 30.0, 34)]:
             child = row.copy()
-            child["cell_id"] = f"{base_cell}__SS{suffix}"
-            child["Node_Cell_ID"] = str(child["cell_id"])
+            child_id = f"{base_cell}__SS{suffix}"
+            child = _set_synthetic_identity(child, child_id)
             child["PCI"] = int((base_pci + pci_offset) % 504)
             child["azimuth"] = float((bearing + delta_deg) % 360.0)
             child["carrier_variant"] = f"sector_split_{suffix.lower()}"
@@ -1881,8 +2199,8 @@ def _build_current_add_sector_topology(
         child = row.copy()
         base_cell = str(row.get("cell_id") or row.get("Node_Cell_ID") or "CELL").strip()
         band_num = future_rules._scalar_to_int(row.get("band"), 1800)
-        child["cell_id"] = f"{base_cell}__AS{idx}"
-        child["Node_Cell_ID"] = str(child["cell_id"])
+        child_id = f"{base_cell}__AS{idx}"
+        child = _set_synthetic_identity(child, child_id)
         child["sector"] = f"{sector_num}A"
         child["azimuth"] = float(bearing % 360.0)
         child["carrier_variant"] = f"add_sector_{idx}"
@@ -1956,8 +2274,8 @@ def _build_current_new_site_topology(
             base["tx_power"] = pd.to_numeric(base["tx_power"], errors="coerce").fillna(43.0).clip(lower=46.0)
         if "antenna_height" in base.columns:
             base["antenna_height"] = pd.to_numeric(base["antenna_height"], errors="coerce").fillna(25.0).clip(lower=25.0)
-        base["cell_id"] = f"{new_site_id}_{idx}__NS"
-        base["Node_Cell_ID"] = base["cell_id"].astype(str)
+        base_id = f"{new_site_id}_{idx}__NS"
+        base = _set_synthetic_identity(base, base_id)
         if "PCI" in base.columns:
             base["PCI"] = int((100 + idx * 29 + (band_num % 41)) % 504)
         base["carrier_variant"] = "new_site"
@@ -2009,7 +2327,7 @@ def _cached_current_k1k2_for_cells(
         if cell not in cache and cell not in missing_original:
             missing_original.append(cell)
 
-    compute_cells = missing_original
+    compute_cells = list(dict.fromkeys(missing_original + synthetic_or_changed))
     if compute_cells:
         computed = production_compute_k1k2_for_cells(scoped_points, modified_site_df, compute_cells)
     else:
@@ -2020,6 +2338,12 @@ def _cached_current_k1k2_for_cells(
             cache[cell] = computed[cell]
             cached_map[cell] = computed[cell]
 
+    computed_action: list[str] = []
+    for cell in synthetic_or_changed:
+        if cell in computed:
+            cached_map[cell] = computed[cell]
+            computed_action.append(cell)
+
     source_k1k2 = None
     for cell in source_originals:
         if cell in cache:
@@ -2029,16 +2353,20 @@ def _cached_current_k1k2_for_cells(
         source_k1k2 = next(iter(cache.values()))
     if source_k1k2 is None:
         source_k1k2 = (0.0, 0.0)
+    inherited_action: list[str] = []
     for cell in synthetic_or_changed:
-        cached_map[cell] = source_k1k2
+        if cell not in cached_map:
+            cached_map[cell] = source_k1k2
+            inherited_action.append(cell)
 
     logger.info(
-        "%s_k1k2_cache affected=%d cached_original=%d computed_original=%d inherited_action=%d returned=%d",
+        "%s_k1k2_cache affected=%d cached_original=%d computed_original=%d computed_action=%d inherited_action=%d returned=%d",
         action_label,
         len(affected),
         len([cell for cell in affected if cell in cache]),
         len([cell for cell in missing_original if cell in computed]),
-        len(synthetic_or_changed),
+        len(computed_action),
+        len(inherited_action),
         len(cached_map),
     )
     return cached_map
@@ -2314,6 +2642,9 @@ def _rerun_current_topology(
         after_inventory=local_inventory,
         candidate_node_cell_ids=candidate_node_cell_ids,
         demand_serving_cell_ids=demand_serving_cell_ids,
+        action_node_cell_ids=set(changed_rows["Node_Cell_ID"].dropna().astype(str).str.strip())
+        if "Node_Cell_ID" in changed_rows.columns
+        else set(),
         config=config,
         logger=logger,
         action_label=action_label,
@@ -2324,7 +2655,7 @@ def _rerun_current_topology(
         "projected_prb_after_pct": outcome["projected_prb_after_pct"],
         "projected_rrc_after_pct": outcome["projected_rrc_after_pct"],
         "projected_rrc_users_after": outcome["projected_rrc_users_after"],
-        "next_step": outcome["next_step"] or "New Site",
+        "next_step": outcome["next_step"],
         "resimulation_required": True,
         "resimulation_flow": f"{action_label} topology -> production affected cells ({len(affected_cells)} cells/{len(affected_sites)} sites; changed={changed_rows['Node_Cell_ID'].nunique()}) -> baseline/optimized RF rerun on saved PART_3 points -> deterministic current KPI rebuild -> Model 3 reevaluation",
     }
@@ -2690,7 +3021,9 @@ def _build_recommendations(cell_df: pd.DataFrame, config: CurrentModel3Config, l
         scenario_order = [
             "load_balance_success",
             "carrier_addition_required",
+            "sector_split_candidate",
             "sector_split_required",
+            "carrier_blocked_new_site",
             "new_site_required",
             "",
         ]
@@ -2957,13 +3290,10 @@ def run_model3_current_recommendation_test(config: CurrentModel3Config) -> Path:
     logger.info("start dataset=%s summary=%s", config.dataset_path, config.summary_path)
     if config.dataset_path.suffix.lower() in {".xlsx", ".xlsm", ".xls"}:
         source_df = pd.read_excel(config.dataset_path, sheet_name="Model3_Cell_Input")
+        source_df = _filter_project196_cell_input(source_df)
         cell_inventory, inventory_summary = _build_cell_inventory_from_excel_input(source_df, config)
-        context = {
-            "excel_input_mode": True,
-            "current_df": pd.DataFrame(),
-            "part3_site_df": pd.DataFrame(),
-        }
-        logger.info("excel_input_mode rows=%d sectors=%d", len(cell_inventory), cell_inventory["sector_id"].nunique(dropna=True))
+        context = _load_project196_excel_context(config, source_df, logger)
+        logger.info("project196_excel_full_rf_mode rows=%d sectors=%d", len(cell_inventory), cell_inventory["sector_id"].nunique(dropna=True))
     else:
         source_df = pd.read_csv(config.dataset_path)
         cell_inventory, inventory_summary = _build_current_cell_inventory(source_df, config)
@@ -3017,6 +3347,10 @@ def run_model3_current_recommendation_test(config: CurrentModel3Config) -> Path:
         try:
             if str(src) and src.is_file():
                 shutil.copy2(src, config.stable_output_dir / dest_name)
+            elif dest_name.startswith("model3_after_") or dest_name.startswith("model3_before_"):
+                stale = config.stable_output_dir / dest_name
+                if stale.exists():
+                    stale.unlink()
         except PermissionError:
             pass
     print(json.dumps(summary, indent=2, default=str))

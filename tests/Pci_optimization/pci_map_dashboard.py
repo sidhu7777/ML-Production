@@ -330,64 +330,69 @@ def select_collision_confusion_cluster(
     return selected_sites_df, selected_ids, " | ".join(explanation_parts), conflicts
 
 
-def detect_pci_collisions(selected_sites_df: pd.DataFrame) -> list[dict]:
+def detect_pci_collisions(graph: nx.Graph) -> list[dict]:
     """
-    Independent Collision detector: 2+ of the currently-selected sites
-    sharing the same (PCI, EARFCN) — no serving-site/neighbor concept at
-    all, unlike Confusion (select_collision_confusion_cluster). Run
-    separately so "Collision" and "Confusion" are genuinely independent
-    toggles in the UI, not the same check shown under two names.
+    Independent Collision detector: two NEIGHBOR sectors (a graph edge —
+    real observed handover OR within the configured distance threshold,
+    per build_neighbor_graph) sharing the exact same PCI on the same
+    EARFCN. Evaluated over actual neighbor pairs, not blindly across the
+    whole selection — this naturally includes same-site sector pairs
+    (their distance is ~0m, so they're always graph-connected), matching
+    real LTE PCI planning practice: a UE can hand over between two
+    sectors of the same physical site just as easily as between two
+    different sites, so both need checking. Run separately from
+    Confusion so they're genuinely independent toggles in the UI, not
+    the same check shown under two names.
     """
-    df = selected_sites_df.dropna(subset=["site_pci", "site_earfcn", "site_id_inferred"]).copy()
-    if df.empty:
-        return []
-    df["site_pci"] = pd.to_numeric(df["site_pci"], errors="coerce")
-    df["site_earfcn"] = pd.to_numeric(df["site_earfcn"], errors="coerce")
-    df = df.dropna(subset=["site_pci", "site_earfcn"])
+    sites_by_key: dict[tuple, set] = {}
+    for u, v in graph.edges():
+        if u[2] != v[2] or u[1] != v[1]:  # different EARFCN or different PCI -- not a collision
+            continue
+        key = (u[1], u[2])  # (pci, earfcn)
+        sites_by_key.setdefault(key, set()).update([u[0], v[0]])
 
     collisions: list[dict] = []
-    for (pci_val, earfcn_val), grp in df.groupby(["site_pci", "site_earfcn"]):
-        sites = sorted(grp["site_id_inferred"].unique().tolist())
-        if len(sites) >= 2:
-            collisions.append({"type": "Collision", "pci": int(pci_val), "earfcn": earfcn_val, "sites": sites})
+    for (pci_val, earfcn_val), sites in sites_by_key.items():
+        collisions.append({"type": "Collision", "pci": pci_val, "earfcn": earfcn_val, "sites": sorted(sites)})
     return collisions
 
 
 MOD_RULE_VALUES = (1, 3, 7, 9)
 
 
-def detect_pci_mod_conflicts(selected_sites_df: pd.DataFrame, mod_n: int) -> list[dict]:
+def detect_pci_mod_conflicts(graph: nx.Graph, mod_n: int) -> list[dict]:
     """
-    Generic PCI-mod-N conflict: 2+ of the currently-selected sites' real
-    PCIs share the same (PCI % mod_n) remainder on the same EARFCN, even
-    when their actual PCI values differ (unlike Collision, which needs an
-    exact PCI match). Mod3 is the one with real 3GPP meaning here (PSS
-    group — neighbor cells sharing a PSS degrade cross-correlation/sync).
-    Mod1 is trivial (every PCI % 1 == 0, so it will flag almost every
-    same-EARFCN site pair) and Mod7/Mod9 have no standard 3GPP planning
-    meaning — all three are included because they were explicitly
-    requested, not because they're meaningful network-planning checks.
+    Generic PCI-mod-N conflict: two NEIGHBOR sectors (graph edge — real
+    handover OR within the distance threshold, including same-site pairs)
+    whose real PCIs share the same (PCI % mod_n) remainder on the same
+    EARFCN, even when their actual PCI values differ (unlike Collision,
+    which needs an exact match). Mod3 is the one with real 3GPP meaning
+    here (PSS group — neighbor cells sharing a PSS degrade cross-
+    correlation/sync). Mod1 is trivial (every PCI % 1 == 0, so it flags
+    almost every neighbor pair) and Mod7/Mod9 have no standard 3GPP
+    planning meaning — all three are included because they were
+    explicitly requested, not because they're meaningful checks.
     """
-    df = selected_sites_df.dropna(subset=["site_pci", "site_earfcn", "site_id_inferred"]).copy()
-    if df.empty:
-        return []
-    df["site_pci"] = pd.to_numeric(df["site_pci"], errors="coerce")
-    df["site_earfcn"] = pd.to_numeric(df["site_earfcn"], errors="coerce")
-    df = df.dropna(subset=["site_pci", "site_earfcn"])
-    df["_mod"] = df["site_pci"].astype(int) % mod_n
+    members_by_key: dict[tuple, set] = {}
+    for u, v in graph.edges():
+        if u[2] != v[2]:
+            continue
+        earfcn = u[2]
+        mod_u, mod_v = u[1] % mod_n, v[1] % mod_n
+        if mod_u != mod_v:
+            continue
+        key = (mod_u, earfcn)
+        members_by_key.setdefault(key, set()).update([(u[0], u[1]), (v[0], v[1])])
 
     conflicts: list[dict] = []
-    for (mod_val, earfcn_val), grp in df.groupby(["_mod", "site_earfcn"]):
-        if grp["site_id_inferred"].nunique() < 2:
-            continue  # one site with several same-mod sectors of its own isn't a neighbor-facing conflict
-        members = sorted({(row.site_id_inferred, int(row.site_pci)) for row in grp.itertuples()})
+    for (mod_val, earfcn_val), members in members_by_key.items():
         conflicts.append(
             {
                 "type": f"Mod{mod_n}",
                 "mod_n": mod_n,
-                "mod_value": int(mod_val),
+                "mod_value": mod_val,
                 "earfcn": earfcn_val,
-                "members": members,
+                "members": sorted(members),
             }
         )
     conflicts.sort(key=lambda c: len(c["members"]), reverse=True)
@@ -456,33 +461,32 @@ def inject_synthetic_mod_conflict(
     return site_df, description
 
 
-def detect_pci_group_conflicts(selected_sites_df: pd.DataFrame) -> list[dict]:
+def detect_pci_group_conflicts(graph: nx.Graph) -> list[dict]:
     """
     Grouped PCI (3GPP PCI group, N_ID_1): the 504 PCIs (0-503) are divided
     into 168 groups of 3 consecutive values each. The group number is
     `PCI // 3` (integer division), 0-167 — NOT "PCI % 30", which is what
     the Site PCI table's earlier "Mod30 (SSS group)" column actually
     computed. That was a rough approximation, not the real 3GPP formula;
-    this is the correct one. Two sites sharing a PCI group on the same
-    EARFCN means they share the same underlying SSS-derived group even
-    though their exact PCI (and PSS) differ.
+    this is the correct one. Two NEIGHBOR sectors (graph edge — real
+    handover OR within the distance threshold, including same-site pairs)
+    sharing a PCI group on the same EARFCN share the same underlying
+    SSS-derived group even though their exact PCI (and PSS) differ.
     """
-    df = selected_sites_df.dropna(subset=["site_pci", "site_earfcn", "site_id_inferred"]).copy()
-    if df.empty:
-        return []
-    df["site_pci"] = pd.to_numeric(df["site_pci"], errors="coerce")
-    df["site_earfcn"] = pd.to_numeric(df["site_earfcn"], errors="coerce")
-    df = df.dropna(subset=["site_pci", "site_earfcn"])
-    df["_group"] = df["site_pci"].astype(int) // 3
+    members_by_key: dict[tuple, set] = {}
+    for u, v in graph.edges():
+        if u[2] != v[2]:
+            continue
+        earfcn = u[2]
+        group_u, group_v = u[1] // 3, v[1] // 3
+        if group_u != group_v:
+            continue
+        key = (group_u, earfcn)
+        members_by_key.setdefault(key, set()).update([(u[0], u[1]), (v[0], v[1])])
 
     conflicts: list[dict] = []
-    for (group_val, earfcn_val), grp in df.groupby(["_group", "site_earfcn"]):
-        if grp["site_id_inferred"].nunique() < 2:
-            continue
-        members = sorted({(row.site_id_inferred, int(row.site_pci)) for row in grp.itertuples()})
-        conflicts.append(
-            {"type": "Grouped", "group_value": int(group_val), "earfcn": earfcn_val, "members": members}
-        )
+    for (group_val, earfcn_val), members in members_by_key.items():
+        conflicts.append({"type": "Grouped", "group_value": group_val, "earfcn": earfcn_val, "members": sorted(members)})
     conflicts.sort(key=lambda c: len(c["members"]), reverse=True)
     return conflicts
 
@@ -691,17 +695,29 @@ def inject_synthetic_collision_confusion(site_df: pd.DataFrame, events_df: pd.Da
     # is exactly what breaks Streamlit's Arrow serialization for st.dataframe
     # (only to_site_earfcn is genuinely numeric in real rows, from the
     # site_df merge, so that one stays numeric here too).
+    #
+    # Also adds a DIRECT event between site_b and site_c themselves, not
+    # just servingsite->B and servingsite->C — confirmed necessary: under
+    # the neighbor-graph model (build_neighbor_graph), being each only a
+    # neighbor of a common third site does NOT make B and C neighbors of
+    # EACH OTHER (they can be on opposite sides of the serving site, well
+    # over the distance threshold apart) — detect_pci_collisions() found
+    # 0 collisions here without this direct edge, because Site 2/Site 3
+    # had no real OR distance-based edge connecting them despite both
+    # being confused-neighbors of Site 1.
     new_event_rows = []
-    for idx, neighbor_site in enumerate((site_b, site_c), start=1):
+    pairs = [(serving_site, site_b), (serving_site, site_c), (site_b, site_c)]
+    for idx, (from_site, to_site) in enumerate(pairs, start=1):
+        from_pci_val = str(int(from_pci)) if from_site == serving_site else str(synthetic_pci)
         new_event_rows.append(
             {
                 "session_id": f"SYNTH-{idx}",
-                "from_pci": str(int(from_pci)),
+                "from_pci": from_pci_val,
                 "to_pci": str(synthetic_pci),
-                "from_earfcn": str(int(from_earfcn)),
+                "from_earfcn": str(int(from_earfcn)) if from_site == serving_site else str(int(synthetic_earfcn)),
                 "to_earfcn": str(int(synthetic_earfcn)),
-                "from_site_id_inferred": serving_site,
-                "to_site_id_inferred": neighbor_site,
+                "from_site_id_inferred": from_site,
+                "to_site_id_inferred": to_site,
                 "to_site_earfcn": synthetic_earfcn,
                 "segment_distance_m": 100.0,
                 "time_delta_sec": 5.0,
@@ -722,8 +738,9 @@ def inject_synthetic_collision_confusion(site_df: pd.DataFrame, events_df: pd.Da
 
     description = (
         f"Synthetic (Collision + Confusion): real serving site {serving_site} given 2 synthetic handover "
-        f"events to its real neighbor sites {site_b} and {site_c}, both assigned synthetic PCI {synthetic_pci} "
-        f"on EARFCN {synthetic_earfcn}."
+        f"events to its real neighbor sites {site_b} and {site_c} (plus one direct {site_b}<->{site_c} event "
+        f"so they're graph-neighbors of each other too, not just both of {serving_site}), all three assigned "
+        f"synthetic PCI {synthetic_pci} on EARFCN {synthetic_earfcn}."
     )
     return site_df, events_out, description
 
@@ -743,6 +760,14 @@ def inject_synthetic_pure_collision(
     added here, deliberately — nothing observes these two as shared
     neighbors, so detect_pci_confusion() will never flag them, only
     detect_pci_collisions() will.
+
+    Picks the CLOSEST such pair (haversine), not just the first one found
+    in arbitrary order — confirmed necessary: under the neighbor-graph
+    model (build_neighbor_graph), Collision only fires for sectors that
+    are graph-neighbors (real handover OR within the distance threshold).
+    An arbitrary "not confused" pair can easily be many km apart, which
+    made this example silently stop being detected as a collision at all
+    once distance-based neighbor checking was added.
     """
     confused_pairs: set = set()
     if not events_df.empty and {"from_site_id_inferred", "to_site_id_inferred"}.issubset(events_df.columns):
@@ -752,19 +777,31 @@ def inject_synthetic_pure_collision(
                 for j in range(i + 1, len(neighbors)):
                     confused_pairs.add(frozenset((neighbors[i], neighbors[j])))
 
-    candidate_ids = [
-        sid for sid in site_df.dropna(subset=["site_id_inferred"])["site_id_inferred"].unique()
-        if str(sid) != "0" and sid not in exclude_site_ids
-    ]
+    candidates = (
+        site_df.dropna(subset=["site_id_inferred", "site_lat", "site_lon"])
+        .loc[lambda d: (d["site_id_inferred"].astype(str) != "0") & (~d["site_id_inferred"].isin(exclude_site_ids))]
+        .assign(
+            site_lat=lambda d: pd.to_numeric(d["site_lat"], errors="coerce"),
+            site_lon=lambda d: pd.to_numeric(d["site_lon"], errors="coerce"),
+        )
+        .dropna(subset=["site_lat", "site_lon"])
+        .drop_duplicates("site_id_inferred")
+    )
+    candidate_ids = candidates["site_id_inferred"].tolist()
+    latlon = dict(zip(candidates["site_id_inferred"], zip(candidates["site_lat"], candidates["site_lon"])))
+
     site_x = site_y = None
+    best_distance = None
     for i in range(len(candidate_ids)):
         for j in range(i + 1, len(candidate_ids)):
             a, b = candidate_ids[i], candidate_ids[j]
-            if frozenset((a, b)) not in confused_pairs:
-                site_x, site_y = a, b
-                break
-        if site_x is not None:
-            break
+            if frozenset((a, b)) in confused_pairs:
+                continue
+            lat1, lon1 = latlon[a]
+            lat2, lon2 = latlon[b]
+            dist = _haversine_scalar_m(lat1, lon1, lat2, lon2)
+            if best_distance is None or dist < best_distance:
+                best_distance, site_x, site_y = dist, a, b
     if site_x is None:
         raise ValueError("No pair of sites available for a Collision-only synthetic example.")
 
@@ -801,9 +838,10 @@ def inject_synthetic_pure_collision(
     site_df = pd.concat([site_df, pd.DataFrame(new_rows)], ignore_index=True)
 
     description = (
-        f"Synthetic (Collision only): real sites {site_x} and {site_y} — confirmed NOT linked as neighbors of "
-        f"any common serving site in the real handover data — both assigned synthetic PCI {synthetic_pci} on "
-        f"EARFCN {int(synthetic_earfcn)}. No handover events added, so Confusion will never flag this pair."
+        f"Synthetic (Collision only): real sites {site_x} and {site_y}, {best_distance:.0f}m apart (the closest "
+        f"available pair) — confirmed NOT linked as neighbors of any common serving site in the real handover "
+        f"data — both assigned synthetic PCI {synthetic_pci} on EARFCN {int(synthetic_earfcn)}. No handover "
+        "events added, so Confusion will never flag this pair; Collision relies on the distance threshold."
     )
     return site_df, site_x, site_y, description
 
@@ -1199,28 +1237,63 @@ def _candidates_by_distance(current_pci: int) -> list[int]:
     return candidates
 
 
-def build_neighbor_graph(selected_sites_df: pd.DataFrame, events_df: pd.DataFrame) -> nx.Graph:
+def _haversine_scalar_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """Great-circle distance in meters between two lat/lon points — same
+    formula as compute_offset()/the frontend's own distance math, just
+    scalar instead of vectorized (called pairwise, node-by-node)."""
+    radius_m = 6371000.0
+    phi1, phi2 = math.radians(lat1), math.radians(lat2)
+    dphi = math.radians(lat2 - lat1)
+    dlambda = math.radians(lon2 - lon1)
+    a = math.sin(dphi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlambda / 2) ** 2
+    return radius_m * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+
+
+DEFAULT_NEIGHBOR_DISTANCE_M = 500.0
+
+
+def build_neighbor_graph(
+    selected_sites_df: pd.DataFrame, events_df: pd.DataFrame, distance_threshold_m: float = DEFAULT_NEIGHBOR_DISTANCE_M
+) -> nx.Graph:
     """
     Nodes = every real (site, pci, earfcn) sector in the current
-    selection. Edges = REAL observed adjacency from events_df (the same
-    corrected, frequency-layer-aware handover data used by
-    detect_pci_confusion), weighted by handover count — "who actually
-    needs to avoid whom," independent of whether they currently conflict.
-    A literal networkx.Graph, not an ad hoc dict, so later graph-theoretic
-    work (centrality, formal coloring, NSGA-II's neighbor lookups) doesn't
-    need a rewrite.
+    selection. Two sectors are an EDGE ("neighbors") if EITHER:
+      - there's a REAL observed handover between them (events_df, the
+        same corrected, frequency-layer-aware data used by
+        detect_pci_confusion) -- highest confidence, always trusted; OR
+      - they're within `distance_threshold_m` of each other (haversine,
+        each sector's own site_lat/site_lon) on the SAME EARFCN --
+        the fallback for pairs with no observed handover, so the model
+        still works when real mobility data is sparse or missing for a
+        given pair.
+
+    This is a single unified rule, not "same site vs different site":
+    same-site sector pairs have distance ~0m, so they always satisfy the
+    distance criterion automatically and need no special case. A UE can
+    hand over between two sectors of the same physical site just as
+    easily as between two different sites, so they must be checked for
+    Collision/Mod-N/Grouped exactly like any other neighbor pair.
+
+    Real edges get weight = handover count and observed=True; distance-
+    only edges get weight 0 and observed=False (so callers can tell real
+    vs inferred adjacency apart). A literal networkx.Graph, not an ad hoc
+    dict, so later graph-theoretic work doesn't need a rewrite.
     """
-    df = selected_sites_df.dropna(subset=["site_pci", "site_earfcn", "site_id_inferred"]).copy()
+    df = selected_sites_df.dropna(subset=["site_pci", "site_earfcn", "site_id_inferred", "site_lat", "site_lon"]).copy()
     df["site_pci"] = pd.to_numeric(df["site_pci"], errors="coerce")
     df["site_earfcn"] = pd.to_numeric(df["site_earfcn"], errors="coerce")
-    df = df.dropna(subset=["site_pci", "site_earfcn"])
+    df["site_lat"] = pd.to_numeric(df["site_lat"], errors="coerce")
+    df["site_lon"] = pd.to_numeric(df["site_lon"], errors="coerce")
+    df = df.dropna(subset=["site_pci", "site_earfcn", "site_lat", "site_lon"])
 
     graph = nx.Graph()
     node_by_site_pci: dict[tuple, tuple] = {}
+    node_latlon: dict[tuple, tuple] = {}
     for row in df.itertuples():
         node = (row.site_id_inferred, int(row.site_pci), int(row.site_earfcn))
         graph.add_node(node)
         node_by_site_pci[(row.site_id_inferred, int(row.site_pci))] = node
+        node_latlon[node] = (row.site_lat, row.site_lon)
 
     required = {"from_site_id_inferred", "to_site_id_inferred", "from_pci", "to_pci"}
     if not events_df.empty and required.issubset(events_df.columns):
@@ -1236,8 +1309,25 @@ def build_neighbor_graph(selected_sites_df: pd.DataFrame, events_df: pd.DataFram
                 continue
             if graph.has_edge(u, v):
                 graph[u][v]["weight"] += 1
+                graph[u][v]["observed"] = True
             else:
-                graph.add_edge(u, v, weight=1)
+                graph.add_edge(u, v, weight=1, observed=True, distance_m=None)
+
+    nodes_by_earfcn: dict[int, list] = {}
+    for n in graph.nodes:
+        nodes_by_earfcn.setdefault(n[2], []).append(n)
+    for nodes in nodes_by_earfcn.values():
+        for i in range(len(nodes)):
+            for j in range(i + 1, len(nodes)):
+                u, v = nodes[i], nodes[j]
+                if graph.has_edge(u, v):
+                    continue
+                lat1, lon1 = node_latlon[u]
+                lat2, lon2 = node_latlon[v]
+                dist = _haversine_scalar_m(lat1, lon1, lat2, lon2)
+                if dist <= distance_threshold_m:
+                    graph.add_edge(u, v, weight=0, observed=False, distance_m=dist)
+
     return graph
 
 
@@ -1292,18 +1382,18 @@ def recommend_pci_reassignment(
     checked Mod rule at once, e.g. Mod3 and Mod7 both checked).
 
     Collision/Mod-N/Grouped conflicts are defined by detect_pci_collisions/
-    detect_pci_mod_conflicts/detect_pci_group_conflicts as EARFCN-scoped
-    across the WHOLE selection, among DIFFERENT sites only (site_id_inferred.
-    nunique() >= 2) — any two different sites sharing a PCI/remainder/group
-    on the same EARFCN, with no requirement of a real observed handover
-    between them. The candidate search matches this exactly: cost is
-    computed against every OTHER sector in the selection sharing the same
-    EARFCN AND a different site (confirmed bug, now fixed: a site's own
-    other sectors were previously being counted too) — not graph edges,
-    which missed conflict partners with no real handover between them
-    (e.g. two sites that are each only a neighbor of a common third site).
-    The graph is used only to decide processing ORDER (highest-degree
-    touched node first — standard greedy-coloring heuristic).
+    detect_pci_mod_conflicts/detect_pci_group_conflicts over NEIGHBOR
+    PAIRS in `graph` (real observed handover OR within the distance
+    threshold — see build_neighbor_graph), including same-site pairs
+    (their distance is ~0m, so they're always graph-connected) — matching
+    real LTE PCI planning, where a UE can hand over between two sectors
+    of the same site just as easily as between two different sites. The
+    candidate search matches this exactly: cost is computed against every
+    GRAPH NEIGHBOR of the node being reassigned, using the same graph the
+    detectors used, so the optimizer can never "solve" a conflict against
+    a pair the detectors wouldn't themselves flag, or fail to consider a
+    pair they would. The graph also decides processing ORDER (highest-
+    degree touched node first — standard greedy-coloring heuristic).
     """
     # Track WHICH conflict type(s) flagged each node, not just a flat
     # touched set — the table needs to say "Collision" / "Mod3" / etc by
@@ -1332,18 +1422,17 @@ def recommend_pci_reassignment(
     target_nodes = [node_by_site_pci[k] for k in touched_types if k in node_by_site_pci]
     target_nodes.sort(key=lambda n: graph.degree(n), reverse=True)
 
-    nodes_by_earfcn: dict[int, list] = {}
-    for n in graph.nodes:
-        nodes_by_earfcn.setdefault(n[2], []).append(n)
-
     assignments: dict = {}
     rows = []
     for node in target_nodes:
         site_id, current_pci, earfcn = node
-        # Only DIFFERENT sites count — matches detect_pci_collisions/
-        # detect_pci_mod_conflicts/detect_pci_group_conflicts, which all
-        # require site_id_inferred.nunique() >= 2 before flagging anything.
-        others = [n for n in nodes_by_earfcn.get(earfcn, []) if n[0] != site_id]
+        # Graph neighbors only (real handover OR within distance threshold,
+        # same set the detectors use), restricted to the SAME EARFCN —
+        # real handover edges can span inter-frequency handovers (a real
+        # neighbor on a different EARFCN), but PCI collision/Mod-N/Grouped
+        # only mean anything within one frequency layer, exactly like the
+        # detectors themselves check (u[2] != v[2] -> skipped).
+        others = [n for n in graph.neighbors(node) if n[2] == earfcn]
         other_pcis = [assignments.get(n, n[1]) for n in others]
 
         before_cost = sum(pair_cost(current_pci, npci) for npci in other_pcis)
@@ -1530,6 +1619,18 @@ def main() -> None:
             "(e.g. LTE1800 + LTE2100 on one sector) — informational, not a fault; shown in violet, not red."
         ),
     )
+    neighbor_distance_m = st.sidebar.number_input(
+        "Neighbor distance threshold (m)",
+        value=int(DEFAULT_NEIGHBOR_DISTANCE_M),
+        min_value=0,
+        step=50,
+        help=(
+            "Two sectors count as neighbors (checkable for Collision/Mod-N/Grouped) if EITHER they have a "
+            "real observed handover between them, OR they're within this distance of each other — same-site "
+            "sectors always qualify (their distance is ~0m). Only used when real handover data doesn't "
+            "already cover a pair; raise it if you want conflicts checked over a wider radius."
+        ),
+    )
 
     st.sidebar.header("Optimizer (beta)")
     run_optimizer_clicked = st.sidebar.button(
@@ -1597,35 +1698,45 @@ def main() -> None:
         st.warning(note)
 
     confusion_conflicts = detect_pci_confusion(events_df, site_ids_filter=set(selected_site_ids))
-    collision_conflicts = detect_pci_collisions(selected_sites_df)
 
-    # Mod1/3/7/9: in practice these occur naturally among 5+ real sites
-    # (coarse groupings collide far more easily than an exact PCI match),
-    # so the synthetic fallback rarely fires — but if a project/selection
-    # genuinely has none, inject one rather than showing an empty check.
+    # Unified neighbor graph (real observed handover OR within
+    # neighbor_distance_m — see build_neighbor_graph) drives Collision/
+    # Mod-N/Grouped from here on, not a blanket "anyone sharing a value in
+    # the selection" scan. Rebuilt after every injection below because
+    # each one adds a new sector row to selected_sites_df.
+    graph = build_neighbor_graph(selected_sites_df, events_df, distance_threshold_m=neighbor_distance_m)
+    collision_conflicts = detect_pci_collisions(graph)
+
+    # Mod1/3/7/9: in practice these occur naturally among 5+ real
+    # neighbor sectors (coarse groupings collide far more easily than an
+    # exact PCI match), so the synthetic fallback rarely fires — but if a
+    # project/selection genuinely has none, inject one rather than
+    # showing an empty check.
     mod_conflicts: dict[int, list] = {}
     used_pcis = set(pd.to_numeric(selected_sites_df["site_pci"], errors="coerce").dropna().astype(int).tolist())
     for mod_n in MOD_RULE_VALUES:
-        found = detect_pci_mod_conflicts(selected_sites_df, mod_n)
+        found = detect_pci_mod_conflicts(graph, mod_n)
         if not found:
             try:
                 selected_sites_df, mod_note = inject_synthetic_mod_conflict(
                     selected_sites_df, selected_site_ids, mod_n, used_pcis
                 )
                 st.warning(mod_note)
-                found = detect_pci_mod_conflicts(selected_sites_df, mod_n)
+                graph = build_neighbor_graph(selected_sites_df, events_df, distance_threshold_m=neighbor_distance_m)
+                found = detect_pci_mod_conflicts(graph, mod_n)
             except Exception as exc:  # noqa: BLE001
                 st.error(f"Could not find or synthesize a Mod{mod_n} example: {exc}")
         mod_conflicts[mod_n] = found
 
     # Grouped PCI (PCI // 3, the correct 3GPP formula) — same
     # naturally-occurring pattern as Mod-N, synthetic fallback rarely fires.
-    grouped_conflicts = detect_pci_group_conflicts(selected_sites_df)
+    grouped_conflicts = detect_pci_group_conflicts(graph)
     if show_grouped and not grouped_conflicts:
         try:
             selected_sites_df, grouped_note = inject_synthetic_group_conflict(selected_sites_df, selected_site_ids, used_pcis)
             st.warning(grouped_note)
-            grouped_conflicts = detect_pci_group_conflicts(selected_sites_df)
+            graph = build_neighbor_graph(selected_sites_df, events_df, distance_threshold_m=neighbor_distance_m)
+            grouped_conflicts = detect_pci_group_conflicts(graph)
         except Exception as exc:  # noqa: BLE001
             st.error(f"Could not find or synthesize a Grouped PCI example: {exc}")
 
@@ -1718,15 +1829,15 @@ def main() -> None:
         st.caption(
             "Only optimizes for the rule(s) currently checked above: "
             + (", ".join(active_rule_labels) if active_rule_labels else "none — check a rule first")
-            + ". Real observed neighbor graph (networkx) sets processing order only; each candidate PCI is "
-            "scored against every OTHER SITE's sector on the same EARFCN (not same-site sectors, not just "
-            "real neighbors — that's how Collision/Mod-N/Grouped are actually defined) — a first-pass greedy "
-            "heuristic, not the eventual NSGA-II solver. Recommend-only: nothing above (map/tables) changes."
+            + f". Each candidate PCI is scored against every NEIGHBOR sector (real observed handover OR "
+            f"within {int(neighbor_distance_m)}m — same-site sectors included, since they're always ~0m "
+            "apart) on the same EARFCN — the same neighbor graph the rules above use, so the optimizer can "
+            "never contradict what they detected. A first-pass greedy heuristic, not the eventual NSGA-II "
+            "solver. Recommend-only: nothing above (map/tables) changes."
         )
         if not active_rule_labels:
             st.warning("No PCI rule is checked above — check at least one (Collision, Confusion, a Mod, or Grouped) to run the optimizer.")
         else:
-            graph = build_neighbor_graph(selected_sites_df, events_df)
             mod_conflicts_checked = {n: mod_conflicts.get(n, []) for n in mod_values_checked}
             recs = recommend_pci_reassignment(
                 graph,

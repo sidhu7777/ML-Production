@@ -15,26 +15,31 @@ ML_ROOT = Path(__file__).resolve().parents[2]
 if str(ML_ROOT) not in sys.path:
     sys.path.insert(0, str(ML_ROOT))
 
-MODEL3_DIR = ML_ROOT / "models" / "model4_future_recommendation_experiment"
+PROJECT196_DIR = ML_ROOT / "models" / "model3_project196_input"
+MODEL3_DIR = ML_ROOT / "models" / "model3_current_recommendation_experiment"
 MODEL4_DIR = ML_ROOT / "models" / "model4_future_recommendation_experiment"
+PROJECT196_CELL_INPUT = PROJECT196_DIR / "project_196_model3_cell_input.csv"
+PROJECT196_BASELINE_INPUT = PROJECT196_DIR / "project_196_model3_baseline_grid_input.csv"
 
 MODEL_CONFIG = {
     "Model 3": {
         "subtitle": "Current recommendation flow",
-        "dataset": ML_ROOT / "models" / "model3_project196_input" / "project_196_model3_baseline_grid_input.csv",
-        "scope_dataset": MODEL4_DIR / "model4_project196_future_dataset.csv",
-        "cell_input": ML_ROOT / "models" / "model3_project196_input" / "project_196_model3_cell_input.csv",
+        "dataset": PROJECT196_BASELINE_INPUT,
+        "scope_dataset": PROJECT196_CELL_INPUT,
+        "scope_from_cell_input": True,
+        "cell_input": PROJECT196_CELL_INPUT,
         "recommendations": MODEL3_DIR / "model3_current_recommendations.csv",
         "summary": MODEL3_DIR / "model3_current_recommendation_summary.json",
         "before_rf": None,
-        "after_rf": MODEL3_DIR / "model4_full_after_baseline_rf_surface.csv",
+        "after_rf": MODEL3_DIR / "model3_after_rf_surface_combined.csv",
         "project_id": "196",
     },
     "Model 4": {
         "subtitle": "Future recommendation flow",
         "dataset": MODEL4_DIR / "model4_project196_future_dataset.csv",
-        "scope_dataset": MODEL4_DIR / "model4_project196_future_dataset.csv",
-        "cell_input": ML_ROOT / "models" / "model3_project196_input" / "project_196_model3_cell_input.csv",
+        "scope_dataset": PROJECT196_CELL_INPUT,
+        "scope_from_cell_input": True,
+        "cell_input": PROJECT196_CELL_INPUT,
         "recommendations": MODEL4_DIR / "model4_future_recommendations.csv",
         "summary": MODEL4_DIR / "model4_future_recommendation_summary.json",
         "before_rf": None,
@@ -44,7 +49,6 @@ MODEL_CONFIG = {
 }
 
 
-@st.cache_data(show_spinner=False)
 def load_csv(path_text: str) -> pd.DataFrame:
     path = Path(path_text)
     if not path.exists():
@@ -52,7 +56,6 @@ def load_csv(path_text: str) -> pd.DataFrame:
     return pd.read_csv(path, low_memory=False)
 
 
-@st.cache_data(show_spinner=False)
 def load_json(path_text: str) -> dict[str, Any]:
     path = Path(path_text)
     if not path.exists():
@@ -296,12 +299,53 @@ def recommendation_scope_warning(rec_df: pd.DataFrame, cell_input: pd.DataFrame,
     dataset_path = str(summary.get("dataset_path", ""))
     if outside_sites or ("model3_current_dataset.csv" in dataset_path and "project_196" not in dataset_path):
         return (
-            "This Model 3 recommendation artifact was generated from the old 142-cell "
-            "`model3_current_dataset.csv`, not directly from the Project 196 full-grid input. "
-            "The RF baseline map below is Project 196 polygon-correct, but this recommendation "
-            f"CSV contains non-Project196 sites: {', '.join(outside_sites[:8])}."
+            "The congested input scope is the corrected Project 196 18-cell input, but this "
+            "recommendation artifact appears stale or generated from a different source. "
+            f"Non-Project196 sites in recommendation CSV: {', '.join(outside_sites[:8]) or 'none detected'}."
         )
     return ""
+
+
+def artifact_uses_project196_input(summary: dict[str, Any]) -> bool:
+    text = json.dumps(summary, default=str).replace("\\", "/").lower()
+    if not text:
+        return False
+    if "model3_current_dataset.csv" in text:
+        return False
+    if "model3_project196_input" in text or "project_196_model3" in text:
+        return True
+    return False
+
+
+def valid_project196_cells(cell_input: pd.DataFrame) -> set[str]:
+    if cell_input.empty or "Node_Cell_ID" not in cell_input.columns:
+        return set()
+    return set(cell_input["Node_Cell_ID"].map(clean_text).loc[lambda s: s.ne("")])
+
+
+def valid_project196_sites(cell_input: pd.DataFrame) -> set[str]:
+    if cell_input.empty or "site_id" not in cell_input.columns:
+        return set()
+    return set(cell_input["site_id"].map(clean_text).loc[lambda s: s.ne("")])
+
+
+def artifact_has_only_project196_cells(df: pd.DataFrame, cell_input: pd.DataFrame) -> bool:
+    if df.empty:
+        return True
+    valid_cells = valid_project196_cells(cell_input)
+    valid_sites = valid_project196_sites(cell_input)
+    if "Node_Cell_ID" in df.columns:
+        cells = set(df["Node_Cell_ID"].map(clean_text).loc[lambda s: s.ne("")])
+        if cells and valid_cells and not cells.issubset(valid_cells):
+            return False
+    if "site_id" in df.columns:
+        sites = set(df["site_id"].map(clean_text).str.replace(r"^s-", "", regex=True).loc[lambda s: s.ne("")])
+        synthetic_sites = {site for site in sites if site.startswith("MB") or site in {"1", "2", "3"}}
+        if synthetic_sites:
+            return False
+        if sites and valid_sites and not sites.issubset(valid_sites):
+            return False
+    return True
 
 
 def display_columns_for_dataset(df: pd.DataFrame) -> dict[str, str | None]:
@@ -366,7 +410,11 @@ def congested_cells_table(df: pd.DataFrame, threshold: float) -> pd.DataFrame:
     if "available_bands" in grouped:
         grouped["available_band"] = grouped["available_bands"].map(has_value)
     if "carrier_possible" in grouped:
-        grouped["available_band"] = grouped["available_band"] | grouped["carrier_possible"].fillna(False).astype(bool)
+        carrier_possible = grouped["carrier_possible"].map(
+            lambda value: clean_text(value).lower() in {"true", "1", "yes", "y"}
+            or (pd.notna(value) and not isinstance(value, str) and bool(value))
+        )
+        grouped["available_band"] = grouped["available_band"].astype(bool) | carrier_possible
 
     view = grouped[["site", "cell", "sector", "band", "available_band", "prb", "rrc", "pressure"]].copy()
     return view.sort_values(["pressure", "prb", "rrc"], ascending=False).reset_index(drop=True)
@@ -576,19 +624,31 @@ def metric_row(dataset: pd.DataFrame, rec_df: pd.DataFrame, congested_df: pd.Dat
 def page(model_name: str) -> None:
     config = MODEL_CONFIG[model_name]
     raw_baseline = load_csv(str(config["dataset"]))
-    raw_scope = load_csv(str(config.get("scope_dataset", config["dataset"])))
     before_rf_path = config.get("before_rf")
     after_rf_path = config.get("after_rf")
     raw_before_rf = load_csv(str(before_rf_path)) if before_rf_path else pd.DataFrame()
     raw_after_rf = load_csv(str(after_rf_path)) if after_rf_path else pd.DataFrame()
     cell_input = load_csv(str(config["cell_input"]))
+    if config.get("scope_from_cell_input"):
+        raw_scope = cell_input.copy()
+    else:
+        raw_scope = load_csv(str(config.get("scope_dataset", config["dataset"])))
     baseline_dataset = normalize_dataset(enrich_from_cell_input(raw_baseline, cell_input))
-    scope_dataset = normalize_dataset(enrich_from_cell_input(raw_scope, cell_input))
+    scope_dataset = normalize_dataset(raw_scope if config.get("scope_from_cell_input") else enrich_from_cell_input(raw_scope, cell_input))
     before_rf_dataset = normalize_dataset(raw_before_rf) if not raw_before_rf.empty else pd.DataFrame()
     after_rf_dataset = normalize_dataset(raw_after_rf) if not raw_after_rf.empty else pd.DataFrame()
     rec_df = load_csv(str(config["recommendations"]))
     summary = load_json(str(config["summary"]))
     threshold = float(summary.get("threshold") or 70.0)
+    stale_recommendations = not artifact_uses_project196_input(summary) or not artifact_has_only_project196_cells(rec_df, cell_input)
+    stale_after_rf = not artifact_has_only_project196_cells(raw_after_rf, cell_input)
+    stale_before_rf = not artifact_has_only_project196_cells(raw_before_rf, cell_input)
+    if stale_recommendations:
+        rec_df = pd.DataFrame()
+    if stale_after_rf:
+        after_rf_dataset = pd.DataFrame()
+    if stale_before_rf:
+        before_rf_dataset = pd.DataFrame()
 
     st.subheader(config["subtitle"])
     st.caption(f"Project 196 RF baseline dataset: {config['dataset']}")
@@ -599,6 +659,16 @@ def page(model_name: str) -> None:
         st.caption(f"After-effect after RF: {after_rf_path}")
     st.caption(f"Cell input: {config['cell_input']}")
     st.caption(f"Recommendations: {config['recommendations']}")
+    if stale_recommendations:
+        st.warning(
+            "Recommendation artifact is stale or not Project 196 aligned, so it is hidden. "
+            "Run Model 3/Model 4 again on the corrected Project 196 18-cell Excel to populate this section."
+        )
+    if stale_after_rf:
+        st.warning(
+            "After-RF artifact is stale or contains non-Project196/synthetic-only sites, so it is hidden. "
+            "This prevents outside-polygon points from being plotted as Project 196 results."
+        )
     warning = recommendation_scope_warning(rec_df, cell_input, summary)
     if warning:
         st.warning(warning)
