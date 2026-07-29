@@ -40,10 +40,20 @@ def _engine_for_region(region: str):
     return create_engine(url)
 
 
+def _bridge_region_params(project_id: int, region: str) -> dict:
+    normalized_region = str(region or "india").strip().lower()
+    params = {"projectId": int(project_id), "region": normalized_region}
+    if normalized_region == "taiwan":
+        params["countryCode"] = "TW"
+    elif normalized_region == "india":
+        params["countryCode"] = "IN"
+    return params
+
+
 def _load_project_polygon(project_id: int, region: str, site_df: Optional[pd.DataFrame] = None) -> gpd.GeoDataFrame:
     bridge = get_bridge_client()
     if bridge:
-        df = bridge.get_rows("GetProjectRegions", {"projectId": int(project_id)})
+        df = bridge.get_rows("GetProjectRegions", _bridge_region_params(project_id, region))
         source = "python_bridge"
     else:
         engine = _engine_for_region(region)

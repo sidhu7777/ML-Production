@@ -172,10 +172,27 @@ def _print_df_profile(stage, df):
         print(f"[LTE][{stage}] top_network_counts={top_network}")
 
 
-def _load_project_polygons(project_id, current_engine):
+def _country_code_for_region(region):
+    normalized = str(region or "").strip().lower()
+    if normalized == "taiwan":
+        return "TW"
+    if normalized == "india":
+        return "IN"
+    return normalized.upper() if normalized else None
+
+
+def _bridge_region_params(project_id, region):
+    params = {"projectId": int(project_id), "region": str(region or "india").lower()}
+    country_code = _country_code_for_region(region)
+    if country_code:
+        params["countryCode"] = country_code
+    return params
+
+
+def _load_project_polygons(project_id, current_engine, region="india"):
     bridge = get_bridge_client()
     if bridge:
-        region_df = bridge.get_rows("GetProjectRegions", {"projectId": int(project_id)})
+        region_df = bridge.get_rows("GetProjectRegions", _bridge_region_params(project_id, region))
         source = "python_bridge"
     else:
         source = "database"
@@ -228,7 +245,7 @@ def _resolve_prediction_polygons(params, current_engine):
             return [load_wkt(polygon_wkt)]
         except Exception as exc:
             print(f"[LTE][POLYGON_OVERRIDE] invalid_wkt={exc}")
-    return _load_project_polygons(params["project_id"], current_engine)
+    return _load_project_polygons(params["project_id"], current_engine, params.get("region", "india"))
 
 
 def _swap_polygon_coords(polygons):
@@ -249,8 +266,8 @@ def _filter_df_by_polygons(df, polygons):
     return df.loc[mask].copy()
 
 
-def _apply_drive_polygon_filter(df, project_id, current_engine):
-    polygons = _load_project_polygons(project_id, current_engine)
+def _apply_drive_polygon_filter(df, project_id, current_engine, region="india"):
+    polygons = _load_project_polygons(project_id, current_engine, region)
     if not polygons:
         print("[LTE][DRIVE_FETCH_POLYGON] polygons_found=0 skipped=True")
         return df, {
@@ -294,8 +311,8 @@ def _apply_drive_polygon_filter(df, project_id, current_engine):
     return swapped_df, stats
 
 
-def _apply_prediction_polygon_filter(df, project_id, current_engine):
-    polygons = _load_project_polygons(project_id, current_engine)
+def _apply_prediction_polygon_filter(df, project_id, current_engine, region="india"):
+    polygons = _load_project_polygons(project_id, current_engine, region)
     if not polygons:
         print("[LTE][RF_OUTPUT_POLYGON] polygons_found=0 skipped=True")
         return df, {
@@ -398,7 +415,7 @@ def fetch_site_data(project_id, region="india", polygon_ids=None, operator=None)
     polygon_id_list = _parse_polygon_ids(polygon_ids)
     bridge = get_bridge_client()
     if bridge:
-        params = {"projectId": int(project_id)}
+        params = _bridge_region_params(project_id, region)
         if polygon_id_list:
             params["polygon_ids"] = ",".join(str(value) for value in polygon_id_list)
         start_time = time.perf_counter()
@@ -597,7 +614,7 @@ def fetch_drive_data(
                 if col in frontend_df.columns:
                     frontend_df[col] = frontend_df[col].astype(str).str.strip()
             frontend_df, polygon_stats = _apply_drive_polygon_filter(
-                frontend_df, project_id, current_engine
+                frontend_df, project_id, current_engine, region
             )
             _print_fetch_summary(
                 "DRIVE_FETCH_FRONTEND",
@@ -673,7 +690,11 @@ def fetch_drive_data(
                 "SessionIds": [int(sid) for sid in session_ids],
                 "IncludeNeighbour": True,
                 "PrimaryOnly": bool(primary_only),
+                "Region": str(region or "india").lower(),
             }
+            country_code = _country_code_for_region(region)
+            if country_code:
+                body["CountryCode"] = country_code
             if operator_value:
                 body["Operator"] = operator_value
             return _normalize_drive_dataframe(bridge.post_rows("GetDriveTestRows", body))
@@ -771,7 +792,7 @@ def fetch_drive_data(
     for col in ["cell_id", "nodeb_id", "pci", "earfcn"]:
         if col in df.columns:
             df[col] = df[col].astype(str).str.strip()
-    df, polygon_stats = _apply_drive_polygon_filter(df, project_id, current_engine)
+    df, polygon_stats = _apply_drive_polygon_filter(df, project_id, current_engine, region)
     print(
         f"[LTE][DRIVE_FETCH_COUNTS] raw_total_rows={raw_total_rows} "
         f"after_primary_rows={primary_filtered_rows} "
@@ -791,7 +812,7 @@ def fetch_building_data(project_id, region="india"):
     current_engine = engine.get(region.lower(), engine["india"])
     bridge = get_bridge_client()
     if bridge:
-        df = bridge.get_rows("GetLteBuildingRows", {"projectId": int(project_id)})
+        df = bridge.get_rows("GetLteBuildingRows", _bridge_region_params(project_id, region))
         source = "python_bridge"
     else:
         query = f"""
@@ -943,6 +964,8 @@ def run_rf_prediction_fast(site_df, drive_df, building_df, params):
                 min_cells_per_grid=int(params.get("min_cells_per_grid", 1) or 1),
                 ensure_all_cells=bool(params.get("ensure_all_cells", True)),
                 min_grids_per_cell=int(params.get("min_grids_per_cell", 1) or 1),
+                min_candidate_rsrp_dbm=float(params.get("min_candidate_rsrp_dbm", -128) or -128),
+                candidate_safety_cap=int(params.get("candidate_safety_cap", 20) or 20),
             )
             if not prediction_points_df.empty:
                 print(
@@ -1010,7 +1033,7 @@ def run_rf_prediction_fast(site_df, drive_df, building_df, params):
         )
     else:
         pred_df, polygon_stats = _apply_prediction_polygon_filter(
-            pred_df, params["project_id"], current_engine
+            pred_df, params["project_id"], current_engine, params.get("region", "india")
         )
     pred_df = attach_site_identity_to_predictions(pred_df, site_df)
     print(

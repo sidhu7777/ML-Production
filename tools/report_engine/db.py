@@ -167,6 +167,8 @@ def get_network_logs_for_sessions(
         """).bindparams(bindparam("session_ids", expanding=True))
 
         df = pd.read_sql(query, conn, params={"session_ids": session_ids})
+        df.attrs["report_data_source"] = "direct_db_raw"
+        df.attrs["report_prefiltered"] = False
         return df
     finally:
         if close_conn:

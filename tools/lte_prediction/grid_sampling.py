@@ -30,6 +30,83 @@ def haversine_m(lat1, lon1, lat2, lon2):
     return 2.0 * radius_m * np.arcsin(np.sqrt(a))
 
 
+def bearing_deg(lat1, lon1, lat2, lon2):
+    lat1 = np.radians(lat1)
+    lon1 = np.radians(lon1)
+    lat2 = np.radians(lat2)
+    lon2 = np.radians(lon2)
+    dlon = lon2 - lon1
+    x = np.sin(dlon) * np.cos(lat2)
+    y = np.cos(lat1) * np.sin(lat2) - (np.sin(lat1) * np.cos(lat2) * np.cos(dlon))
+    return (np.degrees(np.arctan2(x, y)) + 360.0) % 360.0
+
+
+def _numeric_series(df: pd.DataFrame, col: str, default: float) -> pd.Series:
+    if col in df.columns:
+        series = pd.to_numeric(df[col], errors="coerce")
+    else:
+        series = pd.Series(np.nan, index=df.index, dtype=float)
+    return series.fillna(default).astype(float)
+
+
+def _derive_frequency_series(df: pd.DataFrame, default: float = 1800.0) -> pd.Series:
+    for col in ("frequency_mhz", "frequency", "band"):
+        if col not in df.columns:
+            continue
+        numeric = pd.to_numeric(df[col], errors="coerce")
+        if numeric.notna().any():
+            return numeric.fillna(default).astype(float)
+        extracted = (
+            df[col]
+            .astype(str)
+            .str.extract(r"(\d{3,4}(?:\.\d+)?)", expand=False)
+        )
+        numeric = pd.to_numeric(extracted, errors="coerce")
+        if numeric.notna().any():
+            return numeric.fillna(default).astype(float)
+    return pd.Series(default, index=df.index, dtype=float)
+
+
+def _antenna_gain_estimate(az_diff, elev_diff, max_gain=18.0):
+    ah = np.minimum(12.0 * np.square(az_diff / 65.0), 30.0)
+    av = np.minimum(12.0 * np.square(elev_diff / 6.0), 20.0)
+    return max_gain - np.minimum(ah + av, 30.0)
+
+
+def _estimate_candidate_rsrp(
+    site_lat: np.ndarray,
+    site_lon: np.ndarray,
+    freq: np.ndarray,
+    height: np.ndarray,
+    tx_power: np.ndarray,
+    azimuth: np.ndarray,
+    etilt: np.ndarray,
+    mtilt: np.ndarray,
+    point_lat: float,
+    point_lon: float,
+    distance_m: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    d_m = np.maximum(distance_m, 1.0)
+    d_km = np.maximum(d_m / 1000.0, 0.001)
+    h_rx = 1.5
+    a_hm = (1.1 * np.log10(freq) - 0.7) * h_rx - (1.56 * np.log10(freq) - 0.8)
+    base_pl = 46.3 + 33.9 * np.log10(freq) - 13.82 * np.log10(height) - a_hm + 3.0
+    slope = 44.9 - 6.55 * np.log10(height)
+    pathloss = base_pl + slope * np.log10(d_km)
+
+    bearing = bearing_deg(
+        site_lat,
+        site_lon,
+        point_lat,
+        point_lon,
+    )
+    az_diff = np.abs((bearing - azimuth + 180.0) % 360.0 - 180.0)
+    elev_angle = np.degrees(np.arctan2(h_rx - height, d_m))
+    elev_diff = elev_angle + etilt + mtilt
+    gain = _antenna_gain_estimate(az_diff, elev_diff)
+    return tx_power + gain - pathloss - 2.0, az_diff
+
+
 def fetch_frontend_grid_cells(
     current_engine,
     project_id: int,
@@ -189,6 +266,8 @@ def assign_samples_to_relevant_cells(
     min_cells_per_grid: int = 1,
     ensure_all_cells: bool = True,
     min_grids_per_cell: int = 1,
+    min_candidate_rsrp_dbm: float = -128.0,
+    candidate_safety_cap: int = 20,
 ) -> pd.DataFrame:
     if samples_df.empty or site_df.empty:
         return pd.DataFrame()
@@ -203,36 +282,11 @@ def assign_samples_to_relevant_cells(
     if valid_sites.empty:
         return pd.DataFrame()
 
-    if "canonical_sector_id" in valid_sites.columns:
-        sector_key = valid_sites["canonical_sector_id"].astype(str).str.strip()
-    elif "frontend_site_sector_key" in valid_sites.columns:
-        sector_key = valid_sites["frontend_site_sector_key"].astype(str).str.strip()
-    elif {"site_identity_key", "sector_identity"}.issubset(valid_sites.columns):
-        sector_key = valid_sites["site_identity_key"].astype(str).str.strip() + "|" + valid_sites["sector_identity"].astype(str).str.strip()
-    elif {"site", "sector"}.issubset(valid_sites.columns):
-        sector_key = valid_sites["site"].astype(str).str.strip() + "|" + valid_sites["sector"].astype(str).str.strip()
-    elif {"Site ID", "sector"}.issubset(valid_sites.columns):
-        sector_key = valid_sites["Site ID"].astype(str).str.strip() + "|" + valid_sites["sector"].astype(str).str.strip()
-    else:
-        sector_key = valid_sites["Node_Cell_ID"].astype(str)
-    invalid_sector = sector_key.isna() | sector_key.eq("") | sector_key.str.lower().isin({"nan", "none", "<na>"})
-    valid_sites["_assignment_sector_key"] = sector_key.mask(invalid_sector, valid_sites["Node_Cell_ID"].astype(str))
-
-    sector_centers = (
+    valid_sites = (
         valid_sites
-        .groupby("_assignment_sector_key", dropna=False)
-        .agg(site_lat=("lat", "mean"), site_lon=("lon", "mean"))
-        .reset_index()
-    )
-    if sector_centers.empty:
-        return pd.DataFrame()
-
-    sector_to_cells = (
-        valid_sites[["_assignment_sector_key", "Node_Cell_ID"]]
-        .drop_duplicates()
-        .groupby("_assignment_sector_key")["Node_Cell_ID"]
-        .apply(lambda s: sorted(set(s.astype(str))))
-        .to_dict()
+        .sort_values(["Node_Cell_ID", "lat", "lon"])
+        .drop_duplicates(subset=["Node_Cell_ID"], keep="first")
+        .reset_index(drop=True)
     )
 
     grid_centers = (
@@ -240,51 +294,67 @@ def assign_samples_to_relevant_cells(
         .drop_duplicates(subset=["frontend_grid_id"])
         .copy()
     )
-    max_cells_per_grid = max(1, int(max_cells_per_grid or 1))
+    candidate_safety_cap = max(1, int(candidate_safety_cap or max_cells_per_grid or 20))
     min_cells_per_grid = max(1, int(min_cells_per_grid or 1))
     radius_m = float(radius_m or 0.0)
+    min_candidate_rsrp_dbm = float(min_candidate_rsrp_dbm)
 
     assignments = []
-    site_lat = sector_centers["site_lat"].to_numpy(dtype=float)
-    site_lon = sector_centers["site_lon"].to_numpy(dtype=float)
-    sector_ids = sector_centers["_assignment_sector_key"].astype(str).to_numpy()
+    site_lat = valid_sites["lat"].to_numpy(dtype=float)
+    site_lon = valid_sites["lon"].to_numpy(dtype=float)
+    node_cell_ids = valid_sites["Node_Cell_ID"].astype(str).to_numpy()
+    site_freq = np.clip(_derive_frequency_series(valid_sites).to_numpy(dtype=float), 450.0, 3800.0)
+    site_height = np.clip(_numeric_series(valid_sites, "antenna_height", 30.0).to_numpy(dtype=float), 5.0, 120.0)
+    site_tx_power = _numeric_series(valid_sites, "tx_power", 46.0).to_numpy(dtype=float)
+    site_azimuth = _numeric_series(valid_sites, "azimuth", 0.0).to_numpy(dtype=float)
+    site_etilt = _numeric_series(valid_sites, "electrical_tilt", 3.0).to_numpy(dtype=float)
+    site_mtilt = _numeric_series(valid_sites, "mechanical_tilt", 0.0).to_numpy(dtype=float)
     for grid in grid_centers.itertuples(index=False):
         dist = haversine_m(float(grid.grid_center_lat), float(grid.grid_center_lon), site_lat, site_lon)
-        within = np.where(dist <= radius_m)[0] if radius_m > 0 else np.array([], dtype=int)
-        if within.size:
-            selected = within[np.argsort(dist[within])[:max_cells_per_grid]]
-            source = "within_radius_sector_all_bands"
+        estimated_rsrp, az_diff = _estimate_candidate_rsrp(
+            site_lat,
+            site_lon,
+            site_freq,
+            site_height,
+            site_tx_power,
+            site_azimuth,
+            site_etilt,
+            site_mtilt,
+            float(grid.grid_center_lat),
+            float(grid.grid_center_lon),
+            dist,
+        )
+        viable = np.where(estimated_rsrp >= min_candidate_rsrp_dbm)[0]
+        if viable.size:
+            selected = viable[np.argsort(estimated_rsrp[viable])[::-1][:candidate_safety_cap]]
+            source = "rf_viable_cell_band"
         else:
-            nearest_count = min(min_cells_per_grid, len(sector_ids))
-            selected = np.argsort(dist)[:nearest_count]
-            source = "nearest_sector_fallback_all_bands"
+            nearest_count = min(min_cells_per_grid, len(node_cell_ids))
+            selected = np.argsort(estimated_rsrp)[::-1][:nearest_count]
+            source = "rf_best_fallback_cell_band"
         for idx in selected:
-            for node_cell_id in sector_to_cells.get(str(sector_ids[idx]), []):
-                assignments.append(
-                    {
-                        "frontend_grid_id": str(grid.frontend_grid_id),
-                        "Node_Cell_ID": str(node_cell_id),
-                        "distance_m": float(dist[idx]),
-                        "assignment_source": source,
-                    }
-                )
+            assignments.append(
+                {
+                    "frontend_grid_id": str(grid.frontend_grid_id),
+                    "Node_Cell_ID": str(node_cell_ids[idx]),
+                    "distance_m": float(dist[idx]),
+                    "estimated_rsrp_dbm": float(estimated_rsrp[idx]),
+                    "azimuth_delta_deg": float(az_diff[idx]),
+                    "assignment_source": source,
+                }
+            )
 
     assignment_df = pd.DataFrame(assignments)
     if ensure_all_cells and not assignment_df.empty:
         min_grids_per_cell = max(1, int(min_grids_per_cell or 1))
         assigned_cells = set(assignment_df["Node_Cell_ID"].astype(str))
-        cell_centers = (
-            valid_sites.groupby("Node_Cell_ID", dropna=False)
-            .agg(site_lat=("lat", "mean"), site_lon=("lon", "mean"))
-            .reset_index()
-        )
-        missing_sites = cell_centers.loc[~cell_centers["Node_Cell_ID"].astype(str).isin(assigned_cells)].copy()
+        missing_sites = valid_sites.loc[~valid_sites["Node_Cell_ID"].astype(str).isin(assigned_cells)].copy()
         if not missing_sites.empty:
             grid_lat = pd.to_numeric(grid_centers["grid_center_lat"], errors="coerce").to_numpy(dtype=float)
             grid_lon = pd.to_numeric(grid_centers["grid_center_lon"], errors="coerce").to_numpy(dtype=float)
             backfill_rows = []
             for site in missing_sites.itertuples(index=False):
-                dist = haversine_m(float(site.site_lat), float(site.site_lon), grid_lat, grid_lon)
+                dist = haversine_m(float(site.lat), float(site.lon), grid_lat, grid_lon)
                 nearest = np.argsort(dist)[: min(min_grids_per_cell, len(grid_centers))]
                 for idx in nearest:
                     backfill_rows.append(
@@ -292,7 +362,9 @@ def assign_samples_to_relevant_cells(
                             "frontend_grid_id": str(grid_centers.iloc[idx]["frontend_grid_id"]),
                             "Node_Cell_ID": str(site.Node_Cell_ID),
                             "distance_m": float(dist[idx]),
-                            "assignment_source": "cell_coverage_backfill",
+                            "estimated_rsrp_dbm": np.nan,
+                            "azimuth_delta_deg": np.nan,
+                            "assignment_source": "cell_band_coverage_backfill",
                         }
                     )
             if backfill_rows:
@@ -305,7 +377,7 @@ def assign_samples_to_relevant_cells(
     if assignment_df.empty:
         return pd.DataFrame()
     assignment_df = (
-        assignment_df.sort_values(["frontend_grid_id", "distance_m", "Node_Cell_ID"])
+        assignment_df.sort_values(["frontend_grid_id", "estimated_rsrp_dbm", "distance_m", "Node_Cell_ID"], ascending=[True, False, True, True])
         .drop_duplicates(subset=["frontend_grid_id", "Node_Cell_ID"], keep="first")
         .copy()
     )
@@ -314,7 +386,8 @@ def assign_samples_to_relevant_cells(
         f"[LTE][FRONTEND_GRID_ASSIGN] grids={grid_centers['frontend_grid_id'].nunique()} "
         f"assigned_grids={assignment_df['frontend_grid_id'].nunique()} "
         f"cells={assignment_df['Node_Cell_ID'].nunique()} rows={len(out)} "
-        f"fallback_grids={int((assignment_df['assignment_source'] == 'nearest_sector_fallback_all_bands').sum())} "
-        f"sector_expansion=True"
+        f"fallback_grids={int((assignment_df['assignment_source'] == 'rf_best_fallback_cell_band').sum())} "
+        f"cell_band_assignment=True min_candidate_rsrp_dbm={min_candidate_rsrp_dbm} "
+        f"candidate_safety_cap={candidate_safety_cap}"
     )
     return out.reset_index(drop=True)

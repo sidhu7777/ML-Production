@@ -606,6 +606,7 @@ def _build_current_cell_inventory(df: pd.DataFrame, config: CurrentModel3Config)
             "carrier_addition_possible": bool(group.get("carrier_addition_possible", pd.Series(False)).astype(bool).any()),
             "carrier_addition_blocked": bool(group.get("carrier_addition_blocked", pd.Series(False)).astype(bool).all()),
             "carrier_addition_reason": future_rules._first_non_empty(group.get("carrier_addition_reason", pd.Series(dtype=object))),
+            "recommendation_scope_cell": bool(group.get("recommendation_scope_cell", pd.Series(False)).astype(bool).any()),
             "model3_scenario": future_rules._first_non_empty(group.get("model3_scenario", pd.Series(dtype=object))),
             "model3_scenario_reason": future_rules._first_non_empty(group.get("model3_scenario_reason", pd.Series(dtype=object))),
             "sector_has_alternate_carrier": bool(group.get("sector_has_alternate_carrier", pd.Series(False)).astype(bool).any()),

@@ -3,6 +3,7 @@ import math
 import numpy as np
 from numpy import around
 import pandas as pd
+from datetime import datetime
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -1129,6 +1130,41 @@ def get_session_data_for_drive_summary(session_ids: list):
         return None
 
 
+def _coerce_report_datetime(value):
+    if not isinstance(value, dict):
+        return value
+
+    keys = {str(k).lower(): k for k in value.keys()}
+    if "year" in keys and value.get(keys["year"]) is not None:
+        if value.get(keys.get("isvaliddatetime", "")) is False:
+            return None
+        try:
+            microsecond = int(value.get(keys.get("microsecond", ""), 0) or 0)
+            millisecond = int(value.get(keys.get("millisecond", ""), 0) or 0)
+            if not microsecond and millisecond:
+                microsecond = millisecond * 1000
+            return datetime(
+                int(value[keys["year"]]),
+                int(value[keys["month"]]),
+                int(value[keys["day"]]),
+                int(value.get(keys.get("hour", ""), 0) or 0),
+                int(value.get(keys.get("minute", ""), 0) or 0),
+                int(value.get(keys.get("second", ""), 0) or 0),
+                microsecond,
+            )
+        except (KeyError, TypeError, ValueError):
+            return None
+
+    for nested_key in ("value", "datetime", "dateTime", "date", "timestamp", "Timestamp"):
+        if nested_key in value:
+            return _coerce_report_datetime(value.get(nested_key))
+    return None
+
+
+def _coerce_report_datetime_series(series: pd.Series) -> pd.Series:
+    return series.apply(_coerce_report_datetime)
+
+
 def _build_session_df_from_network_logs(network_df: pd.DataFrame) -> pd.DataFrame | None:
     if network_df is None or network_df.empty:
         return None
@@ -1136,6 +1172,7 @@ def _build_session_df_from_network_logs(network_df: pd.DataFrame) -> pd.DataFram
         return None
 
     df = network_df[["session_id", "timestamp"]].copy()
+    df["timestamp"] = _coerce_report_datetime_series(df["timestamp"])
     df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
     df = df.dropna(subset=["timestamp"])
     if df.empty:
@@ -1151,6 +1188,8 @@ def _normalize_session_times(session_df: pd.DataFrame | None) -> pd.DataFrame | 
         return None
 
     normalized = session_df.copy()
+    normalized["start_time"] = _coerce_report_datetime_series(normalized["start_time"])
+    normalized["end_time"] = _coerce_report_datetime_series(normalized["end_time"])
     normalized["start_time"] = pd.to_datetime(normalized["start_time"], errors="coerce")
     normalized["end_time"] = pd.to_datetime(normalized["end_time"], errors="coerce")
     normalized = normalized.dropna(subset=["start_time", "end_time"])

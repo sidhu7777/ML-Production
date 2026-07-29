@@ -6,6 +6,25 @@ lte_prediction_op = Blueprint("lte_prediction_optimized", __name__)
 service = LTEPredictionService_optimised()
 
 
+def _resolve_region(data):
+    raw_region = str(data.get("region") or "").strip().lower()
+    if raw_region:
+        if raw_region in {"tw", "twn"}:
+            return "taiwan"
+        if raw_region in {"in", "ind"}:
+            return "india"
+        return raw_region
+
+    country_code = str(
+        data.get("country_code") or data.get("countryCode") or ""
+    ).strip().lower()
+    if country_code in {"tw", "twn", "taiwan"}:
+        return "taiwan"
+    if country_code in {"in", "ind", "india"}:
+        return "india"
+    return "india"
+
+
 # ==========================================================
 # RUN OPTIMIZED PREDICTION
 # ==========================================================
@@ -21,8 +40,7 @@ def run_optimized():
         if field not in data:
             return jsonify({"error": f"{field} is required"}), 400
 
-    # Explicitly set a default if the frontend forgot it
-    data["region"] = str(data.get("region", "india")).lower()
+    data["region"] = _resolve_region(data)
 
     result = service.submit(data)
     return jsonify(result)
@@ -40,7 +58,7 @@ def run_recommendation_optimized():
         if field not in data:
             return jsonify({"error": f"{field} is required"}), 400
 
-    data["region"] = str(data.get("region", "india")).lower()
+    data["region"] = _resolve_region(data)
 
     result = service.submit_recommendation_optimization(data)
     return jsonify(result), 202

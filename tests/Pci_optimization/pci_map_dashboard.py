@@ -30,6 +30,7 @@ import json
 import math
 import random
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -39,8 +40,11 @@ if str(PROJECT_ROOT) not in sys.path:
 
 import folium
 import networkx as nx
+import numpy as np
 import pandas as pd
 import streamlit as st
+from shapely.wkt import loads as load_wkt
+from sqlalchemy import text
 from streamlit_folium import st_folium
 
 from tests.Pci_optimization.pci_optimization_dataset_test import (
@@ -52,11 +56,11 @@ from tests.Pci_optimization.pci_optimization_dataset_test import (
     _enrich_transition_sites,
     _fetch_network_logs,
     _fetch_project_session_ids,
-    _fetch_site_metadata,
     _polygon_filter_logs,
-    _polygon_filter_sites,
     _resolve_engine,
 )
+from tools.lte_prediction import ml_engine
+from utils.python_bridge import _filter_complete_site_prediction_identity
 
 ARTIFACT_DIR = Path(__file__).resolve().parent / "artifacts"
 
@@ -144,27 +148,170 @@ def get_artifact_path(project_id: int) -> Path:
     return ARTIFACT_DIR / f"project_{int(project_id)}.json"
 
 
+def _load_project_polygon_wkts(project_id: int, current_engine) -> list[str]:
+    """
+    Real project boundary from map_regions.region (tbl_project_id, status=1)
+    -- the same table ml_engine._load_project_polygons() reads. That function
+    tries the Electron/Node PythonBridge (localhost:5224) FIRST whenever
+    PYTHON_BRIDGE_BASE_URL/SIGNAL_TRACKERS_BRIDGE_URL is set in .env, and
+    does NOT fail over gracefully if nothing is actually listening there --
+    confirmed directly: bridge_enabled() is True in this repo's env, but
+    calling it standalone (no Electron running) raises a hard
+    ConnectionRefusedError instead of falling back to the DB. Calling
+    ml_engine._load_project_polygons_from_db() directly skips the bridge
+    attempt entirely and hits map_regions the same way, so this works the
+    same whether or not the desktop app is open.
+    """
+    polygons = ml_engine._load_project_polygons_from_db(int(project_id), current_engine)
+    return [p.wkt for p in polygons]
+
+
+def _filter_sites_within_polygon(site_df: pd.DataFrame, polygons: list) -> tuple[pd.DataFrame, dict]:
+    """
+    Restricts site_df to sectors whose (site_lat, site_lon) falls inside the
+    project's real polygon(s), using the same contains-check +
+    coordinate-swap-fallback ml_engine._apply_drive_polygon_filter already
+    uses elsewhere in this repo (map_regions.region WKT points are stored
+    as (lat, lon) for this data, confirmed directly against project 193 --
+    non-standard vs. the (lon, lat) order _filter_df_by_polygons assumes,
+    which is exactly what the swap fallback is for).
+    """
+    if not polygons or site_df.empty:
+        return site_df, {"applied": False, "polygons_found": len(polygons), "rows_before": len(site_df), "rows_after": len(site_df)}
+
+    work = site_df.rename(columns={"site_lat": "lat", "site_lon": "lon"}).copy()
+    filtered = ml_engine._filter_df_by_polygons(work, polygons)
+    swapped = False
+    if filtered.empty:
+        swapped_polygons = ml_engine._swap_polygon_coords(polygons)
+        filtered = ml_engine._filter_df_by_polygons(work, swapped_polygons)
+        swapped = True
+    filtered = filtered.rename(columns={"lat": "site_lat", "lon": "site_lon"})
+    stats = {
+        "applied": True,
+        "polygons_found": len(polygons),
+        "rows_before": len(site_df),
+        "rows_after": len(filtered),
+        "swapped": swapped,
+    }
+    return filtered, stats
+
+
+def _fetch_site_prediction_metadata(project_id: int, operator: str, current_engine) -> pd.DataFrame:
+    """
+    The REAL site/sector source — matches ml_engine.fetch_site_data(), what
+    the live frontend map itself renders from. NOT site_ml/site_noMl (the
+    old _fetch_site_metadata in pci_optimization_dataset_test.py): that pair
+    of tables has no operator filter at all and silently mixes every
+    carrier together (confirmed on project 193: 712 rows = 401 airtel + 185
+    jio 4g + 124 vi india + 2 junk "000 000" rows, all merged into one pool).
+
+    site_prediction stores ~6 duplicate re-inserted rows per real sector
+    (one per past prediction/upload run for this project — group sizes are
+    almost all exactly 6). The live frontend collapses these via a Map
+    keyed by the 5-field identity (site|cell_id|sector|band|operator) the
+    backend attaches as site_prediction_key (SiteLegend.jsx's
+    readLegendIdentityKey / useSiteData.js's getSitePredictionMergeKey both
+    consume this exact key) — utils.python_bridge.
+    _filter_complete_site_prediction_identity() builds that same key and
+    drops rows missing any of the 5 fields, but does NOT itself dedupe
+    identical keys against each other; that final drop_duplicates step is
+    what's actually needed here too. Verified end-to-end against project
+    193: raw Airtel rows=1100 -> identity-complete=398 ->
+    drop_duplicates(site_prediction_key)=199 sectors / 62 sites — matching
+    the live map's own "Cell Sectors BY OPERATOR: Airtel 199" legend count
+    exactly (previously site_ml/site_noMl gave a meaningless, mixed-
+    operator "92").
+    """
+    query = text(
+        """
+        SELECT site_prediction.*, cluster AS provider, cluster AS operator_name
+        FROM site_prediction
+        WHERE tbl_project_id = :project_id
+        """
+    )
+    raw_df = pd.read_sql(query, current_engine, params={"project_id": int(project_id)})
+    if raw_df.empty:
+        return pd.DataFrame()
+
+    complete_df = _filter_complete_site_prediction_identity(raw_df, endpoint="pci_map_dashboard")
+    if complete_df.empty:
+        return pd.DataFrame()
+
+    requested_operator = str(operator or "").strip().lower()
+    if requested_operator and requested_operator not in {"all", "auto"}:
+        operator_candidates = ["operator", "operator_name", "cluster", "provider", "network"]
+        mask = pd.Series(False, index=complete_df.index)
+        for col in operator_candidates:
+            if col not in complete_df.columns:
+                continue
+            mask = mask | complete_df[col].astype(str).str.strip().str.lower().eq(requested_operator)
+        complete_df = complete_df.loc[mask].copy()
+    if complete_df.empty:
+        return pd.DataFrame()
+
+    deduped = complete_df.drop_duplicates(subset=["site_prediction_key"], keep="first").copy()
+    deduped = deduped.rename(
+        columns={
+            "site": "site_id_inferred",
+            "latitude": "site_lat",
+            "longitude": "site_lon",
+            "pci": "site_pci",
+            "earfcn": "site_earfcn",
+            "azimuth": "site_azimuth_deg",
+            "cell_id": "site_cell_id_representative",
+            "cluster": "network",
+        }
+    )
+    for col in ("site_lat", "site_lon", "site_pci", "site_earfcn"):
+        if col in deduped.columns:
+            deduped[col] = pd.to_numeric(deduped[col], errors="coerce")
+    # site_prediction has no per-sector sample-count/beamwidth/range fields
+    # (that's a site_ml/site_noMl-only concept) -- "samples" here is just a
+    # constant per-sector weight (1) so build_real_selection's ranking
+    # degrades to "sites with more resolved sectors first" instead of
+    # pretending to have real drive-sample counts this table doesn't carry.
+    # azimuth_soft/beamwidth/median_sample_distance stay absent, so
+    # normalize_beamwidth()/normalize_sector_range() fall back to their
+    # documented defaults (30 deg / 220m) exactly as they already do for
+    # any sector missing those fields.
+    deduped["samples"] = 1
+    deduped["site_azimuth_soft_deg"] = np.nan
+    deduped["site_source_table"] = "site_prediction"
+    deduped["is_synthetic"] = False
+    return deduped.reset_index(drop=True)
+
+
 def fetch_pci_map_data_from_db(project_id: int, region: str, operator: str, polygon_filter: bool) -> dict:
     """
-    The only place this module touches the DB / the Electron PythonBridge.
-    `polygon_filter` mirrors the old CLI script's own --no-polygon-filter
-    escape hatch: _apply_drive_polygon_filter calls out to the local
-    Electron/Node PythonBridge service (localhost:5224) for project region
-    polygons, which is only reachable when this runs inside/alongside the
-    desktop app. Turn it off to run standalone.
+    The only place this module touches the DB. Site/sector data comes from
+    site_prediction (_fetch_site_prediction_metadata) — the same table and
+    identity-dedup the live frontend map itself uses, operator-filtered
+    correctly (see that function's docstring for the confirmed 199-sector
+    parity check). Also fetches the project's real polygon (map_regions.
+    region) via the direct-DB path (_load_project_polygon_wkts) so it can
+    be drawn on the map and used to keep the site selection inside it.
+    `polygon_filter` still gates the older log-row-level filter
+    (_polygon_filter_logs, which goes through ml_engine.
+    _apply_drive_polygon_filter and DOES attempt the Electron bridge first)
+    for backward compatibility, but the polygon geometry itself and the
+    site-level polygon filter (_filter_sites_within_polygon, called by
+    main()) are both bridge-free.
     """
     current_engine = _resolve_engine(region)
     with current_engine.connect() as conn:
         session_ids, project_meta = _fetch_project_session_ids(project_id, conn)
         raw_log_df = _fetch_network_logs(session_ids, operator, conn, primary_only=True)
         log_df, log_polygon_stats = _polygon_filter_logs(raw_log_df, project_id, current_engine, enabled=polygon_filter)
-        site_df = _fetch_site_metadata(project_id, conn)
-        site_df, site_polygon_stats = _polygon_filter_sites(site_df, project_id, current_engine, enabled=polygon_filter)
+
+    site_df = _fetch_site_prediction_metadata(project_id, operator, current_engine)
+    site_polygon_stats = {"enabled": False, "skipped": True, "rows_before": len(site_df), "rows_after": len(site_df)}
+    polygon_wkts = _load_project_polygon_wkts(project_id, current_engine)
 
     if log_df.empty:
         raise ValueError(f"No network log rows for project_id={project_id} (session_ids={session_ids}).")
     if site_df.empty:
-        raise ValueError(f"No site metadata rows for project_id={project_id}.")
+        raise ValueError(f"No site_prediction rows for project_id={project_id}, operator={operator}.")
 
     events_df = _detect_pci_transitions(log_df)
     enriched_events_df = _enrich_transition_sites(events_df, site_df)
@@ -175,6 +322,7 @@ def fetch_pci_map_data_from_db(project_id: int, region: str, operator: str, poly
         "region": region,
         "operator": operator,
         "polygon_filter": bool(polygon_filter),
+        "polygon_wkt": polygon_wkts,
         "session_ids": session_ids,
         "project_meta": project_meta,
         "log_polygon_stats": log_polygon_stats,
@@ -357,7 +505,7 @@ def detect_pci_collisions(graph: nx.Graph) -> list[dict]:
     return collisions
 
 
-MOD_RULE_VALUES = (1, 3, 7, 9)
+MOD_RULE_VALUES = (1, 3, 6, 7, 8, 9)
 
 
 def detect_pci_mod_conflicts(graph: nx.Graph, mod_n: int) -> list[dict]:
@@ -882,6 +1030,28 @@ def build_demo_selection(site_df: pd.DataFrame, events_df: pd.DataFrame, num_sit
     return site_df3, events_df2, selected_sites_df, selected_site_ids, [note1, note2]
 
 
+def build_real_selection(site_df: pd.DataFrame, events_df: pd.DataFrame, num_sites: int) -> tuple[pd.DataFrame, list, str]:
+    """
+    Real-project mode: NO synthetic injection at all -- every sector shown
+    is real data from this project/operator/polygon selection. Ranked by
+    total observed samples (richest/most-driven sites first, the most
+    representative real sites), not the demo's smallest-PCI cosmetic
+    ranking. num_sites <= 0 means "every plausible real site" (no cap) --
+    use this to test detection/optimizer behavior at full project scale
+    (e.g. project 193/Airtel has ~92 real sites / ~166 sectors within its
+    polygon), not just the small synthetic 5-site example.
+    """
+    sites_with_id = _plausible_sites(site_df)
+    site_rank = sites_with_id.groupby("site_id_inferred")["samples"].sum().sort_values(ascending=False)
+    selected_site_ids = list(site_rank.index) if num_sites <= 0 else list(site_rank.head(num_sites).index)
+    selected_sites_df = sites_with_id[sites_with_id["site_id_inferred"].isin(selected_site_ids)].copy()
+    note = (
+        f"Real project mode: {len(selected_site_ids)} real site(s) / {len(selected_sites_df)} real sector(s) "
+        "loaded (no synthetic data), ranked by total observed samples."
+    )
+    return selected_sites_df, selected_site_ids, note
+
+
 CONFLICT_BORDER_COLOR = "#DC2626"
 # Co-centric is structural/informational, not a fault -- distinct violet,
 # not the red used for every genuine conflict type (Collision, Confusion,
@@ -963,6 +1133,7 @@ def render_map(
     site_labels: dict | None = None,
     conflict_types: dict | None = None,
     filter_to_conflicts: bool = False,
+    polygons: list | None = None,
 ) -> folium.Map:
     """
     `filter_to_conflicts=True` only draws a sector's wedge+PCI label if its
@@ -972,6 +1143,14 @@ def render_map(
     still always draw (so you can see where a serving site is even if none
     of its own sectors match), and every wedge that IS drawn in this mode
     is, by construction, a conflict, so it's always given the red border.
+
+    `polygons`, if given, is a list of shapely Polygons from the project's
+    real map_regions.region boundary (see _load_project_polygon_wkts) —
+    drawn as an unfilled dashed outline so the selected sites' containment
+    inside the actual project drive area is visually checkable, not asserted.
+    Their own exterior points are folded into the map's fit_bounds too, so
+    the whole boundary stays in view together with the sites, not just
+    whichever edge happens to be closest to them.
     """
     site_labels = site_labels or {}
     conflict_types = conflict_types or {}
@@ -980,6 +1159,24 @@ def render_map(
     fmap = folium.Map(location=[center_lat, center_lon], zoom_start=17, tiles="CartoDB positron", control_scale=True)
 
     bounds_points: list[tuple[float, float]] = []
+
+    for polygon in polygons or []:
+        # map_regions.region WKT points are stored as (lat, lon) for this
+        # data (confirmed directly against project 193 — not the standard
+        # (lon, lat) WKT convention), so exterior.coords can be handed to
+        # folium's [lat, lon] `locations` directly, with no swap needed here
+        # (the swap only matters for the shapely Point-in-polygon check in
+        # _filter_sites_within_polygon, which assumes the opposite order).
+        boundary = [(lat, lon) for lat, lon in polygon.exterior.coords]
+        folium.Polygon(
+            locations=boundary,
+            color="#2563EB",
+            weight=3,
+            dash_array="10,8",
+            fill=False,
+            tooltip="Project drive area (map_regions)",
+        ).add_to(fmap)
+        bounds_points.extend(boundary)
 
     for site_id, site_rows in selected_sites_df.groupby("site_id_inferred"):
         first = site_rows.iloc[0]
@@ -1356,7 +1553,119 @@ def _make_pci_pair_cost(check_exact: bool, mod_values: list, check_grouped: bool
     return cost
 
 
+def _apply_pci_assignments(
+    selected_sites_df: pd.DataFrame, events_df: pd.DataFrame, substitution: dict
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Substitutes {(site_id, old_pci): new_pci} into REAL copies of the
+    sector table and the observed-handover events table (from_pci/to_pci
+    are strings there, per _detect_column_transitions' _clean_transition_
+    text — matched as strings here too), so the real detectors
+    (detect_pci_collisions/detect_pci_confusion/detect_pci_mod_conflicts/
+    detect_pci_group_conflicts) can be rerun against a genuinely
+    hypothetical post-change state, not just a cost formula re-evaluated
+    on paper.
+    """
+    site_df2 = selected_sites_df.copy()
+    events_df2 = events_df.copy()
+    site_pci_numeric = pd.to_numeric(site_df2["site_pci"], errors="coerce")
+    for (site_id, old_pci), new_pci in substitution.items():
+        if new_pci == old_pci:
+            continue
+        site_mask = (site_df2["site_id_inferred"] == site_id) & (site_pci_numeric == old_pci)
+        site_df2.loc[site_mask, "site_pci"] = new_pci
+        if not events_df2.empty and {"from_site_id_inferred", "from_pci", "to_site_id_inferred", "to_pci"}.issubset(events_df2.columns):
+            from_mask = (events_df2["from_site_id_inferred"] == site_id) & (events_df2["from_pci"] == str(old_pci))
+            events_df2.loc[from_mask, "from_pci"] = str(new_pci)
+            to_mask = (events_df2["to_site_id_inferred"] == site_id) & (events_df2["to_pci"] == str(old_pci))
+            events_df2.loc[to_mask, "to_pci"] = str(new_pci)
+    return site_df2, events_df2
+
+
+def _count_remaining_conflicts(
+    graph: nx.Graph,
+    events_df: pd.DataFrame,
+    selected_site_ids: list,
+    check_collision: bool,
+    check_confusion: bool,
+    mod_values: list,
+    check_grouped: bool,
+) -> int:
+    """Runs the ACTUAL detector functions (not the cost formula) against a
+    hypothetical graph/events state and counts conflicts for only the
+    currently-checked rules — the real verification step of the closed
+    loop, independent of whatever the greedy search's own cost function
+    assumed."""
+    total = 0
+    if check_collision:
+        total += len(detect_pci_collisions(graph))
+    if check_confusion:
+        total += len(detect_pci_confusion(events_df, site_ids_filter=set(selected_site_ids)))
+    for mod_n in mod_values:
+        total += len(detect_pci_mod_conflicts(graph, mod_n))
+    if check_grouped:
+        total += len(detect_pci_group_conflicts(graph))
+    return total
+
+
+def _max_clique_size_per_earfcn(graph: nx.Graph, earfcns: set) -> dict:
+    """
+    Largest fully-mutually-connected group (clique) of sectors on each
+    given EARFCN, restricted to graph edges (real observed handover OR
+    within the distance threshold — see build_neighbor_graph). A clique
+    of size K means those K sectors are ALL pairwise neighbors of each
+    other, so a rule offering fewer than K distinct buckets (Mod-N's
+    mod_n remainders, Grouped's 168 groups) can NEVER be fully satisfied
+    there by any PCI assignment whatsoever — pigeonhole guarantees at
+    least one pair keeps the same bucket. This is a hard mathematical
+    property of the neighbor graph itself (independent of current PCI
+    values), computed once up front rather than re-derived by watching
+    the heuristic fail to converge.
+    """
+    sizes = {}
+    for earfcn in earfcns:
+        nodes_here = [n for n in graph.nodes if n[2] == earfcn]
+        subgraph = graph.subgraph(nodes_here)
+        best = 1
+        for clique in nx.find_cliques(subgraph):
+            if len(clique) > best:
+                best = len(clique)
+        sizes[earfcn] = best
+    return sizes
+
+
+def _check_rule_infeasibility(graph: nx.Graph, target_nodes: list, mod_values: list, check_grouped: bool) -> list:
+    """
+    Proves — not guesses — whether the checked Mod-N/Grouped rule(s) can
+    ever reach zero conflicts on this neighbor graph, via the clique bound
+    in _max_clique_size_per_earfcn. Collision isn't checked here: its
+    "capacity" is the full 504-value PCI range, and a same-EARFCN clique
+    that large essentially never occurs in practice. Returns a list of
+    proof records (empty if nothing is provably infeasible) — each one
+    names the rule, the EARFCN, the clique size found, and the rule's
+    bucket capacity, so a "this can't converge" report is backed by a
+    concrete, checkable fact instead of an assumption.
+    """
+    if not mod_values and not check_grouped:
+        return []
+    earfcns = {n[2] for n in target_nodes}
+    clique_sizes = _max_clique_size_per_earfcn(graph, earfcns)
+    problems = []
+    for mod_n in mod_values:
+        for earfcn, clique_size in clique_sizes.items():
+            if clique_size > mod_n:
+                problems.append({"rule": f"Mod{mod_n}", "earfcn": earfcn, "clique_size": clique_size, "capacity": mod_n})
+    if check_grouped:
+        for earfcn, clique_size in clique_sizes.items():
+            if clique_size > 168:
+                problems.append({"rule": "Grouped", "earfcn": earfcn, "clique_size": clique_size, "capacity": 168})
+    return problems
+
+
 def recommend_pci_reassignment(
+    selected_sites_df: pd.DataFrame,
+    events_df: pd.DataFrame,
+    selected_site_ids: list,
     graph: nx.Graph,
     collision_conflicts: list,
     confusion_conflicts: list,
@@ -1366,38 +1675,48 @@ def recommend_pci_reassignment(
     check_confusion: bool,
     mod_values: list,
     check_grouped: bool,
-) -> pd.DataFrame:
+    distance_threshold_m: float,
+) -> tuple[pd.DataFrame, dict]:
     """
-    v1 graph-based heuristic — explicitly not NSGA-II.
+    v1 graph-based heuristic — explicitly not NSGA-II. Closed-loop: a
+    single greedy pass is NOT trusted on its own. After every full pass
+    over the touched sectors, the proposed PCI values are substituted
+    into real copies of selected_sites_df/events_df (_apply_pci_
+    assignments), the neighbor graph is rebuilt, and the SAME real
+    detectors used everywhere else in this file are rerun against that
+    hypothetical state (_count_remaining_conflicts) — not the cost
+    formula recomputed on itself. This directly answers whether a
+    recommendation is "just an assumption": a single pass is exactly
+    that (see the earlier finding that a node's reported after_cost
+    could go stale once later nodes were reassigned); this loop instead
+    proves — or honestly reports failing to prove — that the FINAL
+    suggested state has zero remaining conflicts for the checked rule(s).
+
+    No arbitrary small iteration cap: this keeps going as long as real
+    progress is being made (remaining conflict count still decreasing).
+    Before looping, _check_rule_infeasibility proves — via a same-EARFCN
+    clique-size bound, a hard graph-coloring fact — whether the checked
+    Mod-N/Grouped rule(s) can EVER reach zero here at all. If so, the
+    patience budget for "no further improvement" is small (a few extra
+    passes to reach the best achievable state, since we already know 0 is
+    mathematically unreachable — more looping wouldn't change that). If
+    nothing is proven infeasible, the patience budget scales with problem
+    size instead of a flat magic number, so a genuinely solvable case
+    isn't cut off early just because it took a while.
 
     Only optimizes for rules actually checked in the sidebar: pass an
     empty list for any conflict type that's unchecked, and False/empty
-    for the matching check_*/mod_values flag. A sector never flagged by
-    any CHECKED rule is left alone entirely, and the candidate search
-    itself only penalizes matching whatever's checked — e.g. with only
-    Collision checked, it won't avoid a Mod3 match at all, and may well
-    land on a PCI that still shares Mod3 with something (expected: that
-    rule isn't active). `mod_conflicts_by_n` is {mod_n: conflicts} for
-    each checked Mod value only (a sector can be touched by more than one
-    checked Mod rule at once, e.g. Mod3 and Mod7 both checked).
+    for the matching check_*/mod_values flag. `mod_conflicts_by_n` is
+    {mod_n: conflicts} for each checked Mod value only.
 
     Collision/Mod-N/Grouped conflicts are defined by detect_pci_collisions/
     detect_pci_mod_conflicts/detect_pci_group_conflicts over NEIGHBOR
     PAIRS in `graph` (real observed handover OR within the distance
-    threshold — see build_neighbor_graph), including same-site pairs
-    (their distance is ~0m, so they're always graph-connected) — matching
-    real LTE PCI planning, where a UE can hand over between two sectors
-    of the same site just as easily as between two different sites. The
-    candidate search matches this exactly: cost is computed against every
-    GRAPH NEIGHBOR of the node being reassigned, using the same graph the
-    detectors used, so the optimizer can never "solve" a conflict against
-    a pair the detectors wouldn't themselves flag, or fail to consider a
-    pair they would. The graph also decides processing ORDER (highest-
-    degree touched node first — standard greedy-coloring heuristic).
+    threshold — see build_neighbor_graph), including same-site pairs.
+    Returns (recommendation DataFrame, verification dict with keys
+    iterations/converged/remaining_conflicts/verified_clean/
+    remaining_by_iteration/infeasible_rules/stopped_reason).
     """
-    # Track WHICH conflict type(s) flagged each node, not just a flat
-    # touched set — the table needs to say "Collision" / "Mod3" / etc by
-    # name, not just a cost number, and severity comes directly from this.
     touched_types: dict[tuple, set] = {}
     for c in collision_conflicts:
         for s in c["sites"]:
@@ -1414,7 +1733,10 @@ def recommend_pci_reassignment(
             touched_types.setdefault((s, p), set()).add("Grouped")
 
     if not touched_types:
-        return pd.DataFrame()
+        return pd.DataFrame(), {
+            "iterations": 0, "converged": True, "remaining_conflicts": 0, "verified_clean": True,
+            "remaining_by_iteration": [], "infeasible_rules": [], "stopped_reason": "nothing_to_do",
+        }
 
     pair_cost = _make_pci_pair_cost(check_collision or check_confusion, mod_values, check_grouped)
 
@@ -1422,61 +1744,118 @@ def recommend_pci_reassignment(
     target_nodes = [node_by_site_pci[k] for k in touched_types if k in node_by_site_pci]
     target_nodes.sort(key=lambda n: graph.degree(n), reverse=True)
 
-    assignments: dict = {}
+    def neighbors_of(node):
+        return [n for n in graph.neighbors(node) if n[2] == node[2]]
+
+    # True baseline cost -- against the ORIGINAL, never-reassigned neighbor
+    # PCIs, so "before" always means the real starting state, not whatever
+    # a previous node happened to already be reassigned to.
+    before_costs = {node: sum(pair_cost(node[1], n[1]) for n in neighbors_of(node)) for node in target_nodes}
+
+    # Prove (not guess) whether the checked Mod-N/Grouped rule(s) can ever
+    # reach zero on this graph at all, once, up front -- it's a structural
+    # fact about the graph, unaffected by which PCIs anyone currently has.
+    infeasible_rules = _check_rule_infeasibility(graph, target_nodes, mod_values, check_grouped)
+    # If something is proven mathematically unreachable, a small patience
+    # window is enough to settle on the best achievable state -- no amount
+    # of extra looping changes a pigeonhole fact. If nothing is proven
+    # infeasible, scale patience with problem size instead of a flat
+    # magic cap, so a genuinely solvable case isn't cut off early.
+    patience = 5 if infeasible_rules else max(30, 5 * len(target_nodes))
+
+    assignments = {node: node[1] for node in target_nodes}
+    iterations_used = 0
+    converged = False
+    remaining = None
+    remaining_by_iteration: list[int] = []
+    best_remaining = None
+    no_improve_streak = 0
+    stopped_reason = "converged"
+
+    iteration = 0
+    while True:
+        iteration += 1
+        iterations_used = iteration
+
+        # Proposal pass: every touched node whose cost against the LATEST
+        # known assignments of its neighbors is nonzero gets a fresh
+        # candidate search. Nodes already at cost 0 are left untouched.
+        for node in target_nodes:
+            neighbors = neighbors_of(node)
+            neighbor_pcis = [assignments.get(n, n[1]) for n in neighbors]
+            current_pci = assignments[node]
+            current_cost = sum(pair_cost(current_pci, npci) for npci in neighbor_pcis)
+            if current_cost == 0:
+                continue
+
+            if check_grouped:
+                search_order = _candidates_by_distance(node[1])
+            else:
+                search_order = [p for p in range(PCI_MIN, PCI_MAX + 1) if p != current_pci]
+                random.shuffle(search_order)
+
+            best_pci, best_cost = current_pci, current_cost
+            for candidate in search_order:
+                cost = sum(pair_cost(candidate, npci) for npci in neighbor_pcis)
+                if cost < best_cost:
+                    best_cost, best_pci = cost, candidate
+                if cost == 0:
+                    break
+            assignments[node] = best_pci
+
+        # Verification pass: substitute the CURRENT full proposal into
+        # real data and rerun the actual detectors -- ground truth, not
+        # the cost formula grading its own homework.
+        substitution = {(node[0], node[1]): assignments[node] for node in target_nodes}
+        hyp_site_df, hyp_events_df = _apply_pci_assignments(selected_sites_df, events_df, substitution)
+        hyp_graph = build_neighbor_graph(hyp_site_df, hyp_events_df, distance_threshold_m=distance_threshold_m)
+        remaining = _count_remaining_conflicts(
+            hyp_graph, hyp_events_df, selected_site_ids, check_collision, check_confusion, mod_values, check_grouped
+        )
+        remaining_by_iteration.append(int(remaining))
+        if remaining == 0:
+            converged = True
+            stopped_reason = "converged"
+            break
+
+        if best_remaining is None or remaining < best_remaining:
+            best_remaining = remaining
+            no_improve_streak = 0
+        else:
+            no_improve_streak += 1
+
+        if no_improve_streak >= patience:
+            stopped_reason = "proven_infeasible" if infeasible_rules else "no_improvement_exhausted"
+            break
+
     rows = []
     for node in target_nodes:
         site_id, current_pci, earfcn = node
-        # Graph neighbors only (real handover OR within distance threshold,
-        # same set the detectors use), restricted to the SAME EARFCN —
-        # real handover edges can span inter-frequency handovers (a real
-        # neighbor on a different EARFCN), but PCI collision/Mod-N/Grouped
-        # only mean anything within one frequency layer, exactly like the
-        # detectors themselves check (u[2] != v[2] -> skipped).
-        others = [n for n in graph.neighbors(node) if n[2] == earfcn]
-        other_pcis = [assignments.get(n, n[1]) for n in others]
-
-        before_cost = sum(pair_cost(current_pci, npci) for npci in other_pcis)
-
-        # Search order depends on whether Grouped is checked:
-        #   - Grouped checked: nearest-to-current first (see
-        #     _candidates_by_distance) — smallest possible change that
-        #     clears every checked conflict, not the lowest free number
-        #     anywhere in 0-503.
-        #   - Grouped unchecked: a fully random candidate order. Nearest-
-        #     first would land in the same/adjacent 3GPP group far more
-        #     often than chance (groups are 3 consecutive PCIs), which
-        #     looks like group-preserving behavior even when Grouped was
-        #     never checked. Random order removes that coincidence
-        #     entirely when group isn't an active rule.
-        if check_grouped:
-            search_order = _candidates_by_distance(current_pci)
-        else:
-            search_order = [p for p in range(PCI_MIN, PCI_MAX + 1) if p != current_pci]
-            random.shuffle(search_order)
-
-        best_pci, best_cost = current_pci, before_cost
-        for candidate in search_order:
-            cost = sum(pair_cost(candidate, npci) for npci in other_pcis)
-            if cost < best_cost:
-                best_cost, best_pci = cost, candidate
-            if cost == 0:
-                break
-        assignments[node] = best_pci
-
+        neighbors = neighbors_of(node)
+        final_cost = sum(pair_cost(assignments[node], assignments.get(n, n[1])) for n in neighbors)
         rows.append(
             {
                 "site": site_id,
                 "current_pci": current_pci,
-                "suggested_pci": best_pci,
+                "suggested_pci": assignments[node],
                 "earfcn": earfcn,
-                "before_cost": before_cost,
-                "after_cost": best_cost,
-                "num_same_earfcn_sectors": len(other_pcis),
+                "before_cost": before_costs[node],
+                "after_cost": final_cost,
+                "num_same_earfcn_sectors": len(neighbors),
                 "conflict_types": touched_types.get((site_id, current_pci), set()),
             }
         )
 
-    return pd.DataFrame(rows)
+    verification = {
+        "iterations": iterations_used,
+        "converged": converged,
+        "remaining_conflicts": int(remaining) if remaining is not None else 0,
+        "verified_clean": bool(remaining == 0),
+        "remaining_by_iteration": remaining_by_iteration,
+        "infeasible_rules": infeasible_rules,
+        "stopped_reason": stopped_reason,
+    }
+    return pd.DataFrame(rows), verification
 
 
 # Highest severity wins when a sector is flagged by more than one rule.
@@ -1545,26 +1924,43 @@ def main() -> None:
         "live frontend map; PCI handover pairs use the corrected, frontend-consistent transition detector."
     )
 
-    with st.sidebar.form("pci_map_controls"):
-        st.header("Data source")
-        project_id = st.number_input("Project ID", value=DEFAULT_PROJECT_ID, step=1, min_value=1)
-        region = st.text_input("Region", value=DEFAULT_REGION)
-        operator = st.text_input("Operator", value=DEFAULT_OPERATOR)
-        # 5 minimum: a Confusion+Collision cluster (3 sites) and a separate
-        # Collision-only pair (2 sites) need to coexist so each rule can be
-        # shown in isolation — see build_demo_selection(). Extra sites (up
-        # to 7) are real, conflict-free filler (smallest-PCI ranking).
-        num_sites = st.number_input("Number of sites", value=5, min_value=5, max_value=7, step=1)
-        # Synthetic injection is always on now (neither project has a real
-        # same-EARFCN case — see inject_synthetic_collision_confusion
-        # docstring) and always builds two SEPARATE examples, not a toggle
-        # anymore. Polygon filter: always off (needs the Electron/Node
-        # PythonBridge on localhost:5224, only reachable inside the desktop
-        # app).
-        polygon_filter = False
-        col_load, col_refresh = st.columns(2)
-        load_clicked = col_load.form_submit_button("Load")
-        refresh_clicked = col_refresh.form_submit_button("Refresh from DB")
+    st.sidebar.header("Data source")
+    # A single top-level choice instead of manual Project ID/Region/
+    # Operator entry: both options load from the SAME underlying project
+    # (193, region india, operator Airtel) -- they only differ in which
+    # sites they show and whether any data is synthetic.
+    site_mode = st.sidebar.radio(
+        "Data source",
+        ["Demo (5 sites, synthetic conflicts)", "Project 193 (real Airtel data)"],
+        index=0,
+        help=(
+            "Demo: the fixed 5-site synthetic Collision+Confusion example (2 real sites get a shared "
+            "synthetic PCI injected, plus a separate synthetic Collision-only pair) -- always the same 5 "
+            "sites, no inputs needed, for testing the rules/optimizer in isolation. Project 193: every real "
+            "site/cell/sector that actually exists under this project (operator Airtel, region india) -- "
+            "no synthetic data, no cap, whatever the DB has."
+        ),
+    )
+    is_demo_mode = site_mode.startswith("Demo")
+    project_id, region, operator = DEFAULT_PROJECT_ID, DEFAULT_REGION, DEFAULT_OPERATOR
+    if is_demo_mode:
+        num_sites = 5
+        st.sidebar.caption("Fixed 5-site synthetic demo — no additional inputs needed.")
+    else:
+        # 0 = no cap -- build_real_selection() loads every real,
+        # plausible site under this project (see _plausible_sites/
+        # _filter_sites_within_polygon), not an arbitrary chosen slice.
+        num_sites = 0
+        st.sidebar.caption("Loads every real site/cell/sector that exists under project 193 (Airtel) — no cap, no synthetic data.")
+
+    # Polygon filter (map_regions.region, real DB query — see
+    # _load_project_polygon_wkts) is always fetched and drawn; this only
+    # gates the older row-level log/site filter that also runs through
+    # ml_engine's Electron-bridge-first path.
+    polygon_filter = False
+    col_load, col_refresh = st.sidebar.columns(2)
+    load_clicked = col_load.button("Load")
+    refresh_clicked = col_refresh.button("Refresh from DB")
 
     st.sidebar.header("PCI rule view")
     # Separate, independent detectors/toggles (not one merged "Collision +
@@ -1593,11 +1989,16 @@ def main() -> None:
     show_mod: dict[int, bool] = {}
     mod_remainder: dict[int, int] = {}
     for n in MOD_RULE_VALUES:
+        label_suffix = " (PSS group)" if n == 3 else " (vendor 6-sector reuse heuristic)" if n == 6 else ""
+        help_suffix = (
+            " Trivial — PCI % 1 is always 0." if n == 1
+            else " Not a 3GPP requirement — some vendors use it as a soft reuse-distance guideline for 6-sector sites." if n == 6
+            else ""
+        )
         show_mod[n] = st.sidebar.checkbox(
-            f"Mod{n}" + (" (PSS group)" if n == 3 else ""),
+            f"Mod{n}{label_suffix}",
             value=False,
-            help=f"2+ shown sites whose PCI % {n} matches on the same EARFCN, even with different actual PCIs."
-            + (" Trivial — PCI % 1 is always 0." if n == 1 else ""),
+            help=f"2+ shown sites whose PCI % {n} matches on the same EARFCN, even with different actual PCIs.{help_suffix}",
         )
         if show_mod[n]:
             mod_remainder[n] = st.sidebar.selectbox(
@@ -1661,14 +2062,15 @@ def main() -> None:
 
     if load_clicked or refresh_clicked:
         st.session_state["pci_map_loaded"] = True
-        st.session_state["pci_map_args"] = (int(project_id), region, operator, int(num_sites), bool(polygon_filter))
+        st.session_state["pci_map_args"] = (int(project_id), region, operator, int(num_sites), bool(polygon_filter), site_mode)
         st.session_state["force_refresh"] = bool(refresh_clicked)
 
     if not st.session_state["pci_map_loaded"]:
         st.info("Set project/region/operator in the sidebar and click Load.")
         return
 
-    proj_id, region, operator, num_sites, polygon_filter = st.session_state["pci_map_args"]
+    proj_id, region, operator, num_sites, polygon_filter, site_mode = st.session_state["pci_map_args"]
+    is_demo_mode = site_mode.startswith("Demo")
     artifact_path = get_artifact_path(proj_id)
 
     try:
@@ -1687,16 +2089,62 @@ def main() -> None:
         st.error(f"Failed to load PCI map data: {exc}")
         return
 
+    # Real project boundary (map_regions.region for this project_id, see
+    # _load_project_polygon_wkts) — restricts the site pool BEFORE
+    # build_demo_selection runs, so every one of the "N sites" (real +
+    # synthetic-on-real) is guaranteed to sit inside the project's actual
+    # drive polygon, not just drawn alongside it as decoration.
+    polygons = []
+    for wkt in raw_data.get("polygon_wkt") or []:
+        try:
+            polygons.append(load_wkt(wkt))
+        except Exception:  # noqa: BLE001
+            continue
+
+    site_df_pool = raw_data["site_df"]
+    events_df_pool = raw_data["events_df"]
+    if polygons:
+        filtered_site_df, polygon_stats = _filter_sites_within_polygon(site_df_pool, polygons)
+        if filtered_site_df.empty:
+            st.warning(
+                f"Project polygon found ({len(polygons)} polygon(s)) but 0 of {polygon_stats['rows_before']} "
+                "sector rows fell inside it, even after the coordinate-swap fallback — falling back to all "
+                "project sites so the dashboard still loads. The polygon is still drawn on the map below."
+            )
+        else:
+            site_df_pool = filtered_site_df
+            pool_site_ids = set(site_df_pool["site_id_inferred"])
+            events_df_pool = events_df_pool[
+                events_df_pool["from_site_id_inferred"].isin(pool_site_ids)
+                & events_df_pool["to_site_id_inferred"].isin(pool_site_ids)
+            ]
+            st.caption(
+                f"Project polygon loaded from map_regions ({len(polygons)} polygon(s)) — "
+                f"{polygon_stats['rows_after']}/{polygon_stats['rows_before']} sector rows fall inside it"
+                f"{' (coordinate-swap fallback used)' if polygon_stats.get('swapped') else ''}. "
+                "Site selection below is drawn only from those sectors."
+            )
+    else:
+        st.info(f"No project polygon found in map_regions for project {proj_id} — showing all sites without a drawn boundary.")
+
     try:
-        site_df, events_df, selected_sites_df, selected_site_ids, demo_notes = build_demo_selection(
-            raw_data["site_df"], raw_data["events_df"], num_sites
-        )
+        if is_demo_mode:
+            site_df, events_df, selected_sites_df, selected_site_ids, demo_notes = build_demo_selection(
+                site_df_pool, events_df_pool, 5
+            )
+        else:
+            selected_sites_df, selected_site_ids, real_note = build_real_selection(
+                site_df_pool, events_df_pool, int(num_sites)
+            )
+            site_df, events_df = site_df_pool, events_df_pool
+            demo_notes = [real_note]
     except Exception as exc:  # noqa: BLE001
-        st.error(f"Failed to build demo site selection: {exc}")
+        st.error(f"Failed to build site selection: {exc}")
         return
     for note in demo_notes:
-        st.warning(note)
+        st.warning(note) if is_demo_mode else st.caption(note)
 
+    _detection_t0 = time.perf_counter()
     confusion_conflicts = detect_pci_confusion(events_df, site_ids_filter=set(selected_site_ids))
 
     # Unified neighbor graph (real observed handover OR within
@@ -1711,12 +2159,13 @@ def main() -> None:
     # neighbor sectors (coarse groupings collide far more easily than an
     # exact PCI match), so the synthetic fallback rarely fires — but if a
     # project/selection genuinely has none, inject one rather than
-    # showing an empty check.
+    # showing an empty check. Only in Demo mode — Project 193 (real) mode
+    # never injects anything, by definition (see build_real_selection).
     mod_conflicts: dict[int, list] = {}
     used_pcis = set(pd.to_numeric(selected_sites_df["site_pci"], errors="coerce").dropna().astype(int).tolist())
     for mod_n in MOD_RULE_VALUES:
         found = detect_pci_mod_conflicts(graph, mod_n)
-        if not found:
+        if not found and is_demo_mode:
             try:
                 selected_sites_df, mod_note = inject_synthetic_mod_conflict(
                     selected_sites_df, selected_site_ids, mod_n, used_pcis
@@ -1729,9 +2178,10 @@ def main() -> None:
         mod_conflicts[mod_n] = found
 
     # Grouped PCI (PCI // 3, the correct 3GPP formula) — same
-    # naturally-occurring pattern as Mod-N, synthetic fallback rarely fires.
+    # naturally-occurring pattern as Mod-N, synthetic fallback rarely
+    # fires, and only runs in Demo mode.
     grouped_conflicts = detect_pci_group_conflicts(graph)
-    if show_grouped and not grouped_conflicts:
+    if show_grouped and not grouped_conflicts and is_demo_mode:
         try:
             selected_sites_df, grouped_note = inject_synthetic_group_conflict(selected_sites_df, selected_site_ids, used_pcis)
             st.warning(grouped_note)
@@ -1741,6 +2191,7 @@ def main() -> None:
             st.error(f"Could not find or synthesize a Grouped PCI example: {exc}")
 
     co_centric_groups = detect_co_centric_groups(selected_sites_df)
+    _detection_elapsed_s = time.perf_counter() - _detection_t0
 
     # site_id_inferred is an internal join key, not a display name — ~46% of
     # real sites in this project have it partly asterisked because the
@@ -1797,8 +2248,12 @@ def main() -> None:
         f"{len(selected_site_ids)} site(s) shown "
         f"(of {raw_data['site_df']['site_id_inferred'].nunique()} available in project {proj_id})"
     )
+    st.caption(
+        f"Graph build + Collision/Confusion/Mod/Grouped/Co-centric detection over "
+        f"{graph.number_of_nodes()} sector(s) / {graph.number_of_edges()} neighbor edge(s): {_detection_elapsed_s:.2f}s."
+    )
 
-    fmap = render_map(selected_sites_df, site_labels=site_labels, conflict_types=conflict_types, filter_to_conflicts=True)
+    fmap = render_map(selected_sites_df, site_labels=site_labels, conflict_types=conflict_types, filter_to_conflicts=True, polygons=polygons)
     st_folium(fmap, width=None, height=700, key="pci_map")
 
     col1, col2 = st.columns(2)
@@ -1831,15 +2286,22 @@ def main() -> None:
             + (", ".join(active_rule_labels) if active_rule_labels else "none — check a rule first")
             + f". Each candidate PCI is scored against every NEIGHBOR sector (real observed handover OR "
             f"within {int(neighbor_distance_m)}m — same-site sectors included, since they're always ~0m "
-            "apart) on the same EARFCN — the same neighbor graph the rules above use, so the optimizer can "
-            "never contradict what they detected. A first-pass greedy heuristic, not the eventual NSGA-II "
-            "solver. Recommend-only: nothing above (map/tables) changes."
+            "apart) on the same EARFCN — the same neighbor graph the rules above use. Closed-loop: after "
+            "every proposal pass, the suggested PCIs are substituted into real copies of the site/event "
+            "data and the ACTUAL Collision/Confusion/Mod/Grouped detectors are rerun against that "
+            "hypothetical state to verify it, not just re-scored on paper — repeated until 0 conflicts "
+            "remain or a max-iteration cap is hit. A first-pass greedy heuristic, not the eventual "
+            "NSGA-II solver. Recommend-only: nothing above (map/tables) changes."
         )
         if not active_rule_labels:
             st.warning("No PCI rule is checked above — check at least one (Collision, Confusion, a Mod, or Grouped) to run the optimizer.")
         else:
             mod_conflicts_checked = {n: mod_conflicts.get(n, []) for n in mod_values_checked}
-            recs = recommend_pci_reassignment(
+            t_start = time.perf_counter()
+            recs, verification = recommend_pci_reassignment(
+                selected_sites_df,
+                events_df,
+                selected_site_ids,
                 graph,
                 collision_conflicts if show_collision else [],
                 confusion_conflicts if show_confusion else [],
@@ -1849,14 +2311,49 @@ def main() -> None:
                 check_confusion=show_confusion,
                 mod_values=mod_values_checked,
                 check_grouped=show_grouped,
+                distance_threshold_m=neighbor_distance_m,
             )
+            elapsed_s = time.perf_counter() - t_start
             if recs.empty:
-                st.info("No conflicts found for the currently checked rule(s) among the selected sites — nothing to recommend.")
+                st.info(f"No conflicts found for the currently checked rule(s) among the selected sites — nothing to recommend. ({elapsed_s:.2f}s)")
             else:
                 st.dataframe(build_recommendation_table(recs, site_labels), use_container_width=True)
                 total_before = int(recs["before_cost"].sum())
                 total_after = int(recs["after_cost"].sum())
                 st.caption(f"Total conflict cost across recommended sectors: {total_before} -> {total_after}.")
+                st.caption(
+                    f"Ran in {elapsed_s:.2f}s over {verification['iterations']} iteration(s) for "
+                    f"{len(recs)} touched sector(s). Remaining conflicts per iteration: "
+                    f"{verification['remaining_by_iteration']}."
+                )
+                if verification["verified_clean"]:
+                    st.success(
+                        f"Closed-loop verified: after {verification['iterations']} iteration(s), rerunning the "
+                        "real Collision/Confusion/Mod/Grouped detectors on the substituted PCI values found 0 "
+                        "remaining conflicts among the checked rule(s) for these sectors."
+                    )
+                elif verification["infeasible_rules"]:
+                    proofs = "; ".join(
+                        f"{p['rule']} on EARFCN {p['earfcn']}: {p['clique_size']} sectors are all mutual "
+                        f"neighbors of each other, but {p['rule']} only offers {p['capacity']} distinct bucket(s)"
+                        for p in verification["infeasible_rules"]
+                    )
+                    st.error(
+                        f"Mathematically unsolvable, not a heuristic failure: {proofs}. By the pigeonhole "
+                        "principle, no PCI assignment can avoid at least one same-bucket pair there — ran "
+                        f"{verification['iterations']} iteration(s) to reach the best achievable state "
+                        f"({verification['remaining_conflicts']} conflict(s) remaining), then stopped because "
+                        "further looping cannot change a proven mathematical fact. The table above shows that "
+                        "best-achievable state, not a guaranteed-clean fix. Reduce the neighbor distance "
+                        "threshold, narrow which sectors are selected, or uncheck this rule to resolve it."
+                    )
+                else:
+                    st.error(
+                        f"NOT fully resolved after {verification['iterations']} iteration(s) — gave up after "
+                        f"{verification['remaining_conflicts']} conflict(s) stopped improving with no proof "
+                        "it's mathematically impossible; this heuristic simply couldn't find a better state. "
+                        "The table above shows the best state found, but this is NOT a guaranteed-clean fix."
+                    )
 
 
 if __name__ == "__main__":

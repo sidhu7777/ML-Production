@@ -319,26 +319,29 @@ class PythonBridgeClient:
             f"sessions={len(session_ids)} project_id={project_id} "
             f"provider={provider!r} start_date={start_date} end_date={end_date} limit={limit}"
         )
-        if os.getenv("REPORT_USE_MAPVIEW_NETWORKLOG_API", "0") == "1":
-            try:
-                df = self.get_mapview_network_logs(session_ids, limit=limit, project_id=project_id)
-                print(f"[ReportLogs] received rows from MapView/GetNetworkLog: {len(df)}")
-                return df
-            except PythonBridgeError as exc:
-                print(f"[ReportLogs] MapView/GetNetworkLog failed, falling back to PythonBridge: {exc}")
+
+        def _json_date(value: Any) -> Any:
+            if isinstance(value, (datetime, date)):
+                return value.isoformat()
+            return value
+
         df = self.post_rows(
-            "GetReportNetworkLogs",
+            "GetDriveTestRows",
             {
                 "SessionIds": session_ids,
                 "ProjectId": int(project_id) if project_id is not None else None,
-                "Provider": provider,
-                "StartDate": start_date,
-                "EndDate": end_date,
+                "Operator": provider,
+                "PrimaryOnly": True,
+                "IncludeNeighbour": False,
+                "StartDate": _json_date(start_date),
+                "EndDate": _json_date(end_date),
                 "Limit": int(limit),
             },
             limit=limit,
         )
-        print(f"[ReportLogs] received rows from PythonBridge/GetReportNetworkLogs: {len(df)}")
+        df.attrs["report_data_source"] = "python_bridge_get_drive_test_rows"
+        df.attrs["report_prefiltered"] = True
+        print(f"[ReportLogs] received rows from PythonBridge/GetDriveTestRows: {len(df)}")
         return df
 
     def get_mapview_network_logs(
@@ -384,8 +387,42 @@ class PythonBridgeClient:
         return payload.get("Data")
 
     def get_user_thresholds(self, user_id: int) -> dict[str, Any] | None:
-        payload = self._request("GET", "GetUserThresholds", params={"userId": int(user_id)})
-        return payload.get("Data")
+        payload = self._request("GET", "GetThresholds")
+        rows = payload.get("Data") or []
+        user_id = int(user_id)
+
+        def _int_value(value: Any) -> int | None:
+            try:
+                if value is None or value == "":
+                    return None
+                return int(value)
+            except (TypeError, ValueError):
+                return None
+
+        def _is_default(row: dict[str, Any]) -> bool:
+            value = row.get("is_default")
+            if isinstance(value, bool):
+                return value
+            return str(value or "").strip().lower() in {"1", "true", "yes", "y"}
+
+        user_rows = [
+            row for row in rows
+            if _int_value(row.get("user_id")) == user_id and not _is_default(row)
+        ]
+        if user_rows:
+            return max(user_rows, key=lambda row: _int_value(row.get("id")) or 0)
+
+        default_rows = [
+            row for row in rows
+            if _is_default(row) and (_int_value(row.get("user_id")) in (None, 0))
+        ]
+        if default_rows:
+            return max(default_rows, key=lambda row: _int_value(row.get("id")) or 0)
+
+        if rows:
+            return min(rows, key=lambda row: _int_value(row.get("id")) or 0)
+
+        return None
 
     def update_project_download_path(self, project_id: int, download_path: str) -> bool:
         payload = self._request(

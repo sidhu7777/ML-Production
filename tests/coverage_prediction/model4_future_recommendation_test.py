@@ -236,7 +236,7 @@ def build_model4_future_dataset_from_excel(
     if "project_id" in cell_input.columns:
         cell_input = cell_input.loc[cell_input["project_id"].map(_clean_text).eq("196")].copy()
     if "site_id" in cell_input.columns:
-        cell_input = cell_input.loc[cell_input["site_id"].map(_clean_text).str.fullmatch(r"\d+", na=False)].copy()
+        cell_input = cell_input.loc[cell_input["site_id"].map(_clean_text).ne("")].copy()
     if "project_id" in base_grid.columns:
         base_grid = base_grid.loc[base_grid["project_id"].map(_clean_text).eq("196")].copy()
     if "Node_Cell_ID" in base_grid.columns:
@@ -335,11 +335,6 @@ def build_model4_future_dataset_from_excel(
     if max_congested_cells is not None and int(max_congested_cells) > 0:
         current_scope = current_scope.sort_values("model4_pressure", ascending=False).head(int(max_congested_cells)).copy()
     selected_future_ids = current_scope["Node_Cell_ID"].dropna().astype(str).tolist()
-    selected_sectors = current_scope["topology_frontend_site_sector_key"].dropna().astype(str).unique().tolist()
-    if selected_future_ids:
-        cell_out = cell_out.loc[cell_out["topology_frontend_site_sector_key"].astype(str).isin(selected_sectors)].copy()
-    else:
-        cell_out = cell_out.iloc[0:0].copy()
     cell_out["recommendation_scope_cell"] = cell_out["Node_Cell_ID"].astype(str).isin(set(selected_future_ids)) if selected_future_ids else cell_out["model4_pressure"] > float(congestion_threshold)
 
     overlay_cols = [
@@ -389,11 +384,8 @@ def build_model4_future_dataset_from_excel(
     coord_label = out["lat_6dp"].astype(str) + "_" + out["lon_6dp"].astype(str)
     out["grid_label"] = out["grid_label"].where(out["grid_label"].ne(""), coord_label)
     out = out.loc[out["lat_6dp"].notna() & out["lon_6dp"].notna()].copy()
-    grid_lookup = _archive_grid_id_lookup()
-    out = out.merge(grid_lookup, on=["lat_6dp", "lon_6dp"], how="left")
     fallback_grid_id = pd.factorize(out["grid_label"], sort=True)[0] + 1
-    out["grid_id"] = pd.to_numeric(out["archive_grid_id"], errors="coerce").fillna(pd.Series(fallback_grid_id, index=out.index)).astype(int)
-    out = out.drop(columns=["archive_grid_id"], errors="ignore")
+    out["grid_id"] = pd.to_numeric(out.get("grid_id"), errors="coerce").fillna(pd.Series(fallback_grid_id, index=out.index)).astype(int)
     grid_row_src = out["grid_row"] if "grid_row" in out.columns else pd.Series(np.nan, index=out.index)
     grid_col_src = out["grid_col"] if "grid_col" in out.columns else pd.Series(np.nan, index=out.index)
     out["grid_row"] = pd.to_numeric(grid_row_src, errors="coerce").fillna(out["grid_id"]).astype(int)
@@ -492,6 +484,11 @@ def run_model4_future_recommendation(
     excel_path: Path,
     future_dataset_path: Path = DEFAULT_FUTURE_DATASET,
     max_congested_cells: int | None = 18,
+    rf_workers: int = current_rules.DEFAULT_RF_WORKERS,
+    sector_parallelism: int = 1,
+    max_interference_sites: int = 10,
+    action_neighbor_cells: int = 2,
+    carrier_reselection_hysteresis_db: float = 0.0,
 ) -> Path:
     stable_dir = config.stable_output_dir
     stable_dir.mkdir(parents=True, exist_ok=True)
@@ -510,10 +507,11 @@ def run_model4_future_recommendation(
         congestion_threshold=config.congestion_threshold,
         rrc_sector_capacity=config.rrc_sector_capacity,
         sector_split_local_radius_m=config.sector_split_local_radius_m,
-        rf_workers=3,
-        max_interference_sites=10,
-        action_neighbor_cells=2,
-        sector_parallelism=1,
+        rf_workers=rf_workers,
+        max_interference_sites=max_interference_sites,
+        action_neighbor_cells=action_neighbor_cells,
+        sector_parallelism=sector_parallelism,
+        carrier_reselection_hysteresis_db=carrier_reselection_hysteresis_db,
         dashboard_model_label="Model 4",
     )
     run_dir = current_rules.run_model3_current_recommendation_test(run_config)
@@ -565,6 +563,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--congestion-threshold", type=float, default=future_rules.DEFAULT_CONGESTION_THRESHOLD)
     parser.add_argument("--rrc-sector-capacity", type=float, default=future_rules.DEFAULT_RRC_SECTOR_CAPACITY)
     parser.add_argument("--max-congested-cells", type=int, default=18)
+    parser.add_argument("--rf-workers", type=int, default=current_rules.DEFAULT_RF_WORKERS)
+    parser.add_argument("--sector-parallelism", type=int, default=1)
+    parser.add_argument("--max-interference-sites", type=int, default=10)
+    parser.add_argument("--action-neighbor-cells", type=int, default=2)
+    parser.add_argument("--carrier-reselection-hysteresis-db", type=float, default=0.0)
     return parser.parse_args()
 
 
@@ -583,4 +586,9 @@ if __name__ == "__main__":
         excel_path=args.excel_path,
         future_dataset_path=args.future_dataset_path,
         max_congested_cells=args.max_congested_cells,
+        rf_workers=args.rf_workers,
+        sector_parallelism=args.sector_parallelism,
+        max_interference_sites=args.max_interference_sites,
+        action_neighbor_cells=args.action_neighbor_cells,
+        carrier_reselection_hysteresis_db=args.carrier_reselection_hysteresis_db,
     )

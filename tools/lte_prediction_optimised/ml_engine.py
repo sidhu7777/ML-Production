@@ -758,11 +758,28 @@ def _site_polygon_filter_sql(table_name, polygon_ids):
     """
 
 
+def _country_code_for_region(region):
+    normalized = str(region or "").strip().lower()
+    if normalized == "taiwan":
+        return "TW"
+    if normalized == "india":
+        return "IN"
+    return normalized.upper() if normalized else None
+
+
+def _bridge_region_params(project_id, region):
+    params = {"projectId": int(project_id), "region": str(region or "india").lower()}
+    country_code = _country_code_for_region(region)
+    if country_code:
+        params["countryCode"] = country_code
+    return params
+
+
 def fetch_site_data(project_id, region="india", operator=None, allowed_cells=None, polygon_ids=None):
     polygon_id_list = _parse_polygon_ids(polygon_ids)
     bridge = get_bridge_client()
     if bridge:
-        params = {"projectId": int(project_id)}
+        params = _bridge_region_params(project_id, region)
         if polygon_id_list:
             params["polygon_ids"] = ",".join(str(value) for value in polygon_id_list)
         start_time = time.perf_counter()
@@ -991,7 +1008,8 @@ def fetch_optimized_sites(project_id, operator, region="india", polygon_ids=None
             selected_scenario = None
     bridge = get_bridge_client()
     if bridge:
-        params = {"projectId": int(project_id), "operator": operator}
+        params = _bridge_region_params(project_id, region)
+        params["operator"] = operator
         if selected_scenario is not None:
             params["scenario"] = selected_scenario
         if polygon_id_list:

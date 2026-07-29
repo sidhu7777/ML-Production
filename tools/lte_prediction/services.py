@@ -367,6 +367,8 @@ class LTEPredictionService:
                     "min_cells_per_grid": cfg.get("min_cells_per_grid", 1),
                     "ensure_all_cells": cfg.get("ensure_all_cells", True),
                     "min_grids_per_cell": cfg.get("min_grids_per_cell", 1),
+                    "min_candidate_rsrp_dbm": cfg.get("min_candidate_rsrp_dbm", -128),
+                    "candidate_safety_cap": cfg.get("candidate_safety_cap", 20),
                     "grid_analytics_scenario_id": cfg.get("grid_analytics_scenario_id"),
                 }
             )

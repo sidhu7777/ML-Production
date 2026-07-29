@@ -5,6 +5,25 @@ lte_prediction_bp = Blueprint("lte_prediction", __name__)
 svc = LTEPredictionService()
 
 
+def _resolve_region(data):
+    raw_region = str(data.get("region") or "").strip().lower()
+    if raw_region:
+        if raw_region in {"tw", "twn"}:
+            return "taiwan"
+        if raw_region in {"in", "ind"}:
+            return "india"
+        return raw_region
+
+    country_code = str(
+        data.get("country_code") or data.get("countryCode") or ""
+    ).strip().lower()
+    if country_code in {"tw", "twn", "taiwan"}:
+        return "taiwan"
+    if country_code in {"in", "ind", "india"}:
+        return "india"
+    return "india"
+
+
 @lte_prediction_bp.route("/run", methods=["POST"])
 def run_prediction():
 
@@ -17,7 +36,8 @@ def run_prediction():
         cfg = {
             "project_id": int(data["project_id"]),
             "session_ids": data["session_ids"],
-            "region": str(data.get("region", "india")).lower(),
+            "region": _resolve_region(data),
+            "country_code": data.get("country_code") or data.get("countryCode"),
             "operator": str(data.get("operator", "") or "").strip(),
             "radius_m": float(data.get("radius", data.get("radius_m", 500))),
             "grid_resolution": float(data.get("grid_resolution", 25)),
@@ -30,6 +50,8 @@ def run_prediction():
             "min_cells_per_grid": int(data.get("min_cells_per_grid", 1)),
             "ensure_all_cells": bool(data.get("ensure_all_cells", True)),
             "min_grids_per_cell": int(data.get("min_grids_per_cell", 1)),
+            "min_candidate_rsrp_dbm": float(data.get("min_candidate_rsrp_dbm", -128)),
+            "candidate_safety_cap": int(data.get("candidate_safety_cap", data.get("max_viable_candidates_per_grid", 20))),
             "grid_analytics_scenario_id": data.get("grid_analytics_scenario_id"),
             "grid_analytics_auth_header": request.headers.get("Authorization") or data.get("grid_analytics_auth_header"),
             "grid_analytics_cookie_header": request.headers.get("Cookie") or data.get("grid_analytics_cookie_header"),

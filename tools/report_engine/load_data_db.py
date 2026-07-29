@@ -191,47 +191,57 @@ def load_project_data(project_id: int):
         filtered_df  : DataFrame (polygon-filtered data)
         project_meta : dict (tbl_project row)
     """
-    engine = get_engine()
+    # Each DB helper already chooses Python Bridge when configured, otherwise
+    # it falls back to direct DB. Avoid opening a DB connection here first,
+    # because bridge-only production should not require direct MySQL access.
+    project = get_project_by_id(project_id)
+    if not project:
+        raise ValueError(f"No project found for id={project_id}")
 
-    with engine.connect() as conn:
-        # 1 Project
-        project = get_project_by_id(project_id, conn)
-        if not project:
-            raise ValueError(f"No project found for id={project_id}")
+    ref_session_id = project["ref_session_id"]
+    session_ids = _parse_session_ids(ref_session_id)
 
-        ref_session_id = project["ref_session_id"]
-        session_ids = _parse_session_ids(ref_session_id)
+    if not session_ids:
+        raise ValueError("No valid session IDs found for project")
 
-        if not session_ids:
-            raise ValueError("No valid session IDs found for project")
+    # 2 Raw network logs
+    raw_df = get_network_logs_for_sessions(
+        session_ids,
+        project_id=project_id,
+        provider=project.get("provider"),
+        start_date=project.get("from_date"),
+        end_date=project.get("to_date"),
+    )
 
-        # 2 Raw network logs
-        raw_df = get_network_logs_for_sessions(
-            session_ids,
-            conn,
-            project_id=project_id,
-            provider=project.get("provider"),
-            start_date=project.get("from_date"),
-            end_date=project.get("to_date"),
-        )
+    valid_geo_rows = 0
+    if {"lat", "lon"}.issubset(raw_df.columns):
+        valid_geo_rows = int((raw_df["lat"].notna() & raw_df["lon"].notna()).sum())
+    print(
+        "[ReportLogs] load_project_data received raw logs "
+        f"project_id={project_id} sessions={session_ids} rows={len(raw_df)} "
+        f"valid_lat_lon_rows={valid_geo_rows} columns={list(raw_df.columns)}"
+    )
 
-        valid_geo_rows = 0
-        if {"lat", "lon"}.issubset(raw_df.columns):
-            valid_geo_rows = int((raw_df["lat"].notna() & raw_df["lon"].notna()).sum())
+    # 3 Regions / polygons
+    region_rows = get_project_regions(project_id)
+    polygons = _parse_polygons(region_rows)
+    used_polygons = polygons
+    used_region_wkts = None
+
+    bridge_prefiltered = bool(raw_df.attrs.get("report_prefiltered"))
+    project["report_data_prefiltered"] = bridge_prefiltered
+    project["report_data_source"] = raw_df.attrs.get("report_data_source", "direct_db_raw")
+
+    if bridge_prefiltered:
+        filtered_df = raw_df.reset_index(drop=True)
         print(
-            "[ReportLogs] load_project_data received raw logs "
-            f"project_id={project_id} sessions={session_ids} rows={len(raw_df)} "
-            f"valid_lat_lon_rows={valid_geo_rows} columns={list(raw_df.columns)}"
+            "[ReportLogs] using bridge-prefiltered report rows "
+            f"project_id={project_id} rows={len(filtered_df)} "
+            f"source={project['report_data_source']}"
         )
-
-        
-
-        # 3 Primary row filtering
+    else:
+        # 4 Primary row filtering
         primary_df = _filter_primary_rows(raw_df)
-
-        # 4 Regions / polygons
-        region_rows = get_project_regions(project_id, conn)
-        polygons = _parse_polygons(region_rows)
 
         # 5 Spatial filtering
         filtered_df = _filter_df_by_polygons(primary_df, polygons)
@@ -240,8 +250,6 @@ def load_project_data(project_id: int):
             f"project_id={project_id} polygons={len(polygons)} rows_before={len(primary_df)} "
             f"rows_after={len(filtered_df)}"
         )
-        used_polygons = polygons
-        used_region_wkts = None
 
         # Fallback: try swapped polygon coords if first pass returns 0 rows
         if filtered_df.empty and polygons:
@@ -256,12 +264,12 @@ def load_project_data(project_id: int):
                 used_polygons = swapped_polygons
                 used_region_wkts = _polygons_to_wkt(swapped_polygons)
 
-        # 6 Add region WKT to project metadata for map generation
-        if used_region_wkts:
-            project["region"] = used_region_wkts[0]
-        elif region_rows and len(region_rows) > 0:
-            project["region"] = region_rows[0]["region_wkt"]
-        else:
-            project["region"] = None
+    # 6 Add region WKT to project metadata for map generation
+    if used_region_wkts:
+        project["region"] = used_region_wkts[0]
+    elif region_rows and len(region_rows) > 0:
+        project["region"] = region_rows[0]["region_wkt"]
+    else:
+        project["region"] = None
 
-        return raw_df, filtered_df, project
+    return raw_df, filtered_df, project

@@ -88,19 +88,30 @@ def main(
         print("No data after polygon filtering — stopping.")
         return
 
-    # report_df = primary + polygon + KNOWN band.  Every report visual (maps,
-    # KPI analysis, CDF, metadata) is computed over this single population so
-    # band %, table and LLM text all agree.
-    report_df = filter_known_band_rows(filtered_df)
-    print("Report rows (primary + polygon + known band):", len(report_df))
+    bridge_prefiltered = bool(project_meta.get("report_data_prefiltered"))
+    if bridge_prefiltered:
+        # Bridge mode uses GetDriveTestRows, which already applies the report
+        # input contract before Python receives the rows.
+        report_df = filtered_df.reset_index(drop=True)
+        print("Report rows (bridge-prefiltered):", len(report_df))
+    else:
+        # report_df = primary + polygon + KNOWN band.  Every report visual (maps,
+        # KPI analysis, CDF, metadata) is computed over this single population so
+        # band %, table and LLM text all agree.
+        report_df = filter_known_band_rows(filtered_df)
+        print("Report rows (primary + polygon + known band):", len(report_df))
     if report_df.empty:
         print("No rows with a known band after filtering — stopping.")
         return
 
-    # handover_df = polygon-filtered ALL cells (no primary-cell restriction) so
-    # the handover count matches the frontend's GetNetworkLog backend.
-    handover_df = polygon_filter_all_cells(raw_df, polygon_wkt)
-    print("Handover rows (all cells, polygon):", len(handover_df))
+    if bridge_prefiltered:
+        handover_df = raw_df.reset_index(drop=True)
+        print("Handover rows (bridge-prefiltered):", len(handover_df))
+    else:
+        # handover_df = polygon-filtered ALL cells (no primary-cell restriction)
+        # so the handover count matches the frontend's GetNetworkLog backend.
+        handover_df = polygon_filter_all_cells(raw_df, polygon_wkt)
+        print("Handover rows (all cells, polygon):", len(handover_df))
 
     # In production, remove temp files after successful report generation.
     # Keep during local debugging by setting REPORT_KEEP_TMP=1

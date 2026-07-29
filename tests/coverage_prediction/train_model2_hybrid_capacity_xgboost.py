@@ -64,7 +64,6 @@ TARGET_CONFIG = {
 TARGETS = [cfg["target"] for cfg in TARGET_CONFIG.values()]
 
 NUMERIC_FEATURES = [
-    "bucket_seq",
     "building_count",
     "building_area_ratio",
     "road_density",
@@ -104,7 +103,7 @@ NUMERIC_FEATURES = [
     "capacity_context_score",
     "capacity_gap_score",
 ]
-CATEGORICAL_FEATURES = ["time_bucket", "clutter_class", "dominant_band_class"]
+CATEGORICAL_FEATURES = ["clutter_class", "dominant_band_class"]
 ALL_FEATURES = NUMERIC_FEATURES + CATEGORICAL_FEATURES
 
 
@@ -147,12 +146,12 @@ def build_preprocessor() -> ColumnTransformer:
 def load_dataset() -> pd.DataFrame:
     build_hybrid_model2_dataset()
     df = pd.read_csv(HYBRID_MODEL2_CSV)
-    required = set(ALL_FEATURES + TARGETS + ["grid_id", "time_bucket"])
+    required = set(ALL_FEATURES + TARGETS + ["grid_id", "time_bucket", "bucket_seq"])
     missing = sorted(required.difference(df.columns))
     if missing:
         raise RuntimeError(f"Hybrid Model 2 dataset is missing required columns: {missing}")
 
-    for col in NUMERIC_FEATURES + TARGETS + ["grid_id", "grid_row", "grid_col", "grid_centroid_lat", "grid_centroid_lon"]:
+    for col in NUMERIC_FEATURES + TARGETS + ["grid_id", "grid_row", "grid_col", "grid_centroid_lat", "grid_centroid_lon", "bucket_seq"]:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
     df["time_bucket"] = df["time_bucket"].astype(str)
@@ -443,6 +442,13 @@ def train_all(trials: int, timeout: int) -> dict[str, Any]:
         "split_rows": {"train": int(len(train_df)), "valid": int(len(valid_df)), "test": int(len(test_df))},
         "optuna_trials": int(trials),
         "optuna_timeout": int(timeout),
+        "training_granularity": "grid_id + time_bucket split only; bucket/time excluded from model features",
+        "features": {
+            "numeric": NUMERIC_FEATURES,
+            "categorical": CATEGORICAL_FEATURES,
+            "excluded": ["bucket_seq", "time_bucket", "estimated_prb_mean"],
+            "total": len(ALL_FEATURES),
+        },
         "targets": {},
     }
 
@@ -478,6 +484,13 @@ def train_all(trials: int, timeout: int) -> dict[str, Any]:
             "model_file": str(out_dir / cfg["model_file"]),
             "root_model_file": str(MODEL_ROOT / cfg["model_file"]),
             "best_params": params,
+            "training_granularity": "grid_id + time_bucket split only; bucket/time excluded from model features",
+            "features": {
+                "numeric": NUMERIC_FEATURES,
+                "categorical": CATEGORICAL_FEATURES,
+                "excluded": ["bucket_seq", "time_bucket", "estimated_prb_mean"],
+                "total": len(ALL_FEATURES),
+            },
             "metrics": metrics,
             "diagnostics": diagnostics,
         }

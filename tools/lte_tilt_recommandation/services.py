@@ -773,7 +773,12 @@ class RFOptimizationService:
             # ==========================================
             self._update(job_id, "running", "Fetching antenna records...")
             if use_bridge:
-                antenna_df = bridge.get_rows("GetLteTiltAntennaRows", {"projectId": int(project_id)}, limit=50000)
+                antenna_params = {"projectId": int(project_id), "region": region}
+                if region == "taiwan":
+                    antenna_params["countryCode"] = "TW"
+                elif region == "india":
+                    antenna_params["countryCode"] = "IN"
+                antenna_df = bridge.get_rows("GetLteTiltAntennaRows", antenna_params, limit=50000)
                 print(f"[TILT][ANTENNA_FETCH] source=python_bridge rows={len(antenna_df)}")
             else:
                 ant_query = text("""

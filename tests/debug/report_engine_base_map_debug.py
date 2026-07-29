@@ -1753,6 +1753,298 @@ def _generate_range_kpi_map_with_tile(
     m.save(str(output_html))
 
 
+def _range_index_for_value(value: float, ranges: list[dict]) -> int:
+    for idx, range_def in enumerate(ranges):
+        if value_in_range(value, range_def, idx == len(ranges) - 1):
+            return idx
+    return -1
+
+
+def _range_color_for_index(range_index: int, ranges: list[dict]) -> str:
+    if 0 <= range_index < len(ranges):
+        return ranges[range_index]["color"]
+    return "#808080"
+
+
+def _generalize_range_kpi_points(
+    df: pd.DataFrame,
+    kpi_column: str,
+    ranges: list[dict],
+    *,
+    render_width: int,
+    render_height: int,
+    cell_px: int,
+    max_points: int,
+) -> tuple[pd.DataFrame, dict]:
+    """
+    Cartographic point thinning for printable report maps.
+
+    The full dataframe remains the source for analysis and legends.  This only
+    selects a deterministic representative set for drawing: one point per
+    screen-space cell per KPI range/color, then coarsens the cell size until the
+    rendered marker count is safe for Folium/Chromium.
+    """
+    work = df.dropna(subset=["lat", "lon", kpi_column]).copy()
+    work[kpi_column] = pd.to_numeric(work[kpi_column], errors="coerce")
+    work = work.dropna(subset=[kpi_column])
+    if work.empty:
+        return work, {"input_rows": 0, "draw_rows": 0, "cell_px": cell_px}
+
+    work["__range_index"] = work[kpi_column].apply(lambda value: _range_index_for_value(float(value), ranges))
+
+    min_lat, max_lat = float(work["lat"].min()), float(work["lat"].max())
+    min_lon, max_lon = float(work["lon"].min()), float(work["lon"].max())
+    lat_span = max(max_lat - min_lat, 1e-12)
+    lon_span = max(max_lon - min_lon, 1e-12)
+
+    chosen = work
+    chosen_cell_px = max(1, int(cell_px))
+    attempts = []
+
+    while True:
+        cols = max(1, int(render_width / chosen_cell_px))
+        rows = max(1, int(render_height / chosen_cell_px))
+        tmp = work.copy()
+        tmp["__xbin"] = np.floor(((tmp["lon"].astype(float) - min_lon) / lon_span) * (cols - 1)).astype(int)
+        tmp["__ybin"] = np.floor(((tmp["lat"].astype(float) - min_lat) / lat_span) * (rows - 1)).astype(int)
+        tmp["__cell_center_lon"] = min_lon + ((tmp["__xbin"] + 0.5) / cols) * lon_span
+        tmp["__cell_center_lat"] = min_lat + ((tmp["__ybin"] + 0.5) / rows) * lat_span
+        tmp["__cell_dist"] = (
+            (tmp["lon"].astype(float) - tmp["__cell_center_lon"]) ** 2
+            + (tmp["lat"].astype(float) - tmp["__cell_center_lat"]) ** 2
+        )
+        idx = (
+            tmp.sort_values(["__cell_dist", kpi_column])
+            .groupby(["__ybin", "__xbin", "__range_index"], sort=False)
+            .head(1)
+            .index
+        )
+        chosen = tmp.loc[idx].copy()
+        attempts.append({"cell_px": int(chosen_cell_px), "draw_rows": int(len(chosen))})
+
+        if len(chosen) <= max_points or chosen_cell_px >= 96:
+            break
+        chosen_cell_px = int(chosen_cell_px * 1.35) + 1
+
+    if len(chosen) > max_points:
+        parts = []
+        full_counts = work["__range_index"].value_counts(normalize=True)
+        for range_index, share in full_counts.items():
+            part = chosen[chosen["__range_index"] == range_index]
+            take = max(1, int(round(max_points * float(share))))
+            if len(part) > take:
+                part = part.sort_values(["__ybin", "__xbin", "__cell_dist"]).iloc[:: max(1, len(part) // take)].head(take)
+            parts.append(part)
+        chosen = pd.concat(parts, ignore_index=False).head(max_points)
+
+    helper_cols = [
+        "__xbin", "__ybin", "__cell_center_lon", "__cell_center_lat", "__cell_dist",
+    ]
+    summary = {
+        "method": "cartographic_point_generalization_grid_per_kpi_range",
+        "input_rows": int(len(work)),
+        "draw_rows": int(len(chosen)),
+        "cell_px": int(chosen_cell_px),
+        "max_points": int(max_points),
+        "attempts": attempts,
+        "full_range_counts": {
+            str(int(k)): int(v)
+            for k, v in work["__range_index"].value_counts().sort_index().items()
+        },
+        "draw_range_counts": {
+            str(int(k)): int(v)
+            for k, v in chosen["__range_index"].value_counts().sort_index().items()
+        },
+    }
+    return chosen.drop(columns=[c for c in helper_cols if c in chosen.columns]), summary
+
+
+def _generate_range_kpi_map_cartographic_with_tile(
+    df: pd.DataFrame,
+    kpi_column: str,
+    ranges: list[dict],
+    polygon_wkt: str | None,
+    output_html: Path,
+    tile_name: str,
+    left_padding_px: int,
+    legend_right_padding_px: int,
+    top_padding_px: int,
+    bottom_padding_px: int,
+    legend_top_px: int,
+    legend_right_px: int,
+    render_width: int,
+    render_height: int,
+    generalization_cell_px: int,
+    generalized_max_points: int,
+) -> dict:
+    full_df = df.dropna(subset=["lat", "lon", kpi_column]).copy()
+    full_df[kpi_column] = pd.to_numeric(full_df[kpi_column], errors="coerce")
+    full_df = full_df.dropna(subset=[kpi_column])
+    if full_df.empty:
+        raise ValueError(f"No data available for KPI map: {kpi_column}")
+
+    draw_df, summary = _generalize_range_kpi_points(
+        full_df,
+        kpi_column,
+        ranges,
+        render_width=render_width,
+        render_height=render_height,
+        cell_px=generalization_cell_px,
+        max_points=generalized_max_points,
+    )
+
+    m = folium.Map(
+        tiles=tile_name, zoom_control=True, control_scale=False,
+        prefer_canvas=True, max_zoom=22,
+    )
+    add_fullscreen_css(m)
+
+    for _, row in draw_df.iterrows():
+        color = _range_color_for_index(int(row.get("__range_index", -1)), ranges)
+        folium.CircleMarker(
+            location=(row["lat"], row["lon"]), radius=4,
+            color=color, fill=True, fill_opacity=0.9,
+        ).add_to(m)
+
+    # Legend intentionally uses the full dataframe, not the thinned draw set.
+    legend_items = build_legend_from_ranges(full_df, kpi_column, ranges)
+    add_legend(m, kpi_column, legend_items)
+    m.get_root().header.add_child(folium.Element(f"""
+    <style>
+        .kpi-legend {{
+            top: {legend_top_px}px !important;
+            right: {legend_right_px}px !important;
+        }}
+    </style>
+    """))
+
+    if polygon_wkt:
+        geom = loads(polygon_wkt)
+        polygon_latlon = [(c[1], c[0]) for c in geom.exterior.coords]
+        folium.Polygon(
+            locations=polygon_latlon, color="#FF0000", weight=5,
+            fill=False, opacity=1.0, tooltip="Polygon Boundary",
+        ).add_to(m)
+
+    _fit_tight_bounds(
+        m, get_df_bounds(full_df),
+        left_padding_px=left_padding_px, right_padding_px=legend_right_padding_px,
+        top_padding_px=top_padding_px, bottom_padding_px=bottom_padding_px,
+    )
+    m.save(str(output_html))
+    summary["legend_source"] = "full_kpi_dataframe_not_generalized"
+    summary["legend_items"] = [
+        {"label": label, "color": color, "count": int(count)}
+        for label, color, count in legend_items
+    ]
+    return summary
+
+
+def generate_project_rsrp_cartographic_image(
+    project_id: int,
+    user_id: int | None,
+    out_dir: Path,
+    render_timeout_ms: int,
+    candidate_width: int,
+    candidate_height: int,
+    tile_name: str,
+    left_padding_px: int,
+    legend_right_padding_px: int,
+    top_padding_px: int,
+    bottom_padding_px: int,
+    legend_top_px: int,
+    legend_right_px: int,
+    generalization_cell_px: int,
+    generalized_max_points: int,
+) -> Path:
+    """
+    Project-level RSRP-only validation image using cartographic point thinning.
+    This follows the production report data path, but only writes test artifacts.
+    """
+    os.environ.setdefault("REPORT_RENDER_TIMEOUT_MS", str(render_timeout_ms))
+    os.environ.setdefault("REPORT_RENDER_NAV_ATTEMPTS", "1")
+
+    run_dir = _make_run_dir(out_dir, project_id, "rsrp_cartographic")
+    html_dir = run_dir / "html"
+    image_dir = run_dir / "images" / "kpi_maps"
+    processed_dir = run_dir / "processed"
+    for d in (html_dir, image_dir, processed_dir):
+        d.mkdir(parents=True, exist_ok=True)
+
+    raw_df, filtered_df, project_meta = load_project_data(project_id)
+    polygon_wkt = project_meta.get("region")
+    if filtered_df.empty:
+        raise ValueError(f"Project {project_id} has no rows after report filtering.")
+
+    if project_meta.get("report_data_prefiltered"):
+        report_df = filtered_df.reset_index(drop=True)
+    else:
+        report_df = _filter_known_band_rows(filtered_df)
+    if report_df.empty:
+        raise ValueError(f"Project {project_id} has no known-band rows after report filtering.")
+
+    kpi_cfg = KPI_CONFIG["RSRP"]
+    kpi_column = kpi_cfg["column"]
+    kpi_df = report_df[
+        report_df[kpi_column].notna()
+        & report_df["lat"].notna()
+        & report_df["lon"].notna()
+    ].copy()
+    ranges = resolve_kpi_ranges(kpi_name="RSRP", user_id=user_id, values=kpi_df[kpi_column])
+
+    safe_tile = tile_name.lower().replace(" ", "_")
+    html_path = html_dir / f"rsrp_map_{safe_tile}_cartographic.html"
+    png_path = image_dir / f"rsrp_map_{safe_tile}_cartographic.png"
+
+    generalization_summary = _generate_range_kpi_map_cartographic_with_tile(
+        kpi_df,
+        kpi_column=kpi_column,
+        ranges=ranges,
+        polygon_wkt=polygon_wkt,
+        output_html=html_path,
+        tile_name=tile_name,
+        left_padding_px=left_padding_px,
+        legend_right_padding_px=legend_right_padding_px,
+        top_padding_px=top_padding_px,
+        bottom_padding_px=bottom_padding_px,
+        legend_top_px=legend_top_px,
+        legend_right_px=legend_right_px,
+        render_width=candidate_width,
+        render_height=candidate_height,
+        generalization_cell_px=generalization_cell_px,
+        generalized_max_points=generalized_max_points,
+    )
+    html_to_png(str(html_path), str(png_path), width=candidate_width, height=candidate_height)
+
+    raw_df.to_csv(processed_dir / "raw_data.csv", index=False)
+    filtered_df.to_csv(processed_dir / "filtered_primary_polygon_data.csv", index=False)
+    report_df.to_csv(processed_dir / "report_primary_polygon_known_band_data.csv", index=False)
+    _write_json(processed_dir / "project_meta.json", project_meta)
+
+    summary = {
+        "project_id": project_id,
+        "user_id": user_id,
+        "mode": "rsrp_cartographic_validation",
+        "session_ids": _parse_session_ids(project_meta.get("ref_session_id")),
+        "raw": _route_summary(raw_df, polygon_wkt),
+        "filtered_primary_polygon": _route_summary(filtered_df, polygon_wkt),
+        "report_primary_polygon_known_band": _route_summary(report_df, polygon_wkt),
+        "kpi_name": "RSRP",
+        "kpi_column": kpi_column,
+        "tile_name": tile_name,
+        "png_path": str(png_path),
+        "html_path": str(html_path),
+        "generalization": generalization_summary,
+    }
+    _write_json(run_dir / "rsrp_cartographic_summary.json", summary)
+
+    print(f"Generated cartographic RSRP image: {png_path}")
+    print(f"Full RSRP rows: {generalization_summary['input_rows']}")
+    print(f"Drawn RSRP rows: {generalization_summary['draw_rows']}")
+    print(f"Summary: {run_dir / 'rsrp_cartographic_summary.json'}")
+    return run_dir
+
+
 def generate_project_base_route_image(
     project_id: int,
     user_id: int | None,
@@ -1881,6 +2173,7 @@ def main():
         description=(
             "Report engine debug/validation test.\n"
             "  --mode debug  : generate base route map + one KPI map (default)\n"
+            "  --mode rsrp-cartographic : generate one generalized RSRP map image\n"
             "  --mode full   : generate complete PDF report with all fixes applied"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -1888,8 +2181,8 @@ def main():
     parser.add_argument("--project-id",  type=int, default=272)
     parser.add_argument("--user-id",     type=int, default=13)
     parser.add_argument(
-        "--mode", choices=["debug", "full"], default="debug",
-        help="'debug' = base map + one KPI (original behaviour); 'full' = complete PDF with fixes",
+        "--mode", choices=["debug", "rsrp-cartographic", "full"], default="debug",
+        help="'debug' = base map + one KPI; 'rsrp-cartographic' = one generalized RSRP map; 'full' = complete PDF with fixes",
     )
     parser.add_argument(
         "--out-dir",
@@ -1920,6 +2213,18 @@ def main():
     parser.add_argument("--bottom-padding-px",        type=int, default=10)
     parser.add_argument("--legend-top-px",            type=int, default=44)
     parser.add_argument("--legend-right-px",          type=int, default=6)
+    parser.add_argument(
+        "--generalization-cell-px",
+        type=int,
+        default=8,
+        help="Screen-space cell size for cartographic point thinning.",
+    )
+    parser.add_argument(
+        "--generalized-max-points",
+        type=int,
+        default=15000,
+        help="Maximum marker count for cartographic validation image.",
+    )
 
     args = parser.parse_args()
     out_dir = Path(args.out_dir)
@@ -1935,6 +2240,24 @@ def main():
             render_width=args.render_width,
             render_height=args.render_height,
             skip_llm=args.skip_llm,
+        )
+    elif args.mode == "rsrp-cartographic":
+        generate_project_rsrp_cartographic_image(
+            project_id=args.project_id,
+            user_id=args.user_id,
+            out_dir=out_dir,
+            render_timeout_ms=args.render_timeout_ms,
+            candidate_width=args.candidate_width,
+            candidate_height=args.candidate_height,
+            tile_name=args.tile_name,
+            left_padding_px=args.left_padding_px,
+            legend_right_padding_px=args.legend_right_padding_px,
+            top_padding_px=args.top_padding_px,
+            bottom_padding_px=args.bottom_padding_px,
+            legend_top_px=args.legend_top_px,
+            legend_right_px=args.legend_right_px,
+            generalization_cell_px=args.generalization_cell_px,
+            generalized_max_points=args.generalized_max_points,
         )
     else:
         generate_project_base_route_image(
