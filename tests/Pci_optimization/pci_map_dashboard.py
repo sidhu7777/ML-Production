@@ -2142,7 +2142,10 @@ def main() -> None:
         st.error(f"Failed to build site selection: {exc}")
         return
     for note in demo_notes:
-        st.warning(note) if is_demo_mode else st.caption(note)
+        if is_demo_mode:
+            st.warning(note)
+        else:
+            st.caption(note)
 
     _detection_t0 = time.perf_counter()
     confusion_conflicts = detect_pci_confusion(events_df, site_ids_filter=set(selected_site_ids))

@@ -1084,6 +1084,38 @@ def _load_or_build_grid(
     return grid_cells_df, utm_crs, origin_xy
 
 
+def _grid_cells_to_frontend_grid_df(grid_cells_df: pd.DataFrame) -> pd.DataFrame:
+    """Expose the local polygon grid in the same shape as GridAnalyticsController."""
+    if grid_cells_df.empty:
+        return pd.DataFrame()
+    rows: List[Dict[str, object]] = []
+    for row in grid_cells_df.itertuples(index=False):
+        geometry_wkt = getattr(row, "geometry_wkt", None)
+        if not geometry_wkt:
+            continue
+        try:
+            geometry = load_wkt(str(geometry_wkt))
+        except Exception:
+            continue
+        if geometry.is_empty:
+            continue
+        min_lon, min_lat, max_lon, max_lat = geometry.bounds
+        rows.append(
+            {
+                "grid_id": str(getattr(row, "grid_id")),
+                "center_lat": float(getattr(row, "centroid_lat")),
+                "center_lon": float(getattr(row, "centroid_lon")),
+                "min_lat": float(min_lat),
+                "max_lat": float(max_lat),
+                "min_lon": float(min_lon),
+                "max_lon": float(max_lon),
+                "grid_size_meters": float(getattr(row, "grid_size_m")),
+                "scenario_id": None,
+            }
+        )
+    return pd.DataFrame(rows)
+
+
 def _time_step(timings: Dict[str, float], step_name: str, builder):
     started = time.perf_counter()
     result = builder()
@@ -2134,29 +2166,56 @@ def _run_project_baseline_prediction(
     polygon_wkt: Optional[str] = None,
     use_frontend_grid_sampling: bool = True,
     grid_analytics_scenario_id: Optional[int] = None,
+    frontend_grid_df: Optional[pd.DataFrame] = None,
 ) -> pd.DataFrame:
     if site_df.empty:
         return pd.DataFrame()
-    pred_df = base_ml.run_rf_prediction_fast(
-        site_df=site_df,
-        drive_df=drive_df if not drive_df.empty else pd.DataFrame(columns=["lat", "lon"]),
-        building_df=building_df,
-        params={
-            "project_id": int(project_id),
-            "region": str(region).lower(),
-            "polygon_wkt": str(polygon_wkt or "").strip(),
-            "radius": float(baseline_radius_m),
-            "grid": float(grid_size_m),
-            "workers": int(workers),
-            "max_interference_sites": int(max_interference_sites),
-            "max_cells_per_grid": 6,
-            "min_grids_per_cell": 3,
-            "use_frontend_grid_sampling": bool(use_frontend_grid_sampling),
-            "grid_analytics_scenario_id": (
-                int(grid_analytics_scenario_id) if grid_analytics_scenario_id is not None else None
-            ),
-        },
-    )
+    params = {
+        "project_id": int(project_id),
+        "region": str(region).lower(),
+        "polygon_wkt": str(polygon_wkt or "").strip(),
+        "radius": float(baseline_radius_m),
+        "grid": float(grid_size_m),
+        "workers": int(workers),
+        "max_interference_sites": int(max_interference_sites),
+        "max_cells_per_grid": 3,
+        "min_grids_per_cell": 3,
+        "candidate_safety_cap": 20,
+        "use_frontend_grid_sampling": bool(use_frontend_grid_sampling),
+        "grid_analytics_scenario_id": (
+            int(grid_analytics_scenario_id) if grid_analytics_scenario_id is not None else None
+        ),
+    }
+    if use_frontend_grid_sampling and frontend_grid_df is not None and not frontend_grid_df.empty:
+        original_get_bridge_client = base_ml.get_bridge_client
+        original_fetch_frontend_grid_cells = base_ml.fetch_frontend_grid_cells
+
+        def _fetch_local_frontend_grid(*args, **kwargs):
+            print(
+                f"[COVERAGE_TEST][FRONTEND_GRID_LOCAL] rows={len(frontend_grid_df)} "
+                f"grid_size_m={grid_size_m} source=coverage_grid_cells"
+            )
+            return frontend_grid_df.copy(), None
+
+        try:
+            base_ml.get_bridge_client = lambda: None
+            base_ml.fetch_frontend_grid_cells = _fetch_local_frontend_grid
+            pred_df = base_ml.run_rf_prediction_fast(
+                site_df=site_df,
+                drive_df=drive_df if not drive_df.empty else pd.DataFrame(columns=["lat", "lon"]),
+                building_df=building_df,
+                params=params,
+            )
+        finally:
+            base_ml.get_bridge_client = original_get_bridge_client
+            base_ml.fetch_frontend_grid_cells = original_fetch_frontend_grid_cells
+    else:
+        pred_df = base_ml.run_rf_prediction_fast(
+            site_df=site_df,
+            drive_df=drive_df if not drive_df.empty else pd.DataFrame(columns=["lat", "lon"]),
+            building_df=building_df,
+            params=params,
+        )
     if pred_df.empty:
         return pd.DataFrame()
     out = pred_df.copy()
@@ -2180,6 +2239,7 @@ def _run_bucket_baseline_predictions(
     polygon_wkt: Optional[str] = None,
     use_frontend_grid_sampling: bool = True,
     grid_analytics_scenario_id: Optional[int] = None,
+    frontend_grid_df: Optional[pd.DataFrame] = None,
 ) -> pd.DataFrame:
     out_rows: List[pd.DataFrame] = []
     for label, _, _ in buckets:
@@ -2202,6 +2262,7 @@ def _run_bucket_baseline_predictions(
             polygon_wkt=polygon_wkt,
             use_frontend_grid_sampling=use_frontend_grid_sampling,
             grid_analytics_scenario_id=grid_analytics_scenario_id,
+            frontend_grid_df=frontend_grid_df,
         )
         if baseline_df.empty:
             continue
@@ -2543,6 +2604,11 @@ def run_coverage_test(config: CoverageTestConfig) -> Path:
             config.grid_size_m,
         ),
     )
+    local_frontend_grid_df = _time_step(
+        timings,
+        "local_frontend_grid",
+        lambda: _grid_cells_to_frontend_grid_df(grid_cells_df),
+    )
     detail_df = _time_step(
         timings,
         "coverage_rows_mapped",
@@ -2619,7 +2685,11 @@ def run_coverage_test(config: CoverageTestConfig) -> Path:
                 "use_frontend_grid_sampling": config.use_frontend_grid_sampling,
                 "grid_analytics_scenario_id": config.grid_analytics_scenario_id,
                 "buckets": [[str(label), str(start_ts), str(end_ts)] for label, start_ts, end_ts in config.buckets],
-                "baseline_mode": "per_bucket_dt",
+                "baseline_mode": "per_bucket_local_frontend_grid_samples_v1",
+                "frontend_grid_rows": int(len(local_frontend_grid_df)),
+                "samples_per_grid_axis": 3,
+                "max_cells_per_grid": 3,
+                "candidate_safety_cap": 20,
                 "bucket_topology_key": bucket_topology_key,
             },
             lambda: _assign_points_to_grid(
@@ -2637,6 +2707,7 @@ def run_coverage_test(config: CoverageTestConfig) -> Path:
                     polygon_wkt=config.polygon_wkt,
                     use_frontend_grid_sampling=config.use_frontend_grid_sampling,
                     grid_analytics_scenario_id=config.grid_analytics_scenario_id,
+                    frontend_grid_df=local_frontend_grid_df,
                 ),
                 grid_size_m=config.grid_size_m,
                 utm_crs=utm_crs,

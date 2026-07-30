@@ -38,6 +38,7 @@ REPORT_RENDER_WIDTH = 1200
 REPORT_RENDER_HEIGHT = 900
 REPORT_DEVICE_SCALE = 1
 REPORT_MAP_WORKERS = 4
+REPORT_MAP_WORKER_REDUCTION_THRESHOLD = 40000
 
 def clean_directory(path):
     if os.path.exists(path):
@@ -103,6 +104,11 @@ def main(
     if report_df.empty:
         print("No rows with a known band after filtering — stopping.")
         return
+
+    map_workers = REPORT_MAP_WORKERS
+    if len(report_df) > REPORT_MAP_WORKER_REDUCTION_THRESHOLD:
+        map_workers = min(REPORT_MAP_WORKERS, 2)
+    print(f"Report map workers: {map_workers}")
 
     if bridge_prefiltered:
         handover_df = raw_df.reset_index(drop=True)
@@ -190,7 +196,7 @@ def main(
         except Exception as exc:
             return kpi, False, str(exc)
 
-    with ThreadPoolExecutor(max_workers=REPORT_MAP_WORKERS) as pool:
+    with ThreadPoolExecutor(max_workers=map_workers) as pool:
         futures = {pool.submit(_render_kpi_map, kpi, cfg): kpi for kpi, cfg in KPI_CONFIG.items()}
         for fut in as_completed(futures):
             kpi, ok, err = fut.result()

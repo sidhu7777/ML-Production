@@ -24,6 +24,13 @@ REPORT_PAD_LEFT = 30
 REPORT_PAD_VERT = 30
 REPORT_PAD_RIGHT_BASE = 40
 REPORT_PAD_RIGHT_LEGEND = 340
+REPORT_POINT_GENERALIZATION_THRESHOLD = int(os.getenv("REPORT_POINT_GENERALIZATION_THRESHOLD", "50000"))
+REPORT_POOR_POINT_GENERALIZATION_THRESHOLD = int(os.getenv("REPORT_POOR_POINT_GENERALIZATION_THRESHOLD", "20000"))
+REPORT_GENERALIZED_MAX_POINTS = int(os.getenv("REPORT_GENERALIZED_MAX_POINTS", "15000"))
+REPORT_POOR_GENERALIZED_MAX_POINTS = int(os.getenv("REPORT_POOR_GENERALIZED_MAX_POINTS", "8000"))
+REPORT_GENERALIZATION_CELL_PX = int(os.getenv("REPORT_GENERALIZATION_CELL_PX", "8"))
+REPORT_RENDER_WIDTH_HINT = int(os.getenv("REPORT_RENDER_WIDTH", "1200"))
+REPORT_RENDER_HEIGHT_HINT = int(os.getenv("REPORT_RENDER_HEIGHT", "900"))
 
 
 def new_report_map():
@@ -304,6 +311,112 @@ def build_legend_from_ranges(df, kpi_column, ranges):
     return legend_items
 
 
+def _range_key_for_value(value, ranges):
+    for idx, range_def in enumerate(ranges):
+        if value_in_range(value, range_def, idx == len(ranges) - 1):
+            return idx
+    return -1
+
+
+def _prepare_geo_numeric_df(df, value_col=None):
+    subset = ["lat", "lon"] + ([value_col] if value_col else [])
+    work = df.dropna(subset=subset).copy()
+    if work.empty:
+        return work
+
+    work["lat"] = pd.to_numeric(work["lat"], errors="coerce")
+    work["lon"] = pd.to_numeric(work["lon"], errors="coerce")
+    if value_col:
+        work[value_col] = pd.to_numeric(work[value_col], errors="coerce")
+        work = work.dropna(subset=["lat", "lon", value_col])
+    else:
+        work = work.dropna(subset=["lat", "lon"])
+
+    return work[
+        work["lat"].between(-90, 90)
+        & work["lon"].between(-180, 180)
+    ].copy()
+
+
+def _cartographic_point_thinning(
+    df,
+    key_col=None,
+    render_width=REPORT_RENDER_WIDTH_HINT,
+    render_height=REPORT_RENDER_HEIGHT_HINT,
+    cell_px=REPORT_GENERALIZATION_CELL_PX,
+    max_points=REPORT_GENERALIZED_MAX_POINTS,
+):
+    """
+    Deterministic map-scale point thinning.
+
+    One representative point is kept per screen-space cell and optional
+    attribute bucket. Bounds and legends still use the full source dataframe.
+    """
+    if df.empty:
+        return df
+
+    work = df.copy()
+    min_lat, max_lat = float(work["lat"].min()), float(work["lat"].max())
+    min_lon, max_lon = float(work["lon"].min()), float(work["lon"].max())
+    lat_span = max(max_lat - min_lat, 1e-12)
+    lon_span = max(max_lon - min_lon, 1e-12)
+
+    chosen = work
+    chosen_cell_px = max(1, int(cell_px))
+    group_cols = ["__ybin", "__xbin"]
+    if key_col and key_col in work.columns:
+        group_cols.append(key_col)
+
+    while True:
+        cols = max(1, int(render_width / chosen_cell_px))
+        rows = max(1, int(render_height / chosen_cell_px))
+        tmp = work.copy()
+        tmp["__xbin"] = (
+            ((tmp["lon"].astype(float) - min_lon) / lon_span) * (cols - 1)
+        ).clip(lower=0, upper=cols - 1).astype(int)
+        tmp["__ybin"] = (
+            ((tmp["lat"].astype(float) - min_lat) / lat_span) * (rows - 1)
+        ).clip(lower=0, upper=rows - 1).astype(int)
+        tmp["__cell_center_lon"] = min_lon + ((tmp["__xbin"] + 0.5) / cols) * lon_span
+        tmp["__cell_center_lat"] = min_lat + ((tmp["__ybin"] + 0.5) / rows) * lat_span
+        tmp["__cell_dist"] = (
+            (tmp["lon"].astype(float) - tmp["__cell_center_lon"]) ** 2
+            + (tmp["lat"].astype(float) - tmp["__cell_center_lat"]) ** 2
+        )
+        idx = (
+            tmp.sort_values(["__cell_dist"])
+            .groupby(group_cols, sort=False)
+            .head(1)
+            .index
+        )
+        chosen = tmp.loc[idx].copy()
+
+        if len(chosen) <= max_points or chosen_cell_px >= 96:
+            break
+        chosen_cell_px = int(chosen_cell_px * 1.35) + 1
+
+    helper_cols = [
+        "__xbin", "__ybin", "__cell_center_lon", "__cell_center_lat", "__cell_dist",
+    ]
+    return chosen.drop(columns=[c for c in helper_cols if c in chosen.columns])
+
+
+def _maybe_generalize_points(
+    df,
+    threshold=REPORT_POINT_GENERALIZATION_THRESHOLD,
+    key_col=None,
+    max_points=REPORT_GENERALIZED_MAX_POINTS,
+):
+    if len(df) <= threshold:
+        return df
+    draw_df = _cartographic_point_thinning(df, key_col=key_col, max_points=max_points)
+    print(
+        "[ReportMaps] cartographic point generalization "
+        f"rows_before={len(df)} rows_drawn={len(draw_df)} threshold={threshold}"
+    )
+    return draw_df
+
+
 
 # Data validation functions 
 
@@ -405,16 +518,24 @@ def generate_debug_map(df, polygon_wkt, output_path, sample_points=50):
 
 def generate_kpi_map(df, kpi_column, color_func,ranges, output_html, polygon_wkt=None):
     # Drop rows with missing lat/lon or KPI values
-    df = df.dropna(subset=["lat", "lon", kpi_column])
+    df = _prepare_geo_numeric_df(df, kpi_column)
 
     if df.empty:
         raise ValueError("No data available for KPI map")
+
+    df["__report_range_key"] = df[kpi_column].apply(lambda value: _range_key_for_value(float(value), ranges))
+    draw_df = _maybe_generalize_points(
+        df,
+        threshold=REPORT_POINT_GENERALIZATION_THRESHOLD,
+        key_col="__report_range_key",
+        max_points=REPORT_GENERALIZED_MAX_POINTS,
+    )
 
     m = new_report_map()
 
     add_fullscreen_css(m)
 
-    for _, row in df.iterrows():
+    for _, row in draw_df.iterrows():
         
 
         raw_value = row[kpi_column]
@@ -653,7 +774,7 @@ def generate_categorical_kpi_map(df, kpi_column, output_html, polygon_wkt=None):
     - Dynamically generated distinct colors
     """
 
-    df = df.dropna(subset=["lat", "lon", kpi_column])
+    df = _prepare_geo_numeric_df(df).dropna(subset=[kpi_column])
 
     if df.empty:
         raise ValueError(f"No data available for categorical KPI: {kpi_column}")
@@ -699,6 +820,13 @@ def generate_categorical_kpi_map(df, kpi_column, output_html, polygon_wkt=None):
         category_col = kpi_column
         radius = 4
         fill_opacity = 0.9
+
+    draw_df = _maybe_generalize_points(
+        draw_df,
+        threshold=REPORT_POINT_GENERALIZATION_THRESHOLD,
+        key_col=category_col,
+        max_points=REPORT_GENERALIZED_MAX_POINTS,
+    )
 
     # 3 Plot points
     for _, row in draw_df.iterrows():
@@ -976,9 +1104,7 @@ def generate_poor_region_map(
         print(f" Missing column: {value_col}")
         return
 
-    df = filtered_df[["lat", "lon", value_col]].copy()
-    df[value_col] = pd.to_numeric(df[value_col], errors="coerce")
-    df = df.dropna(subset=["lat", "lon", value_col])
+    df = _prepare_geo_numeric_df(filtered_df[["lat", "lon", value_col]].copy(), value_col)
 
     poor = df[df[value_col] < threshold]
     print(f"{title} | Filtered Samples: {len(df)} | Poor Samples: {len(poor)}")
@@ -991,11 +1117,11 @@ def generate_poor_region_map(
     # clustering collapsed 17 000 poor points into ~5 blobs; this shows the true
     # spatial spread.  Subsample only for render speed — the legend keeps the
     # true count and the dots overlap densely at this zoom anyway.
-    MAX_POOR_DOTS = 8000
     true_count = len(poor)
-    draw_df = (
-        poor.iloc[:: max(1, true_count // MAX_POOR_DOTS)]
-        if true_count > MAX_POOR_DOTS else poor
+    draw_df = _maybe_generalize_points(
+        poor,
+        threshold=REPORT_POOR_POINT_GENERALIZATION_THRESHOLD,
+        max_points=REPORT_POOR_GENERALIZED_MAX_POINTS,
     )
 
     fmap = new_report_map()
@@ -1045,10 +1171,16 @@ def generate_base_route_map(df, polygon_wkt, output_html):
     Generate a basic map showing the drive route and polygon boundary.
     No KPI overlays, just the route and boundary.
     """
-    df = df.dropna(subset=["lat", "lon"])
+    df = _prepare_geo_numeric_df(df)
 
     if df.empty:
         raise ValueError("No GPS data to plot for base route map")
+
+    draw_df = _maybe_generalize_points(
+        df,
+        threshold=REPORT_POINT_GENERALIZATION_THRESHOLD,
+        max_points=REPORT_GENERALIZED_MAX_POINTS,
+    )
 
     m = new_report_map()
 
@@ -1056,7 +1188,7 @@ def generate_base_route_map(df, polygon_wkt, output_html):
 
     # 1 Dense filled points for solid appearance (same style as KPI maps).
     # No polyline so nothing appears outside the polygon.
-    for _, r in df.iterrows():
+    for _, r in draw_df.iterrows():
         folium.CircleMarker(
             location=(r["lat"], r["lon"]),
             radius=4,
