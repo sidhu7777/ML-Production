@@ -1,212 +1,253 @@
 # LTE Tilt Recommendation
 
-This tool finds problematic LTE cells/areas and writes RF optimization recommendations into `rf_optimization_results`.
+This module creates RF optimization recommendations from the latest LTE baseline prediction. It reads baseline RF rows, antenna/site rows, geo features, optional frontend grid analytics, and optional per-cell constraints, then runs RF-validated candidate search before saving accepted rows.
 
-Note: the folder name is currently spelled `lte_tilt_recommandation` in the codebase. Keep that spelling in imports and paths unless the package is renamed everywhere.
+The package path is intentionally spelled `lte_tilt_recommandation` in the current codebase. Keep that spelling in imports and URLs unless the whole package is renamed.
 
-## Where It Lives
+## Public API
 
-| File | Role |
-| --- | --- |
-| `routes.py` | Flask endpoints under `/api/lte-tilt-recommandation` |
-| `services.py` | Background job, DB/bridge reads, constraints, report/DB write |
-| `recommendation_engine.py` | Production recommendation orchestration |
-| `candidate_validation.py` | Candidate target selection, RF validation, before/after scoring |
-| `geo_logic.py` | Geo-aware scoring and older recommendation logic helpers |
-| `etilt_optimizer_cd2.py` | Shared/legacy ETilt optimizer functions used by the engine |
-| `cell_identity.py` | Canonical cell id helpers |
-| `candidate_validation.py` | Current candidate evaluation core |
-
-## Code Architecture Map
-
-| Layer | Code reference | What it does |
-| --- | --- | --- |
-| Optimize route | `tools/lte_tilt_recommandation/routes.py:13` | Registers `POST /optimize`, accepts JSON or uploaded threshold file |
-| Status route | `tools/lte_tilt_recommandation/routes.py:42` | Returns job state |
-| Download route | `tools/lte_tilt_recommandation/routes.py:52` | Downloads generated Excel report |
-| Service class | `tools/lte_tilt_recommandation/services.py:708` | `RFOptimizationService` owns job lifecycle |
-| Job submit | `tools/lte_tilt_recommandation/services.py:710` | Creates RF recommendation job id and starts background work |
-| Main job runner | `tools/lte_tilt_recommandation/services.py:730` | Fetches inputs, runs recommendation engine, writes report and DB rows |
-| Antenna normalization | `tools/lte_tilt_recommandation/services.py:169` | `_prepare_tilt_antenna_df()` normalizes `site_prediction` fields |
-| Baseline/log normalization | `tools/lte_tilt_recommandation/services.py:212` | `_prepare_tilt_log_df()` enriches baseline rows with antenna context |
-| Baseline direct fetch | `tools/lte_tilt_recommandation/services.py:277` | Reads latest baseline rows from `lte_prediction_baseline_results` |
-| Grid analytics fetch | `tools/lte_tilt_recommandation/services.py:316` | Reads latest/selected `grid_analytics_results` |
-| Bridge RF save | `tools/lte_tilt_recommandation/services.py:424` | Sends rows to bridge `SaveRfOptimizationResults` |
-| Production engine | `tools/lte_tilt_recommandation/recommendation_engine.py:208` | `run_recommendation_engine()` orchestrates validated recommendation creation |
-| Candidate search | `tools/lte_tilt_recommandation/candidate_validation.py:1109` | `coordinate_search_recommendations()` selects and evaluates candidate changes |
-| Site update apply helper | `tools/lte_tilt_recommandation/candidate_validation.py:170` | `_apply_updates_to_site_df()` applies candidate updates to site DataFrame |
-| ETilt candidate maker | `tools/lte_tilt_recommandation/candidate_validation.py:886` | `_make_etilt_update()` generates the current stable production candidate type |
-| Geo-aware legacy/helper logic | `tools/lte_tilt_recommandation/geo_logic.py:442` | `build_geo_aware_recommendations()` contains geo scoring logic for ETilt/Azimuth/TX support |
-
-## Recommendation Architecture
-
-Current production recommendation is a validated candidate-search workflow.
+Base prefix:
 
 ```text
-POST /api/lte-tilt-recommandation/optimize
-  -> routes.py:13
-  -> RFOptimizationService.submit()
-  -> RFOptimizationService._run()
-  -> fetch site_prediction antenna rows
-  -> _prepare_tilt_antenna_df()
-  -> fetch latest lte_prediction_baseline_results
-  -> _prepare_tilt_log_df()
-  -> fetch grid_analytics_results
-  -> fetch lte_prediction_geo_features
-  -> load optional threshold constraints
-  -> run_recommendation_engine()
-  -> coordinate_search_recommendations()
-  -> candidate RF before/after scoring
-  -> write Excel report
-  -> append accepted rows to rf_optimization_results
+/api/lte-tilt-recommandation
 ```
 
-The important production distinction:
-
-| Capability | Current status |
-| --- | --- |
-| ETilt candidate generation | Production active through `_make_etilt_update()` |
-| ETilt RF validation | Production active through candidate search and before/after scoring |
-| Azimuth/TX/Mechanical/Height normalization | Present in service and candidate helpers |
-| Azimuth/TX scoring support | Present in geo helper logic |
-| Azimuth/TX/Mechanical/Height production candidate generation | Not fully production-enabled as the main coordinate search path |
-
-The current production interpretation is therefore: ETilt recommendations are validated end to end, while additional antenna parameters require dedicated candidate generation and RF validation before being enabled as primary recommendation actions.
-
-## API
-
-### `POST /api/lte-tilt-recommandation/optimize`
-
-The route accepts JSON or multipart form data.
+| Endpoint | Method | Purpose |
+| --- | --- | --- |
+| `/optimize` | `POST` | Starts an RF recommendation job. Accepts JSON or multipart form data. |
+| `/status/<job_id>` | `GET` | Returns in-memory job state. |
+| `/download?file=<xlsx_path>` | `GET` | Downloads the generated Excel report. |
 
 Required field:
 
 | Field | Meaning |
 | --- | --- |
-| `project_id` | Project id |
+| `project_id` | Project id. |
 
 Common optional fields:
 
-| Field | Meaning |
-| --- | --- |
-| `region` | Defaults to `india` |
-| `operator` | Operator filter; empty/all means all operators |
-| `rsrp` | Bad RSRP threshold, default `-105` |
-| `rsrq` | Bad RSRQ threshold, default `-15` |
-| `sinr` | Bad SINR threshold, default `0` |
-| `mode` / `kpi_mode` / `recommendation_mode` | KPI weighting mode, default `combined_weighted` |
-| `threshold_file_path` / `threshold_file` | Per-cell constraints file |
-| `threshold_file` upload | Multipart uploaded constraints file |
-| `validate_candidates` | Current production expects this to be true |
-| `max_validation_candidates` / `max_candidates` | Candidate search limit |
-| `candidate_workers` | Candidate evaluation worker count |
+| Field | Default | Meaning |
+| --- | --- | --- |
+| `region` / `country_code` / `countryCode` | `india` | Region selector with India/Taiwan aliases. |
+| `operator` | all | Operator filter; blank/all means all operators. |
+| `rsrp` | `-105` | Bad RSRP threshold. |
+| `rsrq` | `-15` | Bad RSRQ threshold. |
+| `sinr` | `0` | Bad SINR threshold. |
+| `mode` / `kpi_mode` / `recommendation_mode` | `combined_weighted` | One of `combined_weighted`, `rsrp_only`, `rsrq_only`, `sinr_only`. |
+| `rsrp_weight`, `rsrq_weight`, `sinr_weight` | `34/33/33` | Combined KPI weights. |
+| `validate_candidates` | `true` | Production requires this to be true. |
+| `max_validation_candidates` / `max_candidates` | `25` | Candidate search limit. |
+| `radius_m` / `radius` | `500` | RF recompute radius. |
+| `grid_resolution_m` / `grid_resolution` | `30` | RF recompute grid size. |
+| `n_workers` / `workers` | `1` | RF worker count. |
+| `impact_radius_m` | radius | Affected-area radius for candidate validation. |
+| `neighbor_site_count` | `3` | Neighbor sites included in validation. |
+| `max_interference_sites` | `10` | Interference-site cap. |
+| `coordinate_passes` | `2` | Coordinate/candidate search passes. |
+| `candidate_workers` | `1` | Candidate evaluation workers. |
+| `bad_grid_coverage_pct` | `80` | Bad-grid coverage requirement for target selection/scoring. |
+| `max_group_cells` | `0` | Optional cap for grouped cell handling. |
+| `max_neighbors_per_update_cell` | `2` | Neighbor expansion limit. |
+| `threshold_file_path` / `threshold_file` | none | Constraint CSV path, or multipart uploaded constraint file. |
 
-Status and download:
+## Code Map
+
+| File | Current role |
+| --- | --- |
+| `routes.py` | Accepts JSON/form requests, stores uploaded threshold files, resolves region, starts jobs. |
+| `services.py` | Fetches antenna/baseline/geo/grid rows, loads constraints, runs engine, writes artifacts and DB rows. |
+| `recommendation_engine.py` | Normalizes KPI modes/weights and orchestrates RF-validated recommendation generation. |
+| `candidate_validation.py` | Target cell selection, candidate update generation, RF recompute, before/after scoring, debug exports. |
+| `cell_identity.py` | Canonical identity helpers shared with baseline and optimized prediction. |
+| `etilt_optimizer_cd2.py` | Shared ETilt/legacy optimizer functions used by the production engine. |
+| `geo_logic.py` | Geo-aware helper logic used by older/supporting recommendation paths. |
+
+## Production Flow
 
 ```text
-GET /api/lte-tilt-recommandation/status/<job_id>
-GET /api/lte-tilt-recommandation/download?file=<xlsx_path>
+POST /api/lte-tilt-recommandation/optimize
+  -> route accepts JSON or multipart threshold upload
+  -> RFOptimizationService.submit()
+  -> fetch antenna rows from site_prediction
+  -> normalize antenna identities and antenna fields
+  -> resolve latest LTE baseline job
+  -> fetch baseline rows from lte_prediction_baseline_results
+  -> prepare baseline log rows and attach antenna context
+  -> fetch lte_prediction_geo_features
+  -> fetch optional frontend grid analytics
+  -> allocate next RF recommendation scenario id
+  -> load optional constraint CSV
+  -> run_recommendation_engine()
+  -> coordinate_search_recommendations()
+  -> write Excel/debug artifacts
+  -> apply constraint ranges to final recommendations
+  -> append accepted rows to rf_optimization_results
+  -> job status done/failed
 ```
 
-## Current Production Flow
+## Input Data
 
-1. The route validates `project_id` and submits a background job.
-2. The service fetches antenna/site rows from `site_prediction`.
-3. Site rows are normalized into antenna fields:
-   - `Node_Cell_ID`
-   - `lat`
-   - `lon`
-   - `azimuth`
-   - `electrical_tilt`
-   - `mechanical_tilt`
-   - `tx_power`
-   - `antenna_height`
-4. The service loads the latest baseline job id from `lte_prediction_baseline_results`.
-5. Baseline RF rows are fetched for the selected project/operator.
-6. Baseline rows are prepared and joined with antenna context.
-7. Grid analytics rows are fetched from `grid_analytics_results` when available.
-8. Geo feature rows are fetched from `lte_prediction_geo_features`.
-9. A threshold/constraint CSV is loaded if supplied.
-10. `run_recommendation_engine()` runs the production candidate validation flow.
-11. Candidate evaluation results and best-candidate debug artifacts are saved under a temp output folder.
-12. Final recommendations are constrained by per-cell allowed min/max ranges.
-13. An Excel report is generated.
-14. Only RF-validated recommendation rows are written to `rf_optimization_results`.
-15. The job status becomes `done` or `failed`.
+### Antenna Rows
 
-## Current Candidate Evaluation Reality
+Antenna rows come from PythonBridge `GetLteTiltAntennaRows` or direct `site_prediction`.
 
-The current production candidate search is ETilt-centered.
+The service normalizes:
 
-The code normalizes and can apply multiple antenna fields:
+- `Node_Cell_ID`
+- `local_cell_id`
+- `lat`, `lon`
+- `azimuth`
+- `electrical_tilt`
+- `mechanical_tilt`
+- `tx_power`
+- `antenna_height`
+- `dashboard_site_id`
+- `Technology`
 
-- `ETilt`
-- `Azimuth`
-- `TX Power`
-- `Mechanical Tilt`
-- `Height`
+Strict identity columns such as `site_prediction_key` or `site_cell_sector_band_operator_key` are preferred when available.
 
-However, the coordinate candidate generation currently uses ETilt update generation as the main production path. The RF validation engine proves before/after improvement for those ETilt candidates before rows are saved.
+### Baseline Rows
 
-Operational implications:
+The service uses the latest baseline job id for the project and then loads rows from PythonBridge `GetLteBaselineRows` or direct `lte_prediction_baseline_results`.
 
-- ETilt recommendations are the established production path.
-- Azimuth, TX power, mechanical tilt, and height are partially supported through normalization, constraints, and apply logic.
-- Full production readiness for additional antenna parameters requires multi-parameter candidate generation and validation before those recommendations are persisted at scale.
+Required baseline metrics:
 
-Recommended rollout for future antenna expansion:
+```text
+lat, lon, pred_rsrp, pred_rsrq, pred_sinr, job_id
+```
 
-1. Keep ETilt stable.
-2. Add Azimuth candidate generation and RF validation.
-3. Add TX Power candidate generation and RF validation.
-4. Add Mechanical Tilt and Height only with strict bounds and likely manual approval.
+When present, topology/interference columns are loaded too, including best interferer and neighbor fields. These improve candidate scope and validation.
 
-Additional antenna-parameter recommendations should not be enabled solely through the UI or output schema. Each parameter requires validated candidate generation before it is treated as production-ready.
+### Geo Features
 
-## Input Tables
+Geo rows come from PythonBridge `GetLtePredictionGeoFeatures` or direct `lte_prediction_geo_features`.
 
-| Table | Used for |
+The recommendation engine uses geo context such as clutter, morphology, building density, LOS/NLOS blockage, terrain, site density, serving distance, nearest-site distance, and azimuth delta.
+
+### Grid Analytics
+
+Frontend grid analytics comes from the bridge grid analytics helper or direct `grid_analytics_results`. When multiple scenarios exist, direct DB mode selects a scenario by row count and recent timestamp. Grid analytics can be used as the reference grid population for before/after scoring.
+
+## Candidate Validation
+
+Production recommendation requires `validate_candidates=true`. If it is false, `run_recommendation_engine()` raises an error because the geo-only fallback is disabled.
+
+The current validation flow:
+
+1. Scores baseline prediction points against active KPI thresholds.
+2. Scores frontend grid analytics when available.
+3. Selects bad/priority cells from combined weighted severity or KPI-only mode.
+4. Builds candidate antenna updates, mainly ETilt plus azimuth support in the validation helpers.
+5. Applies candidate updates to a site DataFrame.
+6. Runs optimized RF prediction for candidate cells using the optimized prediction engine.
+7. Applies RF delta to the baseline population.
+8. Scores before/after KPI impact.
+9. Accepts candidates only when constraints pass and the candidate improves bad-grid/weighted impact.
+
+## KPI Modes
+
+| Mode | Active KPI thresholds | Weights |
+| --- | --- | --- |
+| `combined_weighted` | RSRP, RSRQ, SINR | Normalized `rsrp_weight`, `rsrq_weight`, `sinr_weight`. |
+| `rsrp_only` | RSRP only | RSRP weight `1.0`. |
+| `rsrq_only` | RSRQ only | RSRQ weight `1.0`. |
+| `sinr_only` | SINR only | SINR weight `1.0`. |
+
+Inactive thresholds are internally disabled with a very low sentinel value.
+
+## Recommendation Parameters
+
+The current code can normalize and apply several antenna parameters:
+
+| Parameter | Support status |
 | --- | --- |
-| `site_prediction` | Antenna/site metadata |
-| `lte_prediction_baseline_results` | Latest baseline RF prediction rows |
-| `lte_prediction_geo_features` | Geo, terrain, clutter, blockage, distance, and azimuth context |
-| `grid_analytics_results` | Frontend grid population and KPI context when available |
-| `rf_optimization_results` | Used for scenario numbering and later downstream optimized prediction |
+| `ETilt` | Main production candidate path through RF validation. |
+| `Azimuth` | Candidate helper exists and supports constraint bounds. |
+| `TX Power` | Apply/constraint plumbing exists, but production candidate generation must be validated before broad rollout. |
+| `Mechanical Tilt` | Apply/constraint plumbing exists, but production candidate generation must be validated before broad rollout. |
+| `Height` | Apply/constraint plumbing exists, but production candidate generation must be validated before broad rollout. |
 
-## Output
+Rows are saved only after the engine returns accepted recommendations.
 
-### Excel report
+## Constraint File
 
-The service writes an Excel report under the ML output/temp area. The download endpoint returns that file.
+The route accepts a multipart upload named `file` or `threshold_file`, or a path supplied as `threshold_file_path` / `threshold_file`.
 
-The workbook includes recommendation data and supporting forecast/candidate information generated by the recommendation engine.
+Default fallback name:
 
-### `rf_optimization_results`
+```text
+lte_tilt_recommendation_transformed.csv
+```
 
-Accepted recommendations are appended to this table.
+Expected constraint concepts:
 
-Important columns:
+| Column concept | Meaning |
+| --- | --- |
+| `cell_id` | Target cell identity. |
+| `optimised` | Whether the cell is eligible. |
+| `min_e_tilt`, `max_e_tilt` | ETilt bounds. |
+| `min_m_tilt`, `max_m_tilt` | Mechanical tilt bounds. |
+| `min_height`, `max_height` | Antenna height bounds. |
+| `min_azimuth`, `max_azimuth` | Azimuth bounds. |
+| `min_tx_power`, `max_tx_power` | TX power bounds. |
+
+The service can clamp/mark recommendations according to the parameter and writes constrained recommendation rows back to the Excel workbook.
+
+## Output Artifacts
+
+Each job writes into:
+
+```text
+ML/outputs/temp_<job_id>/
+```
+
+Important artifacts:
+
+| Artifact | Meaning |
+| --- | --- |
+| `RF_Optimization_Report.xlsx` | Main downloadable workbook. |
+| `candidate_validation_results.csv` | Candidate metrics and pass/fail context. |
+| `frontend_grid_scores.csv` | Scored frontend grid rows when available. |
+| `best_candidate_before_scope.csv.gz` | Before RF population for best candidate. |
+| `best_candidate_after_scope.csv.gz` | After RF population for best candidate. |
+| `best_candidate_before_bad_combined.csv.gz` | Bad-grid subset before. |
+| `best_candidate_after_bad_combined.csv.gz` | Bad-grid subset after. |
+| `best_candidate_before_grid_metrics.csv` | Grid metrics before. |
+| `best_candidate_after_grid_metrics.csv` | Grid metrics after. |
+| `combined_kpi_grid_impact.csv` | Combined KPI before/after grid impact. |
+| `best_candidate_summary.json` | Selected candidate summary. |
+| `tilt_rf_debug.log` | RF debug log path from candidate validation config. |
+
+## Output Table
+
+Accepted recommendations are appended to:
+
+```text
+rf_optimization_results
+```
+
+Saved columns include:
 
 | Column | Meaning |
 | --- | --- |
-| `project_id` | Project id |
-| `scenario_id` | RF recommendation scenario id |
-| `operator` | Operator |
-| `cell_id` | Target cell |
-| `technology` | Usually `4G` |
-| `parameter` | Recommended parameter, such as `ETilt` |
-| `current_value` | Current antenna value |
-| `recommended_value` | Recommended antenna value |
-| `reason` | Human-readable reason |
-| `swap_sector_detected` | Swap-sector suspicion flag |
-| `rsrp_threshold`, `rsrq_threshold`, `sinr_threshold` | Thresholds used by the job |
-| `created_at` | Save timestamp |
+| `project_id` | Project id. |
+| `scenario_id` | RF recommendation scenario id. |
+| `operator` | Actual operator for the cell. |
+| `cell_id` | Target cell identity. |
+| `technology` | Usually `4G`. |
+| `parameter` | Recommended parameter. |
+| `current_value` | Current value. |
+| `recommended_value` | Accepted recommended value. |
+| `reason` | Engine reason text. |
+| `swap_sector_detected` | Swap-sector suspicion flag. |
+| `rsrp_threshold`, `rsrq_threshold`, `sinr_threshold` | Thresholds used for this job. |
+| `created_at` | Save timestamp. |
 
-`rf_optimization_results.scenario_id` is not the optimized LTE scenario id. It is only the RF recommendation scenario id.
+`rf_optimization_results.scenario_id` is only the RF recommendation scenario id. It is not the optimized LTE scenario id.
 
 ## Scenario Numbering
 
-The service gets the next RF recommendation scenario id from:
+Direct DB mode gets the next RF scenario with:
 
 ```sql
 SELECT COALESCE(MAX(scenario_id), 0) + 1
@@ -214,89 +255,53 @@ FROM rf_optimization_results
 WHERE project_id = :pid
 ```
 
-With the bridge enabled, the .NET endpoint handles this same scenario lookup/write path.
+Bridge mode uses `GetNextRfOptimizationScenarioId`.
 
-Downstream optimized prediction reads this RF scenario through `recommendation_scenario_id`.
-
-## Constraint File Behavior
-
-The threshold/constraint file can control whether a recommendation is allowed for a cell.
-
-Expected constraint concepts include:
-
-| Constraint | Used for |
-| --- | --- |
-| `optimised` | Whether the cell can be optimized |
-| `min_e_tilt`, `max_e_tilt` | ETilt bounds |
-| `min_m_tilt`, `max_m_tilt` | Mechanical tilt bounds |
-| `min_height`, `max_height` | Antenna height bounds |
-| `min_azimuth`, `max_azimuth` | Azimuth bounds |
-| `min_tx_power`, `max_tx_power` | TX power bounds |
-
-If a recommendation is outside bounds, the service clamps or marks it according to the parameter logic. Constraint application is logged with:
-
-```text
-[TILT][CONSTRAINT_APPLY]
-```
-
-## Bridge Behavior
-
-When configured, the service uses the Python bridge for supported reads/writes.
+## Bridge Endpoints Used
 
 | Operation | Bridge endpoint |
 | --- | --- |
+| Antenna/site rows | `GetLteTiltAntennaRows` |
 | Latest baseline job id | `GetLatestLteBaselineJobId` |
-| Fetch baseline rows | `GetLteBaselineRows` |
-| Fetch antenna rows | `GetLteTiltAntennaRows` |
-| Fetch geo features | `GetLtePredictionGeoFeatures` |
+| Baseline rows | `GetLteBaselineRows` |
+| Geo feature rows | `GetLtePredictionGeoFeatures` |
+| Frontend grid analytics | `/api/GridAnalytics/GetGridAnalytics` |
+| Next RF recommendation scenario | `GetNextRfOptimizationScenarioId` |
 | Save RF recommendation rows | `SaveRfOptimizationResults` |
 
-Without the bridge, direct SQLAlchemy reads/writes are used through `DATABASE_URL` or `DATABASE_URL_Taiwan`.
+Without bridge mode, direct SQLAlchemy access is used.
 
-## Debug Artifacts
+## Downstream Link
 
-During candidate validation the service writes debug artifacts such as:
+The optimized prediction module consumes saved rows through:
 
-| Artifact | Purpose |
-| --- | --- |
-| `candidate_validation_results.csv` | Evaluated candidates and scores |
-| `best_candidate_before_scope.csv.gz` | RF population before selected candidate |
-| `best_candidate_after_scope.csv.gz` | RF population after selected candidate |
-| `best_candidate_before_bad_combined.csv.gz` | Bad-grid subset before |
-| `best_candidate_after_bad_combined.csv.gz` | Bad-grid subset after |
-| `best_candidate_before_grid_metrics.csv` | Grid metrics before |
-| `best_candidate_after_grid_metrics.csv` | Grid metrics after |
-| `best_candidate_summary.json` | Selected candidate summary |
+```text
+POST /api/lte-prediction-optimised/recommendation-optimized
+```
 
-These files are useful when explaining why a recommendation was accepted or rejected.
+It reads `rf_optimization_results.scenario_id` as `recommendation_scenario_id`, applies those recommendations to site rows, saves a public optimized site scenario, and writes optimized RF rows.
 
-## Important Logs
+## Debug Markers
 
 | Marker | Meaning |
 | --- | --- |
-| `[TILT][JOB_START]` | Job config and thresholds |
-| `[TILT][ANTENNA_FETCH]` | Site/antenna rows loaded |
-| `[TILT][BASELINE_FETCH]` | Baseline rows loaded |
-| `[TILT][GRID_ANALYTICS_FETCH]` | Grid analytics rows loaded |
-| `[TILT][CONSTRAINT_FILE]` | Constraint file selected |
-| `[TILT][CONSTRAINT_APPLY]` | Constraints applied to recommendations |
-| `[TILT][DB_WRITE]` | RF recommendation DB write started or skipped |
-| `[TILT][DB_WRITE_DONE]` | RF recommendation DB write completed |
+| `[TILT][JOB_START]` | Job request, region, operator, and threshold summary. |
+| `[TILT][ANTENNA_FETCH]` | Antenna/site input loaded. |
+| `[TILT][BASELINE_FETCH]` | Baseline rows and latest baseline job loaded. |
+| `[TILT][GEO_FETCH]` | Geo features loaded. |
+| `[TILT][GRID_ANALYTICS_FETCH]` | Frontend grid analytics loaded or skipped. |
+| `[TILT][CONSTRAINT_FILE]`, `[TILT][CONSTRAINT_FETCH]` | Constraint file selection and load. |
+| `[TILT][ENGINE_CONFIG]` | Final engine config. |
+| `[TILT_TARGET_SELECTION_EMPTY]` | No target cells survived bad-area selection. |
+| `[TILT][CONSTRAINT_APPLY]` | Constraints applied to final rows. |
+| `[TILT][DB_WRITE]`, `[TILT][DB_WRITE_DONE]` | RF recommendation persistence. |
 
-## Common Debug Checks
+## Common Failure Checks
 
-If no RF rows are saved:
-
-1. Check that baseline prediction exists for the project.
-2. Check the selected operator; wrong operator filters can remove all rows.
-3. Check candidate validation artifacts to see if all candidates were rejected.
-4. Check whether the constraint file has `optimised = false` for target cells.
-5. Check `[TILT][DB_WRITE] skipped=True` logs; this means no RF-validated rows survived to save.
-6. Confirm `rf_optimization_results` is queried by the RF recommendation scenario id, not optimized LTE scenario id.
-
-## Production Notes
-
-- This module should write recommendations only after RF validation.
-- The downstream optimized prediction module consumes rows from `rf_optimization_results`.
-- A successful recommendation save does not automatically mean optimized LTE prediction has run; that is a separate endpoint.
-- Keep RF recommendation scenario ids separate from LTE optimization scenario row ids.
+1. Confirm a successful LTE baseline exists for the project.
+2. Confirm the selected operator has matching site and baseline rows.
+3. Check identity completeness: site, cell, sector, band, operator.
+4. Check whether grid analytics is empty or using an unexpected scenario.
+5. Check the constraint file for `optimised=false` or overly tight bounds.
+6. Check candidate validation artifacts to see whether all candidates failed constraints or worsened priority areas.
+7. Query downstream optimized prediction with `recommendation_scenario_id = rf_optimization_results.scenario_id`.
