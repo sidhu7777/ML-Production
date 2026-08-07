@@ -56,11 +56,25 @@ htmlcov/
 cache/
 uploads/
 outputs/
+output/
 data/
 models/
+weights/
 data/reports/
 tests/output/
 tests/output/project_*/
+
+# Trained model artifacts (checkpoints, plots, HTML reports)
+*.pkl
+*.joblib
+*.h5
+*.onnx
+*.pt
+*.pth
+*.png
+
+# Runtime job markers written by the app
+job_id_*.txt
 
 # new_pdf_report test case: generated PDFs/PNGs/HTML/JSON only, code stays tracked
 tests/new_pdf_report/output/

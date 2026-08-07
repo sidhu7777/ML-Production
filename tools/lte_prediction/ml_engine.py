@@ -9,6 +9,11 @@ from shapely.geometry import Point
 from shapely.ops import transform
 from shapely.wkt import loads as load_wkt
 
+try:
+    import osmnx as ox
+except Exception:  # pragma: no cover - optional dependency
+    ox = None
+
 from .geo_correction_pipeline import (
     _derive_frequency_mhz,
     apply_full_display_correction,
@@ -396,16 +401,21 @@ def _site_polygon_filter_sql(polygon_ids):
             FROM map_regions mr_filter
             WHERE mr_filter.tbl_project_id = site_prediction.tbl_project_id
               AND mr_filter.id IN ({id_list})
-              AND (
-                ST_Contains(
+              AND CASE
+                WHEN (site_prediction.latitude) BETWEEN -90 AND 90
+                  AND (site_prediction.longitude) BETWEEN -180 AND 180
+                THEN ST_Contains(
                   mr_filter.region,
-                  ST_GeomFromText(CONCAT('POINT(', site_prediction.longitude, ' ', site_prediction.latitude, ')'), 4326)
+                  ST_SRID(POINT(site_prediction.longitude, site_prediction.latitude), 4326)
                 )
-                OR ST_Contains(
+                WHEN (site_prediction.longitude) BETWEEN -90 AND 90
+                  AND (site_prediction.latitude) BETWEEN -180 AND 180
+                THEN ST_Contains(
                   mr_filter.region,
-                  ST_GeomFromText(CONCAT('POINT(', site_prediction.latitude, ' ', site_prediction.longitude, ')'), 4326)
+                  ST_SRID(POINT(site_prediction.latitude, site_prediction.longitude), 4326)
                 )
-              )
+                ELSE 0
+              END = 1
         )
     """
 
@@ -687,6 +697,7 @@ def fetch_drive_data(
     if bridge:
         def _bridge_drive_rows(primary_only, operator_value):
             body = {
+                "ProjectId": int(project_id),
                 "SessionIds": [int(sid) for sid in session_ids],
                 "IncludeNeighbour": True,
                 "PrimaryOnly": bool(primary_only),
@@ -808,6 +819,110 @@ def fetch_drive_data(
     return df
 
 
+def _swap_lon_lat_if_needed(polygon):
+    """OSM/shapely expect (lon, lat). Project polygons pulled from map_regions
+    are sometimes stored (lat, lon) instead, which makes OSM queries fail or
+    return the wrong area. Mirrors tools/buildings/app.py's own guard."""
+    from shapely import ops as shapely_ops
+
+    min_x, min_y, max_x, max_y = polygon.bounds
+    needs_swap = min_y < -90 or max_y > 90 or (min_y > 60 and min_x < 60)
+    if needs_swap:
+        return shapely_ops.transform(lambda x, y: (y, x), polygon)
+    return polygon
+
+
+def _fetch_and_cache_osm_buildings(project_id, region, current_engine):
+    """Cache-miss fallback for fetch_building_data(): tbl_savepolygon has no
+    rows for this project yet, so fetch buildings from OpenStreetMap once and
+    persist them into tbl_savepolygon (same table/shape tools/buildings/app.py
+    writes), so every future call is a plain cached DB read instead of a live
+    OSM fetch. Returns the freshly fetched rows so the current job can use
+    them immediately too."""
+    if ox is None:
+        print("[LTE][BUILDING_OSM_CACHE] skipped=True reason=osmnx_not_installed")
+        return pd.DataFrame()
+    if current_engine is None:
+        print(f"[LTE][BUILDING_OSM_CACHE] skipped=True reason=no_db_engine region={region}")
+        return pd.DataFrame()
+
+    polygons = _load_project_polygons(project_id, current_engine, region)
+    if not polygons:
+        print(f"[LTE][BUILDING_OSM_CACHE] skipped=True reason=no_project_polygon project_id={project_id}")
+        return pd.DataFrame()
+
+    polygon = _swap_lon_lat_if_needed(polygons[0])
+    if not polygon.is_valid:
+        polygon = polygon.buffer(0)
+
+    try:
+        osm_buildings = ox.features_from_polygon(polygon, tags={"building": True, "residential": True})
+    except Exception as exc:
+        print(f"[LTE][BUILDING_OSM_CACHE] osm_fetch_failed project_id={project_id} error={exc}")
+        return pd.DataFrame()
+
+    osm_buildings = osm_buildings[osm_buildings.geometry.type.isin(["Polygon", "MultiPolygon"])].copy()
+    if osm_buildings.empty:
+        print(f"[LTE][BUILDING_OSM_CACHE] osm_returned_zero_buildings project_id={project_id}")
+        return pd.DataFrame()
+
+    osm_buildings = osm_buildings.explode(index_parts=True, ignore_index=True)
+    # shapely/osmnx geometries are (lon, lat). MySQL's ST_GeomFromText(..., 4326)
+    # uses EPSG:4326's own (lat, lon) axis order, not the usual GIS convention -
+    # inserting lon-first WKT crashes for any longitude > 90 (e.g. Taiwan ~121E).
+    osm_buildings["wkt_4326"] = osm_buildings.geometry.to_wkt()
+    osm_buildings["wkt_4326_latlon"] = osm_buildings.geometry.apply(
+        lambda geom: transform(lambda x, y: (y, x), geom).wkt
+    )
+    osm_buildings["calc_area"] = osm_buildings.geometry.area
+    area_name = f"osm_auto_{project_id}"
+
+    values_list = [
+        (area_name, row.wkt_4326_latlon, int(project_id), float(row.calc_area))
+        for row in osm_buildings.itertuples()
+    ]
+
+    inserted = 0
+    try:
+        raw_conn = current_engine.raw_connection()
+        try:
+            cursor = raw_conn.cursor()
+            cursor.execute("SET autocommit=0")
+            batch_size = 1000
+            for i in range(0, len(values_list), batch_size):
+                batch = values_list[i:i + batch_size]
+                placeholders = "(%s, ST_GeomFromText(%s, 4326), %s, %s)"
+                values_str = ", ".join([placeholders] * len(batch))
+                cursor.execute(
+                    f"INSERT INTO tbl_savepolygon (name, region, project_id, area) VALUES {values_str}",
+                    [item for row_vals in batch for item in row_vals],
+                )
+                inserted += len(batch)
+            raw_conn.commit()
+            cursor.close()
+        finally:
+            raw_conn.close()
+    except Exception as exc:
+        print(f"[LTE][BUILDING_OSM_CACHE] db_insert_failed project_id={project_id} error={exc}")
+        return pd.DataFrame()
+
+    print(
+        f"[LTE][BUILDING_OSM_CACHE] project_id={project_id} region={region} "
+        f"osm_buildings_fetched={len(osm_buildings)} rows_inserted={inserted}"
+    )
+
+    return pd.DataFrame({
+        "id": pd.NA,
+        "name": area_name,
+        "region": osm_buildings["wkt_4326"],
+        "project_id": int(project_id),
+        "area": osm_buildings["calc_area"],
+        "geometry": osm_buildings["wkt_4326"],
+        "region_wkt": osm_buildings["wkt_4326"],
+        "geometry_wkt": osm_buildings["wkt_4326"],
+    })
+
+
 def fetch_building_data(project_id, region="india"):
     current_engine = engine.get(region.lower(), engine["india"])
     bridge = get_bridge_client()
@@ -832,6 +947,13 @@ def fetch_building_data(project_id, region="india"):
         current_engine = _require_engine(current_engine, region, "fetching LTE building data")
         df = pd.read_sql(query, current_engine)
         source = "database"
+
+    if df.empty:
+        cache_fill_df = _fetch_and_cache_osm_buildings(project_id, region, current_engine)
+        if not cache_fill_df.empty:
+            df = cache_fill_df
+            source = f"{source}+osm_cache_fill"
+
     _print_fetch_summary(
         "BUILDING_FETCH",
         f"tbl_savepolygon via {source}",

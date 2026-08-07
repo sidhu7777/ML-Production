@@ -16,6 +16,8 @@ from .ml_engine import (
     resolve_site_prediction_scenario_operator,
     compute_k1k2_for_cells,
     _compute_affected_cells,
+    _bridge_region_params,
+    _country_code_for_region,
     _normalize_site_df,
     run_prediction_only_optimized,
     replace_cells,
@@ -97,7 +99,7 @@ def _resolve_engine(region="india"):
 def _latest_baseline_job_id(project_id, region="india", operator=None):
     bridge = get_bridge_client()
     if bridge:
-        params = {"projectId": int(project_id), "region": region}
+        params = _bridge_region_params(project_id, region)
         if operator and str(operator).strip().lower() != "all":
             params["operator"] = str(operator).strip()
         payload = bridge._request("GET", "GetLatestLteBaselineJobId", params=params)
@@ -155,7 +157,7 @@ def _values_changed(current_value, recommended_value):
 def _latest_recommendation_scenario_id(project_id, region, operator=None):
     bridge = get_bridge_client()
     if bridge:
-        params = {"projectId": int(project_id)}
+        params = _bridge_region_params(project_id, region)
         if operator:
             params["operator"] = operator
         payload = bridge._request("GET", "GetLatestRfOptimizationScenarioId", params=params)
@@ -193,7 +195,8 @@ def _fetch_recommendation_rows(project_id, region, operator=None, recommendation
 
     bridge = get_bridge_client()
     if bridge:
-        params = {"projectId": int(project_id), "scenarioId": int(scenario_id)}
+        params = _bridge_region_params(project_id, region)
+        params["scenarioId"] = int(scenario_id)
         if operator:
             params["operator"] = operator
         reco_df = bridge.get_rows("GetRfOptimizationRows", params, limit=50000)
@@ -204,7 +207,7 @@ def _fetch_recommendation_rows(project_id, region, operator=None, recommendation
             )
             reco_df = bridge.get_rows(
                 "GetRfOptimizationRows",
-                {"projectId": int(project_id), "scenarioId": int(scenario_id)},
+                {**_bridge_region_params(project_id, region), "scenarioId": int(scenario_id)},
                 limit=50000,
             )
         if reco_df.empty:
@@ -1201,6 +1204,8 @@ class LTEPredictionService_optimised:
                 json={
                     "ProjectId": int(df["project_id"].iloc[0]),
                     "JobId": str(df["job_id"].iloc[0]) if "job_id" in df.columns else "",
+                    "Region": str(region or "india").lower(),
+                    "CountryCode": _country_code_for_region(region),
                     "Rows": rows,
                 },
             )
@@ -1435,6 +1440,7 @@ class LTEPredictionService_optimised:
                 "ScenarioName": _build_scenario_name(cfg),
                 "ScenarioDescription": _build_scenario_description(cfg),
                 "Region": region,
+                "CountryCode": _country_code_for_region(region),
                 "Operator": cfg.get("operator"),
                 "TargetType": str(cfg.get("target_type", "")).strip() or None,
                 "TargetId": str(cfg.get("target_id", "")).strip() or None,
@@ -1530,7 +1536,13 @@ class LTEPredictionService_optimised:
             bridge._request(
                 "POST",
                 "UpdateLteOptimizationScenarioStatus",
-                json={"ScenarioRowId": int(scenario_row_id), "Status": status, "BaselineJobId": baseline_job_id},
+                json={
+                    "ScenarioRowId": int(scenario_row_id),
+                    "Region": str(region or "india").lower(),
+                    "CountryCode": _country_code_for_region(region),
+                    "Status": status,
+                    "BaselineJobId": baseline_job_id,
+                },
             )
             print(f"[LTE_OPT][SCENARIO_STATUS] source=python_bridge row_id={scenario_row_id} status={status}")
             return

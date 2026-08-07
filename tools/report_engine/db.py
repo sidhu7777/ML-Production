@@ -8,6 +8,7 @@ from utils.python_bridge import get_bridge_client, PythonBridgeError
 load_dotenv()
 
 _ENGINE = None
+_REGIONAL_ENGINES = {}
 
 
 def _bridge_client():
@@ -56,20 +57,39 @@ def init_engine(engine):
     _ENGINE = engine
 
 
-def get_engine():
+def _normalize_region(region: str | None = None, country_code: str | None = None) -> str:
+    raw = str(region or country_code or "").strip().lower()
+    if raw in {"tw", "twn", "taiwan"}:
+        return "taiwan"
+    if raw in {"in", "ind", "india"}:
+        return "india"
+    return raw or "india"
+
+
+def _engine_url_for_region(region: str) -> str | None:
+    if region == "taiwan":
+        return os.getenv("DATABASE_URL_Taiwan") or os.getenv("DATABASE_URL_TAIWAN")
+    return os.getenv("DATABASE_URL")
+
+
+def get_engine(region: str | None = None, country_code: str | None = None):
     """
-    Return the shared engine or create one from DATABASE_URL.
+    Return the shared/default engine or create a regional engine from env.
     """
     global _ENGINE
-    if _ENGINE is not None:
+    normalized_region = _normalize_region(region, country_code)
+    if normalized_region == "india" and _ENGINE is not None:
         return _ENGINE
 
-    db_url = os.getenv("DATABASE_URL")
+    if normalized_region in _REGIONAL_ENGINES:
+        return _REGIONAL_ENGINES[normalized_region]
+
+    db_url = _engine_url_for_region(normalized_region)
     if not db_url:
-        raise RuntimeError("Missing DATABASE_URL for report engine")
+        raise RuntimeError(f"Missing database URL for report engine region={normalized_region}")
 
     # Keep connections healthy for long-running jobs
-    _ENGINE = create_engine(
+    engine = create_engine(
         db_url,
         pool_pre_ping=True,
         pool_recycle=1800,
@@ -77,11 +97,14 @@ def get_engine():
         max_overflow=10,
         connect_args={"connect_timeout": 30},
     )
-    return _ENGINE
+    if normalized_region == "india":
+        _ENGINE = engine
+    _REGIONAL_ENGINES[normalized_region] = engine
+    return engine
 
 
-def _connect():
-    return get_engine().connect()
+def _connect(region: str | None = None, country_code: str | None = None):
+    return get_engine(region=region, country_code=country_code).connect()
 
 
 # =====================================================
@@ -108,15 +131,20 @@ def describe_table(table_name: str):
 # CORE DATA ACCESS FUNCTIONS
 # =====================================================
 
-def get_project_by_id(project_id: int, conn=None):
+def get_project_by_id(
+    project_id: int,
+    conn=None,
+    region: str | None = None,
+    country_code: str | None = None,
+):
     bridge = _bridge_client()
     if bridge is not None:
-        project = bridge.get_project(project_id)
+        project = bridge.get_project(project_id, region=region, country_code=country_code)
         return dict(project) if project else None
 
     close_conn = False
     if conn is None:
-        conn = _connect()
+        conn = _connect(region=region, country_code=country_code)
         close_conn = True
 
     try:
@@ -139,6 +167,8 @@ def get_network_logs_for_sessions(
     provider: str | None = None,
     start_date: str | None = None,
     end_date: str | None = None,
+    region: str | None = None,
+    country_code: str | None = None,
 ) -> pd.DataFrame:
     if not session_ids:
         return pd.DataFrame()
@@ -151,12 +181,14 @@ def get_network_logs_for_sessions(
             provider=provider,
             start_date=start_date,
             end_date=end_date,
+            region=region,
+            country_code=country_code,
         )
         return _normalize_bridge_datetime_columns(df, ["timestamp"])
 
     close_conn = False
     if conn is None:
-        conn = _connect()
+        conn = _connect(region=region, country_code=country_code)
         close_conn = True
 
     try:
@@ -175,15 +207,20 @@ def get_network_logs_for_sessions(
             conn.close()
 
 
-def get_project_regions(project_id: int, conn=None) -> list[dict]:
+def get_project_regions(
+    project_id: int,
+    conn=None,
+    region: str | None = None,
+    country_code: str | None = None,
+) -> list[dict]:
     bridge = _bridge_client()
     if bridge is not None:
-        rows = bridge.get_project_regions(project_id)
+        rows = bridge.get_project_regions(project_id, region=region, country_code=country_code)
         return [dict(r) for r in rows]
 
     close_conn = False
     if conn is None:
-        conn = _connect()
+        conn = _connect(region=region, country_code=country_code)
         close_conn = True
 
     try:
@@ -203,10 +240,16 @@ def get_project_regions(project_id: int, conn=None) -> list[dict]:
             conn.close()
 
 
-def get_user_thresholds(user_id: int, debug: bool = False, conn=None) -> dict | None:
+def get_user_thresholds(
+    user_id: int,
+    debug: bool = False,
+    conn=None,
+    region: str | None = None,
+    country_code: str | None = None,
+) -> dict | None:
     bridge = _bridge_client()
     if bridge is not None:
-        data = bridge.get_user_thresholds(user_id)
+        data = bridge.get_user_thresholds(user_id, region=region, country_code=country_code)
         if debug:
             print("\n================ BRIDGE THRESHOLD ROW =================")
             print(f"user_id = {user_id}")
@@ -220,7 +263,7 @@ def get_user_thresholds(user_id: int, debug: bool = False, conn=None) -> dict | 
 
     close_conn = False
     if conn is None:
-        conn = _connect()
+        conn = _connect(region=region, country_code=country_code)
         close_conn = True
 
     try:
@@ -249,15 +292,20 @@ def get_user_thresholds(user_id: int, debug: bool = False, conn=None) -> dict | 
     return data
 
 
-def get_user_by_id(user_id: int, conn=None) -> dict | None:
+def get_user_by_id(
+    user_id: int,
+    conn=None,
+    region: str | None = None,
+    country_code: str | None = None,
+) -> dict | None:
     bridge = _bridge_client()
     if bridge is not None:
-        row = bridge.get_user(user_id)
+        row = bridge.get_user(user_id, region=region, country_code=country_code)
         return dict(row) if row else None
 
     close_conn = False
     if conn is None:
-        conn = _connect()
+        conn = _connect(region=region, country_code=country_code)
         close_conn = True
 
     try:
@@ -274,18 +322,29 @@ def get_user_by_id(user_id: int, conn=None) -> dict | None:
             conn.close()
 
 
-def update_project_download_path(project_id: int, download_path: str, conn=None) -> None:
+def update_project_download_path(
+    project_id: int,
+    download_path: str,
+    conn=None,
+    region: str | None = None,
+    country_code: str | None = None,
+) -> None:
     """
     Update tbl_project.Download_path for the given project.
     """
     bridge = _bridge_client()
     if bridge is not None:
-        bridge.update_project_download_path(project_id, download_path)
+        bridge.update_project_download_path(
+            project_id,
+            download_path,
+            region=region,
+            country_code=country_code,
+        )
         return
 
     close_conn = False
     if conn is None:
-        conn = _connect()
+        conn = _connect(region=region, country_code=country_code)
         close_conn = True
 
     try:
@@ -301,16 +360,20 @@ def update_project_download_path(project_id: int, download_path: str, conn=None)
             conn.close()
 
 
-def get_sessions_by_ids(session_ids: list[int]) -> pd.DataFrame:
+def get_sessions_by_ids(
+    session_ids: list[int],
+    region: str | None = None,
+    country_code: str | None = None,
+) -> pd.DataFrame:
     if not session_ids:
         return pd.DataFrame()
 
     bridge = _bridge_client()
     if bridge is not None:
-        df = bridge.get_sessions(session_ids)
+        df = bridge.get_sessions(session_ids, region=region, country_code=country_code)
         return _normalize_bridge_datetime_columns(df, ["start_time", "end_time"])
 
-    with _connect() as conn:
+    with _connect(region=region, country_code=country_code) as conn:
         query = text("""
             SELECT id, start_time, end_time, distance
             FROM defaultdb.tbl_session

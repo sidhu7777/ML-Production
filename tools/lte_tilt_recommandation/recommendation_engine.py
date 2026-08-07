@@ -42,6 +42,10 @@ class TiltEngineConfig:
     bad_grid_coverage_pct: float = 80.0
     max_group_cells: int = 0
     max_neighbors_per_update_cell: int = 2
+    etilt_candidate_max_delta_deg: float = 4.0
+    azimuth_fallback_max_delta_deg: float = 30.0
+    azimuth_fallback_step_deg: float = 5.0
+    azimuth_fallback_steps_deg: Optional[tuple[float, ...]] = None
     rf_debug_log_path: Optional[str] = None
     constraint_map: Optional[Dict[str, Dict[str, object]]] = None
 
@@ -218,12 +222,16 @@ def run_recommendation_engine(
         baseline_job_id=config.baseline_job_id,
         coordinate_passes=int(config.coordinate_passes),
         candidate_workers=int(config.candidate_workers),
-            bad_grid_coverage_pct=float(config.bad_grid_coverage_pct),
-            max_group_cells=int(config.max_group_cells),
-            max_neighbors_per_update_cell=int(config.max_neighbors_per_update_cell),
-            rf_debug_log_path=config.rf_debug_log_path,
-            constraint_map=config.constraint_map,
-        )
+        bad_grid_coverage_pct=float(config.bad_grid_coverage_pct),
+        max_group_cells=int(config.max_group_cells),
+        max_neighbors_per_update_cell=int(config.max_neighbors_per_update_cell),
+        etilt_candidate_max_delta_deg=float(config.etilt_candidate_max_delta_deg),
+        azimuth_fallback_max_delta_deg=float(config.azimuth_fallback_max_delta_deg),
+        azimuth_fallback_step_deg=float(config.azimuth_fallback_step_deg),
+        azimuth_fallback_steps_deg=config.azimuth_fallback_steps_deg,
+        rf_debug_log_path=config.rf_debug_log_path,
+        constraint_map=config.constraint_map,
+    )
     validation_outputs = coordinate_search_recommendations(
         baseline_df=log_work,
         antenna_df=antenna_df,

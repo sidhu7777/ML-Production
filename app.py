@@ -29,10 +29,11 @@ from tools.report.routes import report_bp
 from tools.lte_prediction.routes import lte_prediction_bp
 from tools.lte_prediction_optimised.routes import lte_prediction_op
 from tools.lte_tilt_recommandation.routes import rf_optimization_bp
-from tools.coverage_prediction.model1.routes import lte_model1_coverage_prediction_bp
-from tools.coverage_prediction.model2.routes import lte_model2_demand_capacity_bp
-from tools.coverage_prediction.model3.routes import lte_model3_current_recommendation_bp
-from tools.coverage_prediction.model4.routes import lte_model4_future_recommendation_bp
+from tools.coverage_prediction.future_coverage_kpi_prediction.routes import lte_model1_coverage_prediction_bp
+from tools.coverage_prediction.future_demand_capacity_forecast.routes import lte_model2_demand_capacity_bp
+from tools.coverage_prediction.current_capacity_recommendation.routes import lte_model3_current_recommendation_bp
+from tools.coverage_prediction.future_capacity_recommendation.routes import lte_model4_future_recommendation_bp
+from tools.pci_optimization.routes import pci_optimization_bp
 
 from extensions import db
 from flask_migrate import Migrate
@@ -105,6 +106,7 @@ def create_app(config_name='default'):
     app.register_blueprint(lte_model2_demand_capacity_bp, url_prefix="/api/lte-model2-demand-capacity")
     app.register_blueprint(lte_model3_current_recommendation_bp, url_prefix="/api/lte-model3-current-recommendation")
     app.register_blueprint(lte_model4_future_recommendation_bp, url_prefix="/api/lte-model4-future-recommendation")
+    app.register_blueprint(pci_optimization_bp, url_prefix="/api/pci-optimization")
     # ---------------- ROOT ----------------
     @app.route('/', methods=['GET'])
     def root():
@@ -119,10 +121,11 @@ def create_app(config_name='default'):
                 "site_prediction": "/api/lte-prediction/run",
                 "optimized_prediction": "/api/lte-prediction-optimised/run",
                 "rf_optimization": "/api/lte-tilt-recommandation/optimize",
-                "model1_coverage": "/api/lte-model1-coverage/run",
-                "model2_demand_capacity": "/api/lte-model2-demand-capacity/run",
-                "model3_current_recommendation": "/api/lte-model3-current-recommendation/run",
-                "model4_future_recommendation": "/api/lte-model4-future-recommendation/run"
+                "future_coverage_kpi_prediction": "/api/lte-model1-coverage/run",
+                "future_demand_capacity_forecast": "/api/lte-model2-demand-capacity/run",
+                "current_capacity_recommendation": "/api/lte-model3-current-recommendation/run",
+                "future_capacity_recommendation": "/api/lte-model4-future-recommendation/run",
+                "pci_optimization": "/api/pci-optimization/run"
             }
         })
 

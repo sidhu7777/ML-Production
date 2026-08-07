@@ -54,8 +54,11 @@ class CandidateValidationConfig:
     min_safe_etilt: float = 2.0
     max_safe_etilt: float = 12.0
     max_good_area_loss_pct: float = 15.0
+    etilt_candidate_max_delta_deg: float = 4.0
     enable_azimuth_fallback: bool = True
-    azimuth_fallback_steps_deg: tuple[float, ...] = (5.0, 10.0, 15.0)
+    azimuth_fallback_max_delta_deg: float = 30.0
+    azimuth_fallback_step_deg: float = 5.0
+    azimuth_fallback_steps_deg: Optional[tuple[float, ...]] = None
     rf_debug_log_path: Optional[str] = None
     constraint_map: Optional[Dict[str, Dict[str, object]]] = None
 
@@ -100,6 +103,56 @@ def _frontend_grid_component(metrics: Dict[str, object], kpi: str) -> float:
     recovery_term = _safe_float(metrics.get(f"{kpi}_grid_recovered_share")) - _safe_float(metrics.get(f"{kpi}_grid_new_bad_share"))
     mean_delta_term = _safe_float(metrics.get(f"mean_{kpi}_delta")) / MEAN_DELTA_SCALES[kpi]
     return float(severity_term + recovery_term + mean_delta_term)
+
+
+def _positive_delta_sequence(max_delta: object, step: object) -> list[float]:
+    max_value = _safe_float(max_delta, 0.0)
+    step_value = _safe_float(step, 0.0)
+    if max_value <= 0.0 or step_value <= 0.0:
+        return []
+    max_value = abs(float(max_value))
+    step_value = abs(float(step_value))
+    values: list[float] = []
+    current = step_value
+    while current < max_value and not np.isclose(current, max_value):
+        values.append(round(float(current), 6))
+        current += step_value
+    values.append(round(float(max_value), 6))
+    deduped: list[float] = []
+    for value in values:
+        if value > 0.0 and not any(np.isclose(value, existing) for existing in deduped):
+            deduped.append(float(value))
+    return deduped
+
+
+def _etilt_candidate_delta_sets(config: CandidateValidationConfig) -> tuple[list[float], Dict[str, list[float]]]:
+    max_delta = abs(_safe_float(config.etilt_candidate_max_delta_deg, 4.0))
+    if max_delta <= 0.0:
+        max_delta = 4.0
+    first_abs = min(1.0, max_delta)
+    positives = _positive_delta_sequence(max_delta, 1.0)
+    directional_positive = [value for value in positives if value > first_abs and not np.isclose(value, first_abs)]
+    return (
+        [-first_abs, first_abs],
+        {
+            "plus": directional_positive,
+            "minus": [-value for value in directional_positive],
+        },
+    )
+
+
+def _azimuth_fallback_steps(config: CandidateValidationConfig) -> list[float]:
+    explicit_steps = config.azimuth_fallback_steps_deg
+    if explicit_steps:
+        steps = [abs(float(step)) for step in explicit_steps if abs(float(step)) > 0.0]
+        return sorted(set(round(step, 6) for step in steps))
+    max_delta = abs(_safe_float(config.azimuth_fallback_max_delta_deg, 30.0))
+    step = abs(_safe_float(config.azimuth_fallback_step_deg, 5.0))
+    if max_delta <= 0.0:
+        max_delta = 30.0
+    if step <= 0.0:
+        step = 5.0
+    return _positive_delta_sequence(max_delta, step)
 
 
 @contextlib.contextmanager
@@ -193,10 +246,26 @@ def _identity_match_mask(df: pd.DataFrame, cell_id: object) -> pd.Series:
 
 def _prepare_optimizer_site_df(antenna_df: pd.DataFrame) -> pd.DataFrame:
     out = _ensure_node_cell(antenna_df)
-    if "cell_id" in out.columns and "local_cell_id" not in out.columns:
-        out["local_cell_id"] = out["cell_id"].map(_clean_id)
-    if "Node_Cell_ID" in out.columns:
+    if "cell_id" in out.columns:
+        original_cell_id = out["cell_id"].map(_clean_id)
+        if "local_cell_id" not in out.columns:
+            out["local_cell_id"] = original_cell_id
+        else:
+            local_cell_id = out["local_cell_id"].map(_clean_id)
+            out["local_cell_id"] = local_cell_id.where(local_cell_id.astype(str).str.strip().ne(""), original_cell_id)
+    elif "Node_Cell_ID" in out.columns:
         out["cell_id"] = out["Node_Cell_ID"].astype(str).str.strip()
+        out["local_cell_id"] = out["cell_id"].map(_clean_id)
+    if "nodeb_id_cell_id" not in out.columns and "local_cell_id" in out.columns:
+        node_col = "nodeb_id" if "nodeb_id" in out.columns else ("node_b_id" if "node_b_id" in out.columns else None)
+        if node_col:
+            out["nodeb_id_cell_id"] = (
+                out[node_col].map(_clean_id).astype(str).str.strip()
+                + "_"
+                + out["local_cell_id"].map(_clean_id).astype(str).str.strip()
+            ).str.strip("_")
+        elif "Node_Cell_ID" in out.columns:
+            out["nodeb_id_cell_id"] = out["Node_Cell_ID"].map(_clean_id)
     alias_cols = {
         "latitude": "lat",
         "longitude": "lon",
@@ -794,14 +863,17 @@ def _select_coordinate_target_cells(
         print("[TILT_TARGET_SELECTION_EMPTY] reason=no_bad_grids_in_grid_reference")
         return []
     ant = opt_ml._normalize_site_df(_prepare_optimizer_site_df(antenna_df), log_stage="TILT_COORDINATE_TARGETS")
-    tunable = set(ant["Node_Cell_ID"].astype(str).str.strip().tolist()) if "Node_Cell_ID" in ant.columns else set()
-    for alias_col in ["local_cell_id", "cell_id"]:
+    tunable = set()
+    for alias_col in [col for col in _MATCH_ALIAS_COLS if col in ant.columns]:
         if alias_col in ant.columns:
-            tunable.update(ant[alias_col].astype(str).str.strip().tolist())
-    if {"nodeb_id", "cell_id"}.issubset(ant.columns):
-        tunable.update((ant["nodeb_id"].map(_clean_id) + "_" + ant["cell_id"].map(_clean_id)).astype(str).tolist())
-    if {"node_b_id", "cell_id"}.issubset(ant.columns):
-        tunable.update((ant["node_b_id"].map(_clean_id) + "_" + ant["cell_id"].map(_clean_id)).astype(str).tolist())
+            tunable.update(ant[alias_col].map(_clean_id).astype(str).str.strip().tolist())
+    for node_col in ["nodeb_id", "node_b_id", "dashboard_site_id", "site_id"]:
+        if node_col not in ant.columns:
+            continue
+        for cell_col in ["local_cell_id", "cell_id"]:
+            if cell_col in ant.columns:
+                tunable.update((ant[node_col].map(_clean_id) + "_" + ant[cell_col].map(_clean_id)).astype(str).str.strip("_").tolist())
+    tunable = {cell for cell in tunable if cell and cell not in {"nan", "None", "<NA>"}}
     work = baseline.copy()
     work["grid_id"] = normalize_grid_id_series(work["grid_id"])
     bad_work = work.loc[work["grid_id"].astype(str).isin(bad_grid_ids)].copy()
@@ -958,7 +1030,7 @@ def _make_etilt_update(
     current = pd.to_numeric(pd.Series([row.iloc[0].get("electrical_tilt")]), errors="coerce").iloc[0]
     if pd.isna(current):
         return None
-    target = float(np.clip(float(current) + float(delta), float(config.min_safe_etilt), float(config.max_safe_etilt)))
+    target = float(current) + float(delta)
     constraint = (config.constraint_map or {}).get(_threshold_cell_id(cell_id))
     if constraint and bool(constraint.get("optimised")):
         min_allowed = pd.to_numeric(pd.Series([constraint.get("min_e_tilt")]), errors="coerce").iloc[0]
@@ -1093,6 +1165,81 @@ def _make_azimuth_update(
     }
 
 
+def _rf_base_site_df(antenna_work: pd.DataFrame) -> pd.DataFrame:
+    base_site = antenna_work.copy()
+    for col in ["lat", "lon", "azimuth", "electrical_tilt", "mechanical_tilt", "tx_power", "antenna_height"]:
+        if col in base_site.columns:
+            base_site[f"orig_{col}"] = pd.to_numeric(base_site[col], errors="coerce")
+    return base_site
+
+
+def _rf_prediction_params(
+    *,
+    config: CandidateValidationConfig,
+    baseline_work: pd.DataFrame,
+    geo_df: pd.DataFrame,
+    recompute_cells: list[str],
+) -> Dict[str, object]:
+    return {
+        "project_id": int(config.project_id),
+        "region": config.region,
+        "radius": float(config.radius_m),
+        "grid_resolution": float(config.grid_resolution_m),
+        "n_workers": int(config.workers),
+        "impact_radius_m": float(config.impact_radius_m),
+        "neighbor_site_count": int(config.neighbor_site_count),
+        "max_interference_sites": int(config.max_interference_sites),
+        "baseline_job_id": config.baseline_job_id,
+        "prediction_points_df": baseline_work,
+        "geo_features_df": geo_df,
+        "strict_prediction_points": True,
+        "recompute_cells": recompute_cells,
+    }
+
+
+def _ensure_k1k2_for_recompute_cells(
+    *,
+    baseline_work: pd.DataFrame,
+    antenna_work: pd.DataFrame,
+    recompute_cells: list[str],
+    k1k2_cache: Optional[Dict[str, tuple[float, float]]],
+    seed_map: Optional[Dict[str, tuple[float, float]]] = None,
+) -> Dict[str, tuple[float, float]]:
+    k1k2_map: Dict[str, tuple[float, float]] = {}
+    missing_k1k2_cells = []
+    for cid in recompute_cells:
+        key = str(cid)
+        cached = seed_map.get(key) if seed_map is not None else None
+        if cached is None and k1k2_cache is not None:
+            cached = k1k2_cache.get(key)
+        if cached is None:
+            missing_k1k2_cells.append(key)
+        else:
+            pair = (float(cached[0]), float(cached[1]))
+            k1k2_map[key] = pair
+            if k1k2_cache is not None:
+                k1k2_cache[key] = pair
+    if missing_k1k2_cells:
+        computed_k1k2 = opt_ml.compute_k1k2_for_cells(baseline_work, antenna_work, missing_k1k2_cells)
+        for cid, value in computed_k1k2.items():
+            pair = (float(value[0]), float(value[1]))
+            key = str(cid)
+            k1k2_map[key] = pair
+            if k1k2_cache is not None:
+                k1k2_cache[key] = pair
+    return k1k2_map
+
+
+def _filter_identity_rows(df: pd.DataFrame, cell_ids: list[str]) -> pd.DataFrame:
+    if df.empty or not cell_ids:
+        return df.iloc[0:0].copy() if isinstance(df, pd.DataFrame) else pd.DataFrame()
+    mask = pd.Series(False, index=df.index)
+    for cid in cell_ids:
+        mask = mask | opt_ml._identity_match_mask(df, cid)
+    out = df.loc[mask].copy()
+    return out if not out.empty else df.iloc[0:0].copy()
+
+
 def _evaluate_update_set(
     *,
     updates: list[Dict[str, object]],
@@ -1107,6 +1254,9 @@ def _evaluate_update_set(
     k1k2_cache: Optional[Dict[str, tuple[float, float]]] = None,
     baseline_work_df: Optional[pd.DataFrame] = None,
     antenna_work_df: Optional[pd.DataFrame] = None,
+    rf_prediction_points_df: Optional[pd.DataFrame] = None,
+    precomputed_k1k2_map: Optional[Dict[str, tuple[float, float]]] = None,
+    precomputed_baseline_rf: Optional[pd.DataFrame] = None,
 ) -> tuple[Dict[str, object], pd.DataFrame]:
     eval_start = time.perf_counter()
     baseline_prep_sec = 0.0
@@ -1144,49 +1294,36 @@ def _evaluate_update_set(
     k1k2_start = time.perf_counter()
     with _rf_debug_capture(config):
         candidate_site = _apply_updates_to_site_df(antenna_work, updates)
-        k1k2_map: Dict[str, tuple[float, float]] = {}
-        missing_k1k2_cells = []
-        if k1k2_cache is not None:
-            for cid in recompute_cells:
-                cached = k1k2_cache.get(str(cid))
-                if cached is None:
-                    missing_k1k2_cells.append(str(cid))
-                else:
-                    k1k2_map[str(cid)] = cached
-        else:
-            missing_k1k2_cells = [str(cid) for cid in recompute_cells]
-        if missing_k1k2_cells:
-            computed_k1k2 = opt_ml.compute_k1k2_for_cells(baseline_work, antenna_work, missing_k1k2_cells)
-            for cid, value in computed_k1k2.items():
-                pair = (float(value[0]), float(value[1]))
-                k1k2_map[str(cid)] = pair
-                if k1k2_cache is not None:
-                    k1k2_cache[str(cid)] = pair
+        k1k2_map = _ensure_k1k2_for_recompute_cells(
+            baseline_work=baseline_work,
+            antenna_work=antenna_work,
+            recompute_cells=recompute_cells,
+            k1k2_cache=k1k2_cache,
+            seed_map=precomputed_k1k2_map,
+        )
     k1k2_sec = time.perf_counter() - k1k2_start
     if not k1k2_map:
         raise ValueError("coordinate_dynamic_k1k2_not_available")
-    params = {
-        "project_id": int(config.project_id),
-        "region": config.region,
-        "radius": float(config.radius_m),
-        "grid_resolution": float(config.grid_resolution_m),
-        "n_workers": int(config.workers),
-        "impact_radius_m": float(config.impact_radius_m),
-        "neighbor_site_count": int(config.neighbor_site_count),
-        "max_interference_sites": int(config.max_interference_sites),
-        "baseline_job_id": config.baseline_job_id,
-        "prediction_points_df": baseline_work,
-        "geo_features_df": geo_df,
-        "strict_prediction_points": True,
-        "recompute_cells": recompute_cells,
-    }
+    scoped_rf_points = (
+        rf_prediction_points_df
+        if isinstance(rf_prediction_points_df, pd.DataFrame) and not rf_prediction_points_df.empty
+        else _filter_identity_rows(baseline_work, recompute_cells)
+    )
+    if scoped_rf_points.empty:
+        scoped_rf_points = baseline_work
+    scoped_geo_df = _filter_identity_rows(geo_df, recompute_cells)
+    if scoped_geo_df.empty and isinstance(geo_df, pd.DataFrame) and not geo_df.empty:
+        scoped_geo_df = geo_df
+    params = _rf_prediction_params(
+        config=config,
+        baseline_work=scoped_rf_points,
+        geo_df=scoped_geo_df,
+        recompute_cells=recompute_cells,
+    )
     cache_key = tuple(sorted(recompute_cells))
-    baseline_rf = baseline_rf_cache.get(cache_key)
+    baseline_rf = precomputed_baseline_rf.copy() if isinstance(precomputed_baseline_rf, pd.DataFrame) and not precomputed_baseline_rf.empty else baseline_rf_cache.get(cache_key)
     if baseline_rf is None:
-        base_site = antenna_work.copy()
-        for col in ["lat", "lon", "azimuth", "electrical_tilt", "mechanical_tilt", "tx_power", "antenna_height"]:
-            if col in base_site.columns:
-                base_site[f"orig_{col}"] = pd.to_numeric(base_site[col], errors="coerce")
+        base_site = _rf_base_site_df(antenna_work)
         baseline_rf_start = time.perf_counter()
         with _rf_debug_capture(config):
             baseline_rf = opt_ml.run_prediction_only_optimized(base_site, k1k2_map, params)
@@ -1277,6 +1414,9 @@ def _evaluate_trial_process(payload: Dict[str, object]) -> tuple[Dict[str, objec
         k1k2_cache={},
         baseline_work_df=payload.get("baseline_work_df"),
         antenna_work_df=payload.get("antenna_work_df"),
+        rf_prediction_points_df=payload.get("rf_prediction_points_df"),
+        precomputed_k1k2_map=payload.get("precomputed_k1k2_map"),
+        precomputed_baseline_rf=payload.get("precomputed_baseline_rf"),
     )
 
 
@@ -1441,7 +1581,7 @@ def coordinate_search_recommendations(
                 evaluation_rows.append(metrics)
                 stage_results.append((delta, trial_state, metrics, after_df))
             return stage_results
-        process_jobs: list[tuple[float, Dict[str, Dict[str, object]], list[Dict[str, object]], str]] = []
+        process_jobs: list[tuple[float, Dict[str, Dict[str, object]], list[Dict[str, object]], str, tuple]] = []
         for delta in valid_deltas:
             if str(parameter).strip().lower() == "azimuth":
                 update = _make_azimuth_update(
@@ -1464,11 +1604,77 @@ def coordinate_search_recommendations(
                 if key in seen_coordinate_keys:
                     continue
                 seen_coordinate_keys.add(key)
+            update_cells = [_clean_id(update.get("cell_id")) for update in trial_updates if _clean_id(update.get("cell_id"))]
+            recompute_cells = _build_recompute_cells(
+                antenna_df,
+                prepared_baseline_work,
+                update_cells,
+                config.max_neighbors_per_update_cell,
+                antenna_work_df=prepared_antenna_work,
+            )
+            if not recompute_cells:
+                continue
+            cache_key = tuple(sorted(recompute_cells))
             candidate_name = f"coord_pass_{pass_idx}_{parameter.lower()}_cell_{cell_id}_delta_{delta:+.1f}_active_{len(trial_updates)}"
-            process_jobs.append((delta, trial_state, trial_updates, candidate_name))
+            process_jobs.append((delta, trial_state, trial_updates, candidate_name, cache_key))
         if not process_jobs:
             return []
         rf_workers_per_candidate = 1
+        process_context_config = CandidateValidationConfig(
+            **{
+                **config.__dict__,
+                "workers": rf_workers_per_candidate,
+            }
+        )
+        process_context_by_key: Dict[tuple, Dict[str, object]] = {}
+        for _, _, _, _, cache_key in process_jobs:
+            if cache_key in process_context_by_key:
+                continue
+            recompute_cells = list(cache_key)
+            scoped_baseline_work = _filter_identity_rows(prepared_baseline_work, recompute_cells)
+            scoped_geo_df = _filter_identity_rows(geo_df, recompute_cells)
+            k1k2_start = time.perf_counter()
+            with _rf_debug_capture(config):
+                k1k2_map = _ensure_k1k2_for_recompute_cells(
+                    baseline_work=prepared_baseline_work,
+                    antenna_work=prepared_antenna_work,
+                    recompute_cells=recompute_cells,
+                    k1k2_cache=k1k2_cache,
+                )
+            k1k2_sec = time.perf_counter() - k1k2_start
+            baseline_rf = baseline_rf_cache.get(cache_key)
+            baseline_rf_cache_hit = baseline_rf is not None
+            baseline_rf_sec = 0.0
+            if baseline_rf is None:
+                parent_params = _rf_prediction_params(
+                    config=process_context_config,
+                    baseline_work=scoped_baseline_work,
+                    geo_df=scoped_geo_df,
+                    recompute_cells=recompute_cells,
+                )
+                baseline_rf_start = time.perf_counter()
+                with _rf_debug_capture(config):
+                    baseline_rf = opt_ml.run_prediction_only_optimized(
+                        _rf_base_site_df(prepared_antenna_work),
+                        k1k2_map,
+                        parent_params,
+                    )
+                baseline_rf_sec = time.perf_counter() - baseline_rf_start
+                baseline_rf_cache[cache_key] = baseline_rf
+            process_context_by_key[cache_key] = {
+                "recompute_cells": recompute_cells,
+                "k1k2_map": k1k2_map,
+                "baseline_rf": baseline_rf,
+                "rf_prediction_points_df": scoped_baseline_work,
+                "geo_df": scoped_geo_df,
+            }
+            print(
+                "[TILT_COORDINATE_PROCESS_CONTEXT] "
+                f"pass={pass_idx} cell={cell_id} stage={stage_name} "
+                f"recompute_cells={len(recompute_cells)} "
+                f"k1k2_cells={len(k1k2_map)} k1k2_sec={k1k2_sec:.2f} "
+                f"base_cache_hit={int(baseline_rf_cache_hit)} base_rf_sec={baseline_rf_sec:.2f}"
+            )
         max_workers = min(candidate_workers, len(process_jobs))
         print(
             f"[TILT_COORDINATE_PROCESS_POOL] pass={pass_idx} cell={cell_id} stage={stage_name} "
@@ -1482,18 +1688,21 @@ def coordinate_search_recommendations(
                         "updates": trial_updates,
                         "baseline_df": pd.DataFrame(),
                         "antenna_df": pd.DataFrame(),
-                        "geo_df": geo_df,
+                        "geo_df": process_context_by_key.get(cache_key, {}).get("geo_df", pd.DataFrame()),
                         "grid_analytics_df": grid_analytics_df,
                         "baseline_work_df": prepared_baseline_work,
                         "antenna_work_df": prepared_antenna_work,
+                        "rf_prediction_points_df": process_context_by_key.get(cache_key, {}).get("rf_prediction_points_df", pd.DataFrame()),
                         "thresholds": thresholds,
                         "weights": weights,
                         "config": config,
+                        "precomputed_k1k2_map": process_context_by_key.get(cache_key, {}).get("k1k2_map", {}),
+                        "precomputed_baseline_rf": process_context_by_key.get(cache_key, {}).get("baseline_rf", pd.DataFrame()),
                         "rf_workers": rf_workers_per_candidate,
                         "worker_idx": idx,
                     },
                 ): (delta, trial_state, candidate_name)
-                for idx, (delta, trial_state, trial_updates, candidate_name) in enumerate(process_jobs, start=1)
+                for idx, (delta, trial_state, trial_updates, candidate_name, cache_key) in enumerate(process_jobs, start=1)
             }
             for future in as_completed(future_to_job):
                 delta, trial_state, candidate_name = future_to_job[future]
@@ -1512,8 +1721,12 @@ def coordinate_search_recommendations(
                 stage_results.append((delta, trial_state, metrics, after_df))
         return sorted(stage_results, key=lambda item: valid_deltas.index(item[0]))
 
-    first_probe = [-1.0, 1.0]
-    directional = {"plus": [2.0, 3.0, 4.0], "minus": [-2.0, -3.0, -4.0]}
+    first_probe, directional = _etilt_candidate_delta_sets(config)
+    print(
+        f"[TILT_CANDIDATE_CONFIG] etilt_first_probe={first_probe} "
+        f"etilt_directional_plus={directional['plus']} "
+        f"etilt_directional_minus={directional['minus']}"
+    )
     for pass_idx in range(1, max(1, int(config.coordinate_passes)) + 1):
         changed = False
         print(f"[TILT_COORDINATE_PASS] pass={pass_idx} active_updates={len(current_updates)} score={float(current_metrics.get('score', 0.0)):.4f}")
@@ -1542,23 +1755,24 @@ def coordinate_search_recommendations(
                     best_probe_delta = delta
             if best_probe_delta is not None:
                 direction_key = "plus" if best_probe_delta > 0 else "minus"
-                step_results = evaluate_delta_stage(
-                    pass_idx=pass_idx,
-                    cell_id=cell_id,
-                    deltas=directional[direction_key],
-                    state=current_updates,
-                    stage_name="directional_step_batch",
-                )
-                for _, trial_updates, metrics, after_df in sorted(
-                    step_results,
-                    key=lambda item: rank(item[2]),
-                    reverse=True,
-                ):
-                    if rank(metrics) > rank(best_metrics):
-                        best_updates = trial_updates
-                        best_metrics = metrics
-                        best_after = after_df
-                        break
+                if directional[direction_key]:
+                    step_results = evaluate_delta_stage(
+                        pass_idx=pass_idx,
+                        cell_id=cell_id,
+                        deltas=directional[direction_key],
+                        state=current_updates,
+                        stage_name="directional_step_batch",
+                    )
+                    for _, trial_updates, metrics, after_df in sorted(
+                        step_results,
+                        key=lambda item: rank(item[2]),
+                        reverse=True,
+                    ):
+                        if rank(metrics) > rank(best_metrics):
+                            best_updates = trial_updates
+                            best_metrics = metrics
+                            best_after = after_df
+                            break
             if rank(best_metrics) > rank(current_metrics):
                 current_updates = best_updates
                 current_metrics = best_metrics
@@ -1574,7 +1788,7 @@ def coordinate_search_recommendations(
 
     if bool(config.enable_azimuth_fallback) and bearing_map:
         remaining_cells = [cell_id for cell_id in target_cells if cell_id not in current_updates]
-        azimuth_steps = [abs(float(step)) for step in config.azimuth_fallback_steps_deg if abs(float(step)) > 0.0]
+        azimuth_steps = _azimuth_fallback_steps(config)
         print(
             f"[TILT_AZIMUTH_FALLBACK_START] remaining_cells={len(remaining_cells)} "
             f"steps={azimuth_steps} active_etilt_updates={len(current_updates)}"
@@ -1643,8 +1857,8 @@ def coordinate_search_recommendations(
     rows = []
     for update in current_updates.values():
         rf_cell_id = _clean_id(update.get("cell_id"))
-        cell_id = canonical_cell_id(rf_cell_id)
-        ant_row = ant.loc[ant["Node_Cell_ID"].astype(str) == rf_cell_id]
+        cell_id = rf_cell_id
+        ant_row = ant.loc[_identity_match_mask(ant, rf_cell_id)]
         tech = ant_row.iloc[0].get("Technology", "4G") if not ant_row.empty else "4G"
         parameter = str(update.get("parameter", "ETilt") or "ETilt").strip()
         if parameter.lower() == "azimuth":

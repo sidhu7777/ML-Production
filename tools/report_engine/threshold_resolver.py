@@ -21,6 +21,8 @@ def resolve_kpi_ranges(
     user_id: int,
     values: Iterable | None = None,
     debug: bool = False,
+    region: str | None = None,
+    country_code: str | None = None,
 ) -> List[Dict]:
     """
     Resolve KPI ranges with FULL DATA COVERAGE.
@@ -41,7 +43,11 @@ def resolve_kpi_ranges(
     # --------------------------------------------------
     # 1. Load DB thresholds (ONCE per call, silent)
     # --------------------------------------------------
-    db_row = get_user_thresholds(user_id)
+    db_row = get_user_thresholds(
+        user_id,
+        region=region,
+        country_code=country_code,
+    )
     if not db_row:
         return _build_fallback_ranges(kpi_name, values, debug=debug, reason="no_db_row")
 
@@ -52,9 +58,20 @@ def resolve_kpi_ranges(
         return _build_fallback_ranges(kpi_name, values, debug=debug, reason="empty_db_json")
 
     try:
-        db_ranges = json.loads(raw_json)
+        parsed_json = json.loads(raw_json)
     except Exception as e:
         return _build_fallback_ranges(kpi_name, values, debug=debug, reason=f"invalid_db_json: {e}")
+
+    # Thresholds are stored grouped by technology, e.g.
+    # {"default": [{"min":..,"max":..,"color":..}, ...], "5g": [...], "4g": [...], ...}
+    # Fall back to treating parsed_json as the ranges list directly for older/flat formats.
+    if isinstance(parsed_json, dict):
+        db_ranges = parsed_json.get("default") or []
+    else:
+        db_ranges = parsed_json
+
+    if not db_ranges:
+        return _build_fallback_ranges(kpi_name, values, debug=debug, reason="empty_default_ranges")
 
     # --------------------------------------------------
     # 2. Normalize & sort DB ranges (filter invalid)

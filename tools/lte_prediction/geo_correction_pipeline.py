@@ -763,22 +763,49 @@ def attach_building_features(grid_gdf: gpd.GeoDataFrame, building_gdf: gpd.GeoDa
 
 
 def _derive_clutter_class(df: pd.DataFrame) -> pd.Series:
-    building_dense = df["building_area_ratio"] >= df["building_area_ratio"].quantile(0.75)
-    building_mid = df["building_area_ratio"] >= df["building_area_ratio"].quantile(0.40)
-    road_dense = df["road_length_m"] >= df["road_length_m"].quantile(0.75)
-    road_mid = df["road_length_m"] >= df["road_length_m"].quantile(0.40)
+    building_ratio = df["building_area_ratio"]
+    road_len = df["road_length_m"]
+    green_ratio = df["green_ratio"]
+    water_ratio = df["water_ratio"]
+
+    has_building_signal = bool(building_ratio.max() > 0)
+    has_road_signal = bool(road_len.max() > 0)
+
+    if not (has_building_signal or has_road_signal or bool(green_ratio.max() > 0) or bool(water_ratio.max() > 0)):
+        # No building/road/green/water context at all (e.g. no source data was
+        # fetched for this project) - quantile(0.75) of an all-zero column is
+        # itself 0, so ">= quantile" would be trivially true everywhere and
+        # misclassify every point as "Dense Urban". Be honest instead.
+        print(f"[LTE][CLUTTER] no_geo_signal=True rows={len(df)} clutter_class=Unknown")
+        return pd.Series(np.full(len(df), "Unknown", dtype=object), index=df.index)
+
+    # Quantile thresholds are only meaningful when the *threshold itself* is
+    # above zero. With sparse real data (e.g. a handful of buildings scattered
+    # across hundreds of grid tiles), quantile(0.40) or even quantile(0.75)
+    # can legitimately still equal 0 if most tiles have no signal - and
+    # "ratio >= 0" is trivially true for every row (ratios can't be negative),
+    # which is the same degeneracy as the all-zero case, just partial.
+    building_q75 = building_ratio.quantile(0.75)
+    building_q40 = building_ratio.quantile(0.40)
+    building_dense = (building_ratio >= building_q75) & bool(building_q75 > 0)
+    building_mid = (building_ratio >= building_q40) & bool(building_q40 > 0)
+
+    road_q75 = road_len.quantile(0.75)
+    road_q40 = road_len.quantile(0.40)
+    road_dense = (road_len >= road_q75) & bool(road_q75 > 0)
+    road_mid = (road_len >= road_q40) & bool(road_q40 > 0)
 
     clutter = np.full(len(df), "Rural/Open", dtype=object)
-    clutter = np.where(df["water_ratio"] >= 0.15, "Water", clutter)
+    clutter = np.where(water_ratio >= 0.15, "Water", clutter)
     clutter = np.where(
-        (df["green_ratio"] >= 0.30) & (df["water_ratio"] < 0.15) & (df["building_area_ratio"] < 0.08),
+        (green_ratio >= 0.30) & (water_ratio < 0.15) & (building_ratio < 0.08),
         "Vegetation",
         clutter,
     )
     clutter = np.where(building_dense & road_dense, "Dense Urban", clutter)
     clutter = np.where((clutter == "Rural/Open") & (building_mid | road_mid), "Urban", clutter)
     clutter = np.where(
-        (clutter == "Rural/Open") & ((df["building_count"] > 0) | (df["road_length_m"] > 0)),
+        (clutter == "Rural/Open") & ((df["building_count"] > 0) | (road_len > 0)),
         "Suburban",
         clutter,
     )

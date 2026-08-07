@@ -165,7 +165,7 @@ def _aggregate_baseline_rf(baseline_csv: Path, chunksize: int = 300_000) -> pd.D
     )
 
 
-def _grid_rf_features(cell_grid_df: pd.DataFrame) -> pd.DataFrame:
+def _grid_rf_features(cell_grid_df: pd.DataFrame, corrected_rf_csv: Path | None = None) -> pd.DataFrame:
     work = cell_grid_df.copy()
     work["band_class"] = work["band"].map(_classify_band)
     work = work.sort_values(["time_bucket", "grid_id", "rsrp_mean"], ascending=[True, True, False])
@@ -273,6 +273,51 @@ def _grid_rf_features(cell_grid_df: pd.DataFrame) -> pd.DataFrame:
     )
     out["rsrp_gap_to_neighbor1"] = out["serving_rsrp_mean"] - out["neighbor1_rsrp"]
     out["neighbor_interference_index"] = np.power(10.0, (out["neighbor1_rsrp"].fillna(-140.0) - out["serving_rsrp_mean"]) / 10.0)
+    if corrected_rf_csv is not None and corrected_rf_csv.exists():
+        corrected = pd.read_csv(
+            corrected_rf_csv,
+            usecols=[
+                "time_bucket",
+                "grid_id",
+                "pred_rsrp",
+                "pred_rsrq",
+                "pred_sinr",
+                "neighbor1_rsrp",
+                "neighbor1_sinr",
+                "mean_candidate_rsrp",
+                "mean_candidate_sinr",
+            ],
+        )
+        corrected["time_bucket"] = corrected["time_bucket"].astype(str)
+        corrected["grid_id"] = pd.to_numeric(corrected["grid_id"], errors="coerce").astype("Int64")
+        corrected = corrected.rename(
+            columns={
+                "pred_rsrp": "corrected_serving_rsrp_mean",
+                "pred_rsrq": "corrected_serving_rsrq_mean",
+                "pred_sinr": "corrected_serving_sinr_mean",
+                "neighbor1_rsrp": "corrected_neighbor1_rsrp",
+                "neighbor1_sinr": "corrected_neighbor1_sinr",
+                "mean_candidate_rsrp": "corrected_mean_candidate_rsrp",
+                "mean_candidate_sinr": "corrected_mean_candidate_sinr",
+            }
+        )
+        out = out.merge(corrected, on=["time_bucket", "grid_id"], how="left", validate="one_to_one")
+        for target, source in [
+            ("serving_rsrp_mean", "corrected_serving_rsrp_mean"),
+            ("serving_rsrq_mean", "corrected_serving_rsrq_mean"),
+            ("serving_sinr_mean", "corrected_serving_sinr_mean"),
+            ("neighbor1_rsrp", "corrected_neighbor1_rsrp"),
+            ("neighbor1_sinr", "corrected_neighbor1_sinr"),
+            ("mean_candidate_rsrp", "corrected_mean_candidate_rsrp"),
+            ("mean_candidate_sinr", "corrected_mean_candidate_sinr"),
+        ]:
+            out[target] = pd.to_numeric(out[source], errors="coerce").combine_first(pd.to_numeric(out[target], errors="coerce"))
+        out = out.drop(columns=[col for col in out.columns if col.startswith("corrected_") and col != "corrected_kpi_source"], errors="ignore")
+        out["corrected_kpi_source"] = str(corrected_rf_csv)
+        out["rsrp_gap_to_neighbor1"] = out["serving_rsrp_mean"] - out["neighbor1_rsrp"]
+        out["neighbor_interference_index"] = np.power(10.0, (out["neighbor1_rsrp"].fillna(-140.0) - out["serving_rsrp_mean"]) / 10.0)
+    else:
+        out["corrected_kpi_source"] = ""
     return out
 
 
@@ -444,16 +489,33 @@ def _add_demand_and_cell_prb(grid_df: pd.DataFrame) -> pd.DataFrame:
         + out["spectral_efficiency_bpshz"].clip(0.0, 5.0) * 11.0
         + out["carrier_count"].clip(0.0, 4.0) * 4.0
     ).clip(0.0, 100.0).round(3)
+    out["rsrp_mean"] = out["serving_rsrp_mean"]
+    out["rsrq_mean"] = out["serving_rsrq_mean"]
+    out["sinr_mean"] = out["serving_sinr_mean"]
+    out["corrected_rsrp_mean"] = out["serving_rsrp_mean"]
+    out["corrected_rsrq_mean"] = out["serving_rsrq_mean"]
+    out["corrected_sinr_mean"] = out["serving_sinr_mean"]
+    out["sample_count"] = out["serving_sample_count"]
+    out["bandwidth_mhz_est"] = out["serving_bandwidth_mhz_est"]
+    out["cqi_mean"] = (out["serving_sinr_mean"] / 2.0 + 7.0).clip(1.0, 15.0).round(4)
+    out["dl_tpt_mean"] = out["cell_capacity_mbps"].round(6)
+    out["ul_tpt_mean"] = (out["dl_tpt_mean"] * 0.25).round(6)
     out["demand_feature_source"] = "geo_rf_heterogeneous_growth_cell_traffic_capacity_prb"
     return out
 
 
-def build_dataset(geo_csv: Path, baseline_csv: Path, output_csv: Path, summary_json: Path) -> tuple[pd.DataFrame, Dict[str, object]]:
+def build_dataset(
+    geo_csv: Path,
+    baseline_csv: Path,
+    output_csv: Path,
+    summary_json: Path,
+    corrected_rf_csv: Path | None = None,
+) -> tuple[pd.DataFrame, Dict[str, object]]:
     geo = pd.read_csv(geo_csv)
     geo["grid_id"] = pd.to_numeric(geo["grid_id"], errors="coerce").astype("Int64")
     geo["time_bucket"] = geo["time_bucket"].astype(str)
     cell_grid = _aggregate_baseline_rf(baseline_csv)
-    rf = _grid_rf_features(cell_grid)
+    rf = _grid_rf_features(cell_grid, corrected_rf_csv=corrected_rf_csv)
     rf["grid_id"] = pd.to_numeric(rf["grid_id"], errors="coerce").astype("Int64")
     merged = geo.merge(rf, on=["time_bucket", "grid_id"], how="left", validate="one_to_one")
     dataset = _add_demand_and_cell_prb(merged)
@@ -543,6 +605,7 @@ def build_dataset(geo_csv: Path, baseline_csv: Path, output_csv: Path, summary_j
         "serving_cells_by_bucket": {
             str(k): int(v) for k, v in dataset.groupby("time_bucket")["serving_cell_key"].nunique(dropna=True).sort_index().items()
         },
+        "corrected_kpi_source": str(corrected_rf_csv) if corrected_rf_csv is not None and corrected_rf_csv.exists() else None,
         "congested_cells_by_bucket": {
             str(k): int(v)
             for k, v in dataset.loc[dataset["cell_congested_flag"] == 1].groupby("time_bucket")["serving_cell_key"].nunique(dropna=True).sort_index().items()
@@ -573,39 +636,22 @@ def rewrite_workbook(
     ws = wb.create_sheet("README")
     for row in [
         ["item", "value"],
-        ["purpose", "Model 1 / Model 2 training workbook with causal Model 2 traffic-to-cell-PRB sheet"],
+        ["purpose", "Model 2 causal demand/capacity training workbook"],
         ["model2_logic", "grid demand -> grid traffic -> serving-cell aggregation -> cell capacity -> PRB/RRC -> grid inherits serving-cell KPI"],
         ["model2_rows", summary.get("rows")],
         ["model2_unique_grids", summary.get("unique_grids")],
-        ["baseline_rows", sum(1 for _ in open(baseline_csv, "r", encoding="utf-8", errors="ignore")) - 1],
-        ["geo_csv", str(geo_csv)],
         ["model2_csv", str(model2_csv)],
+        ["geo_csv_used_to_build", str(geo_csv)],
         ["baseline_csv", str(baseline_csv)],
         ["summary_json", str(model2_csv.with_suffix(".summary.json"))],
+        ["note", "Baseline and geo are inputs to dataset construction only; they are not copied into this Model 2 workbook."],
     ]:
         ws.append(row)
 
-    for sheet_name, csv_path in [("Bucket_Geo_25m", geo_csv), ("Model2_Training_25m", model2_csv)]:
-        ws = wb.create_sheet(sheet_name)
-        with open(csv_path, "r", encoding="utf-8", newline="") as handle:
-            for row in csv.reader(handle):
-                ws.append(row)
-
-    with open(baseline_csv, "r", encoding="utf-8", newline="") as handle:
-        reader = csv.reader(handle)
-        header = next(reader)
-        sheet_idx = 1
-        data_rows = 0
-        ws = wb.create_sheet(f"Baseline_25m_RF_{sheet_idx:02d}")
-        ws.append(header)
-        for row in reader:
-            if data_rows >= MAX_EXCEL_DATA_ROWS:
-                sheet_idx += 1
-                data_rows = 0
-                ws = wb.create_sheet(f"Baseline_25m_RF_{sheet_idx:02d}")
-                ws.append(header)
+    ws = wb.create_sheet("Model2_Training_25m")
+    with open(model2_csv, "r", encoding="utf-8", newline="") as handle:
+        for row in csv.reader(handle):
             ws.append(row)
-            data_rows += 1
     wb.save(workbook)
 
 
@@ -614,7 +660,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--geo-csv", default="tests/coverage_prediction/data/model1_model2_training_geo_25m.csv")
     parser.add_argument("--baseline-csv", default="tests/coverage_prediction/data/model1_model2_training_baseline_25m_polygon.csv")
     parser.add_argument("--output-csv", default="tests/coverage_prediction/data/model2_training_25m_causal.csv")
-    parser.add_argument("--workbook", default="tests/coverage_prediction/data/model1_model2_training_dataset.xlsx")
+    parser.add_argument("--workbook", default="tests/coverage_prediction/data/model2_training_25m_causal_dataset.xlsx")
+    parser.add_argument("--corrected-rf-csv", default="tests/coverage_prediction/data/model1_training_25m_rf_dataset.csv")
     parser.add_argument("--skip-workbook", action="store_true")
     return parser.parse_args()
 
@@ -623,7 +670,7 @@ def main() -> None:
     args = parse_args()
     output_csv = Path(args.output_csv)
     summary_json = output_csv.with_suffix(".summary.json")
-    _, summary = build_dataset(Path(args.geo_csv), Path(args.baseline_csv), output_csv, summary_json)
+    _, summary = build_dataset(Path(args.geo_csv), Path(args.baseline_csv), output_csv, summary_json, Path(args.corrected_rf_csv))
     if not args.skip_workbook:
         rewrite_workbook(Path(args.workbook), Path(args.geo_csv), output_csv, Path(args.baseline_csv), summary)
     print(json.dumps(summary, indent=2))

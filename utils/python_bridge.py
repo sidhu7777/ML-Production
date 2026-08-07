@@ -54,6 +54,47 @@ def _service_root_url() -> str:
     return base
 
 
+def _country_code_for_region(region: str | None) -> str | None:
+    normalized = str(region or "").strip().lower()
+    if normalized == "taiwan":
+        return "TW"
+    if normalized == "india":
+        return "IN"
+    return normalized.upper() if normalized else None
+
+
+def _bridge_region_params(
+    region: str | None = None,
+    country_code: str | None = None,
+) -> dict[str, str]:
+    params: dict[str, str] = {}
+    normalized_region = str(region or "").strip().lower()
+    if normalized_region:
+        params["region"] = normalized_region
+    normalized_country = str(country_code or "").strip().upper()
+    if not normalized_country:
+        normalized_country = _country_code_for_region(normalized_region) or ""
+    if normalized_country:
+        params["countryCode"] = normalized_country
+    return params
+
+
+def _bridge_region_body(
+    region: str | None = None,
+    country_code: str | None = None,
+) -> dict[str, str]:
+    body: dict[str, str] = {}
+    normalized_region = str(region or "").strip().lower()
+    if normalized_region:
+        body["Region"] = normalized_region
+    normalized_country = str(country_code or "").strip().upper()
+    if not normalized_country:
+        normalized_country = _country_code_for_region(normalized_region) or ""
+    if normalized_country:
+        body["CountryCode"] = normalized_country
+    return body
+
+
 def _json_safe(value: Any) -> Any:
     if value is None:
         return None
@@ -296,12 +337,24 @@ class PythonBridgeClient:
             df = _filter_complete_site_prediction_identity(df, endpoint=endpoint)
         return df
 
-    def get_project(self, project_id: int) -> dict[str, Any] | None:
-        payload = self._request("GET", "GetProject", params={"projectId": int(project_id)})
+    def get_project(
+        self,
+        project_id: int,
+        region: str | None = None,
+        country_code: str | None = None,
+    ) -> dict[str, Any] | None:
+        params = {"projectId": int(project_id), **_bridge_region_params(region, country_code)}
+        payload = self._request("GET", "GetProject", params=params)
         return payload.get("Data")
 
-    def get_project_regions(self, project_id: int) -> list[dict[str, Any]]:
-        payload = self._request("GET", "GetProjectRegions", params={"projectId": int(project_id)})
+    def get_project_regions(
+        self,
+        project_id: int,
+        region: str | None = None,
+        country_code: str | None = None,
+    ) -> list[dict[str, Any]]:
+        params = {"projectId": int(project_id), **_bridge_region_params(region, country_code)}
+        payload = self._request("GET", "GetProjectRegions", params=params)
         return payload.get("Data") or []
 
     def get_report_network_logs(
@@ -312,6 +365,8 @@ class PythonBridgeClient:
         provider: str | None = None,
         start_date: str | None = None,
         end_date: str | None = None,
+        region: str | None = None,
+        country_code: str | None = None,
     ) -> pd.DataFrame:
         session_ids = [int(v) for v in session_ids if int(v) > 0]
         print(
@@ -325,20 +380,19 @@ class PythonBridgeClient:
                 return value.isoformat()
             return value
 
-        df = self.post_rows(
-            "GetDriveTestRows",
-            {
-                "SessionIds": session_ids,
-                "ProjectId": int(project_id) if project_id is not None else None,
-                "Operator": provider,
-                "PrimaryOnly": True,
-                "IncludeNeighbour": False,
-                "StartDate": _json_date(start_date),
-                "EndDate": _json_date(end_date),
-                "Limit": int(limit),
-            },
-            limit=limit,
-        )
+        body = {
+            "SessionIds": session_ids,
+            "ProjectId": int(project_id) if project_id is not None else None,
+            "Operator": provider,
+            "PrimaryOnly": True,
+            "IncludeNeighbour": False,
+            "StartDate": _json_date(start_date),
+            "EndDate": _json_date(end_date),
+            "Limit": int(limit),
+        }
+        body.update(_bridge_region_body(region, country_code))
+
+        df = self.post_rows("GetDriveTestRows", body, limit=limit)
         df.attrs["report_data_source"] = "python_bridge_get_drive_test_rows"
         df.attrs["report_prefiltered"] = True
         print(f"[ReportLogs] received rows from PythonBridge/GetDriveTestRows: {len(df)}")
@@ -376,18 +430,36 @@ class PythonBridgeClient:
         rows = payload.get("data") or payload.get("Data") or []
         return pd.DataFrame(rows)
 
-    def get_sessions(self, session_ids: Iterable[int]) -> pd.DataFrame:
+    def get_sessions(
+        self,
+        session_ids: Iterable[int],
+        region: str | None = None,
+        country_code: str | None = None,
+    ) -> pd.DataFrame:
         session_ids = [int(v) for v in session_ids if int(v) > 0]
-        payload = self._request("POST", "GetSessions", json={"SessionIds": session_ids})
+        body = {"SessionIds": session_ids}
+        body.update(_bridge_region_body(region, country_code))
+        payload = self._request("POST", "GetSessions", json=body)
         rows = payload.get("Data") or []
         return pd.DataFrame(rows)
 
-    def get_user(self, user_id: int) -> dict[str, Any] | None:
-        payload = self._request("GET", "GetUser", params={"userId": int(user_id)})
+    def get_user(
+        self,
+        user_id: int,
+        region: str | None = None,
+        country_code: str | None = None,
+    ) -> dict[str, Any] | None:
+        params = {"userId": int(user_id), **_bridge_region_params(region, country_code)}
+        payload = self._request("GET", "GetUser", params=params)
         return payload.get("Data")
 
-    def get_user_thresholds(self, user_id: int) -> dict[str, Any] | None:
-        payload = self._request("GET", "GetThresholds")
+    def get_user_thresholds(
+        self,
+        user_id: int,
+        region: str | None = None,
+        country_code: str | None = None,
+    ) -> dict[str, Any] | None:
+        payload = self._request("GET", "GetThresholds", params=_bridge_region_params(region, country_code))
         rows = payload.get("Data") or []
         user_id = int(user_id)
 
@@ -424,11 +496,20 @@ class PythonBridgeClient:
 
         return None
 
-    def update_project_download_path(self, project_id: int, download_path: str) -> bool:
+    def update_project_download_path(
+        self,
+        project_id: int,
+        download_path: str,
+        region: str | None = None,
+        country_code: str | None = None,
+    ) -> bool:
+        body = {"ProjectId": int(project_id), "DownloadPath": str(download_path)}
+        body.update(_bridge_region_body(region, country_code))
         payload = self._request(
             "POST",
             "UpdateProjectDownloadPath",
-            json={"ProjectId": int(project_id), "DownloadPath": str(download_path)},
+            params=_bridge_region_params(region, country_code),
+            json=body,
         )
         return bool(payload.get("Updated", False) or payload.get("Status") == 1)
 
@@ -439,6 +520,7 @@ class PythonBridgeClient:
         project_id: int,
         job_id: str,
         region: str | None = None,
+        country_code: str | None = None,
         chunk_size: int = 3000,
         replace_existing: bool = False,
     ) -> int:
@@ -450,10 +532,10 @@ class PythonBridgeClient:
             payload = {
                 "ProjectId": int(project_id),
                 "JobId": str(job_id),
-                "Region": region,
                 "ReplaceExisting": bool(replace_existing and start == 0),
                 "Rows": _records(chunk),
             }
+            payload.update(_bridge_region_body(region, country_code))
             result = self._request("POST", endpoint, json=payload)
             written = int(result.get("Inserted") or result.get("Deleted") or 0)
             total += written
@@ -473,10 +555,13 @@ class PythonBridgeClient:
         scenario_id: int | None = None,
         auth_header: str | None = None,
         cookie_header: str | None = None,
+        region: str | None = None,
+        country_code: str | None = None,
     ) -> tuple[pd.DataFrame, Any]:
         params: dict[str, Any] = {
             "projectId": int(project_id),
             "version": "original",
+            **_bridge_region_params(region, country_code),
         }
         if scenario_id is not None:
             params["scenario_id"] = int(scenario_id)

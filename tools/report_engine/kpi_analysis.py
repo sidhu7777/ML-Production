@@ -226,7 +226,12 @@ def generate_band_summary(df):
 # =====================================================
 # 3. KPI RANGE TABLES
 # =====================================================
-def generate_kpi_range_tables(df, user_id):
+def generate_kpi_range_tables(
+    df,
+    user_id,
+    region: str | None = None,
+    country_code: str | None = None,
+):
     for kpi, cfg in KPI_CONFIG.items():
         if cfg["type"] != "range":
             continue
@@ -240,7 +245,13 @@ def generate_kpi_range_tables(df, user_id):
             continue
 
         rows = []
-        ranges = resolve_kpi_ranges(kpi, user_id, values=df[col])
+        ranges = resolve_kpi_ranges(
+            kpi,
+            user_id,
+            values=df[col],
+            region=region,
+            country_code=country_code,
+        )
         cumulative = 0
         for idx, r in enumerate(ranges):
             is_last = (idx == len(ranges) - 1)
@@ -274,7 +285,12 @@ def generate_kpi_range_tables(df, user_id):
 
 # kpi range summary for metadata.json
 
-def generate_kpi_range_summary(df, user_id):
+def generate_kpi_range_summary(
+    df,
+    user_id,
+    region: str | None = None,
+    country_code: str | None = None,
+):
     """
     Returns KPI range distribution for metadata.json
     (same logic as generate_kpi_range_tables, but data-only)
@@ -293,7 +309,13 @@ def generate_kpi_range_summary(df, user_id):
         if total == 0:
             continue
 
-        ranges = resolve_kpi_ranges(kpi, user_id, values=df[col])
+        ranges = resolve_kpi_ranges(
+            kpi,
+            user_id,
+            values=df[col],
+            region=region,
+            country_code=country_code,
+        )
         range_data = []
         cumulative = 0
         for idx, r in enumerate(ranges):
@@ -1116,7 +1138,11 @@ def format_duration(seconds):
     return f"{minutes} min"
 
 
-def get_session_data_for_drive_summary(session_ids: list):
+def get_session_data_for_drive_summary(
+    session_ids: list,
+    region: str | None = None,
+    country_code: str | None = None,
+):
     """Fetch session data from database"""
     from .db import get_sessions_by_ids
     
@@ -1124,7 +1150,11 @@ def get_session_data_for_drive_summary(session_ids: list):
         return None
     
     try:
-        return get_sessions_by_ids(session_ids)
+        return get_sessions_by_ids(
+            session_ids,
+            region=region,
+            country_code=country_code,
+        )
     except Exception as e:
         print(f"ERROR: Failed to fetch session data: {e}")
         return None
@@ -1269,13 +1299,21 @@ def generate_drive_summary_images(
     total_samples: int,
     network_df: pd.DataFrame | None = None,
     gps_df: pd.DataFrame | None = None,
+    region: str | None = None,
+    country_code: str | None = None,
 ):
     """Generate drive summary and session table images"""
 
     # Prefer network log timestamps when available (more reliable than tbl_session)
     session_df = _normalize_session_times(_build_session_df_from_network_logs(network_df))
     if session_df is None:
-        session_df = _normalize_session_times(get_session_data_for_drive_summary(session_ids))
+        session_df = _normalize_session_times(
+            get_session_data_for_drive_summary(
+                session_ids,
+                region=region,
+                country_code=country_code,
+            )
+        )
 
     if session_df is None or session_df.empty:
         print("WARNING: No session data available for drive summary")
@@ -1365,7 +1403,16 @@ def generate_drive_summary_images(
 # =====================================================
 # MASTER ENTRY
 # =====================================================
-def run_kpi_analysis(filtered_df, user_id, kpi_config, session_ids=None, image_dir: str | None = None, gps_df=None):
+def run_kpi_analysis(
+    filtered_df,
+    user_id,
+    kpi_config,
+    session_ids=None,
+    image_dir: str | None = None,
+    gps_df=None,
+    region: str | None = None,
+    country_code: str | None = None,
+):
     global IMAGE_DIR
     if image_dir:
         IMAGE_DIR = image_dir
@@ -1389,7 +1436,12 @@ def run_kpi_analysis(filtered_df, user_id, kpi_config, session_ids=None, image_d
                     print(f"Warning: Failed to convert {col} to numeric: {e}")
 
     kpi_summary = generate_kpi_summary(filtered_df)
-    kpi_ranges = generate_kpi_range_summary(filtered_df, user_id)
+    kpi_ranges = generate_kpi_range_summary(
+        filtered_df,
+        user_id,
+        region=region,
+        country_code=country_code,
+    )
     generate_band_summary(filtered_df)
     # generate_kpi_range_tables(filtered_df, user_id)  # Commented out to avoid DB
     generate_pci_distribution(filtered_df)
@@ -1413,6 +1465,8 @@ def run_kpi_analysis(filtered_df, user_id, kpi_config, session_ids=None, image_d
             len(filtered_df),
             network_df=filtered_df,
             gps_df=gps_df,
+            region=region,
+            country_code=country_code,
         )
     
     if kpi_summary:

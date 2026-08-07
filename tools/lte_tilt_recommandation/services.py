@@ -4,6 +4,7 @@ import pandas as pd
 import os
 import datetime
 import json
+import re
 import traceback
 from sqlalchemy import create_engine, text
 from openpyxl import load_workbook
@@ -18,11 +19,69 @@ from tools.lte_tilt_recommandation.candidate_validation import (
     prepare_scope_export,
 )
 from tools.lte_tilt_recommandation.cell_identity import canonical_cell_id
-from utils.python_bridge import PythonBridgeError, _filter_complete_site_prediction_identity, get_bridge_client
+from utils.python_bridge import (
+    PythonBridgeError,
+    _bridge_region_params,
+    _country_code_for_region,
+    _filter_complete_site_prediction_identity,
+    get_bridge_client,
+)
 
 # Global dictionary to track job status
 JOBS = {}
 DEFAULT_THRESHOLD_FILE = "lte_tilt_recommendation_transformed.csv"
+
+
+def _first_present(cfg: dict, keys: list[str]):
+    for key in keys:
+        value = cfg.get(key)
+        if value is not None and value != "":
+            return value
+    return None
+
+
+def _parse_positive_float(value, default: float) -> float:
+    if value is None or value == "":
+        return float(default)
+    if isinstance(value, (list, tuple)):
+        value = value[0] if value else None
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        matches = re.findall(r"[-+]?(?:\d+(?:\.\d*)?|\.\d+)", str(value))
+        if not matches:
+            return float(default)
+        try:
+            parsed = float(matches[-1])
+        except (TypeError, ValueError):
+            return float(default)
+    parsed = abs(float(parsed))
+    return parsed if parsed > 0.0 else float(default)
+
+
+def _parse_positive_float_from_keys(cfg: dict, keys: list[str], default: float) -> float:
+    return _parse_positive_float(_first_present(cfg, keys), default)
+
+
+def _parse_positive_float_tuple(value) -> tuple[float, ...] | None:
+    if value is None or value == "":
+        return None
+    raw_values = value
+    if isinstance(value, str):
+        text_value = value.strip()
+        try:
+            decoded = json.loads(text_value)
+            raw_values = decoded
+        except Exception:
+            raw_values = re.findall(r"[-+]?(?:\d+(?:\.\d*)?|\.\d+)", text_value)
+    if not isinstance(raw_values, (list, tuple)):
+        raw_values = [raw_values]
+    parsed_values: list[float] = []
+    for raw in raw_values:
+        parsed = _parse_positive_float(raw, 0.0)
+        if parsed > 0.0 and parsed not in parsed_values:
+            parsed_values.append(parsed)
+    return tuple(parsed_values) if parsed_values else None
 
 BASELINE_IDENTITY_COLUMNS = [
     "project_id",
@@ -377,7 +436,7 @@ def _fetch_grid_analytics_df(current_engine, project_id: int, operator_input, is
 def _bridge_latest_baseline_job_id(bridge, project_id: int, region: str, operator_input, is_all_operators: bool) -> str:
     params = {
         "projectId": int(project_id),
-        "region": region,
+        **_bridge_region_params(region),
     }
     if not is_all_operators:
         params["operator"] = operator_input
@@ -392,7 +451,7 @@ def _bridge_fetch_baseline_log_df(bridge, project_id: int, region: str, operator
     baseline_job_id = _bridge_latest_baseline_job_id(bridge, int(project_id), region, operator_input, is_all_operators)
     params = {
         "projectId": int(project_id),
-        "region": region,
+        **_bridge_region_params(region),
         "jobId": baseline_job_id,
     }
     if not is_all_operators:
@@ -417,9 +476,9 @@ def _bridge_fetch_baseline_log_df(bridge, project_id: int, region: str, operator
     return log_df, baseline_job_id
 
 
-def _bridge_fetch_grid_analytics_df(bridge, project_id: int, operator_input, is_all_operators: bool) -> pd.DataFrame:
+def _bridge_fetch_grid_analytics_df(bridge, project_id: int, region: str, operator_input, is_all_operators: bool) -> pd.DataFrame:
     try:
-        grid_df, _grid_size = bridge.get_grid_analytics(int(project_id))
+        grid_df, _grid_size = bridge.get_grid_analytics(int(project_id), region=region)
     except PythonBridgeError as exc:
         print(f"[TILT][GRID_ANALYTICS_FETCH] source=python_bridge skipped=True reason={exc}")
         return pd.DataFrame()
@@ -429,12 +488,16 @@ def _bridge_fetch_grid_analytics_df(bridge, project_id: int, operator_input, is_
     return grid_df
 
 
-def _bridge_next_scenario_id(bridge, project_id: int) -> int:
-    payload = bridge._request("GET", "GetNextRfOptimizationScenarioId", params={"projectId": int(project_id)})
+def _bridge_next_scenario_id(bridge, project_id: int, region: str) -> int:
+    payload = bridge._request(
+        "GET",
+        "GetNextRfOptimizationScenarioId",
+        params={"projectId": int(project_id), **_bridge_region_params(region)},
+    )
     return int(payload.get("ScenarioId") or payload.get("scenarioId") or 1)
 
 
-def _bridge_save_rf_optimization_results(bridge, project_id: int, scenario_id: int, df: pd.DataFrame) -> int:
+def _bridge_save_rf_optimization_results(bridge, project_id: int, region: str, scenario_id: int, df: pd.DataFrame) -> int:
     rows = []
     safe_df = df.replace({pd.NA: None}).where(pd.notna(df), None)
     for row in safe_df.to_dict(orient="records"):
@@ -457,7 +520,13 @@ def _bridge_save_rf_optimization_results(bridge, project_id: int, scenario_id: i
     payload = bridge._request(
         "POST",
         "SaveRfOptimizationResults",
-        json={"ProjectId": int(project_id), "ScenarioId": int(scenario_id), "Rows": rows},
+        json={
+            "ProjectId": int(project_id),
+            "Region": str(region or "india").lower(),
+            "CountryCode": _country_code_for_region(region),
+            "ScenarioId": int(scenario_id),
+            "Rows": rows,
+        },
     )
     return int(payload.get("Inserted") or payload.get("inserted") or 0)
 
@@ -586,7 +655,6 @@ def _apply_constraint_ranges(reco_df: pd.DataFrame, constraint_df: pd.DataFrame)
         return reco_df
 
     out = reco_df.copy()
-    out["Cell ID"] = out["Cell ID"].map(_to_clean_cell_id)
     constraint_map = constraint_df.set_index("cell_id").to_dict("index")
 
     out["Constraint Applied"] = "No"
@@ -773,11 +841,7 @@ class RFOptimizationService:
             # ==========================================
             self._update(job_id, "running", "Fetching antenna records...")
             if use_bridge:
-                antenna_params = {"projectId": int(project_id), "region": region}
-                if region == "taiwan":
-                    antenna_params["countryCode"] = "TW"
-                elif region == "india":
-                    antenna_params["countryCode"] = "IN"
+                antenna_params = {"projectId": int(project_id), **_bridge_region_params(region)}
                 antenna_df = bridge.get_rows("GetLteTiltAntennaRows", antenna_params, limit=50000)
                 print(f"[TILT][ANTENNA_FETCH] source=python_bridge rows={len(antenna_df)}")
             else:
@@ -845,7 +909,7 @@ class RFOptimizationService:
             if use_bridge:
                 geo_df = bridge.get_rows(
                     "GetLtePredictionGeoFeatures",
-                    {"projectId": int(project_id), "region": region},
+                    {"projectId": int(project_id), **_bridge_region_params(region)},
                     limit=50000,
                     progress_label="lte_geo_features",
                 )
@@ -896,6 +960,7 @@ class RFOptimizationService:
                 grid_analytics_df = _bridge_fetch_grid_analytics_df(
                     bridge,
                     project_id,
+                    region,
                     operator_input,
                     is_all_operators,
                 )
@@ -908,7 +973,7 @@ class RFOptimizationService:
                 )
             _log_df("GRID_ANALYTICS_FETCH", grid_analytics_df)
 
-            scenario_id = _bridge_next_scenario_id(bridge, project_id) if use_bridge else self._get_next_scenario_id(project_id, current_engine)
+            scenario_id = _bridge_next_scenario_id(bridge, project_id, region) if use_bridge else self._get_next_scenario_id(project_id, current_engine)
             threshold_file_path = _resolve_threshold_file_path(cfg, project_id, root_dir)
             if threshold_file_path:
                 print(f"[TILT][CONSTRAINT_FILE] path={threshold_file_path}")
@@ -922,6 +987,16 @@ class RFOptimizationService:
                 )
 
             self._update(job_id, "running", "Running production tilt recommendation engine...")
+            azimuth_fallback_steps = _parse_positive_float_tuple(
+                _first_present(
+                    cfg,
+                    [
+                        "azimuth_fallback_steps_deg",
+                        "azimuth_candidate_steps_deg",
+                        "azimuth_steps_deg",
+                    ],
+                )
+            )
             engine_config = TiltEngineConfig(
                 project_id=int(project_id),
                 region=region,
@@ -947,6 +1022,45 @@ class RFOptimizationService:
                 bad_grid_coverage_pct=float(cfg.get("bad_grid_coverage_pct", 80.0)),
                 max_group_cells=int(cfg.get("max_group_cells", 0)),
                 max_neighbors_per_update_cell=int(cfg.get("max_neighbors_per_update_cell", 2)),
+                etilt_candidate_max_delta_deg=_parse_positive_float_from_keys(
+                    cfg,
+                    [
+                        "etilt_candidate_max_delta_deg",
+                        "tilt_candidate_max_delta_deg",
+                        "etilt_threshold_deg",
+                        "tilt_threshold_deg",
+                        "etilt_threshold",
+                        "tilt_threshold",
+                        "max_etilt_delta_deg",
+                        "max_tilt_delta_deg",
+                        "tilt_candidate_range_deg",
+                    ],
+                    4.0,
+                ),
+                azimuth_fallback_max_delta_deg=_parse_positive_float_from_keys(
+                    cfg,
+                    [
+                        "azimuth_fallback_max_delta_deg",
+                        "azimuth_candidate_max_delta_deg",
+                        "azimuth_threshold_deg",
+                        "azimuth_threshold",
+                        "max_azimuth_delta_deg",
+                        "azimuth_max_delta_deg",
+                        "azimuth_range_deg",
+                    ],
+                    30.0,
+                ),
+                azimuth_fallback_step_deg=_parse_positive_float_from_keys(
+                    cfg,
+                    [
+                        "azimuth_fallback_step_deg",
+                        "azimuth_candidate_step_deg",
+                        "azimuth_step_deg",
+                        "azimuth_step",
+                    ],
+                    5.0,
+                ),
+                azimuth_fallback_steps_deg=azimuth_fallback_steps,
                 rf_debug_log_path=os.path.join(temp_dir, "tilt_rf_debug.log"),
                 constraint_map=constraint_df.set_index("cell_id").to_dict("index") if not constraint_df.empty else {},
             )
@@ -965,7 +1079,11 @@ class RFOptimizationService:
                 f"coordinate_passes={engine_config.coordinate_passes} "
                 f"bad_grid_coverage_pct={engine_config.bad_grid_coverage_pct} "
                 f"max_group_cells={engine_config.max_group_cells} "
-                f"max_neighbors_per_update_cell={engine_config.max_neighbors_per_update_cell}"
+                f"max_neighbors_per_update_cell={engine_config.max_neighbors_per_update_cell} "
+                f"etilt_candidate_max_delta_deg={engine_config.etilt_candidate_max_delta_deg} "
+                f"azimuth_fallback_max_delta_deg={engine_config.azimuth_fallback_max_delta_deg} "
+                f"azimuth_fallback_step_deg={engine_config.azimuth_fallback_step_deg} "
+                f"azimuth_fallback_steps_deg={engine_config.azimuth_fallback_steps_deg}"
             )
             engine_outputs = run_recommendation_engine(
                 log_df=log_df,
@@ -1092,7 +1210,7 @@ class RFOptimizationService:
             )
 
             if use_bridge:
-                inserted = _bridge_save_rf_optimization_results(bridge, project_id, scenario_id, db_save_df)
+                inserted = _bridge_save_rf_optimization_results(bridge, project_id, region, scenario_id, db_save_df)
                 print(f"[TILT][DB_WRITE_DONE] source=python_bridge rows={inserted}")
             else:
                 # Fast DB saving with chunks using the correct regional engine

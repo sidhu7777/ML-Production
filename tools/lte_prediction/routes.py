@@ -38,6 +38,7 @@ def run_prediction():
             "session_ids": data["session_ids"],
             "region": _resolve_region(data),
             "country_code": data.get("country_code") or data.get("countryCode"),
+            "polygon_ids": data.get("polygon_ids") or data.get("polygonIds"),
             "operator": str(data.get("operator", "") or "").strip(),
             "radius_m": float(data.get("radius", data.get("radius_m", 500))),
             "grid_resolution": float(data.get("grid_resolution", 25)),

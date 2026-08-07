@@ -278,7 +278,7 @@ def _identity_match_mask(df: pd.DataFrame, identity: object) -> pd.Series:
 
 def _normalize_site_df(site_df, log_stage="SITE_INPUT"):
     work = site_df.copy()
-    work = work.rename(columns={
+    rename_map = {
         "latitude": "lat",
         "longitude": "lon",
         "e_tilt": "electrical_tilt",
@@ -290,7 +290,18 @@ def _normalize_site_df(site_df, log_stage="SITE_INPUT"):
         "frequency": "frequency_mhz",
         "Frequency": "frequency_mhz",
         "maximum_transmission_power_of_resource": "tx_power",
-    })
+    }
+    # If the target name already exists as its own column, a plain rename would
+    # produce two columns with the same name (work[col] then returns a
+    # DataFrame instead of a Series). Coalesce into the existing column instead.
+    for src, dst in list(rename_map.items()):
+        if src not in work.columns:
+            continue
+        if dst in work.columns:
+            work[dst] = work[dst].combine_first(work[src])
+            work = work.drop(columns=[src])
+            rename_map.pop(src)
+    work = work.rename(columns=rename_map)
 
     source_nodeb_id = (
         work["nodeb_id"].map(_rf_cell_id)
@@ -385,7 +396,7 @@ def _normalize_site_df(site_df, log_stage="SITE_INPUT"):
 def _fetch_latest_baseline_job_id(project_id, region="india", operator=None):
     bridge = get_bridge_client()
     if bridge:
-        params = {"projectId": int(project_id), "region": region}
+        params = _bridge_region_params(project_id, region)
         if operator and str(operator).strip().lower() != "all":
             params["operator"] = str(operator).strip()
         payload = bridge._request("GET", "GetLatestLteBaselineJobId", params=params)
@@ -427,11 +438,8 @@ def fetch_baseline(project_id, region="india", operator=None, baseline_job_id=No
                 region=region,
                 operator=operator,
             )
-        params = {
-            "projectId": int(project_id),
-            "region": region,
-            "jobId": str(baseline_job_id),
-        }
+        params = _bridge_region_params(project_id, region)
+        params["jobId"] = str(baseline_job_id)
         if operator:
             params["operator"] = operator
         page_limit = int(os.getenv("PYTHON_BRIDGE_BASELINE_PAGE_SIZE", "50000"))
@@ -561,7 +569,7 @@ def fetch_baseline(project_id, region="india", operator=None, baseline_job_id=No
 def fetch_geo_features(project_id, region="india", affected_cells=None, baseline_job_id=None):
     bridge = get_bridge_client()
     if bridge:
-        df = bridge.get_rows("GetLtePredictionGeoFeatures", {"projectId": int(project_id), "region": region}, limit=50000)
+        df = bridge.get_rows("GetLtePredictionGeoFeatures", _bridge_region_params(project_id, region), limit=50000)
         if "nodeb_id_cell_id" in df.columns:
             df["Node_Cell_ID"] = df["nodeb_id_cell_id"].map(_rf_cell_id)
         else:
@@ -744,16 +752,21 @@ def _site_polygon_filter_sql(table_name, polygon_ids):
         FROM map_regions mr_filter
         WHERE mr_filter.tbl_project_id = {table_name}.tbl_project_id
           AND mr_filter.id IN ({id_list})
-          AND (
-            ST_Contains(
+          AND CASE
+            WHEN ({table_name}.latitude) BETWEEN -90 AND 90
+              AND ({table_name}.longitude) BETWEEN -180 AND 180
+            THEN ST_Contains(
               mr_filter.region,
-              ST_GeomFromText(CONCAT('POINT(', {table_name}.longitude, ' ', {table_name}.latitude, ')'), 4326)
+              ST_SRID(POINT({table_name}.longitude, {table_name}.latitude), 4326)
             )
-            OR ST_Contains(
+            WHEN ({table_name}.longitude) BETWEEN -90 AND 90
+              AND ({table_name}.latitude) BETWEEN -180 AND 180
+            THEN ST_Contains(
               mr_filter.region,
-              ST_GeomFromText(CONCAT('POINT(', {table_name}.latitude, ' ', {table_name}.longitude, ')'), 4326)
+              ST_SRID(POINT({table_name}.latitude, {table_name}.longitude), 4326)
             )
-          )
+            ELSE 0
+          END = 1
     )
     """
 
@@ -895,7 +908,8 @@ def resolve_site_prediction_scenario_operator(project_id, scenario, region="indi
 
     bridge = get_bridge_client()
     if bridge:
-        params = {"projectId": int(project_id), "scenario": selected_scenario}
+        params = _bridge_region_params(project_id, region)
+        params["scenario"] = selected_scenario
         opt_rows = bridge.get_rows("GetSitePredictionOptimized", params, limit=50000)
         source = "python_bridge"
     else:

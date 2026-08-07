@@ -182,7 +182,11 @@ def _filter_primary_rows(df: pd.DataFrame) -> pd.DataFrame:
 # MAIN LOADER (THIS IS WHAT YOU IMPORT)
 # -----------------------------------------------------
 
-def load_project_data(project_id: int):
+def load_project_data(
+    project_id: int,
+    region: str | None = None,
+    country_code: str | None = None,
+):
     """
     DB-based replacement for Excel loading.
 
@@ -194,7 +198,7 @@ def load_project_data(project_id: int):
     # Each DB helper already chooses Python Bridge when configured, otherwise
     # it falls back to direct DB. Avoid opening a DB connection here first,
     # because bridge-only production should not require direct MySQL access.
-    project = get_project_by_id(project_id)
+    project = get_project_by_id(project_id, region=region, country_code=country_code)
     if not project:
         raise ValueError(f"No project found for id={project_id}")
 
@@ -211,6 +215,8 @@ def load_project_data(project_id: int):
         provider=project.get("provider"),
         start_date=project.get("from_date"),
         end_date=project.get("to_date"),
+        region=region,
+        country_code=country_code,
     )
 
     valid_geo_rows = 0
@@ -223,7 +229,11 @@ def load_project_data(project_id: int):
     )
 
     # 3 Regions / polygons
-    region_rows = get_project_regions(project_id)
+    region_rows = get_project_regions(
+        project_id,
+        region=region,
+        country_code=country_code,
+    )
     polygons = _parse_polygons(region_rows)
     used_polygons = polygons
     used_region_wkts = None

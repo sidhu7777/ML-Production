@@ -33,16 +33,11 @@ os.chdir(ML_ROOT)
 if str(ML_ROOT) not in sys.path:
     sys.path.insert(0, str(ML_ROOT))
 
-from tests.coverage_prediction.build_model3_hybrid_load_balancing_dataset import (
-    HYBRID_MODEL2_CSV,
-    build_hybrid_model2_dataset,
-)
-
-
 RANDOM_SEED = 42
 np.random.seed(RANDOM_SEED)
 
 MODEL_ROOT = ML_ROOT / "models" / "model2_hybrid_target_experiment"
+MODEL2_CAUSAL_CSV = ML_ROOT / "tests" / "coverage_prediction" / "data" / "model2_training_25m_causal.csv"
 FULL_PREDICTIONS_CSV = MODEL_ROOT / "model2_hybrid_full_predictions.csv"
 SUMMARY_JSON = MODEL_ROOT / "model2_hybrid_training_summary.json"
 DIAGNOSTICS_JSON = MODEL_ROOT / "model2_hybrid_diagnostics_summary.json"
@@ -144,8 +139,9 @@ def build_preprocessor() -> ColumnTransformer:
 
 
 def load_dataset() -> pd.DataFrame:
-    build_hybrid_model2_dataset()
-    df = pd.read_csv(HYBRID_MODEL2_CSV)
+    if not MODEL2_CAUSAL_CSV.exists():
+        raise FileNotFoundError(f"Missing corrected Model 2 causal dataset: {MODEL2_CAUSAL_CSV}")
+    df = pd.read_csv(MODEL2_CAUSAL_CSV)
     required = set(ALL_FEATURES + TARGETS + ["grid_id", "time_bucket", "bucket_seq"])
     missing = sorted(required.difference(df.columns))
     if missing:
@@ -436,7 +432,7 @@ def train_all(trials: int, timeout: int) -> dict[str, Any]:
 
     summary: dict[str, Any] = {
         "trained_at": datetime.utcnow().isoformat() + "Z",
-        "source_dataset": str(HYBRID_MODEL2_CSV),
+        "source_dataset": str(MODEL2_CAUSAL_CSV),
         "output_root": str(MODEL_ROOT),
         "rows": int(len(df)),
         "split_rows": {"train": int(len(train_df)), "valid": int(len(valid_df)), "test": int(len(test_df))},

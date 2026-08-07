@@ -24,9 +24,13 @@ from tests.coverage_prediction import model3_current_recommendation_test as curr
 DEFAULT_OUTPUT_ROOT = ML_ROOT / "tests" / "output" / "model4_future_recommendation"
 DEFAULT_STABLE_OUTPUT_DIR = ML_ROOT / "models" / "model4_future_recommendation_experiment"
 DEFAULT_EXCEL_INPUT = ML_ROOT / "models" / "model3_project196_input" / "project_196_model3_input.xlsx"
+DEFAULT_MODEL2_INPUT_EXCEL = ML_ROOT / "tools" / "coverage_prediction" / "future_demand_capacity_forecast" / "data" / "project_196_model2_demand_capacity_input.xlsx"
+DEFAULT_PROJECT196_BASELINE = ML_ROOT / "models" / "model3_project196_input" / "project_196_model3_baseline_grid_input.csv"
+DEFAULT_PROJECT196_GEO = ML_ROOT / "models" / "model3_project196_input" / "project_196_model3_geo_features_input.csv"
 DEFAULT_MODEL3_CURRENT_RECOMMENDATIONS = current_rules.DEFAULT_STABLE_OUTPUT_DIR / "model3_current_recommendations.csv"
-DEFAULT_FUTURE_DATASET = future_rules.DEFAULT_MODEL3_DATASET
-DEFAULT_FUTURE_SUMMARY = future_rules.DEFAULT_MODEL3_SUMMARY
+DEFAULT_FUTURE_DATASET = DEFAULT_STABLE_OUTPUT_DIR / "model4_project196_model2_future_forecast.csv"
+DEFAULT_FUTURE_SUMMARY = DEFAULT_STABLE_OUTPUT_DIR / "model4_project196_model2_future_forecast_summary.json"
+DEFAULT_MODEL4_CONGESTION_THRESHOLD = 70.0
 
 
 def _save_json(path: Path, payload: dict[str, Any]) -> None:
@@ -174,6 +178,92 @@ def _model3_selected_cell_ids(limit: int | None) -> list[str]:
     return ids
 
 
+def build_model2_future_forecast_for_project196(
+    *,
+    output_dir: Path,
+    model2_input_excel: Path = DEFAULT_MODEL2_INPUT_EXCEL,
+    baseline_csv: Path = DEFAULT_PROJECT196_BASELINE,
+    geo_csv: Path = DEFAULT_PROJECT196_GEO,
+    project_id: int = 196,
+) -> tuple[Path, dict[str, Any]]:
+    if not model2_input_excel.exists():
+        raise FileNotFoundError(f"Model 2 Project 196 input Excel not found: {model2_input_excel}")
+    if not baseline_csv.exists():
+        raise FileNotFoundError(f"Project 196 baseline CSV not found: {baseline_csv}")
+    if not geo_csv.exists():
+        raise FileNotFoundError(f"Project 196 geo CSV not found: {geo_csv}")
+
+    from tools.coverage_prediction.future_demand_capacity_forecast.feature_builder import build_model2_feature_frame
+    from tools.coverage_prediction.future_demand_capacity_forecast.model_registry import load_latest_model2_bundle
+    from tools.coverage_prediction.future_demand_capacity_forecast.services import _future_forecast_from_model_outputs
+
+    cell_df = pd.read_excel(model2_input_excel, sheet_name="Model2_Cell_Input")
+    if "project_id" in cell_df.columns:
+        cell_df = cell_df.loc[pd.to_numeric(cell_df["project_id"], errors="coerce") == int(project_id)].copy()
+    baseline_df = pd.read_csv(baseline_csv, low_memory=False)
+    geo_df = pd.read_csv(geo_csv, low_memory=False)
+
+    bundle = load_latest_model2_bundle()
+    feature_df = build_model2_feature_frame(
+        cell_df,
+        baseline_df,
+        geo_df,
+        numeric_features=bundle.numeric_features,
+        categorical_features=bundle.categorical_features,
+    )
+    x_cols = bundle.numeric_features + bundle.categorical_features
+    pred = pd.DataFrame(index=feature_df.index)
+    pred["demand_index"] = bundle.models["model2a_demand"].predict(feature_df[x_cols])
+    pred["active_users_est"] = bundle.models["model2b_users"].predict(feature_df[x_cols])
+    pred["traffic_demand_est"] = bundle.models["model2c_traffic"].predict(feature_df[x_cols])
+    forecast = _future_forecast_from_model_outputs(feature_df, pred)
+
+    current_prb = pd.to_numeric(feature_df["current_prb_utilization_pct"], errors="coerce")
+    current_rrc = pd.to_numeric(feature_df["current_rrc_utilization_pct"], errors="coerce")
+    out = pd.DataFrame(
+        {
+            "Node_Cell_ID": feature_df["node_cell_id"].astype(str),
+            "canonical_physical_cell_id": feature_df.get("canonical_physical_cell_id", feature_df["node_cell_id"]).astype(str),
+            "site_id": feature_df["site_id"].astype(str),
+            "sector_id": feature_df["sector_id"].astype(str),
+            "band": feature_df["band"].astype(str),
+            "estimated_prb_utilization_pct": pd.to_numeric(forecast["future_prb_utilization_pct"], errors="coerce"),
+            "estimated_cell_rrc_utilization_pct": pd.to_numeric(forecast["future_rrc_utilization_pct"], errors="coerce"),
+            "estimated_cell_rrc_connected_users": pd.to_numeric(forecast["future_rrc_connected_users"], errors="coerce"),
+            "estimated_rrc_connected_users": pd.to_numeric(forecast["future_rrc_connected_users"], errors="coerce"),
+            "estimated_offered_traffic_mbps": pd.to_numeric(forecast["future_estimated_offered_traffic_mbps"], errors="coerce"),
+            "estimated_dl_capacity_mbps": pd.to_numeric(feature_df["current_estimated_dl_capacity_mbps"], errors="coerce"),
+            "current_prb_utilization_pct": current_prb,
+            "current_rrc_utilization_pct": current_rrc,
+            "model2_future_congested_flag": pd.to_numeric(forecast["future_congested_flag"], errors="coerce"),
+            "model2_model_version": bundle.model_version,
+            "model2_weights_demand_path": bundle.weights_paths["model2a_demand"],
+            "model2_weights_users_path": bundle.weights_paths["model2b_users"],
+            "model2_weights_traffic_path": bundle.weights_paths["model2c_traffic"],
+        }
+    )
+    output_dir.mkdir(parents=True, exist_ok=True)
+    output_csv = output_dir / "model4_project196_model2_future_forecast.csv"
+    out.to_csv(output_csv, index=False)
+    current_congested = ((current_prb > 70) | (current_rrc > 70)).fillna(False)
+    future_congested = pd.to_numeric(out["model2_future_congested_flag"], errors="coerce").fillna(0).astype(bool)
+    summary = {
+        "mode": "project196_model2_future_forecast_for_model4",
+        "model2_input_excel": str(model2_input_excel),
+        "baseline_csv": str(baseline_csv),
+        "geo_csv": str(geo_csv),
+        "rows": int(len(out)),
+        "current_congested_cells": int(current_congested.sum()),
+        "future_congested_cells": int(future_congested.sum()),
+        "new_future_congested_cells": int((future_congested & ~current_congested).sum()),
+        "resolved_current_cells": int((current_congested & ~future_congested).sum()),
+        "model2_model_version": bundle.model_version,
+        "output_csv": str(output_csv),
+    }
+    _save_json(output_dir / "model4_project196_model2_future_forecast_summary.json", summary)
+    return output_csv, summary
+
+
 def _project196_selected_cell_ids(cell_df: pd.DataFrame, limit: int | None, threshold: float) -> list[str]:
     if cell_df.empty:
         return []
@@ -226,8 +316,9 @@ def build_model4_future_dataset_from_excel(
     excel_path: Path,
     output_dir: Path,
     future_dataset_path: Path = DEFAULT_FUTURE_DATASET,
-    max_congested_cells: int | None = 18,
-    congestion_threshold: float = future_rules.DEFAULT_CONGESTION_THRESHOLD,
+    build_model2_forecast: bool = True,
+    max_congested_cells: int | None = None,
+    congestion_threshold: float = DEFAULT_MODEL4_CONGESTION_THRESHOLD,
 ) -> tuple[Path, Path, dict[str, Any]]:
     if not excel_path.exists():
         raise FileNotFoundError(f"Project 196 Excel input not found: {excel_path}")
@@ -242,6 +333,20 @@ def build_model4_future_dataset_from_excel(
     if "Node_Cell_ID" in base_grid.columns:
         base_grid["Node_Cell_ID"] = base_grid["Node_Cell_ID"].map(_clean_text)
         base_grid = base_grid.loc[base_grid["Node_Cell_ID"].map(_clean_text).ne("")].copy()
+    if build_model2_forecast:
+        future_dataset_path, model2_forecast_summary = build_model2_future_forecast_for_project196(output_dir=output_dir)
+    else:
+        model2_forecast_summary = {}
+        existing_summary_path = future_dataset_path.with_name(f"{future_dataset_path.stem}_summary.json")
+        if not existing_summary_path.exists() and DEFAULT_FUTURE_SUMMARY.exists():
+            existing_summary_path = DEFAULT_FUTURE_SUMMARY
+        if existing_summary_path.exists():
+            try:
+                model2_forecast_summary = json.loads(existing_summary_path.read_text(encoding="utf-8"))
+            except Exception:
+                model2_forecast_summary = {}
+    if not future_dataset_path.exists():
+        future_dataset_path, _ = build_model2_future_forecast_for_project196(output_dir=output_dir)
     future_df = pd.read_csv(future_dataset_path) if future_dataset_path.exists() else pd.DataFrame()
     lookup = _future_lookup(future_df)
 
@@ -267,7 +372,7 @@ def build_model4_future_dataset_from_excel(
         future_rrc = max(current_rrc, raw_future_rrc_value)
         raw_future_prb = raw_future_prb_value
         raw_future_rrc = raw_future_rrc_value
-        future_source = "model1_model2_future_match" if future_row is not None else "excel_current_uplift_fallback"
+        future_source = "model2_future_match" if future_row is not None else "excel_current_uplift_fallback"
         users = float(future_row.get("estimated_cell_rrc_connected_users")) if future_row is not None and pd.notna(future_row.get("estimated_cell_rrc_connected_users")) else float(pd.to_numeric(pd.Series([row.get("input_rrc_connected_users", row.get("estimated_cell_rrc_connected_users", row.get("estimated_rrc_connected_users")))]), errors="coerce").fillna(0.0).iloc[0]) * 1.12
         traffic = float(future_row.get("estimated_offered_traffic_mbps")) if future_row is not None and pd.notna(future_row.get("estimated_offered_traffic_mbps")) else float(pd.to_numeric(pd.Series([row.get("input_estimated_offered_traffic_mbps", row.get("estimated_offered_traffic_mbps"))]), errors="coerce").fillna(0.0).iloc[0]) * 1.12
         capacity = float(future_row.get("estimated_dl_capacity_mbps")) if future_row is not None and pd.notna(future_row.get("estimated_dl_capacity_mbps")) else float(pd.to_numeric(pd.Series([row.get("input_estimated_dl_capacity_mbps", row.get("estimated_dl_capacity_mbps"))]), errors="coerce").replace(0, np.nan).fillna(0.1).iloc[0])
@@ -280,7 +385,13 @@ def build_model4_future_dataset_from_excel(
         cell_rows.append(
             {
                 "Node_Cell_ID": excel_node_cell_id,
+                "canonical_physical_cell_id": _clean_text(row.get("canonical_physical_cell_id")) or excel_node_cell_id,
                 "site_id": site_id,
+                "sector_id": sector_id,
+                "band": float(band) if band else np.nan,
+                "earfcn": row.get("earfcn"),
+                "grid_count": row.get("grid_count", 1),
+                "point_count": row.get("point_count", 1),
                 "topology_site_id": site_id,
                 "topology_frontend_site_sector_key": sector_id,
                 "topology_original_node_cell_id": _clean_text(row.get("canonical_physical_cell_id")) or excel_node_cell_id,
@@ -331,10 +442,10 @@ def build_model4_future_dataset_from_excel(
     scope_source = "model4_future_pressure"
     selected_future_ids: list[str] = []
 
-    current_scope = cell_out.loc[cell_out["model4_current_scope_cell"].fillna(False).astype(bool)].copy()
+    future_scope = cell_out.loc[cell_out["model4_pressure"] > float(congestion_threshold)].copy()
     if max_congested_cells is not None and int(max_congested_cells) > 0:
-        current_scope = current_scope.sort_values("model4_pressure", ascending=False).head(int(max_congested_cells)).copy()
-    selected_future_ids = current_scope["Node_Cell_ID"].dropna().astype(str).tolist()
+        future_scope = future_scope.sort_values("model4_pressure", ascending=False).head(int(max_congested_cells)).copy()
+    selected_future_ids = future_scope["Node_Cell_ID"].dropna().astype(str).tolist()
     cell_out["recommendation_scope_cell"] = cell_out["Node_Cell_ID"].astype(str).isin(set(selected_future_ids)) if selected_future_ids else cell_out["model4_pressure"] > float(congestion_threshold)
 
     overlay_cols = [
@@ -447,13 +558,44 @@ def build_model4_future_dataset_from_excel(
 
     output_dir.mkdir(parents=True, exist_ok=True)
     dataset_path = output_dir / "model4_project196_future_dataset.csv"
+    dataset_xlsx_path = output_dir / "model4_project196_future_input.xlsx"
     summary_path = output_dir / "model4_project196_future_dataset_summary.json"
     out.to_csv(dataset_path, index=False)
+
+    model4_cell_input = cell_out.copy()
+    model4_cell_input["input_prb_utilization_pct"] = pd.to_numeric(
+        model4_cell_input["estimated_prb_utilization_pct"], errors="coerce"
+    ).round(3)
+    model4_cell_input["input_rrc_utilization_pct"] = pd.to_numeric(
+        model4_cell_input["estimated_cell_rrc_utilization_pct"], errors="coerce"
+    ).round(3)
+    model4_cell_input["input_rrc_connected_users"] = pd.to_numeric(
+        model4_cell_input["estimated_cell_rrc_connected_users"], errors="coerce"
+    ).round(3)
+    model4_cell_input["input_estimated_offered_traffic_mbps"] = pd.to_numeric(
+        model4_cell_input["estimated_offered_traffic_mbps"], errors="coerce"
+    ).round(3)
+    model4_cell_input["input_estimated_dl_capacity_mbps"] = pd.to_numeric(
+        model4_cell_input["estimated_dl_capacity_mbps"], errors="coerce"
+    ).round(3)
+    model4_cell_input["input_available_bands_to_add"] = model4_cell_input["available_bands_to_add"]
+    model4_cell_input["input_existing_carrier_count"] = model4_cell_input["existing_carrier_count"]
+    model4_cell_input["input_max_supported_carriers"] = model4_cell_input["max_supported_carriers"]
+    model4_cell_input["demo_selected_for_model3"] = model4_cell_input["recommendation_scope_cell"]
+
+    with pd.ExcelWriter(dataset_xlsx_path, engine="openpyxl") as writer:
+        model4_cell_input.to_excel(writer, sheet_name="Model3_Cell_Input", index=False)
+        base_grid.to_excel(writer, sheet_name="Baseline_Grid_Input", index=False)
+        pd.read_excel(excel_path, sheet_name="Geo_Features_Input").to_excel(
+            writer, sheet_name="Geo_Features_Input", index=False
+        )
+
     summary = {
         "mode": "model4_project196_excel_future_dataset",
         "excel_path": str(excel_path),
         "source_grid_dataset_path": f"{excel_path}::Baseline_Grid_Input",
         "future_dataset_path": str(future_dataset_path),
+        "model2_forecast_summary": model2_forecast_summary,
         "rows": int(len(out)),
         "cell_count": int(out["Node_Cell_ID"].nunique(dropna=True)),
         "sector_count": int(out["topology_frontend_site_sector_key"].nunique(dropna=True)),
@@ -472,10 +614,11 @@ def build_model4_future_dataset_from_excel(
         ),
         "source_counts": {str(k): int(v) for k, v in cell_out["model4_future_source"].value_counts(dropna=False).items()},
         "dataset_csv": str(dataset_path),
+        "dataset_xlsx": str(dataset_xlsx_path),
         "summary_json": str(summary_path),
     }
     _save_json(summary_path, summary)
-    return dataset_path, summary_path, summary
+    return dataset_xlsx_path, summary_path, summary
 
 
 def run_model4_future_recommendation(
@@ -483,7 +626,8 @@ def run_model4_future_recommendation(
     *,
     excel_path: Path,
     future_dataset_path: Path = DEFAULT_FUTURE_DATASET,
-    max_congested_cells: int | None = 18,
+    build_model2_forecast: bool = True,
+    max_congested_cells: int | None = None,
     rf_workers: int = current_rules.DEFAULT_RF_WORKERS,
     sector_parallelism: int = 1,
     max_interference_sites: int = 10,
@@ -496,6 +640,7 @@ def run_model4_future_recommendation(
         excel_path=excel_path,
         output_dir=stable_dir,
         future_dataset_path=future_dataset_path,
+        build_model2_forecast=build_model2_forecast,
         max_congested_cells=max_congested_cells,
         congestion_threshold=config.congestion_threshold,
     )
@@ -558,11 +703,12 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run future-state Model 4 recommendations from the Project 196 Excel input.")
     parser.add_argument("--excel-path", type=Path, default=DEFAULT_EXCEL_INPUT)
     parser.add_argument("--future-dataset-path", type=Path, default=DEFAULT_FUTURE_DATASET)
+    parser.add_argument("--use-existing-future-dataset", action="store_true")
     parser.add_argument("--output-root", type=Path, default=DEFAULT_OUTPUT_ROOT)
     parser.add_argument("--stable-output-dir", type=Path, default=DEFAULT_STABLE_OUTPUT_DIR)
-    parser.add_argument("--congestion-threshold", type=float, default=future_rules.DEFAULT_CONGESTION_THRESHOLD)
+    parser.add_argument("--congestion-threshold", type=float, default=DEFAULT_MODEL4_CONGESTION_THRESHOLD)
     parser.add_argument("--rrc-sector-capacity", type=float, default=future_rules.DEFAULT_RRC_SECTOR_CAPACITY)
-    parser.add_argument("--max-congested-cells", type=int, default=18)
+    parser.add_argument("--max-congested-cells", type=int, default=0, help="0 means use all future congested cells")
     parser.add_argument("--rf-workers", type=int, default=current_rules.DEFAULT_RF_WORKERS)
     parser.add_argument("--sector-parallelism", type=int, default=1)
     parser.add_argument("--max-interference-sites", type=int, default=10)
@@ -585,7 +731,8 @@ if __name__ == "__main__":
         cfg,
         excel_path=args.excel_path,
         future_dataset_path=args.future_dataset_path,
-        max_congested_cells=args.max_congested_cells,
+        build_model2_forecast=not args.use_existing_future_dataset,
+        max_congested_cells=args.max_congested_cells if args.max_congested_cells and args.max_congested_cells > 0 else None,
         rf_workers=args.rf_workers,
         sector_parallelism=args.sector_parallelism,
         max_interference_sites=args.max_interference_sites,

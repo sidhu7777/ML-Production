@@ -6,7 +6,7 @@ This script compares XGBoost, LightGBM, and CatBoost on the exact same:
     - feature set
     - temporal split
 
-Artifacts are saved under models/model1/benchmark_boosters.
+Artifacts are saved under models/future_coverage_kpi_prediction/benchmark_boosters.
 """
 
 from __future__ import annotations

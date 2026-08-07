@@ -152,11 +152,11 @@ venv\Scripts\python.exe -B tests\lte_tilt_rsrp_only_recommendation_test.py --pro
 
 # to run the model3 
 
-.\ML\venv\Scripts\python.exe ML\tests\coverage_prediction\model3_current_recommendation_test.py --congestion-threshold 70 --max-congested-cells 18 --rf-workers 3 --max-interference-sites 10 --action-neighbor-cells 2 --carrier-reselection-hysteresis-db 0 --sector-parallelism 3
+.\ML\venv\Scripts\python.exe ML\tests\coverage_prediction\current_capacity_recommendation_current_recommendation_test.py --congestion-threshold 70 --max-congested-cells 18 --rf-workers 3 --max-interference-sites 10 --action-neighbor-cells 2 --carrier-reselection-hysteresis-db 0 --sector-parallelism 3
 
 
 # to run the model 4 
 
-.\ML\venv\Scripts\python.exe ML\tests\coverage_prediction\model4_future_recommendation_test.py --max-congested-cells 18 --congestion-threshold 70
+.\ML\venv\Scripts\python.exe ML\tests\coverage_prediction\future_capacity_recommendation_future_recommendation_test.py --max-congested-cells 18 --congestion-threshold 70
 
 

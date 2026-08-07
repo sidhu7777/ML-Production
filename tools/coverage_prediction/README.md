@@ -24,10 +24,10 @@ Job state is in memory inside each model service module. Result rows are persist
 
 | Path | Role |
 | --- | --- |
-| `model1/routes.py`, `model1/services.py`, `model1/db.py`, `model1/feature_builder.py`, `model1/model_registry.py` | Model 1 API, orchestration, DB/bridge access, feature frame, and weight loading. |
-| `model2/routes.py`, `model2/services.py`, `model2/db.py`, `model2/feature_builder.py`, `model2/model_registry.py` | Model 2 API, orchestration, DB/bridge access, feature frame, and weight loading. |
-| `model3/routes.py`, `model3/services.py`, `model3/db.py` | Model 3 API wrapper, current recommendation runner, and persistence. |
-| `model4/routes.py`, `model4/services.py`, `model4/db.py` | Model 4 API wrapper, upstream Model 1/2 orchestration, future recommendation runner, and persistence. |
+| `future_coverage_kpi_prediction/routes.py`, `future_coverage_kpi_prediction/services.py`, `future_coverage_kpi_prediction/db.py`, `future_coverage_kpi_prediction/feature_builder.py`, `future_coverage_kpi_prediction/model_registry.py` | Model 1 API, orchestration, DB/bridge access, feature frame, and weight loading. |
+| `future_demand_capacity_forecast/routes.py`, `future_demand_capacity_forecast/services.py`, `future_demand_capacity_forecast/db.py`, `future_demand_capacity_forecast/feature_builder.py`, `future_demand_capacity_forecast/model_registry.py` | Model 2 API, orchestration, DB/bridge access, feature frame, and weight loading. |
+| `current_capacity_recommendation/routes.py`, `current_capacity_recommendation/services.py`, `current_capacity_recommendation/db.py` | Model 3 API wrapper, current recommendation runner, and persistence. |
+| `future_capacity_recommendation/routes.py`, `future_capacity_recommendation/services.py`, `future_capacity_recommendation/db.py` | Model 4 API wrapper, upstream Model 1/2 orchestration, future recommendation runner, and persistence. |
 | `model*/schema.py` | Result table definitions and expected columns. |
 | `model*/init_schema.py` | Schema creation/verification scripts. |
 
@@ -85,7 +85,7 @@ fetch baseline rows
 fetch geo rows for resolved baseline job
 build grid feature frame
 predict pred_rsrp, pred_rsrq, pred_sinr
-save lte_model1_coverage_prediction_results
+save lte_future_coverage_kpi_prediction_results
 ```
 
 Weights are loaded from:
@@ -99,7 +99,7 @@ The registry rejects production-unsafe weights that still contain forbidden trai
 Result table:
 
 ```text
-lte_model1_coverage_prediction_results
+lte_future_coverage_kpi_prediction_results
 ```
 
 ## Model 2 - Demand And Capacity Forecast
@@ -120,13 +120,13 @@ Input fields:
 | `region` | No | Defaults to `india`. |
 | `operator` | No | Optional operator filter. |
 | `baseline_job_id` | No | Specific LTE baseline job. |
-| `model_run_id` | No | Custom output run id. Defaults to `model2_<project_id>_<job>`. |
+| `model_run_id` | No | Custom output run id. Defaults to `future_demand_capacity_<project_id>_<job>`. |
 | `input_excel_path` | No | Overrides the default Model 2 cell-input Excel. |
 
 Default input:
 
 ```text
-tools/coverage_prediction/model2/data/project_196_model2_demand_capacity_input.xlsx
+tools/coverage_prediction/future_demand_capacity_forecast/data/project_196_model2_demand_capacity_input.xlsx
 ```
 
 Flow:
@@ -140,7 +140,7 @@ fetch geo rows for resolved baseline job
 build cell feature frame
 predict demand_index, active_users_est, traffic_demand_est
 derive future PRB/RRC/users/traffic/congested fields
-save lte_model2_demand_capacity_forecast_results
+save lte_future_demand_capacity_forecast_results
 ```
 
 Weights are loaded from candidate roots:
@@ -155,10 +155,10 @@ The registry rejects weights that contain forbidden production features such as 
 Result table:
 
 ```text
-lte_model2_demand_capacity_forecast_results
+lte_future_demand_capacity_forecast_results
 ```
 
-See [model2/README.md](model2/README.md) for the current dataset note.
+See [future_demand_capacity_forecast/README.md](future_demand_capacity_forecast/README.md) for the current dataset note.
 
 ## Model 3 - Current Recommendation
 
@@ -178,7 +178,7 @@ Input fields:
 | `region` | No | Defaults to `india`. |
 | `operator` | No | Optional operator filter. |
 | `baseline_job_id` | No | Specific LTE baseline job. If omitted, latest baseline is resolved. |
-| `model_run_id` | No | Custom output run id. Defaults to `model3_<project_id>_<job>`. |
+| `model_run_id` | No | Custom output run id. Defaults to `current_capacity_recommendation_<project_id>_<job>`. |
 | `source_model2_run_id` | No | Links Model 3 output to a Model 2 run. |
 | `input_excel_path` | No | Overrides the Model 3 input Excel. |
 | `congestion_threshold` | No | Defaults to `70.0`. |
@@ -213,8 +213,8 @@ save recommendation and after-RF result tables
 Result tables:
 
 ```text
-lte_model3_current_recommendation_results
-lte_model3_current_recommendation_rf_results
+lte_current_capacity_recommendation_results
+lte_current_capacity_recommendation_rf_results
 ```
 
 ## Model 4 - Future Recommendation
@@ -235,7 +235,7 @@ Input fields:
 | `region` | No | Defaults to `india`. |
 | `operator` | No | Optional operator filter. |
 | `baseline_job_id` | No | Specific LTE baseline job. If omitted, latest baseline is resolved. |
-| `model_run_id` | No | Custom output run id. Defaults to `model4_<project_id>_<job>`. |
+| `model_run_id` | No | Custom output run id. Defaults to `future_capacity_recommendation_<project_id>_<job>`. |
 | `source_model1_run_id` | No | Upstream Model 1 run id. Generated when omitted. |
 | `source_model2_run_id` | No | Upstream Model 2 run id. Generated when omitted. |
 | `model3_input_excel_path` | No | Overrides the default Model 3-style input Excel. |
@@ -268,8 +268,8 @@ save recommendation and after-RF result tables
 Result tables:
 
 ```text
-lte_model4_future_recommendation_results
-lte_model4_future_recommendation_rf_results
+lte_future_capacity_recommendation_results
+lte_future_capacity_recommendation_rf_results
 ```
 
 ## Model 1-4 Relationship

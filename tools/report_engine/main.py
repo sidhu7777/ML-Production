@@ -58,7 +58,9 @@ def main(
     project_id: int,
     user_id: int | None = None,
     report_id: str | None = None,
-    db_engine=None
+    db_engine=None,
+    region: str | None = None,
+    country_code: str | None = None,
 ):
     if db_engine is not None:
         init_engine(db_engine)
@@ -78,7 +80,11 @@ def main(
     # --------------------------------------------------
     # 1. LOAD DATA FROM DB (RAW + FILTERED)
     # --------------------------------------------------
-    raw_df, filtered_df, project_meta = load_project_data(project_id)
+    raw_df, filtered_df, project_meta = load_project_data(
+        project_id,
+        region=region,
+        country_code=country_code,
+    )
 
     polygon_wkt = project_meta.get("region")
 
@@ -86,6 +92,10 @@ def main(
     print("Filtered rows (primary + polygon):", len(filtered_df))
 
     if filtered_df.empty:
+        raise ValueError(
+            f"No report rows found after filtering for project_id={project_id} "
+            f"region={region or 'default'} country_code={country_code or 'default'}."
+        )
         print("No data after polygon filtering — stopping.")
         return
 
@@ -102,6 +112,10 @@ def main(
         report_df = filter_known_band_rows(filtered_df)
         print("Report rows (primary + polygon + known band):", len(report_df))
     if report_df.empty:
+        raise ValueError(
+            f"No report rows with a known band for project_id={project_id} "
+            f"region={region or 'default'} country_code={country_code or 'default'}."
+        )
         print("No rows with a known band after filtering — stopping.")
         return
 
@@ -173,7 +187,13 @@ def main(
             if cfg["type"] == "range":
                 if not has_valid_numeric_data(report_df, col):
                     return kpi, False, "invalid numeric data"
-                ranges = resolve_kpi_ranges(kpi_name=kpi, user_id=user_id, values=report_df[col])
+                ranges = resolve_kpi_ranges(
+                    kpi_name=kpi,
+                    user_id=user_id,
+                    values=report_df[col],
+                    region=region,
+                    country_code=country_code,
+                )
                 generate_kpi_map(
                     df=df_kpi, kpi_column=col, color_func=cfg["color_func"],
                     ranges=ranges, output_html=html_path, polygon_wkt=polygon_wkt,
@@ -273,6 +293,8 @@ def main(
         session_ids=session_ids,
         image_dir=f"{images_dir}/kpi_analysis",
         gps_df=handover_df,
+        region=region,
+        country_code=country_code,
     )
     metadata = build_metadata(
         report_df,
@@ -333,38 +355,44 @@ def main(
     else:
         download_link = f"/api/report/download/{report_id}"
     try:
-        update_project_download_path(project_id, download_link)
+        update_project_download_path(
+            project_id,
+            download_link,
+            region=region,
+            country_code=country_code,
+        )
         print(f"Updated tbl_project.Download_path: {download_link}")
     except Exception as e:
         print(f"Warning: failed to update Download_path: {e}")
 
-    if user_id is not None:
-        user_row = get_user_by_id(user_id)
-        if user_row and user_row.get("email"):
-            print(f"[Email] Sending report link to: {user_row.get('email')}")
-            user_name = (
-                user_row.get("name")
-                or user_row.get("user_name")
-                or user_row.get("username")
-                or "User"
-            )
-            project_name = project_meta.get("project_name") or "Project"
-            try:
-                send_report_ready_email(
-                    to_email=user_row["email"],
-                    user_name=user_name,
-                    project_name=project_name,
-                    report_id=report_id,
-                    download_url=download_link,
-                )
-                print("[Email] Sent successfully.")
-            except Exception as e:
-                print(f"[Email] Failed to send: {e}")
-        else:
-            print(f"Warning: No email found for user_id={user_id}, skipping email send.")
-    else:
-        print("Warning: user_id not provided, skipping email send.")     
-     
+    # Email-on-completion disabled.
+    # if user_id is not None:
+    #     user_row = get_user_by_id(user_id, region=region, country_code=country_code)
+    #     if user_row and user_row.get("email"):
+    #         print(f"[Email] Sending report link to: {user_row.get('email')}")
+    #         user_name = (
+    #             user_row.get("name")
+    #             or user_row.get("user_name")
+    #             or user_row.get("username")
+    #             or "User"
+    #         )
+    #         project_name = project_meta.get("project_name") or "Project"
+    #         try:
+    #             send_report_ready_email(
+    #                 to_email=user_row["email"],
+    #                 user_name=user_name,
+    #                 project_name=project_name,
+    #                 report_id=report_id,
+    #                 download_url=download_link,
+    #             )
+    #             print("[Email] Sent successfully.")
+    #         except Exception as e:
+    #             print(f"[Email] Failed to send: {e}")
+    #     else:
+    #         print(f"Warning: No email found for user_id={user_id}, skipping email send.")
+    # else:
+    #     print("Warning: user_id not provided, skipping email send.")
+
 
 
     if not keep_tmp:

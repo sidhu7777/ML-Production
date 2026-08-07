@@ -32,6 +32,7 @@ import random
 import sys
 import time
 from datetime import datetime, timezone
+from itertools import combinations
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -44,6 +45,7 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 from shapely.wkt import loads as load_wkt
+from sklearn.neighbors import BallTree
 from sqlalchemy import text
 from streamlit_folium import st_folium
 
@@ -282,6 +284,56 @@ def _fetch_site_prediction_metadata(project_id: int, operator: str, current_engi
     return deduped.reset_index(drop=True)
 
 
+CSV_DATASET_PATH = Path(__file__).resolve().parent / "Site_Data_Template_103815_updated.csv"
+
+
+def _load_csv_site_dataset(csv_path: Path) -> pd.DataFrame:
+    """
+    Pure site/sector inventory from a CSV — no DB, no drive-test/handover
+    data at all (no session_id, no observed transitions, so events_df
+    stays empty for this data source). This is exactly the "can we still
+    do PCI optimization without handover" case: Collision/Mod-N/Grouped
+    all work fine, since build_neighbor_graph already falls back to pure
+    distance-based edges when there's no handover data to check against;
+    Confusion is inherently defined by real observed handovers and will
+    correctly always report 0 here, not an error.
+
+    Columns confirmed from Site_Data_Template_103815_updated.csv: site,
+    sector, cell_id, longitude, latitude, pci, azimuth, band, earfcn,
+    height, m_tilt, e_tilt, transmit power (always empty), frequency,
+    cluster (constant "Taiwan" — a region label, not an operator/carrier
+    name), Technology (constant "4G"). No samples/beamwidth/range/soft-
+    azimuth columns, same gap as site_prediction — same fallback handling
+    (normalize_beamwidth/normalize_sector_range default to 30 deg/220m).
+    longitude/latitude are stored as integers with the decimal point
+    stripped (e.g. 25007083 -> 25.007083, 121456528 -> 121.456528) —
+    confirmed against Taiwan's real lat/lon range once divided by 1e6.
+    """
+    df = pd.read_csv(csv_path)
+    df.columns = df.columns.str.strip()
+    df = df.rename(
+        columns={
+            "site": "site_id_inferred",
+            "longitude": "site_lon",
+            "latitude": "site_lat",
+            "pci": "site_pci",
+            "earfcn": "site_earfcn",
+            "azimuth": "site_azimuth_deg",
+            "cluster": "network",
+            "cell_id": "site_cell_id_representative",
+        }
+    )
+    for col in ("site_lat", "site_lon"):
+        df[col] = pd.to_numeric(df[col], errors="coerce") / 1_000_000.0
+    for col in ("site_pci", "site_earfcn", "site_azimuth_deg"):
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    df["samples"] = 1
+    df["site_azimuth_soft_deg"] = np.nan
+    df["site_source_table"] = f"csv:{csv_path.name}"
+    df["is_synthetic"] = False
+    return df.dropna(subset=["site_lat", "site_lon", "site_pci", "site_earfcn", "site_id_inferred"]).reset_index(drop=True)
+
+
 def fetch_pci_map_data_from_db(project_id: int, region: str, operator: str, polygon_filter: bool) -> dict:
     """
     The only place this module touches the DB. Site/sector data comes from
@@ -492,17 +544,101 @@ def detect_pci_collisions(graph: nx.Graph) -> list[dict]:
     Confusion so they're genuinely independent toggles in the UI, not
     the same check shown under two names.
     """
-    sites_by_key: dict[tuple, set] = {}
+    # Grouped by CONNECTED COMPONENT of collision edges, not a flat union
+    # of every site seen under this (pci, earfcn) -- confirmed necessary:
+    # a flat union merges two totally unrelated collisions that happen to
+    # reuse the same PCI number into one fake combined group, even when
+    # the sites involved have no path to each other in the graph at all.
+    edges_by_key: dict[tuple, list] = {}
     for u, v in graph.edges():
         if u[2] != v[2] or u[1] != v[1]:  # different EARFCN or different PCI -- not a collision
             continue
         key = (u[1], u[2])  # (pci, earfcn)
-        sites_by_key.setdefault(key, set()).update([u[0], v[0]])
+        edges_by_key.setdefault(key, []).append((u, v))
 
     collisions: list[dict] = []
-    for (pci_val, earfcn_val), sites in sites_by_key.items():
-        collisions.append({"type": "Collision", "pci": pci_val, "earfcn": earfcn_val, "sites": sorted(sites)})
+    for (pci_val, earfcn_val), edges in edges_by_key.items():
+        component_graph = nx.Graph()
+        component_graph.add_edges_from(edges)
+        for component in nx.connected_components(component_graph):
+            sites = sorted({node[0] for node in component})
+            collisions.append({"type": "Collision", "pci": pci_val, "earfcn": earfcn_val, "sites": sites})
     return collisions
+
+
+def detect_pci_order_conflicts(graph: nx.Graph, max_order: int = 5) -> dict[int, list[dict]]:
+    """
+    Same-PCI+EARFCN reuse bucketed by exact hop-distance ("order") in the
+    neighbor graph, order 1 through max_order. Order 1 = direct neighbor
+    reuse (the same pairs detect_pci_collisions flags, one row per PAIR
+    here instead of one row per PCI/EARFCN group). Order 2 is what
+    Confusion structurally is (two cells both 1 hop from a common serving
+    cell -> 2 hops from each other) -- Confusion itself is still the real,
+    handover-verified detector; this is a purely graph-structural version.
+    Orders 3-5 have no standard 3GPP/RF interference meaning -- a UE
+    realistically never hears two cells that many hops apart at once, so
+    these are a PCI reuse-DISTANCE audit metric, not a fault to fix.
+    """
+    nodes_by_pci_earfcn: dict[tuple, list] = {}
+    for n in graph.nodes:
+        nodes_by_pci_earfcn.setdefault((n[1], n[2]), []).append(n)
+
+    results: dict[int, list[dict]] = {order: [] for order in range(1, max_order + 1)}
+    for (pci, earfcn), members in nodes_by_pci_earfcn.items():
+        if len(members) < 2:
+            continue
+        member_set = set(members)
+        seen_pairs: set = set()
+        for source in members:
+            hop_lengths = nx.single_source_shortest_path_length(graph, source, cutoff=max_order)
+            for other, hops in hop_lengths.items():
+                if hops == 0 or other not in member_set:
+                    continue
+                pair_key = frozenset((source, other))
+                if pair_key in seen_pairs:
+                    continue
+                seen_pairs.add(pair_key)
+                results[hops].append({"type": f"Order{hops}", "pci": pci, "earfcn": earfcn, "sites": sorted({source[0], other[0]})})
+    return results
+
+
+def build_order_conflict_table(
+    order_conflicts_by_order: dict[int, list[dict]],
+    confusion_conflicts: list[dict],
+) -> pd.DataFrame:
+    """
+    One row per order (1-5): total same-PCI+EARFCN pairs at that exact
+    hop distance, plus how many of those same pairs are also flagged by
+    the real, handover-verified Confusion detector -- cross-referenced by
+    matching (pci, earfcn, site-pair), not assumed from the order number.
+
+    "Also Collision" is NOT computed by re-deriving pairs from
+    detect_pci_collisions' grouped output -- a connected COMPONENT can
+    still be a chain (A-B-C with no direct A-C edge), so two members of
+    the same reported collision group aren't necessarily a direct edge
+    themselves. Order 1 IS the direct-edge/same-PCI definition (identical
+    criteria to Collision), so "Also Collision" is exact and trivial by
+    construction: equals Pairs at order 1, always 0 at order 2+ (Collision
+    only ever fires on a direct 1-hop edge).
+    """
+    confusion_pairs: set = set()
+    for c in confusion_conflicts:
+        for a, b in combinations(c["neighbor_sites"], 2):
+            confusion_pairs.add((c["pci"], c["earfcn"], frozenset((a, b))))
+
+    rows = []
+    for order in sorted(order_conflicts_by_order):
+        pairs = order_conflicts_by_order[order]
+        confusion_hits = sum(1 for p in pairs if (p["pci"], p["earfcn"], frozenset(p["sites"])) in confusion_pairs)
+        rows.append(
+            {
+                "Order": order,
+                "Pairs (same PCI+EARFCN)": len(pairs),
+                "Also Collision": len(pairs) if order == 1 else 0,
+                "Also Confusion": confusion_hits,
+            }
+        )
+    return pd.DataFrame(rows)
 
 
 MOD_RULE_VALUES = (1, 3, 6, 7, 8, 9)
@@ -521,7 +657,11 @@ def detect_pci_mod_conflicts(graph: nx.Graph, mod_n: int) -> list[dict]:
     planning meaning — all three are included because they were
     explicitly requested, not because they're meaningful checks.
     """
-    members_by_key: dict[tuple, set] = {}
+    # Grouped by CONNECTED COMPONENT of same-remainder edges, not a flat
+    # union of every (site, pci) seen under this remainder -- same fix as
+    # detect_pci_collisions, same reason: a flat union merges unrelated
+    # mod-N matches with no real path between them into one fake group.
+    edges_by_key: dict[tuple, list] = {}
     for u, v in graph.edges():
         if u[2] != v[2]:
             continue
@@ -530,19 +670,23 @@ def detect_pci_mod_conflicts(graph: nx.Graph, mod_n: int) -> list[dict]:
         if mod_u != mod_v:
             continue
         key = (mod_u, earfcn)
-        members_by_key.setdefault(key, set()).update([(u[0], u[1]), (v[0], v[1])])
+        edges_by_key.setdefault(key, []).append((u, v))
 
     conflicts: list[dict] = []
-    for (mod_val, earfcn_val), members in members_by_key.items():
-        conflicts.append(
-            {
-                "type": f"Mod{mod_n}",
-                "mod_n": mod_n,
-                "mod_value": mod_val,
-                "earfcn": earfcn_val,
-                "members": sorted(members),
-            }
-        )
+    for (mod_val, earfcn_val), edges in edges_by_key.items():
+        component_graph = nx.Graph()
+        component_graph.add_edges_from(edges)
+        for component in nx.connected_components(component_graph):
+            members = sorted({(node[0], node[1]) for node in component})
+            conflicts.append(
+                {
+                    "type": f"Mod{mod_n}",
+                    "mod_n": mod_n,
+                    "mod_value": mod_val,
+                    "earfcn": earfcn_val,
+                    "members": members,
+                }
+            )
     conflicts.sort(key=lambda c: len(c["members"]), reverse=True)
     return conflicts
 
@@ -621,7 +765,9 @@ def detect_pci_group_conflicts(graph: nx.Graph) -> list[dict]:
     sharing a PCI group on the same EARFCN share the same underlying
     SSS-derived group even though their exact PCI (and PSS) differ.
     """
-    members_by_key: dict[tuple, set] = {}
+    # Grouped by CONNECTED COMPONENT, not a flat union -- same fix as
+    # detect_pci_collisions/detect_pci_mod_conflicts.
+    edges_by_key: dict[tuple, list] = {}
     for u, v in graph.edges():
         if u[2] != v[2]:
             continue
@@ -630,11 +776,15 @@ def detect_pci_group_conflicts(graph: nx.Graph) -> list[dict]:
         if group_u != group_v:
             continue
         key = (group_u, earfcn)
-        members_by_key.setdefault(key, set()).update([(u[0], u[1]), (v[0], v[1])])
+        edges_by_key.setdefault(key, []).append((u, v))
 
     conflicts: list[dict] = []
-    for (group_val, earfcn_val), members in members_by_key.items():
-        conflicts.append({"type": "Grouped", "group_value": group_val, "earfcn": earfcn_val, "members": sorted(members)})
+    for (group_val, earfcn_val), edges in edges_by_key.items():
+        component_graph = nx.Graph()
+        component_graph.add_edges_from(edges)
+        for component in nx.connected_components(component_graph):
+            members = sorted({(node[0], node[1]) for node in component})
+            conflicts.append({"type": "Grouped", "group_value": group_val, "earfcn": earfcn_val, "members": members})
     conflicts.sort(key=lambda c: len(c["members"]), reverse=True)
     return conflicts
 
@@ -1178,7 +1328,23 @@ def render_map(
         ).add_to(fmap)
         bounds_points.extend(boundary)
 
-    for site_id, site_rows in selected_sites_df.groupby("site_id_inferred"):
+    # In filter_to_conflicts mode, only draw markers/wedges for sites that
+    # actually have a conflicted sector -- confirmed necessary at real
+    # project scale: drawing all 3,000 site markers (Taiwan CSV) even
+    # though only a handful of sites had any flagged sector was the actual
+    # multi-minute render hang, not detection (which already finished).
+    sites_to_draw = selected_sites_df
+    if filter_to_conflicts:
+        pci_num = pd.to_numeric(selected_sites_df["site_pci"], errors="coerce")
+        earfcn_num = pd.to_numeric(selected_sites_df["site_earfcn"], errors="coerce")
+        is_conflicted_row = [
+            (int(p), int(e)) in conflict_types if pd.notna(p) and pd.notna(e) else False
+            for p, e in zip(pci_num, earfcn_num)
+        ]
+        relevant_site_ids = set(selected_sites_df.loc[is_conflicted_row, "site_id_inferred"])
+        sites_to_draw = selected_sites_df[selected_sites_df["site_id_inferred"].isin(relevant_site_ids)]
+
+    for site_id, site_rows in sites_to_draw.groupby("site_id_inferred"):
         first = site_rows.iloc[0]
         site_lat = float(first["site_lat"])
         site_lon = float(first["site_lon"])
@@ -1510,20 +1676,30 @@ def build_neighbor_graph(
             else:
                 graph.add_edge(u, v, weight=1, observed=True, distance_m=None)
 
+    # Distance-based edges via a haversine BallTree radius query instead of
+    # an all-pairs loop -- O(n log n) instead of O(n^2). Confirmed necessary:
+    # the naive nested loop took ~17s at ~8,000 sectors (Taiwan CSV full
+    # scale), which was the actual bottleneck, not the detectors.
     nodes_by_earfcn: dict[int, list] = {}
     for n in graph.nodes:
         nodes_by_earfcn.setdefault(n[2], []).append(n)
+    earth_radius_m = 6371000.0
+    radius_rad = distance_threshold_m / earth_radius_m
     for nodes in nodes_by_earfcn.values():
-        for i in range(len(nodes)):
-            for j in range(i + 1, len(nodes)):
-                u, v = nodes[i], nodes[j]
+        if len(nodes) < 2:
+            continue
+        coords_rad = np.radians([node_latlon[n] for n in nodes])
+        tree = BallTree(coords_rad, metric="haversine")
+        indices, distances = tree.query_radius(coords_rad, r=radius_rad, return_distance=True)
+        for i, (idx_list, dist_list) in enumerate(zip(indices, distances)):
+            u = nodes[i]
+            for j, dist_rad in zip(idx_list, dist_list):
+                if j <= i:
+                    continue
+                v = nodes[j]
                 if graph.has_edge(u, v):
                     continue
-                lat1, lon1 = node_latlon[u]
-                lat2, lon2 = node_latlon[v]
-                dist = _haversine_scalar_m(lat1, lon1, lat2, lon2)
-                if dist <= distance_threshold_m:
-                    graph.add_edge(u, v, weight=0, observed=False, distance_m=dist)
+                graph.add_edge(u, v, weight=0, observed=False, distance_m=float(dist_rad) * earth_radius_m)
 
     return graph
 
@@ -1931,21 +2107,36 @@ def main() -> None:
     # sites they show and whether any data is synthetic.
     site_mode = st.sidebar.radio(
         "Data source",
-        ["Demo (5 sites, synthetic conflicts)", "Project 193 (real Airtel data)"],
+        [
+            "Demo (5 sites, synthetic conflicts)",
+            "Project 193 (real Airtel data)",
+            "Taiwan CSV (real site data, no handover)",
+        ],
         index=0,
         help=(
             "Demo: the fixed 5-site synthetic Collision+Confusion example (2 real sites get a shared "
             "synthetic PCI injected, plus a separate synthetic Collision-only pair) -- always the same 5 "
             "sites, no inputs needed, for testing the rules/optimizer in isolation. Project 193: every real "
             "site/cell/sector that actually exists under this project (operator Airtel, region india) -- "
-            "no synthetic data, no cap, whatever the DB has."
+            "no synthetic data, no cap, whatever the DB has. Taiwan CSV: a local site/sector inventory file "
+            "(Site_Data_Template_103815_updated.csv) with NO drive-test/handover data at all -- Collision/"
+            "Mod-N/Grouped still work (pure geographic neighbor detection), but Confusion always reports 0 "
+            "here since it needs real observed handovers, which this dataset doesn't have."
         ),
     )
     is_demo_mode = site_mode.startswith("Demo")
+    is_csv_mode = site_mode.startswith("Taiwan")
     project_id, region, operator = DEFAULT_PROJECT_ID, DEFAULT_REGION, DEFAULT_OPERATOR
     if is_demo_mode:
         num_sites = 5
         st.sidebar.caption("Fixed 5-site synthetic demo — no additional inputs needed.")
+    elif is_csv_mode:
+        num_sites = 0
+        st.sidebar.caption(
+            f"Loads every site/sector in {CSV_DATASET_PATH.name} — no cap, no synthetic data, no handover "
+            "data (Confusion will always show 0). ~3,000 sites / ~8,000 sectors, so Load/optimizer runs "
+            "take tens of seconds, not milliseconds."
+        )
     else:
         # 0 = no cap -- build_real_selection() loads every real,
         # plausible site under this project (see _plausible_sites/
@@ -2071,20 +2262,30 @@ def main() -> None:
 
     proj_id, region, operator, num_sites, polygon_filter, site_mode = st.session_state["pci_map_args"]
     is_demo_mode = site_mode.startswith("Demo")
-    artifact_path = get_artifact_path(proj_id)
+    is_csv_mode = site_mode.startswith("Taiwan")
 
     try:
-        if st.session_state.get("force_refresh") or not artifact_path.exists():
-            with st.spinner(f"Fetching project {proj_id} from the DB..."):
-                raw_data = fetch_pci_map_data_from_db(proj_id, region, operator, polygon_filter)
-                save_artifact(raw_data, artifact_path)
-            st.success(f"Saved snapshot to {artifact_path.relative_to(PROJECT_ROOT)}")
-        else:
-            raw_data = load_artifact(artifact_path)
+        if is_csv_mode:
+            with st.spinner(f"Reading {CSV_DATASET_PATH.name}..."):
+                csv_site_df = _load_csv_site_dataset(CSV_DATASET_PATH)
+            raw_data = {"site_df": csv_site_df, "events_df": pd.DataFrame(), "polygon_wkt": []}
             st.caption(
-                f"Loaded local snapshot from {artifact_path.relative_to(PROJECT_ROOT)} "
-                f"(saved {raw_data.get('saved_at', 'unknown time')}). Click 'Refresh from DB' for live data."
+                f"Loaded {CSV_DATASET_PATH.name} directly (no DB, no artifact cache — a local CSV read is "
+                f"already fast): {csv_site_df['site_id_inferred'].nunique()} sites / {len(csv_site_df)} sectors."
             )
+        else:
+            artifact_path = get_artifact_path(proj_id)
+            if st.session_state.get("force_refresh") or not artifact_path.exists():
+                with st.spinner(f"Fetching project {proj_id} from the DB..."):
+                    raw_data = fetch_pci_map_data_from_db(proj_id, region, operator, polygon_filter)
+                    save_artifact(raw_data, artifact_path)
+                st.success(f"Saved snapshot to {artifact_path.relative_to(PROJECT_ROOT)}")
+            else:
+                raw_data = load_artifact(artifact_path)
+                st.caption(
+                    f"Loaded local snapshot from {artifact_path.relative_to(PROJECT_ROOT)} "
+                    f"(saved {raw_data.get('saved_at', 'unknown time')}). Click 'Refresh from DB' for live data."
+                )
     except Exception as exc:  # noqa: BLE001 - surface DB/data errors directly in the UI
         st.error(f"Failed to load PCI map data: {exc}")
         return
@@ -2093,39 +2294,47 @@ def main() -> None:
     # _load_project_polygon_wkts) — restricts the site pool BEFORE
     # build_demo_selection runs, so every one of the "N sites" (real +
     # synthetic-on-real) is guaranteed to sit inside the project's actual
-    # drive polygon, not just drawn alongside it as decoration.
+    # drive polygon, not just drawn alongside it as decoration. The CSV
+    # data source has no project/DB linkage at all, so there's no polygon
+    # to fetch for it -- skipped entirely rather than showing a confusing
+    # "no polygon found for project 193" message that doesn't apply to it.
     polygons = []
-    for wkt in raw_data.get("polygon_wkt") or []:
-        try:
-            polygons.append(load_wkt(wkt))
-        except Exception:  # noqa: BLE001
-            continue
-
-    site_df_pool = raw_data["site_df"]
-    events_df_pool = raw_data["events_df"]
-    if polygons:
-        filtered_site_df, polygon_stats = _filter_sites_within_polygon(site_df_pool, polygons)
-        if filtered_site_df.empty:
-            st.warning(
-                f"Project polygon found ({len(polygons)} polygon(s)) but 0 of {polygon_stats['rows_before']} "
-                "sector rows fell inside it, even after the coordinate-swap fallback — falling back to all "
-                "project sites so the dashboard still loads. The polygon is still drawn on the map below."
-            )
-        else:
-            site_df_pool = filtered_site_df
-            pool_site_ids = set(site_df_pool["site_id_inferred"])
-            events_df_pool = events_df_pool[
-                events_df_pool["from_site_id_inferred"].isin(pool_site_ids)
-                & events_df_pool["to_site_id_inferred"].isin(pool_site_ids)
-            ]
-            st.caption(
-                f"Project polygon loaded from map_regions ({len(polygons)} polygon(s)) — "
-                f"{polygon_stats['rows_after']}/{polygon_stats['rows_before']} sector rows fall inside it"
-                f"{' (coordinate-swap fallback used)' if polygon_stats.get('swapped') else ''}. "
-                "Site selection below is drawn only from those sectors."
-            )
+    if is_csv_mode:
+        st.info(f"{CSV_DATASET_PATH.name} is a standalone site inventory, not tied to a DB project — no polygon to draw.")
+        site_df_pool = raw_data["site_df"]
+        events_df_pool = raw_data["events_df"]
     else:
-        st.info(f"No project polygon found in map_regions for project {proj_id} — showing all sites without a drawn boundary.")
+        for wkt in raw_data.get("polygon_wkt") or []:
+            try:
+                polygons.append(load_wkt(wkt))
+            except Exception:  # noqa: BLE001
+                continue
+
+        site_df_pool = raw_data["site_df"]
+        events_df_pool = raw_data["events_df"]
+        if polygons:
+            filtered_site_df, polygon_stats = _filter_sites_within_polygon(site_df_pool, polygons)
+            if filtered_site_df.empty:
+                st.warning(
+                    f"Project polygon found ({len(polygons)} polygon(s)) but 0 of {polygon_stats['rows_before']} "
+                    "sector rows fell inside it, even after the coordinate-swap fallback — falling back to all "
+                    "project sites so the dashboard still loads. The polygon is still drawn on the map below."
+                )
+            else:
+                site_df_pool = filtered_site_df
+                pool_site_ids = set(site_df_pool["site_id_inferred"])
+                events_df_pool = events_df_pool[
+                    events_df_pool["from_site_id_inferred"].isin(pool_site_ids)
+                    & events_df_pool["to_site_id_inferred"].isin(pool_site_ids)
+                ]
+                st.caption(
+                    f"Project polygon loaded from map_regions ({len(polygons)} polygon(s)) — "
+                    f"{polygon_stats['rows_after']}/{polygon_stats['rows_before']} sector rows fall inside it"
+                    f"{' (coordinate-swap fallback used)' if polygon_stats.get('swapped') else ''}. "
+                    "Site selection below is drawn only from those sectors."
+                )
+        else:
+            st.info(f"No project polygon found in map_regions for project {proj_id} — showing all sites without a drawn boundary.")
 
     try:
         if is_demo_mode:
@@ -2247,14 +2456,37 @@ def main() -> None:
     # injected above) shows up in the neighbor table too.
     pair_summary_df = _build_pair_summary(events_df)
 
-    st.subheader(
-        f"{len(selected_site_ids)} site(s) shown "
-        f"(of {raw_data['site_df']['site_id_inferred'].nunique()} available in project {proj_id})"
-    )
+    total_available = raw_data["site_df"]["site_id_inferred"].nunique()
+    if is_csv_mode:
+        source_label = CSV_DATASET_PATH.name
+    elif is_demo_mode:
+        source_label = f"project {proj_id} (demo)"
+    else:
+        source_label = f"project {proj_id}"
+    st.subheader(f"{len(selected_site_ids)} site(s) shown (of {total_available} available in {source_label})")
     st.caption(
         f"Graph build + Collision/Confusion/Mod/Grouped/Co-centric detection over "
         f"{graph.number_of_nodes()} sector(s) / {graph.number_of_edges()} neighbor edge(s): {_detection_elapsed_s:.2f}s."
     )
+
+    with st.expander("PCI reuse by neighbor order (1-5 hops)"):
+        st.caption(
+            "Same PCI+EARFCN reuse bucketed by exact hop-distance in the neighbor graph. Order 1 = direct "
+            "neighbor reuse (same pairs Collision flags). Order 2 is structurally what Confusion is (two "
+            "cells both 1 hop from a common serving cell). Orders 3-5 have no standard 3GPP/RF interference "
+            "meaning -- a UE realistically never hears cells that many hops apart at once; these are a PCI "
+            "reuse-distance audit metric, not a fault to fix. \"Also Collision\"/\"Also Confusion\" are the "
+            "REAL detectors cross-referenced against each order's pairs, not assumed from the order number."
+        )
+        order_conflicts = detect_pci_order_conflicts(graph, max_order=5)
+        order_cols = st.columns(5)
+        for order, col in zip(range(1, 6), order_cols):
+            col.metric(f"Order {order}", len(order_conflicts[order]))
+        st.dataframe(
+            build_order_conflict_table(order_conflicts, confusion_conflicts),
+            use_container_width=True,
+            hide_index=True,
+        )
 
     fmap = render_map(selected_sites_df, site_labels=site_labels, conflict_types=conflict_types, filter_to_conflicts=True, polygons=polygons)
     st_folium(fmap, width=None, height=700, key="pci_map")

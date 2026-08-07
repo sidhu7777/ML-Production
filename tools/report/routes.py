@@ -25,6 +25,48 @@ def _safe_int(value):
         return None
 
 
+def _resolve_region(data: dict):
+    raw_region = str(data.get("region") or data.get("Region") or "").strip().lower()
+    if raw_region:
+        if raw_region in {"tw", "twn"}:
+            return "taiwan"
+        if raw_region in {"in", "ind"}:
+            return "india"
+        return raw_region
+
+    country_code = str(
+        data.get("country_code")
+        or data.get("countryCode")
+        or data.get("CountryCode")
+        or ""
+    ).strip().lower()
+    if country_code in {"tw", "twn", "taiwan"}:
+        return "taiwan"
+    if country_code in {"in", "ind", "india"}:
+        return "india"
+    return None
+
+
+def _resolve_country_code(data: dict, region: str | None):
+    raw = str(
+        data.get("country_code")
+        or data.get("countryCode")
+        or data.get("CountryCode")
+        or ""
+    ).strip().upper()
+    if raw:
+        if raw in {"TAIWAN", "TWN"}:
+            return "TW"
+        if raw in {"INDIA", "IND"}:
+            return "IN"
+        return raw
+    if region == "taiwan":
+        return "TW"
+    if region == "india":
+        return "IN"
+    return None
+
+
 def _reports_root() -> str:
     root_path = getattr(current_app, "root_path", None)
     if not root_path:
@@ -96,6 +138,8 @@ def _status_payload(report_id: str, job: dict):
         "report_id": report_id,
         "project_id": job.get("project_id"),
         "user_id": job.get("user_id"),
+        "region": job.get("region"),
+        "country_code": job.get("country_code"),
     }
     if job.get("download_url"):
         payload["download_url"] = job["download_url"]
@@ -137,7 +181,7 @@ def _publish_status_event(report_id: str):
         q.put(payload)
 
 
-def background_report_task(app, project_id, user_id, report_id):
+def background_report_task(app, project_id, user_id, report_id, region=None, country_code=None):
     with app.app_context():
         try:
             _set_job(
@@ -145,24 +189,34 @@ def background_report_task(app, project_id, user_id, report_id):
                 status="processing",
                 project_id=project_id,
                 user_id=user_id,
+                region=region,
+                country_code=country_code,
                 message="Report generation is running",
             )
             _publish_status_event(report_id)
             current_app.logger.info(
-                f"[Report] Starting generation: project_id={project_id}, user_id={user_id}, report_id={report_id}"
+                f"[Report] Starting generation: project_id={project_id}, user_id={user_id}, "
+                f"region={region}, country_code={country_code}, report_id={report_id}"
             )
             generate_report(
                 project_id=project_id,
                 user_id=user_id,
                 report_id=report_id,
                 db_engine=db.engine,
+                region=region,
+                country_code=country_code,
             )
+            pdf_path = _report_pdf_path(report_id)
+            if not os.path.exists(pdf_path):
+                raise FileNotFoundError(f"Report PDF was not created: {pdf_path}")
             download_url = f"/api/report/download/{report_id}"
             _set_job(
                 report_id,
                 status="ready",
                 project_id=project_id,
                 user_id=user_id,
+                region=region,
+                country_code=country_code,
                 download_url=download_url,
                 message="Report generation completed",
             )
@@ -184,6 +238,8 @@ def generate():
 
     project_id = _safe_int(data.get("project_id") or data.get("Project_id"))
     user_id = _safe_int(data.get("user_id") or data.get("User_id"))
+    region = _resolve_region(data)
+    country_code = _resolve_country_code(data, region)
 
     if not project_id:
         return jsonify({"error": "project_id is required"}), 400
@@ -196,6 +252,8 @@ def generate():
         status="processing",
         project_id=project_id,
         user_id=user_id,
+        region=region,
+        country_code=country_code,
         download_url=None,
         message="Report generation queued",
     )
@@ -203,7 +261,7 @@ def generate():
 
     thread = threading.Thread(
         target=background_report_task,
-        args=(app, project_id, user_id, report_id),
+        args=(app, project_id, user_id, report_id, region, country_code),
         daemon=True,
     )
     thread.start()
@@ -213,6 +271,8 @@ def generate():
         "status": "processing",
         "project_id": project_id,
         "user_id": user_id,
+        "region": region,
+        "country_code": country_code,
         "report_id": report_id
     }), 202
 
@@ -249,6 +309,8 @@ def status(report_id):
         "report_id": report_id,
         "project_id": job.get("project_id"),
         "user_id": job.get("user_id"),
+        "region": job.get("region"),
+        "country_code": job.get("country_code"),
     }
     if job.get("download_url"):
         payload["download_url"] = job["download_url"]
