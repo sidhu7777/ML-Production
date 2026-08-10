@@ -1052,6 +1052,8 @@ def run_rf_prediction_fast(site_df, drive_df, building_df, params):
                     scenario_id=params.get("grid_analytics_scenario_id"),
                     auth_header=params.get("grid_analytics_auth_header"),
                     cookie_header=params.get("grid_analytics_cookie_header"),
+                    region=params.get("region"),
+                    country_code=params.get("country_code"),
                 )
                 frontend_grid_scenario_id = params.get("grid_analytics_scenario_id")
                 if not grid_df.empty:

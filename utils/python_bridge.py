@@ -76,6 +76,7 @@ def _bridge_region_params(
         normalized_country = _country_code_for_region(normalized_region) or ""
     if normalized_country:
         params["countryCode"] = normalized_country
+        params["country_code"] = normalized_country
     return params
 
 

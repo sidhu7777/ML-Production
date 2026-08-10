@@ -145,13 +145,12 @@ st.caption(
 )
 
 st.info(
-    "**Why the map isn't a clean directional wedge like production's:** COST-231 computes RSRP at every point "
-    "in a full 500m circle around each sector, in every direction, then lets the antenna gain formula "
-    "(`_antenna_gain_estimate`, 65° half-power beamwidth) attenuate off-axis points. The physics is doing the "
-    "right thing — see the azimuth chart below, signal clearly peaks on-axis and drops off-axis — but nothing "
-    "masks the *display* to the ~130° beam cone the way production's map does, so an unmasked scatter plot "
-    "looks like a full circle even though the coverage that matters is directional. This view fades off-axis "
-    "points and outlines the true 3dB beam so you can see both at once."
+    "**Every point in the circle has a real value — direction only changes how strong it is, not whether "
+    "it exists.** COST-231 computes RSRP everywhere in the 500m circle; the antenna gain formula "
+    "(`_antenna_gain_estimate`, 65° half-power beamwidth, continuous — not a cutoff) weakens off-axis points "
+    "gradually. The azimuth chart below shows this directly: signal peaks on-axis and tapers off, but never "
+    "drops out. The map colors every point on the same continuous scale production uses, so it reads as a "
+    "gradient, not a wedge."
 )
 
 meta = STAGE_META[stage_key]
@@ -171,8 +170,12 @@ radial = pd.DataFrame(sector["radial_profile"])
 # (stage1_raw_rsrp, stage2_geo_rsrp, pred_rsrp_calibrated, pred_rsrp_demo).
 stage_col_full = STAGE_META[stage_key]["full"]
 
-# ---- Map: full circle, shaded by off-axis attenuation, beam wedge outlined ----
-st.subheader(f"Coverage map — colored by {meta['label']}, faded off-axis")
+# ---- Map: every point colored by its real value, no masking/fading ----
+# An earlier version faded points past a hard 65deg cutoff and drew a wedge
+# outline. That was a display artifact, not the data - the antenna gain
+# formula is continuous, every point in the circle has a real computed
+# value, and there is no cutoff. This just colors every point honestly.
+st.subheader(f"Coverage map — colored by {meta['label']}")
 azimuth = sector["azimuth"]
 m_per_deg_lat = 111320.0
 m_per_deg_lon = 111320.0 * np.cos(np.radians(site["lat"]))
@@ -180,36 +183,15 @@ plot_df = all_points.copy()
 plot_df["x_m"] = (plot_df["lon"] - site["lon"]) * m_per_deg_lon
 plot_df["y_m"] = (plot_df["lat"] - site["lat"]) * m_per_deg_lat
 plot_df = plot_df.dropna(subset=[stage_col_full])
-plot_df["on_axis"] = plot_df["off_axis_deg"] <= BEAMWIDTH
 
 fig_map = go.Figure()
-off_axis_df = plot_df[~plot_df["on_axis"]]
-on_axis_df = plot_df[plot_df["on_axis"]]
-
 fig_map.add_trace(go.Scatter(
-    x=off_axis_df["x_m"], y=off_axis_df["y_m"], mode="markers",
-    marker=dict(size=5, color=off_axis_df[stage_col_full], colorscale="Blues_r", opacity=0.15, line=dict(width=0)),
-    text=off_axis_df["clutter_class"], hoverinfo="skip", showlegend=False,
-))
-fig_map.add_trace(go.Scatter(
-    x=on_axis_df["x_m"], y=on_axis_df["y_m"], mode="markers",
-    marker=dict(size=6, color=on_axis_df[stage_col_full], colorscale="Blues_r",
+    x=plot_df["x_m"], y=plot_df["y_m"], mode="markers",
+    marker=dict(size=7, color=plot_df[stage_col_full], colorscale="RdYlGn",
                 colorbar=dict(title="dBm"), line=dict(width=0)),
-    text=on_axis_df["clutter_class"],
+    text=plot_df["clutter_class"],
     hovertemplate="%{text}<br>" + meta["label"] + ": %{marker.color:.1f} dBm<extra></extra>",
     showlegend=False,
-))
-
-# 3dB beam wedge outline
-wedge_r = 520
-a0 = np.radians(90 - (azimuth - BEAMWIDTH))
-a1 = np.radians(90 - (azimuth + BEAMWIDTH))
-arc_angles = np.linspace(a0, a1, 40)
-wedge_x = [0] + list(wedge_r * np.cos(arc_angles)) + [0]
-wedge_y = [0] + list(wedge_r * np.sin(arc_angles)) + [0]
-fig_map.add_trace(go.Scatter(
-    x=wedge_x, y=wedge_y, mode="lines", line=dict(color="#0b0b0b", width=1.5, dash="dot"),
-    name="3dB beam edge", hoverinfo="skip",
 ))
 fig_map.add_trace(go.Scatter(
     x=[0], y=[0], mode="markers", marker=dict(symbol="diamond", size=14, color="black"),
@@ -223,8 +205,9 @@ fig_map.update_layout(
 )
 st.plotly_chart(fig_map, use_container_width=True)
 st.caption(
-    f"Faint dots = points beyond the {BEAMWIDTH:.0f}° 3dB beamwidth (off-axis, heavily attenuated by antenna "
-    "gain but still computed by COST-231). Solid dots + dotted wedge = the sector's real, meaningful coverage cone."
+    "Every point in the full 500m circle, colored by its real computed value on a continuous scale - "
+    "same as production. Signal is strongest on-axis and weakens gradually with distance and off-axis "
+    "angle, but never disappears or gets masked; there's no hard directional cutoff in the actual data."
 )
 
 # ---- Azimuth vs RSRP: proves/disproves the directional physics ----

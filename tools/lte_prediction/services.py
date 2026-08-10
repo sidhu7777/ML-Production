@@ -591,13 +591,21 @@ class LTEPredictionService:
             )
         return out
 
-    def _upsert_baseline_results(self, save_engine, out: pd.DataFrame, project_id: int):
+    def _replace_baseline_results(self, save_engine, out: pd.DataFrame, project_id: int):
         table_name = "lte_prediction_baseline_results"
         metadata = MetaData()
 
         started_at = time.perf_counter()
         with save_engine.begin() as conn:
-            out = self._compute_baseline_delta(conn, out, project_id=project_id)
+            conn.execute(
+                text(
+                    """
+                    DELETE FROM lte_prediction_baseline_results
+                    WHERE project_id = :project_id
+                    """
+                ),
+                {"project_id": int(project_id)},
+            )
             if out.empty:
                 elapsed = time.perf_counter() - started_at
                 print(
@@ -646,31 +654,6 @@ class LTEPredictionService:
                     legacy_nodeb_id_cell_id, sector, band,
                     rf_identity_key, sector_identity_key, site_sector_band_key, Technology
                 FROM {staging_table}
-                ON DUPLICATE KEY UPDATE
-                    job_id = VALUES(job_id),
-                    pred_rsrp = VALUES(pred_rsrp),
-                    pred_rsrq = VALUES(pred_rsrq),
-                    pred_sinr = VALUES(pred_sinr),
-                    pred_rsrp_smoothed = VALUES(pred_rsrp_smoothed),
-                    pred_rsrq_smoothed = VALUES(pred_rsrq_smoothed),
-                    pred_sinr_smoothed = VALUES(pred_sinr_smoothed),
-                    node_b_id = VALUES(node_b_id),
-                    cell_id = VALUES(cell_id),
-                    operator = VALUES(operator),
-                    created_at = VALUES(created_at),
-                    site_id = VALUES(site_id),
-                    nodeb_id_cell_id = VALUES(nodeb_id_cell_id),
-                    legacy_nodeb_id_cell_id = VALUES(legacy_nodeb_id_cell_id),
-                    sector = VALUES(sector),
-                    band = VALUES(band),
-                    rf_identity_key = VALUES(rf_identity_key),
-                    sector_identity_key = VALUES(sector_identity_key),
-                    site_sector_band_key = VALUES(site_sector_band_key),
-                    Technology = VALUES(Technology),
-                    lat = VALUES(lat),
-                    lon = VALUES(lon),
-                    lat_6dp = VALUES(lat_6dp),
-                    lon_6dp = VALUES(lon_6dp)
                 """
             )
             conn.execute(merge_sql)
@@ -846,7 +829,7 @@ class LTEPredictionService:
         print(f"[LTE][GEO_DELTA_COLS] {changed_counts}")
         return delta, stale_keys
 
-    def _upsert_geo_features(
+    def _replace_geo_features(
         self,
         save_engine,
         out: pd.DataFrame,
@@ -858,13 +841,17 @@ class LTEPredictionService:
 
         started_at = time.perf_counter()
         with save_engine.begin() as conn:
-            delta, stale_keys = self._compute_geo_delta(
-                conn,
-                out,
-                project_id=project_id,
-                region=region,
+            conn.execute(
+                text(
+                    """
+                    DELETE FROM lte_prediction_geo_features
+                    WHERE project_id = :project_id
+                      AND region = :region
+                    """
+                ),
+                {"project_id": int(project_id), "region": str(region).lower()},
             )
-            if delta.empty and stale_keys.empty:
+            if out.empty:
                 elapsed = time.perf_counter() - started_at
                 print(
                     f"[LTE][GEO_DB_TIMING] table={table_name} rows=0 "
@@ -874,7 +861,6 @@ class LTEPredictionService:
 
             table = Table(table_name, metadata, autoload_with=conn)
             staging_table = f"tmp_lte_geo_stage_{uuid_lib.uuid4().hex[:8]}"
-            staging_key_table = f"tmp_lte_geo_stale_{uuid_lib.uuid4().hex[:8]}"
             staging_cols = [col.name for col in table.columns if col.name != "id"]
             conn.execute(
                 text(
@@ -888,165 +874,108 @@ class LTEPredictionService:
             )
 
             chunk_size = 5000
-            if not delta.empty:
-                for start_idx in range(0, len(delta), chunk_size):
-                    chunk = delta.iloc[start_idx:start_idx + chunk_size].copy()[staging_cols]
-                    chunk.to_sql(
-                        staging_table,
-                        con=conn,
-                        if_exists="append",
-                        index=False,
-                        method="multi",
-                        chunksize=chunk_size,
-                    )
-
-                conn.execute(
-                    text(
-                        f"""
-                        DELETE tgt
-                        FROM {table_name} AS tgt
-                        INNER JOIN {staging_table} AS src
-                            ON tgt.project_id = src.project_id
-                           AND tgt.baseline_job_id = src.baseline_job_id
-                           AND tgt.region = src.region
-                           AND tgt.nodeb_id_cell_id = src.nodeb_id_cell_id
-                           AND tgt.lat = src.lat
-                           AND tgt.lon = src.lon
-                        """
-                    )
-                )
-                conn.execute(
-                    text(
-                        f"""
-                        INSERT INTO {table_name} (
-                            project_id,
-                            baseline_job_id,
-                            region,
-                            operator,
-                            grid_id,
-                            lat,
-                            lon,
-                            nodeb_id_cell_id,
-                            proxy_site_id,
-                            clutter_class,
-                            morphology_cluster,
-                            building_count,
-                            building_area_ratio,
-                            avg_building_area_m2,
-                            road_length_m,
-                            green_ratio,
-                            water_ratio,
-                            los_blocker_count,
-                            los_blocked_ratio,
-                            max_blocker_height_m,
-                            diffraction_proxy_db,
-                            nlos_flag,
-                            terrain_elevation_m,
-                            terrain_slope_deg,
-                            proxy_site_elevation_m,
-                            terrain_relief_to_site_m,
-                            site_count_250m,
-                            site_count_500m,
-                            serving_distance_m,
-                            nearest_site_distance_m,
-                            mean_nearest3_site_distance_m,
-                            azimuth_delta_deg,
-                            polygon_alignment,
-                            building_alignment,
-                            geo_source,
-                            created_at,
-                            updated_at
-                        )
-                        SELECT
-                            project_id,
-                            baseline_job_id,
-                            region,
-                            operator,
-                            grid_id,
-                            lat,
-                            lon,
-                            nodeb_id_cell_id,
-                            proxy_site_id,
-                            clutter_class,
-                            morphology_cluster,
-                            building_count,
-                            building_area_ratio,
-                            avg_building_area_m2,
-                            road_length_m,
-                            green_ratio,
-                            water_ratio,
-                            los_blocker_count,
-                            los_blocked_ratio,
-                            max_blocker_height_m,
-                            diffraction_proxy_db,
-                            nlos_flag,
-                            terrain_elevation_m,
-                            terrain_slope_deg,
-                            proxy_site_elevation_m,
-                            terrain_relief_to_site_m,
-                            site_count_250m,
-                            site_count_500m,
-                            serving_distance_m,
-                            nearest_site_distance_m,
-                            mean_nearest3_site_distance_m,
-                            azimuth_delta_deg,
-                            polygon_alignment,
-                            building_alignment,
-                            geo_source,
-                            created_at,
-                            updated_at
-                        FROM {staging_table}
-                        """
-                    )
+            for start_idx in range(0, len(out), chunk_size):
+                chunk = out.iloc[start_idx:start_idx + chunk_size].copy()[staging_cols]
+                chunk.to_sql(
+                    staging_table,
+                    con=conn,
+                    if_exists="append",
+                    index=False,
+                    method="multi",
+                    chunksize=chunk_size,
                 )
 
-            if not stale_keys.empty:
-                conn.execute(
-                    text(
-                        f"""
-                        CREATE TEMPORARY TABLE {staging_key_table} (
-                            project_id BIGINT NOT NULL,
-                            baseline_job_id VARCHAR(100) NOT NULL,
-                            region VARCHAR(50) NOT NULL,
-                            nodeb_id_cell_id VARCHAR(100) NOT NULL,
-                            lat DOUBLE NOT NULL,
-                            lon DOUBLE NOT NULL
-                        )
-                        """
+            conn.execute(
+                text(
+                    f"""
+                    INSERT INTO {table_name} (
+                        project_id,
+                        baseline_job_id,
+                        region,
+                        operator,
+                        grid_id,
+                        lat,
+                        lon,
+                        nodeb_id_cell_id,
+                        proxy_site_id,
+                        clutter_class,
+                        morphology_cluster,
+                        building_count,
+                        building_area_ratio,
+                        avg_building_area_m2,
+                        road_length_m,
+                        green_ratio,
+                        water_ratio,
+                        los_blocker_count,
+                        los_blocked_ratio,
+                        max_blocker_height_m,
+                        diffraction_proxy_db,
+                        nlos_flag,
+                        terrain_elevation_m,
+                        terrain_slope_deg,
+                        proxy_site_elevation_m,
+                        terrain_relief_to_site_m,
+                        site_count_250m,
+                        site_count_500m,
+                        serving_distance_m,
+                        nearest_site_distance_m,
+                        mean_nearest3_site_distance_m,
+                        azimuth_delta_deg,
+                        polygon_alignment,
+                        building_alignment,
+                        geo_source,
+                        created_at,
+                        updated_at
                     )
+                    SELECT
+                        project_id,
+                        baseline_job_id,
+                        region,
+                        operator,
+                        grid_id,
+                        lat,
+                        lon,
+                        nodeb_id_cell_id,
+                        proxy_site_id,
+                        clutter_class,
+                        morphology_cluster,
+                        building_count,
+                        building_area_ratio,
+                        avg_building_area_m2,
+                        road_length_m,
+                        green_ratio,
+                        water_ratio,
+                        los_blocker_count,
+                        los_blocked_ratio,
+                        max_blocker_height_m,
+                        diffraction_proxy_db,
+                        nlos_flag,
+                        terrain_elevation_m,
+                        terrain_slope_deg,
+                        proxy_site_elevation_m,
+                        terrain_relief_to_site_m,
+                        site_count_250m,
+                        site_count_500m,
+                        serving_distance_m,
+                        nearest_site_distance_m,
+                        mean_nearest3_site_distance_m,
+                        azimuth_delta_deg,
+                        polygon_alignment,
+                        building_alignment,
+                        geo_source,
+                        created_at,
+                        updated_at
+                    FROM {staging_table}
+                    """
                 )
-                for start_idx in range(0, len(stale_keys), chunk_size):
-                    chunk = stale_keys.iloc[start_idx:start_idx + chunk_size].copy()
-                    chunk.to_sql(
-                        staging_key_table,
-                        con=conn,
-                        if_exists="append",
-                        index=False,
-                        method="multi",
-                        chunksize=chunk_size,
-                    )
-                conn.execute(
-                    text(
-                        f"""
-                        DELETE tgt
-                        FROM {table_name} AS tgt
-                        INNER JOIN {staging_key_table} AS stale
-                            ON tgt.project_id = stale.project_id
-                           AND tgt.baseline_job_id = stale.baseline_job_id
-                           AND tgt.region = stale.region
-                           AND tgt.nodeb_id_cell_id = stale.nodeb_id_cell_id
-                           AND tgt.lat = stale.lat
-                           AND tgt.lon = stale.lon
-                        """
-                    )
-                )
+            )
 
         elapsed = time.perf_counter() - started_at
         print(
-            f"[LTE][GEO_DB_TIMING] table={table_name} rows={len(delta)} "
+            f"[LTE][GEO_DB_TIMING] table={table_name} rows={len(out)} "
             f"elapsed_sec={elapsed:.2f}"
         )
-        return len(delta)
+        return len(out)
 
     def _save_baseline_results(self, df, project_id, job_id, site_df=None, operator=None, region="india"):
         print(f"Saving baseline results to {region.upper()} DB...")
@@ -1286,18 +1215,11 @@ class LTEPredictionService:
         _job_df_summary("BASELINE_DB_PAYLOAD", out)
         print(
             f"[LTE][BASELINE_DB_WRITE] table=lte_prediction_baseline_results "
-            f"mode=upsert rows={len(out)} project_id={project_id} job_id={job_id}"
+            f"mode=replace rows={len(out)} project_id={project_id} job_id={job_id}"
         )
         baseline_save_started = time.perf_counter()
         bridge = get_bridge_client()
         if bridge:
-            existing_rows, overlap_rows = _count_baseline_key_overlap(save_engine, out, project_id=int(project_id))
-            replace_existing = existing_rows > 0 and overlap_rows == 0
-            print(
-                f"[LTE][BASELINE_DB_REPLACE_CHECK] project_id={project_id} "
-                f"existing_rows={existing_rows} overlap_rows={overlap_rows} "
-                f"replace_existing={replace_existing}"
-            )
             written_rows = bridge.save_dataframe(
                 "SaveLtePredictionBaselineResults",
                 out,
@@ -1305,17 +1227,17 @@ class LTEPredictionService:
                 job_id=str(job_id),
                 region=str(region).lower(),
                 chunk_size=20000,
-                replace_existing=replace_existing,
+                replace_existing=True,
             )
             print("[LTE][BASELINE_DB_WRITE] source=python_bridge")
         else:
-            written_rows = self._upsert_baseline_results(save_engine, out, project_id=project_id)
+            written_rows = self._replace_baseline_results(save_engine, out, project_id=project_id)
         baseline_save_elapsed = time.perf_counter() - baseline_save_started
         print(
             f"[LTE][BASELINE_DB_WRITE_DONE] table=lte_prediction_baseline_results "
             f"rows={written_rows} elapsed_sec={baseline_save_elapsed:.2f}"
         )
-        print(f"{written_rows} rows upserted into lte_prediction_baseline_results")
+        print(f"{written_rows} rows replaced into lte_prediction_baseline_results")
 
     def _save_geo_features(
         self,
@@ -1443,7 +1365,7 @@ class LTEPredictionService:
         _job_df_summary("GEO_FEATURE_DB_PAYLOAD", geo_out)
         print(
             f"[LTE][GEO_DB_WRITE] table=lte_prediction_geo_features "
-            f"mode=delta_upsert rows={len(geo_out)} project_id={project_id} baseline_job_id={baseline_job_id}"
+            f"mode=replace rows={len(geo_out)} project_id={project_id} baseline_job_id={baseline_job_id}"
         )
 
         geo_save_started = time.perf_counter()
@@ -1460,7 +1382,7 @@ class LTEPredictionService:
             )
             print("[LTE][GEO_DB_WRITE] source=python_bridge")
         else:
-            written_rows = self._upsert_geo_features(
+            written_rows = self._replace_geo_features(
                 save_engine,
                 geo_out,
                 project_id=int(project_id),
