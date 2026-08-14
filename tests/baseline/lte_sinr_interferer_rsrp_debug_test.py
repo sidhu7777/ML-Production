@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import importlib.util
 import json
 import sys
 from pathlib import Path
@@ -10,19 +9,14 @@ from typing import Dict, Optional
 import numpy as np
 import pandas as pd
 
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from tools.lte_prediction.geo_correction_pipeline import _compute_proxy_rsrp_arrays, _haversine_m_np
+
 
 DEFAULT_PROJECT_ID = 196
-RF_DEBUG_LAB_PATH = Path(__file__).with_name("lte_rf_debug_lab.py")
-
-
-def _load_rf_debug_lab_module():
-    spec = importlib.util.spec_from_file_location("lte_rf_debug_lab_for_sinr_debug", RF_DEBUG_LAB_PATH)
-    if spec is None or spec.loader is None:
-        raise ImportError(f"Unable to load RF debug lab module from {RF_DEBUG_LAB_PATH}")
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[str(spec.name)] = module
-    spec.loader.exec_module(module)
-    return module
 
 
 def _latest_rf_debug_run(project_id: int, output_root: Path) -> Path:
@@ -99,7 +93,6 @@ def _candidate_rank_debug(
     if not site_path.exists():
         return {"available": False, "reason": f"Missing site artifact: {site_path}"}
 
-    rf_lab = _load_rf_debug_lab_module()
     site_df = pd.read_csv(site_path, low_memory=False)
     if not {"lat", "lon", "Node_Cell_ID"}.issubset(site_df.columns):
         return {"available": False, "reason": "site_df is missing lat/lon/Node_Cell_ID"}
@@ -144,14 +137,14 @@ def _candidate_rank_debug(
         if point_lat is None or point_lon is None or serving_cell not in serving_lookup:
             continue
 
-        distances = rf_lab._haversine_m_np(site_lat, site_lon, point_lat, point_lon)
+        distances = _haversine_m_np(site_lat, site_lon, point_lat, point_lon)
         nearest_idx = np.argsort(distances)[:candidate_k].astype(int).tolist()
         serving_idx = serving_lookup[serving_cell]
         if serving_idx not in nearest_idx:
             nearest_idx.append(serving_idx)
         candidate_arr = np.array(sorted(set(nearest_idx)), dtype=int)
 
-        rsrp_raw = rf_lab._compute_proxy_rsrp_arrays(
+        rsrp_raw = _compute_proxy_rsrp_arrays(
             np.full(len(candidate_arr), point_lat, dtype=float),
             np.full(len(candidate_arr), point_lon, dtype=float),
             site_lat[candidate_arr],

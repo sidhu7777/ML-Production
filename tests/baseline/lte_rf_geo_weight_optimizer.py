@@ -19,7 +19,7 @@ from sklearn.gaussian_process import GaussianProcessRegressor
 from sklearn.gaussian_process.kernels import Matern, WhiteKernel
 from sklearn.model_selection import GroupKFold, RepeatedKFold
 
-from tests.lte_rf_debug_lab import DEFAULT_PROJECT_ID, _metric_bundle
+from tests.baseline.lte_rf_debug_lab import DEFAULT_PROJECT_ID, _metric_bundle
 
 
 OUTPUT_ROOT = Path("tests/output")

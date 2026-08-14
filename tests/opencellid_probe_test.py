@@ -21,7 +21,7 @@ import pandas as pd
 from shapely.geometry import shape
 from shapely.wkt import loads as load_wkt
 
-from tests.lte_rf_debug_lab import DEFAULT_PROJECT_ID, DEFAULT_REGION, _write_json
+from tests.baseline.lte_rf_debug_lab import DEFAULT_PROJECT_ID, DEFAULT_REGION, _write_json
 
 
 OUTPUT_ROOT = Path("tests/output")

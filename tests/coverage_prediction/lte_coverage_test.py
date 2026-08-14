@@ -29,8 +29,8 @@ from tools.lte_tilt_recommandation.cell_identity import (
     build_site_sector_band_identity,
 )
 
-from tests.lte_rf_debug_lab import DEFAULT_PROJECT_ID, DEFAULT_REGION, _write_json
-from tests.lte_rf_debug_lab import (
+from tests.baseline.lte_rf_debug_lab import DEFAULT_PROJECT_ID, DEFAULT_REGION, _write_json
+from tests.baseline.lte_rf_debug_lab import (
     BUILDING_TAGS,
     GREEN_TAGS,
     ROAD_TAGS,

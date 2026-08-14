@@ -4,13 +4,18 @@ import datetime as dt
 import json
 import threading
 import uuid
+from pathlib import Path
 from typing import Any
 
 import pandas as pd
 
 from . import db
 from .engine import run_pci_optimization, severity_label
+from .export import export_pci_optimization_excel
 
+
+ML_ROOT = Path(__file__).resolve().parents[2]
+OUTPUT_ROOT = ML_ROOT / "outputs" / "pci_optimization"
 
 JOBS: dict[str, dict[str, Any]] = {}
 
@@ -137,6 +142,10 @@ class PciOptimizationService:
             result_df = _build_result_rows(result, project_id, job_id, region, operator)
             saved_rows = db.save_results(result_df, region=region)
 
+            self._update(job_id, "running", "Exporting Excel report")
+            output_dir = OUTPUT_ROOT / f"project_{project_id}"
+            excel_path = export_pci_optimization_excel(result, output_dir)
+
             runtime_sec = (dt.datetime.utcnow() - started).total_seconds()
             verification = result.get("verification") or {}
             self._update(
@@ -161,6 +170,7 @@ class PciOptimizationService:
                 stopped_reason=verification.get("stopped_reason"),
                 infeasible_rules=verification.get("infeasible_rules"),
                 saved_rows=saved_rows,
+                excel_path=str(excel_path) if excel_path else None,
                 runtime_sec=round(runtime_sec, 3),
             )
         except Exception as exc:

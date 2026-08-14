@@ -14,7 +14,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 import pandas as pd
 
-from tests.lte_rf_debug_lab import DEFAULT_GRID_RESOLUTION_M, DEFAULT_PROJECT_ID, DEFAULT_RADIUS_M, DEFAULT_REGION, DEFAULT_WORKERS, _write_json
+from tests.baseline.lte_rf_debug_lab import DEFAULT_GRID_RESOLUTION_M, DEFAULT_PROJECT_ID, DEFAULT_RADIUS_M, DEFAULT_REGION, DEFAULT_WORKERS, _write_json
 from tools.lte_prediction_optimised import ml_engine as opt_ml
 
 

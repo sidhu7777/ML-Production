@@ -51,24 +51,21 @@ def ensure_results_table(region: str = "india") -> None:
 
 
 def save_results(df: pd.DataFrame, region: str = "india") -> int:
-    """Idempotent per (project_id, job_id): deletes any prior rows for the
-    same job before inserting, so re-running/re-saving a job never
-    duplicates rows -- same pattern as lte_current_capacity_recommendation_results."""
+    """Replace, not upsert: deletes EVERY prior row for a project (any
+    older job_id included) before inserting the new run's rows, so a
+    project always reflects only its latest PCI optimization run -- no
+    accumulating job history, no ON DUPLICATE KEY UPDATE. Plain DELETE
+    then INSERT, same as every other tools/* results table in this repo."""
     if df.empty:
         return 0
     ensure_results_table(region)
     out = df.loc[:, RESULT_COLUMNS].copy()
-    keys = out[["project_id", "job_id"]].drop_duplicates()
+    project_ids = out["project_id"].drop_duplicates().tolist()
     with get_engine(region).begin() as conn:
-        for _, row in keys.iterrows():
+        for project_id in project_ids:
             conn.execute(
-                text(
-                    f"""
-                    DELETE FROM {RESULT_TABLE_NAME}
-                    WHERE project_id = :project_id AND job_id = :job_id
-                    """
-                ),
-                {"project_id": int(row["project_id"]), "job_id": str(row["job_id"])},
+                text(f"DELETE FROM {RESULT_TABLE_NAME} WHERE project_id = :project_id"),
+                {"project_id": int(project_id)},
             )
         out.to_sql(RESULT_TABLE_NAME, con=conn, if_exists="append", index=False, method="multi", chunksize=1000)
     return int(len(out))

@@ -23,7 +23,7 @@ import streamlit.components.v1 as components
 from streamlit_folium import st_folium
 from shapely.ops import unary_union
 
-from tests.lte_rf_debug_lab import (
+from tests.baseline.lte_rf_debug_lab import (
     DEFAULT_CLUSTER_COUNT,
     DEFAULT_GRID_RESOLUTION_M,
     DEFAULT_MAX_INTERFERENCE_SITES,

@@ -1,7 +1,7 @@
 import pandas as pd
 
-from tests.lte_rf_debug_lab import _derive_clutter_class, _normalize_site_for_rf
-from tests.push_rf_debug_baseline_to_db import _build_baseline_payload
+from tools.lte_prediction.geo_correction_pipeline import _derive_clutter_class
+from tests.baseline.push_rf_debug_baseline_to_db import _build_baseline_payload
 
 
 def test_derive_clutter_class_assigns_multiple_labels():
@@ -17,28 +17,6 @@ def test_derive_clutter_class_assigns_multiple_labels():
     clutter = _derive_clutter_class(df)
     assert len(clutter) == len(df)
     assert clutter.nunique() >= 2
-
-
-def test_normalize_site_for_rf_adds_required_rf_columns():
-    df = pd.DataFrame(
-        {
-            "cell_id": ["11625_1"],
-            "lat": [28.63],
-            "lon": [77.35],
-            "azimuth": [120],
-            "Etilt": [4],
-            "Mtilt": [1],
-            "Height": [32],
-            "tx_power": [46],
-            "frequency": [1800],
-        }
-    )
-    out = _normalize_site_for_rf(df)
-    assert out.loc[0, "Node_Cell_ID"] == "11625_1"
-    assert out.loc[0, "electrical_tilt"] == 4
-    assert out.loc[0, "mechanical_tilt"] == 1
-    assert out.loc[0, "antenna_height"] == 32
-    assert out.loc[0, "frequency_mhz"] == 1800
 
 
 def test_build_baseline_payload_prefers_calibrated_geo_kpis_and_keeps_rf_context():

@@ -15,8 +15,8 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from tests.lte_rf_debug_lab import DEFAULT_PROJECT_ID, DEFAULT_REGION, DEFAULT_SESSION_IDS, DEFAULT_VALIDATION_FRACTION, _write_json
-from tests import lte_rf_debug_lab as rf_lab
+from tests.baseline.lte_rf_debug_lab import DEFAULT_PROJECT_ID, DEFAULT_REGION, DEFAULT_SESSION_IDS, DEFAULT_VALIDATION_FRACTION, _write_json
+from tests.baseline import lte_rf_debug_lab as rf_lab
 from tests import lte_tilt_recommendation_test as base
 from tests import lte_tilt_rsrp_only_recommendation_test as rsrp_only
 

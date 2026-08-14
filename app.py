@@ -27,6 +27,7 @@ from tools.prediction.routes import prediction_bp
 from tools.area_breakup.routes import area_breakup_bp
 from tools.report.routes import report_bp
 from tools.lte_prediction.routes import lte_prediction_bp
+from tools.lte_prediction_offset.routes import lte_prediction_offset_bp
 from tools.lte_prediction_optimised.routes import lte_prediction_op
 from tools.lte_tilt_recommandation.routes import rf_optimization_bp
 from tools.coverage_prediction.future_coverage_kpi_prediction.routes import lte_model1_coverage_prediction_bp
@@ -100,6 +101,7 @@ def create_app(config_name='default'):
     app.register_blueprint(area_breakup_bp, url_prefix='/api/area-breakup')
     app.register_blueprint(report_bp, url_prefix='/api/report')
     app.register_blueprint(lte_prediction_bp, url_prefix="/api/lte-prediction")
+    app.register_blueprint(lte_prediction_offset_bp, url_prefix="/api/lte-prediction-offset")
     app.register_blueprint(lte_prediction_op, url_prefix="/api/lte-prediction-optimised")
     app.register_blueprint(rf_optimization_bp, url_prefix="/api/lte-tilt-recommandation")
     app.register_blueprint(lte_model1_coverage_prediction_bp, url_prefix="/api/lte-model1-coverage")
@@ -119,6 +121,7 @@ def create_app(config_name='default'):
                 "area_breakup": "/api/area-breakup",
                 "report": "/api/report",
                 "site_prediction": "/api/lte-prediction/run",
+                "site_prediction_offset": "/api/lte-prediction-offset/run",
                 "optimized_prediction": "/api/lte-prediction-optimised/run",
                 "rf_optimization": "/api/lte-tilt-recommandation/optimize",
                 "future_coverage_kpi_prediction": "/api/lte-model1-coverage/run",
