@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import math
 import re
+import sys
 from io import BytesIO
 from pathlib import Path
 
@@ -18,6 +19,18 @@ from shapely.ops import transform
 from streamlit_folium import st_folium
 
 THIS_DIR = Path(__file__).resolve().parent
+if str(THIS_DIR) not in sys.path:
+    sys.path.insert(0, str(THIS_DIR))
+
+import streamlit_project210_phase11_12_dashboard as phase11_12_view
+import streamlit_project210_phase13_beam_check as phase13_view
+import streamlit_project210_phase14_tilt_scale_fix as phase14_view
+import streamlit_project210_phase15_radius_progression as phase15_view
+import streamlit_project210_phase16_site_local_geo as phase16_view
+import streamlit_project210_phase17_full_polygon_comparison as phase17_view
+import streamlit_project210_phase19_branch_calibrated_comparison as phase19_view
+import streamlit_taiwan_mapdata_dashboard as mapdata_view
+
 DATA_DIR = THIS_DIR / "data"
 
 PROJECT_CONFIG = {
@@ -42,83 +55,6 @@ MODEL_CONFIG = {
         "offset_patterns": [
             "cost231_offsets_cells_project{project_id}",
             "cost231_offsets_102_cells_project{project_id}",
-        ],
-        "raw_col": "raw_cost231_rsrp",
-        "dt_raw_col": "raw_cost231_at_dt_rsrp",
-        "dt_delta_col": "dt_minus_cost231_db",
-    },
-    "Cost231 Phase 2 n78 2600": {
-        "label": "Cost231 Phase 2 n78 2600",
-        "subdir": "cost231_phase2_n78_2600",
-        "surface_pattern": "cost231_offset_corrected_surface_project{project_id}",
-        "dt_pattern": "cost231_dt_match_project{project_id}",
-        "offset_patterns": [
-            "cost231_offsets_cells_project{project_id}",
-            "cost231_offsets_102_cells_project{project_id}",
-        ],
-        "raw_col": "raw_cost231_rsrp",
-        "dt_raw_col": "raw_cost231_at_dt_rsrp",
-        "dt_delta_col": "dt_minus_cost231_db",
-    },
-    "Cost231 Phase 3 n78 2600 technology offset": {
-        "label": "Cost231 Phase 3 n78 2600 technology offset",
-        "subdir": "cost231_phase3_n78_2600_technology_offset",
-        "surface_pattern": "cost231_offset_corrected_surface_project{project_id}",
-        "dt_pattern": "cost231_dt_match_project{project_id}",
-        "offset_patterns": [
-            "cost231_offsets_cells_project{project_id}",
-            "cost231_offsets_102_cells_project{project_id}",
-        ],
-        "raw_col": "raw_cost231_rsrp",
-        "dt_raw_col": "raw_cost231_at_dt_rsrp",
-        "dt_delta_col": "dt_minus_cost231_db",
-    },
-    "Cost231 Phase 4 production mean aggregation": {
-        "label": "Cost231 Phase 4 production mean aggregation",
-        "subdir": "cost231_phase4_production_mean_aggregation",
-        "surface_pattern": "cost231_offset_corrected_surface_project{project_id}",
-        "dt_pattern": "cost231_dt_match_project{project_id}",
-        "offset_patterns": [
-            "cost231_offsets_cells_project{project_id}",
-            "cost231_offsets_102_cells_project{project_id}",
-        ],
-        "raw_col": "raw_cost231_rsrp",
-        "dt_raw_col": "raw_cost231_at_dt_rsrp",
-        "dt_delta_col": "dt_minus_cost231_db",
-    },
-    "Cost231 Phase 5 gridwide DT replacement": {
-        "label": "Cost231 Phase 5 gridwide DT replacement",
-        "subdir": "cost231_phase5_gridwide_dt_replacement",
-        "surface_pattern": "cost231_offset_corrected_surface_project{project_id}",
-        "dt_pattern": "cost231_dt_match_project{project_id}",
-        "offset_patterns": [
-            "cost231_offsets_cells_project{project_id}",
-            "cost231_offsets_102_cells_project{project_id}",
-        ],
-        "raw_col": "raw_cost231_rsrp",
-        "dt_raw_col": "raw_cost231_at_dt_rsrp",
-        "dt_delta_col": "dt_minus_cost231_db",
-    },
-    "Cost231 Phase 7 serving grid production average": {
-        "label": "Cost231 Phase 7 serving grid production average",
-        "subdir": "cost231_phase7_serving_grid_production_average",
-        "surface_pattern": "cost231_offset_corrected_surface_project{project_id}",
-        "dt_pattern": "cost231_dt_match_project{project_id}",
-        "offset_patterns": [
-            "cost231_offsets_cells_project{project_id}",
-            "cost231_offsets_102_cells_project{project_id}",
-        ],
-        "raw_col": "raw_cost231_rsrp",
-        "dt_raw_col": "raw_cost231_at_dt_rsrp",
-        "dt_delta_col": "dt_minus_cost231_db",
-    },
-    "Cost231 Phase 8 directional polygon grid": {
-        "label": "Cost231 Phase 8 directional polygon grid",
-        "subdir": "cost231_phase8_directional_polygon_grid",
-        "surface_pattern": "phase8_directional_raw_corrected_surface_project{project_id}",
-        "dt_pattern": "phase8_dt_match_project{project_id}",
-        "offset_patterns": [
-            "phase8_offsets_project{project_id}",
         ],
         "raw_col": "raw_cost231_rsrp",
         "dt_raw_col": "raw_cost231_at_dt_rsrp",
@@ -254,26 +190,7 @@ def _model_available(project_key: str, model_key: str) -> bool:
 def _model_display_name(project_key: str, model_key: str) -> str:
     if project_key == "Project 210 Taiwan" and model_key == "Cost231":
         return "Cost231 Phase 1"
-    if model_key == "Cost231 Phase 2 n78 2600":
-        return "Cost231 Phase 2 n78 2600"
-    if model_key == "Cost231 Phase 3 n78 2600 technology offset":
-        return "Cost231 Phase 3 n78 2600 technology offset"
     return str(MODEL_CONFIG[model_key]["label"])
-
-
-def _has_taiwan_phase_comparison(project_key: str) -> bool:
-    if project_key != "Project 210 Taiwan":
-        return False
-    available_phases = [model for model in _cost231_phase_models() if _model_available(project_key, model)]
-    return len(available_phases) >= 2
-
-
-def _cost231_phase_models() -> list[str]:
-    return [
-        "Cost231",
-        "Cost231 Phase 2 n78 2600",
-        "Cost231 Phase 3 n78 2600 technology offset",
-    ]
 
 
 @st.cache_data(show_spinner=False)
@@ -747,31 +664,6 @@ def render_cdf(surface_df: pd.DataFrame, dt_df: pd.DataFrame, model_label: str) 
     st.plotly_chart(fig, use_container_width=True)
 
 
-def render_phase_comparison_cdf(
-    left_surface: pd.DataFrame,
-    right_surface: pd.DataFrame,
-    dt_df: pd.DataFrame,
-    left_label: str,
-    right_label: str,
-) -> None:
-    fig = go.Figure()
-    fig.add_trace(cdf_trace(left_surface["corrected_rsrp"], f"{left_label} after", "#f97316"))
-    fig.add_trace(cdf_trace(right_surface["corrected_rsrp"], f"{right_label} after", "#168a52"))
-    if not dt_df.empty:
-        fig.add_trace(cdf_trace(dt_df["rsrp_measured"], "DT measured", "#2563eb"))
-    fig.update_layout(
-        height=390,
-        margin=dict(l=20, r=20, t=35, b=20),
-        title="Phase comparison CDF for current selection",
-        xaxis_title="RSRP (dBm)",
-        yaxis_title="Cumulative percentage (%)",
-        yaxis=dict(range=[0, 100]),
-        xaxis=dict(range=[-140, -44]),
-        legend=dict(orientation="h", yanchor="bottom", y=1.02),
-    )
-    st.plotly_chart(fig, use_container_width=True)
-
-
 def _display_key(value: str) -> str:
     if len(value) <= 80:
         return value
@@ -785,52 +677,54 @@ def main() -> None:
         st.header("Filters")
         project_key = st.selectbox("Project", list(PROJECT_CONFIG.keys()), index=0)
         project = _project_cfg(project_key)
+        section_options = ["Propagation model comparison"]
+        if project_key == "Project 210 Taiwan":
+            if (phase11_12_view.OUT_DIR / "phase11_12_summary.json").exists():
+                section_options.append("Phase 11/12 residual blending")
+            if mapdata_view.MAPDATA_DIR.exists():
+                section_options.append("Mapdata inventory")
+            if phase13_view.IDENTITY_PATH.exists():
+                section_options.append("Phase 13 beam check")
+                section_options.append("Phase 14 tilt scale fix")
+                section_options.append("Phase 15 radius progression")
+            if phase16_view.LOCAL_CLUTTER_PATH.exists():
+                section_options.append("Phase 16 site-local geo data")
+            if phase17_view.OUT_DIR.exists():
+                section_options.append("Phase 17 full-polygon comparison")
+            if phase19_view.OUT_DIR.exists():
+                section_options.append("Phase 19 branch-calibrated comparison")
+        section = st.selectbox("Section", section_options, index=0)
+
+    if section == "Phase 11/12 residual blending":
+        phase11_12_view.render()
+        return
+    if section == "Mapdata inventory":
+        mapdata_view.render()
+        return
+    if section == "Phase 13 beam check":
+        phase13_view.render()
+        return
+    if section == "Phase 14 tilt scale fix":
+        phase14_view.render()
+        return
+    if section == "Phase 15 radius progression":
+        phase15_view.render()
+        return
+    if section == "Phase 16 site-local geo data":
+        phase16_view.render()
+        return
+    if section == "Phase 17 full-polygon comparison":
+        phase17_view.render()
+        return
+    if section == "Phase 19 branch-calibrated comparison":
+        phase19_view.render()
+        return
+
+    with st.sidebar:
         available_models = [model for model in MODEL_CONFIG if _model_available(project_key, model)]
         if not available_models:
             st.error(f"No completed model outputs found for {project_key}.")
             st.stop()
-        has_phase_comparison = _has_taiwan_phase_comparison(project_key)
-        view_mode = "Selected model before/after"
-        if has_phase_comparison:
-            view_mode = st.selectbox(
-                "View",
-                ["Cost231 phase comparison", "Selected model before/after"],
-                index=0,
-            )
-        phase_compare_models = [model for model in _cost231_phase_models() if model in available_models]
-        compare_left_model = phase_compare_models[0] if phase_compare_models else "Cost231"
-        compare_right_model = phase_compare_models[-1] if phase_compare_models else "Cost231"
-        if view_mode == "Cost231 phase comparison":
-            default_left = (
-                phase_compare_models.index("Cost231 Phase 2 n78 2600")
-                if "Cost231 Phase 2 n78 2600" in phase_compare_models
-                else 0
-            )
-            default_right = (
-                phase_compare_models.index("Cost231 Phase 3 n78 2600 technology offset")
-                if "Cost231 Phase 3 n78 2600 technology offset" in phase_compare_models
-                else len(phase_compare_models) - 1
-            )
-            compare_left_model = st.selectbox(
-                "Compare left",
-                phase_compare_models,
-                index=default_left,
-                format_func=lambda key: _model_display_name(project_key, key),
-            )
-            right_options = [model for model in phase_compare_models if model != compare_left_model]
-            if not right_options:
-                right_options = phase_compare_models
-            default_right_key = (
-                "Cost231 Phase 3 n78 2600 technology offset"
-                if "Cost231 Phase 3 n78 2600 technology offset" in right_options
-                else right_options[-1]
-            )
-            compare_right_model = st.selectbox(
-                "Compare right",
-                right_options,
-                index=right_options.index(default_right_key),
-                format_func=lambda key: _model_display_name(project_key, key),
-            )
         default_model_key = (
             "Cost231 Phase 10 site technology refresh"
             if project_key == "Project 196 India"
@@ -886,89 +780,43 @@ def main() -> None:
     metric_cols[4].metric("DT rows", f"{len(selected_dt):,}")
     metric_cols[5].metric("DT replaced pixels", f"{int(selected_surface['dt_replaced'].sum()) if not selected_surface.empty else 0:,}")
 
-    if view_mode == "Cost231 phase comparison":
-        left_surface = filter_surface(load_surface(project_key, compare_left_model), band_group, band, sector, site, cell)
-        right_surface = filter_surface(load_surface(project_key, compare_right_model), band_group, band, sector, site, cell)
-        left_dt = filter_dt(load_dt(project_key, compare_left_model), band_group, band, sector, site, cell)
-        right_dt = filter_dt(load_dt(project_key, compare_right_model), band_group, band, sector, site, cell)
-        left_grid = aggregate_grid(left_surface, "corrected_rsrp", agg_mode)
-        right_grid = aggregate_grid(right_surface, "corrected_rsrp", agg_mode)
-        left_label = _model_display_name(project_key, compare_left_model)
-        right_label = _model_display_name(project_key, compare_right_model)
-        left, right = st.columns(2)
-        with left:
-            st.subheader(f"{left_label} After Offset + DT Pixel Replacement")
-            st_folium(
-                make_map(
-                    left_grid,
-                    selected_sites,
-                    left_dt,
-                    polygon_coords,
-                    f"{left_label} after",
-                    left_label,
-                    project_key,
-                ),
-                height=620,
-                use_container_width=True,
-                returned_objects=[],
-                key=f"{project_key}_{compare_left_model}_after_{band_group}_{band}_{sector}_{site}_{cell}_{agg_mode}",
-            )
-        with right:
-            st.subheader(f"{right_label} After Offset + DT Pixel Replacement")
-            st_folium(
-                make_map(
-                    right_grid,
-                    selected_sites,
-                    right_dt,
-                    polygon_coords,
-                    f"{right_label} after",
-                    right_label,
-                    project_key,
-                ),
-                height=620,
-                use_container_width=True,
-                returned_objects=[],
-                key=f"{project_key}_{compare_right_model}_after_{band_group}_{band}_{sector}_{site}_{cell}_{agg_mode}",
-            )
-        render_phase_comparison_cdf(left_surface, right_surface, left_dt if not left_dt.empty else right_dt, left_label, right_label)
-    else:
-        left, right = st.columns(2)
-        with left:
-            st.subheader(f"{model_label} Before Offset")
-            st_folium(
-                make_map(
-                    before_grid,
-                    selected_sites,
-                    selected_dt,
-                    polygon_coords,
-                    f"{model_label} before",
-                    model_label,
-                    project_key,
-                ),
-                height=620,
-                use_container_width=True,
-                returned_objects=[],
-                key=f"{project_key}_{model_key}_before_map_{band_group}_{band}_{sector}_{site}_{cell}_{agg_mode}",
-            )
-        with right:
-            st.subheader("After Offset + DT Pixel Replacement")
-            st_folium(
-                make_map(
-                    after_grid,
-                    selected_sites,
-                    selected_dt,
-                    polygon_coords,
-                    "After offset + DT replacement",
-                    model_label,
-                    project_key,
-                ),
-                height=620,
-                use_container_width=True,
-                returned_objects=[],
-                key=f"{project_key}_{model_key}_after_map_{band_group}_{band}_{sector}_{site}_{cell}_{agg_mode}",
-            )
+    left, right = st.columns(2)
+    with left:
+        st.subheader(f"{model_label} Before Offset")
+        st_folium(
+            make_map(
+                before_grid,
+                selected_sites,
+                selected_dt,
+                polygon_coords,
+                f"{model_label} before",
+                model_label,
+                project_key,
+            ),
+            height=620,
+            use_container_width=True,
+            returned_objects=[],
+            key=f"{project_key}_{model_key}_before_map_{band_group}_{band}_{sector}_{site}_{cell}_{agg_mode}",
+        )
+    with right:
+        st.subheader("After Offset + DT Pixel Replacement")
+        st_folium(
+            make_map(
+                after_grid,
+                selected_sites,
+                selected_dt,
+                polygon_coords,
+                "After offset + DT replacement",
+                model_label,
+                project_key,
+            ),
+            height=620,
+            use_container_width=True,
+            returned_objects=[],
+            key=f"{project_key}_{model_key}_after_map_{band_group}_{band}_{sector}_{site}_{cell}_{agg_mode}",
+        )
 
-        render_cdf(selected_surface, selected_dt, model_label)
+    render_cdf(selected_surface, selected_dt, model_label)
 
     comparison_dir = Path(project["dir"]) / "comparison"
     metrics_path = comparison_dir / "cost231_vs_p1812_dt_error_metrics.csv"

@@ -160,6 +160,28 @@ def get_project_by_id(
             conn.close()
 
 
+# Placeholder values a device/session can report for "no PCI captured" --
+# same vocabulary already used for band normalization elsewhere in this
+# package. Only applied on the direct-DB fallback path below (when the
+# Python Bridge is unavailable and this queries tbl_network_log directly):
+# the bridge's own equivalent data-quality fix belongs upstream in the
+# bridge/backend itself, not duplicated here for the path that already
+# goes through it. Converting these to real NaN (instead of leaving them
+# as the literal string "N/A") means every downstream consumer that
+# already does `.dropna(subset=["pci"])` -- e.g.
+# map_generator.generate_categorical_kpi_map -- excludes them the same
+# way it excludes genuinely missing data, instead of the PCI map/legend
+# showing a spurious "N/A : <count>" category next to real PCI values.
+_INVALID_PCI_VALUES = {"UNKNOWN", "N/A", "NA", "NULL", "UNDEFINED", "-1", ""}
+
+
+def _normalize_invalid_pci(df: pd.DataFrame) -> None:
+    if "pci" not in df.columns:
+        return
+    normalized = df["pci"].astype(str).str.strip().str.upper()
+    df.loc[normalized.isin(_INVALID_PCI_VALUES), "pci"] = pd.NA
+
+
 def get_network_logs_for_sessions(
     session_ids: list[int],
     conn=None,
@@ -201,6 +223,7 @@ def get_network_logs_for_sessions(
         df = pd.read_sql(query, conn, params={"session_ids": session_ids})
         df.attrs["report_data_source"] = "direct_db_raw"
         df.attrs["report_prefiltered"] = False
+        _normalize_invalid_pci(df)
         return df
     finally:
         if close_conn:

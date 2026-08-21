@@ -131,6 +131,15 @@ def new_report_map_gray_clipped(polygon_wkt: str):
     muted, near-grayscale, no colored roads) tile layer stacked on top and
     clipped with a CSS clip-path to ONLY the polygon's own interior.
 
+    Both tile layers (base Voyager + gray Positron overlay) are served
+    through local_tiles.py's local caching proxy rather than live CartoDB --
+    grid maps used to bypass the report's tile cache entirely by hardcoding
+    live CartoDB URLs here, which is exactly the kind of render that could
+    still come back grey/incomplete even after use_local_tiles() was wired
+    up everywhere else. See local_tiles.py's module docstring for why this
+    matters (no network dependency once warm, so tile loads can't be slow
+    or rate-limited during rendering).
+
     Voyager renders roads in yellow, which is also one of our own KPI
     value-range colors (e.g. RSRP "-90 to -80" is yellow -- see
     kpi_config.rsrp_colour_manual), so on a grid map the basemap's own
@@ -159,9 +168,10 @@ def new_report_map_gray_clipped(polygon_wkt: str):
     from shapely.wkt import loads as load_wkt
 
     from tools.report_engine.map_generator import REPORT_MAP_MAX_ZOOM
+    from tests.new_pdf_report.local_tiles import local_tile_url
 
     m = folium.Map(
-        tiles="CartoDB Voyager",
+        tiles=None,
         zoom_control=True,
         control_scale=False,
         prefer_canvas=True,
@@ -169,9 +179,18 @@ def new_report_map_gray_clipped(polygon_wkt: str):
         zoomSnap=0,
         zoomDelta=0.25,
     )
+    folium.TileLayer(
+        tiles=local_tile_url("rastertiles/voyager"),
+        attr="© CartoDB, © OpenStreetMap contributors",
+        name="CartoDB Voyager (local cache)",
+        overlay=False,
+        control=False,
+        max_zoom=REPORT_MAP_MAX_ZOOM,
+    ).add_to(m)
 
     polygon = load_wkt(polygon_wkt)
     latlon = [[c[1], c[0]] for c in polygon.exterior.coords]
+    gray_tile_url = local_tile_url("light_all")
 
     script = f"""
     (function() {{
@@ -187,7 +206,7 @@ def new_report_map_gray_clipped(polygon_wkt: str):
             grayPane.style.zIndex = 350;
 
             var grayLayer = L.tileLayer(
-                'https://{{s}}.basemaps.cartocdn.com/light_all/{{z}}/{{x}}/{{y}}{{r}}.png',
+                {gray_tile_url!r},
                 {{ pane: 'grayClipPane', maxZoom: {REPORT_MAP_MAX_ZOOM}, attribution: '' }}
             ).addTo(map);
 

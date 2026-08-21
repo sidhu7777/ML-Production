@@ -199,6 +199,72 @@ def build_polygon_lattice(polygon_wkt: str, grid_size_meters: float) -> pd.DataF
     return lattice
 
 
+def build_data_bounds_lattice(df: pd.DataFrame, grid_size_meters: float) -> pd.DataFrame:
+    """
+    Same lattice construction as build_polygon_lattice, but anchored to
+    the data's own GPS bounding box instead of a polygon -- for projects
+    with NO filtering polygon. canEnableUnifiedGridView (the frontend
+    rule build_polygon_lattice's docstring cites) governs when the
+    frontend shows a grid-view UI TOGGLE to a user; it says nothing about
+    whether dense point data needs aggregating before rendering, which is
+    a rendering-performance concern that applies regardless of whether a
+    polygon happens to exist. Every cell in the bounding box is kept (no
+    polygon-containment filter -- there is no polygon to test against),
+    and the returned schema (row_idx/col_idx/south/west/north/east +
+    attrs south/west/cell_height/cell_width) matches build_polygon_lattice
+    exactly, so callers can use either interchangeably without knowing
+    which one produced it.
+    """
+    empty = pd.DataFrame(columns=["row_idx", "col_idx", "south", "west", "north", "east", "center_lat", "center_lon"])
+    geo = df.dropna(subset=["lat", "lon"])
+    if geo.empty:
+        return empty
+
+    lon = pd.to_numeric(geo["lon"], errors="coerce")
+    lat = pd.to_numeric(geo["lat"], errors="coerce")
+    west, east = float(lon.min()), float(lon.max())
+    south, north = float(lat.min()), float(lat.max())
+    if not (west < east and south < north):
+        return empty
+
+    avg_lat_rad = math.radians((north + south) / 2.0)
+    lat_deg_per_meter = 1 / 111320
+    lng_deg_per_meter = 1 / (111320 * math.cos(avg_lat_rad))
+    cell_height = grid_size_meters * lat_deg_per_meter
+    cell_width = grid_size_meters * lng_deg_per_meter
+
+    num_rows = max(1, math.ceil((north - south) / cell_height))
+    num_cols = max(1, math.ceil((east - west) / cell_width))
+
+    rows = []
+    for row_idx in range(num_rows):
+        cell_south = south + row_idx * cell_height
+        cell_north = cell_south + cell_height
+        center_lat = (cell_south + cell_north) / 2.0
+        for col_idx in range(num_cols):
+            cell_west = west + col_idx * cell_width
+            cell_east = cell_west + cell_width
+            center_lon = (cell_west + cell_east) / 2.0
+            rows.append((row_idx, col_idx, cell_south, cell_west, cell_north, cell_east, center_lat, center_lon))
+
+    lattice = pd.DataFrame(rows, columns=["row_idx", "col_idx", "south", "west", "north", "east", "center_lat", "center_lon"])
+    lattice.attrs["south"] = south
+    lattice.attrs["west"] = west
+    lattice.attrs["cell_height"] = cell_height
+    lattice.attrs["cell_width"] = cell_width
+    return lattice
+
+
+def resolve_lattice(polygon_wkt: str | None, df: pd.DataFrame, grid_size_meters: float) -> pd.DataFrame:
+    """Polygon-anchored lattice when the project has one, else a lattice
+    anchored to the data's own GPS bounds -- same schema either way, so
+    every consumer (KPI grid maps, handover event grids, ...) can always
+    aggregate dense point data onto SOME grid, polygon or not."""
+    if polygon_wkt:
+        return build_polygon_lattice(polygon_wkt, grid_size_meters)
+    return build_data_bounds_lattice(df, grid_size_meters)
+
+
 def aggregate_grid_cells(df: pd.DataFrame, lattice: pd.DataFrame, value_col: str) -> tuple[pd.DataFrame, int, int]:
     """
     Buckets df's (lat, lon, value_col) rows onto the SHARED `lattice` (same

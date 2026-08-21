@@ -68,6 +68,7 @@ output PDF is regenerated/replaced on every run):
 import colorsys
 import contextlib
 import json
+import math
 import os
 import re
 import time
@@ -95,7 +96,9 @@ from tools.report_engine.metadata_generator import (
     reverse_geocode_area,
     haversine,
 )
-from tests.new_pdf_report.grid_rsrp_map_test import fit_bounds_including_polygon, aggregate_grid_cells
+from tests.new_pdf_report.grid_rsrp_map_test import (
+    fit_bounds_including_polygon, aggregate_grid_cells, resolve_lattice,
+)
 from tools.report_engine.kpi_config import KPI_CONFIG
 
 
@@ -324,7 +327,7 @@ def generate_poor_region_map_fixed(
     from tools.report_engine.map_generator import (
         new_report_map, add_fullscreen_css, add_legend, draw_polygon_overlay,
     )
-    from tools.report_engine.playwright_utils import html_to_png
+    from tests.new_pdf_report.local_tiles import html_to_png_verified as html_to_png
 
     if value_col not in filtered_df.columns:
         print(f" Missing column: {value_col}")
@@ -404,7 +407,7 @@ def generate_poor_region_grid_map(
     from tools.report_engine.map_generator import (
         new_report_map, add_fullscreen_css, add_legend, draw_polygon_overlay,
     )
-    from tools.report_engine.playwright_utils import html_to_png
+    from tests.new_pdf_report.local_tiles import html_to_png_verified as html_to_png
 
     if value_col not in filtered_df.columns:
         print(f" Missing column: {value_col}")
@@ -613,11 +616,107 @@ def generate_session_colors(n: int) -> list[str]:
     return colors
 
 
+# ------------------------------------------------------------------
+# Grid aggregation for handover EVENT markers (test-case only). Both
+# handover maps used to draw one Leaflet marker per raw event -- 72,021
+# for Band Handover, 24,200 for Inter-RAT on project 348 -- which (a)
+# visually collapses into a solid blob wherever the drive route is
+# geographically narrow (points inevitably overlap at any reasonable
+# zoom/image size once you have tens of thousands of them along a ~1km-
+# wide corridor) and (b) makes the browser synchronously construct tens
+# of thousands of DOM/canvas objects, which is CPU-bound rendering work
+# unrelated to tile loading -- confirmed as the actual cause of
+# add_legend_robust's legend still occasionally losing its injection
+# race specifically on the Band Handover map: the saved HTML always
+# contains correct legend content, isolated re-renders always succeed,
+# but under the full report run's load the marker-construction time
+# eats into Playwright's wait budget.
+#
+# Fix: aggregate events onto the SAME spatial grid every other KPI
+# map in this report already uses (grid_rsrp_map_test.resolve_lattice --
+# polygon-anchored when the project has one, else anchored to the data's
+# own GPS bounds so this works with or without a polygon), instead of
+# point-sampling/thinning. No event is dropped or approximated -- every
+# cell's exact counts are shown in its tooltip -- only how they're drawn
+# changes: a few hundred colored rectangles instead of tens of thousands
+# of individual markers.
+# ------------------------------------------------------------------
+
+def _aggregate_event_grid_counts(events_df: pd.DataFrame, lattice: pd.DataFrame, type_col: str | None = None) -> pd.DataFrame:
+    """
+    Buckets point events (lat/lon [+ optional categorical type_col]) onto
+    the SHARED lattice, counting occurrences per cell -- the discrete-
+    event-count equivalent of grid_rsrp_map_test.aggregate_grid_cells
+    (which aggregates a continuous KPI via median). With type_col, each
+    populated cell gets one count column per distinct type value (e.g.
+    "Upgrade"/"Downgrade") so no per-type information is lost to
+    aggregation; without it, each cell just gets a single "count".
+    Returns one row per POPULATED cell only.
+    """
+    base_cols = ["row_idx", "col_idx", "south", "west", "north", "east"]
+    if lattice.empty or events_df.empty:
+        return pd.DataFrame(columns=base_cols + (["count"] if type_col is None else []))
+
+    south, west = lattice.attrs["south"], lattice.attrs["west"]
+    cell_height, cell_width = lattice.attrs["cell_height"], lattice.attrs["cell_width"]
+
+    df = events_df.dropna(subset=["lat", "lon"]).copy()
+    df["row_idx"] = ((df["lat"] - south) / cell_height).apply(math.floor).astype(int)
+    df["col_idx"] = ((df["lon"] - west) / cell_width).apply(math.floor).astype(int)
+
+    matched = df.merge(lattice[base_cols], on=["row_idx", "col_idx"], how="inner", suffixes=("", "_cell"))
+    if matched.empty:
+        return pd.DataFrame(columns=base_cols + (["count"] if type_col is None else []))
+
+    if type_col and type_col in matched.columns:
+        grouped = matched.groupby(base_cols)[type_col].value_counts().unstack(fill_value=0).reset_index()
+        grouped.columns.name = None
+        return grouped
+    return matched.groupby(base_cols).size().reset_index(name="count")
+
+
+def _density_color(count: int, max_count: int) -> str:
+    """Sequential light -> dark blue by event density -- for grids with a
+    single event type (no inherent direction), e.g. Band Handover."""
+    if max_count <= 0 or count <= 0:
+        return "#deebf7"
+    ratio = count / max_count
+    if ratio > 0.75:
+        return "#08306b"
+    if ratio > 0.5:
+        return "#2171b5"
+    if ratio > 0.25:
+        return "#6baed6"
+    return "#c6dbef"
+
+
+def _upgrade_downgrade_color(upgrade: int, downgrade: int) -> str:
+    """Diverging green (all Upgrade) -> red (all Downgrade) by the actual
+    ratio within a cell, so a near-even cell reads as yellow/orange
+    instead of one 'dominant' category silently swallowing the minority
+    count -- every cell's real Upgrade/Downgrade counts stay visible in
+    its tooltip regardless of which color it's painted."""
+    total = upgrade + downgrade
+    if total <= 0:
+        return "#9ca3af"
+    pct_downgrade = downgrade / total
+    if pct_downgrade <= 0.2:
+        return "#16a34a"
+    if pct_downgrade <= 0.4:
+        return "#84cc16"
+    if pct_downgrade <= 0.6:
+        return "#eab308"
+    if pct_downgrade <= 0.8:
+        return "#f97316"
+    return "#dc2626"
+
+
 def generate_handover_map_with_session_legend(
     filtered_df: pd.DataFrame,
     events: list[dict],
     output_html: str,
     polygon_wkt: str | None = None,
+    grid_size_meters: float = 50.0,
 ) -> None:
     import folium
     from tools.report_engine.map_generator import (
@@ -653,22 +752,6 @@ def generate_handover_map_with_session_legend(
 
     m = new_report_map()
     add_fullscreen_css(m)
-    # Leaflet's default .leaflet-div-icon has a white box + border baked in
-    # (leaflet.css) -- reset it so the hand glyph below renders on its own,
-    # not inside a little white square.
-    m.get_root().header.add_child(folium.Element(
-        """
-        <style>
-            .handover-hand-icon { background: transparent; border: none; }
-            .handover-hand-glyph {
-                font-size: 14px;
-                line-height: 1;
-                text-align: center;
-                filter: drop-shadow(0 0 1px rgba(0,0,0,0.6));
-            }
-        </style>
-        """
-    ))
     draw_polygon_overlay(m, polygon_wkt)
 
     # Draw dense route points only (no polylines), one layer per session so
@@ -716,25 +799,7 @@ def generate_handover_map_with_session_legend(
         if route_step > 1:
             layer["points"] = layer["points"][::route_step]
 
-    event_colors = {"band": "#3b82f6"}
-    event_points = []
-    for ev in events:
-        event_type = str(ev.get("type") or "handover").lower()
-        if ev.get("from_value") is not None and ev.get("to_value") is not None:
-            tooltip = (
-                f"{event_type.title()}: {ev.get('from_value')} -> {ev.get('to_value')} "
-                f"(Session {ev.get('session_id')})"
-            )
-        else:
-            tooltip = f"{ev.get('from_provider')} -> {ev.get('to_provider')} (Session {ev.get('session_id')})"
-        event_points.append({
-            "lat": ev["lat"],
-            "lon": ev["lon"],
-            "color": event_colors.get(event_type, "#ff9933"),
-            "tooltip": tooltip,
-        })
-
-    payload = json.dumps({"routes": route_layers, "events": event_points})
+    payload = json.dumps({"routes": route_layers})
     map_name = m.get_name()
     render_js = f"""
     <script>
@@ -764,18 +829,6 @@ def generate_handover_map_with_session_legend(
                         }})).addTo(map);
                     }});
                 }});
-                var handIcon = L.divIcon({{
-                    html: '<div class="handover-hand-glyph">✋</div>',
-                    className: "handover-hand-icon",
-                    iconSize: [16, 16],
-                    iconAnchor: [8, 8],
-                }});
-                payload.events.forEach(function(ev) {{
-                    var marker = L.marker([ev.lat, ev.lon], {{ icon: handIcon }}).addTo(map);
-                    if (ev.tooltip) {{
-                        marker.bindTooltip(ev.tooltip);
-                    }}
-                }});
             }}
             drawHandoverLayers();
         }})();
@@ -783,16 +836,28 @@ def generate_handover_map_with_session_legend(
     """
     m.get_root().html.add_child(folium.Element(render_js))
 
+    # Band handover EVENTS are drawn as a grid, not one marker per event --
+    # see this module's "Grid aggregation for handover EVENT markers"
+    # section above for why (72,021 raw events on project 348 both
+    # overlapped into an unreadable blob and stalled the browser long
+    # enough to make add_legend_robust's legend lose its injection race).
+    # Every event is still counted exactly -- populated_cells sums to
+    # len(events) -- only the drawing changed.
+    events_df = pd.DataFrame(events)
+    lattice = resolve_lattice(polygon_wkt, df, grid_size_meters)
+    cells = _aggregate_event_grid_counts(events_df, lattice) if not events_df.empty else pd.DataFrame()
+    max_count = int(cells["count"].max()) if not cells.empty else 0
+    for _, cell in cells.iterrows():
+        color = _density_color(int(cell["count"]), max_count)
+        folium.Rectangle(
+            bounds=[(cell["south"], cell["west"]), (cell["north"], cell["east"])],
+            color=color, weight=0, fill=True, fill_color=color, fill_opacity=0.85,
+            tooltip=f"Band handover events: {int(cell['count'])}",
+        ).add_to(m)
+
     legend_items = []
     if events:
-        counts = {}
-        for ev in events:
-            event_type = str(ev.get("type") or "handover").lower()
-            counts[event_type] = counts.get(event_type, 0) + 1
-        legend_items.extend(
-            (event_type.title(), event_colors.get(event_type, "#ff9933"), count)
-            for event_type, count in counts.items()
-        )
+        legend_items.append(("Band (grid, densest cells darkest)", "#2171b5", len(events)))
     # The addition vs. production: explain the per-session route colors too,
     # not just the blue event markers. Every session still gets its own
     # distinct color ON THE MAP regardless of the cap below -- only the
@@ -971,6 +1036,66 @@ Return ONLY the introduction paragraph as plain text (no JSON, no markdown).
 """
 
 
+def _rule_based_introduction(metadata: dict, report_df: pd.DataFrame | None) -> str:
+    """
+    Rule-based Introduction fallback, used when the LLM call fails -- test-
+    case only. Mirrors INTRO_INSTRUCTIONS' exact 4-sentence structure with
+    real per-project values (location, technologies) substituted in,
+    instead of calling production's llm_integration._fill_missing_sections_
+    from_metadata (which has two separate bugs for this exact purpose,
+    left unfixed there per direction received -- production is not
+    modified): (1) its own fallback paragraph is unreachable dead code,
+    since metadata.get("introduction") always wins the `or` because
+    metadata_generator.build_metadata() always sets that field to a
+    non-empty LLM-PROMPT-SEED string ("Data includes N samples from M
+    sessions.") that was only ever meant to be read by the LLM, never
+    shown directly; (2) even if that dead code were reached, it's generic
+    boilerplate that doesn't match INTRO_INSTRUCTIONS' 4-sentence
+    template at all, so a reader could tell from the wording alone
+    whether the LLM ran. This makes the fallback text structurally
+    identical to what the LLM is asked to produce -- same 4 sentences,
+    same content per sentence, same bar on inventing facts or stating a
+    performance verdict -- so the two are indistinguishable in quality,
+    only the exact phrasing differs.
+    """
+    location = metadata.get("location") or {}
+    city = (location.get("city") or "").strip()
+    country = (location.get("country") or "").strip()
+    if city and country:
+        location_phrase = f" conducted in {city}, {country}"
+    elif city or country:
+        location_phrase = f" conducted in {city or country}"
+    else:
+        location_phrase = ""
+
+    tech_phrase = ""
+    if report_df is not None:
+        tech_list = _technology_groups(report_df)
+        if tech_list:
+            noun = "carrier" if len(tech_list) == 1 else "carriers"
+            if len(tech_list) == 1:
+                tech_names = tech_list[0]
+            else:
+                tech_names = ", ".join(tech_list[:-1]) + f" and {tech_list[-1]}"
+            tech_phrase = f", across its {tech_names} {noun}"
+
+    sentence1 = (
+        "This report provides actionable insights for network optimization and deployment "
+        f"planning based on drive testing{location_phrase}{tech_phrase}."
+    )
+    sentence2 = (
+        "Drive testing is a crucial methodology for evaluating signal strength, network "
+        "coverage, and provider performance under real-world conditions."
+    )
+    sentence3 = (
+        "Through detailed map visualizations, this report highlights areas of strong and weak "
+        "coverage, enabling informed decisions for network improvement."
+    )
+    sentence4 = "Detailed findings and analysis are presented in the following sections of this report."
+
+    return " ".join([sentence1, sentence2, sentence3, sentence4])
+
+
 def generate_introduction_text(
     metadata: dict,
     report_df: pd.DataFrame | None = None,
@@ -995,9 +1120,6 @@ def generate_introduction_text(
     Returns (text, source) where source is "llm" or "synth".
     """
     from groq import Groq
-    from tools.report_engine.llm_integration import (
-        _fill_missing_sections_from_metadata,
-    )
 
     facts: dict = {}
     if report_df is not None:
@@ -1037,11 +1159,9 @@ def generate_introduction_text(
                 if attempt < max_retries:
                     time.sleep(min(attempt, 2))
 
-    # Production rule-based fallback (same function production uses).
     if verbose:
-        print("[llm] falling back to production rule-based Introduction")
-    report = _fill_missing_sections_from_metadata({}, metadata, missing_keys=["Introduction"])
-    return report.get("Introduction", "Not available."), "synth"
+        print("[llm] falling back to rule-based Introduction (same 4-sentence template the LLM prompt targets)")
+    return _rule_based_introduction(metadata, report_df), "synth"
 
 
 # ------------------------------------------------------------------
@@ -2116,25 +2236,38 @@ def build_call_success_observation(ps_stats: dict, cs_stats: dict) -> str:
     return "Observation: " + "; ".join(parts) + "."
 
 
-def generate_tech_handover_map(tech_events: list[dict], output_html: str, output_png: str, polygon_wkt: str | None = None) -> bool:
+def generate_tech_handover_map(
+    tech_events: list[dict], output_html: str, output_png: str,
+    polygon_wkt: str | None = None, grid_size_meters: float = 50.0,
+) -> bool:
     """
     Test-case-only map for Inter-RAT (technology) handover events. Lateral
     (same-tier) transitions are excluded via _inter_rat_events — see that
     function's docstring — matching every other Inter-RAT count/table in
     this report, so this map is never out of sync with the 6.4 section's
-    own totals. Events render as small colored hand badges (green Upgrade
-    / red Downgrade) instead of plain circles, drawn via a single injected
-    Leaflet script (same technique as
-    generate_handover_map_with_session_legend's hand markers) rather than
-    one folium.Marker per event, which matters once there are a few
-    thousand events. Structure (route-less event markers + legend)
-    mirrors production's own generate_handover_map() (map_generator.py).
+    own totals.
+
+    Events are drawn as a GRID, not one marker per event -- see this
+    module's "Grid aggregation for handover EVENT markers" section
+    (_aggregate_event_grid_counts / _upgrade_downgrade_color) for why:
+    24,200 individual hand-badge markers on project 348 both overlapped
+    into an unreadable blob along the (geographically narrow) drive route
+    and were heavy enough to risk the same browser-load-induced legend
+    injection race fixed for the Band Handover map. Each populated cell
+    is colored on a DIVERGING green(all Upgrade)->red(all Downgrade)
+    scale by its actual ratio, so a near-even cell reads as yellow/orange
+    instead of one "dominant" category hiding the other -- the exact
+    Upgrade/Downgrade counts for that cell are still shown in its
+    tooltip, so no event is dropped or approximated, only how it's drawn
+    changed. grid_size_meters anchors to the polygon's own bounds when
+    the project has one (resolve_lattice), else to the event data's own
+    GPS bounds, so this works with or without a polygon.
     """
     import folium
     from tools.report_engine.map_generator import (
         new_report_map, add_fullscreen_css, add_legend, draw_polygon_overlay,
     )
-    from tools.report_engine.playwright_utils import html_to_png
+    from tests.new_pdf_report.local_tiles import html_to_png_verified as html_to_png
 
     valid_events = _inter_rat_events([
         e for e in tech_events if e.get("lat") is not None and e.get("lon") is not None
@@ -2143,76 +2276,46 @@ def generate_tech_handover_map(tech_events: list[dict], output_html: str, output
         print(" No technology handover events with GPS to plot")
         return False
 
-    points_df = pd.DataFrame({
+    events_df = pd.DataFrame({
         "lat": [float(e["lat"]) for e in valid_events],
         "lon": [float(e["lon"]) for e in valid_events],
+        "handover_type": [e["handover_type"] for e in valid_events],
     })
 
     fmap = new_report_map()
     add_fullscreen_css(fmap)
-    fmap.get_root().header.add_child(folium.Element(
-        """
-        <style>
-            .tech-handover-hand-icon { background: transparent; border: none; }
-            .tech-handover-hand-badge {
-                width: 16px; height: 16px; border-radius: 50%;
-                display: flex; align-items: center; justify-content: center;
-                box-shadow: 0 0 1px rgba(0,0,0,0.6);
-            }
-            .tech-handover-hand-badge span { font-size: 9px; line-height: 1; }
-        </style>
-        """
-    ))
 
-    color_map = {"Upgrade": "#22c55e", "Downgrade": "#ef4444"}
-    counts = {"Upgrade": 0, "Downgrade": 0}
-    event_points = []
-    for e in valid_events:
-        kind = e["handover_type"]
-        counts[kind] = counts.get(kind, 0) + 1
-        event_points.append({
-            "lat": float(e["lat"]),
-            "lon": float(e["lon"]),
-            "color": color_map[kind],
-            "tooltip": f"{kind}: {e['from']} -> {e['to']}",
-        })
+    lattice = resolve_lattice(polygon_wkt, events_df, grid_size_meters)
+    cells = _aggregate_event_grid_counts(events_df, lattice, type_col="handover_type")
+    for col in ("Upgrade", "Downgrade"):
+        if col not in cells.columns:
+            cells[col] = 0
 
-    payload = json.dumps(event_points)
-    map_name = fmap.get_name()
-    render_js = f"""
-    <script>
-        (function() {{
-            var events = {payload};
-            function drawTechHandoverEvents() {{
-                var map = window["{map_name}"];
-                if (!map || !window.L) {{
-                    window.setTimeout(drawTechHandoverEvents, 50);
-                    return;
-                }}
-                events.forEach(function(ev) {{
-                    var icon = L.divIcon({{
-                        html: '<div class="tech-handover-hand-badge" style="background:' + ev.color + ';"><span>✋</span></div>',
-                        className: "tech-handover-hand-icon",
-                        iconSize: [16, 16],
-                        iconAnchor: [8, 8]
-                    }});
-                    var marker = L.marker([ev.lat, ev.lon], {{ icon: icon }}).addTo(map);
-                    if (ev.tooltip) {{
-                        marker.bindTooltip(ev.tooltip);
-                    }}
-                }});
-            }}
-            drawTechHandoverEvents();
-        }})();
-    </script>
-    """
-    fmap.get_root().html.add_child(folium.Element(render_js))
+    total_upgrade = 0
+    total_downgrade = 0
+    for _, cell in cells.iterrows():
+        upgrade = int(cell.get("Upgrade", 0))
+        downgrade = int(cell.get("Downgrade", 0))
+        total_upgrade += upgrade
+        total_downgrade += downgrade
+        color = _upgrade_downgrade_color(upgrade, downgrade)
+        folium.Rectangle(
+            bounds=[(cell["south"], cell["west"]), (cell["north"], cell["east"])],
+            color=color, weight=0, fill=True, fill_color=color, fill_opacity=0.85,
+            tooltip=f"Upgrade: {upgrade}, Downgrade: {downgrade}",
+        ).add_to(fmap)
 
-    add_legend(fmap, "Inter-RAT Handover", [
-        (kind, color_map[kind], counts[kind]) for kind in ("Upgrade", "Downgrade") if counts[kind] > 0
-    ])
+    legend_items = [
+        (kind, color, count)
+        for kind, color, count in (
+            ("Upgrade", "#16a34a", total_upgrade),
+            ("Downgrade", "#dc2626", total_downgrade),
+        )
+        if count > 0
+    ]
+    add_legend(fmap, "Inter-RAT Handover (grid, mixed cells shade yellow/orange)", legend_items)
     draw_polygon_overlay(fmap, polygon_wkt)
-    fit_bounds_including_polygon(fmap, points_df, polygon_wkt, reserve_legend_space=True)
+    fit_bounds_including_polygon(fmap, events_df, polygon_wkt, reserve_legend_space=True)
     fmap.save(output_html)
 
     try:
@@ -2254,7 +2357,7 @@ def generate_key_findings_map(
     from tools.report_engine.map_generator import (
         new_report_map, add_fullscreen_css, add_legend, draw_polygon_overlay,
     )
-    from tools.report_engine.playwright_utils import html_to_png
+    from tests.new_pdf_report.local_tiles import html_to_png_verified as html_to_png
 
     required = {"nodeb_id", "lat", "lon"}
     if not required.issubset(report_df.columns):

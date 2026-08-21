@@ -29,7 +29,18 @@ def clip_to_polygon(gdf: gpd.GeoDataFrame, polygon) -> gpd.GeoDataFrame:
     if gdf.empty:
         return gdf
     gdf = gdf[gdf.geometry.notnull() & ~gdf.geometry.is_empty].copy()
-    return gdf[gdf.geometry.intersects(polygon)].copy()
+    # Bug fix: this used to only *filter* to features whose geometry.intersects()
+    # the project polygon, keeping each matched feature's FULL original geometry.
+    # For land_cover/land_use, Overture ships large multi-part features (a single
+    # feature id can span a huge area); one part touching the small project bbox
+    # was enough to keep the whole untrimmed shape, which for this project (210,
+    # Taiwan) pulled in "green" polygons spanning almost the entire island. A real
+    # geometric clip (gpd.clip) trims every feature down to just the portion that
+    # actually falls inside the project polygon, same as water/roads always needed.
+    if gdf.crs is None:
+        gdf = gdf.set_crs("EPSG:4326")
+    clipped = gpd.clip(gdf, polygon)
+    return clipped[clipped.geometry.notnull() & ~clipped.geometry.is_empty].copy()
 
 
 def fetch_layer(overture_type: str, bbox, polygon, label: str) -> gpd.GeoDataFrame:

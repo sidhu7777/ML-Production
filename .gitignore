@@ -105,6 +105,11 @@ commands.*.local.txt
 *.xls
 *.geojson
 *.zip
+*.rar
+*.7z
+
+# Non-code research materials (slides, archives, etc.)
+Research/
 
 # ML experiment scratch artifacts
 _tmp_evidently*.html

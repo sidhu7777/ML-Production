@@ -44,10 +44,31 @@ def get_engine(region: str = "india"):
     return _ENGINES[key]
 
 
+def _ensure_column(conn, column: str, ddl: str) -> None:
+    """Additive ALTER only -- adds `column` if it's missing, never drops or
+    changes anything else. Checked via information_schema first (portable
+    across MySQL versions, unlike `ADD COLUMN IF NOT EXISTS`)."""
+    exists = conn.execute(
+        text(
+            """
+            SELECT COUNT(*) FROM information_schema.COLUMNS
+            WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = :table_name AND COLUMN_NAME = :column_name
+            """
+        ),
+        {"table_name": RESULT_TABLE_NAME, "column_name": column},
+    ).scalar()
+    if not exists:
+        conn.execute(text(f"ALTER TABLE {RESULT_TABLE_NAME} ADD COLUMN {ddl}"))
+
+
 def ensure_results_table(region: str = "india") -> None:
-    """CREATE TABLE IF NOT EXISTS only -- never touches any other table."""
+    """CREATE TABLE IF NOT EXISTS, plus additive ALTERs for columns added
+    after the table already existed in production (e.g. resolved/reason) --
+    never drops or touches any other table."""
     with get_engine(region).begin() as conn:
         conn.execute(text(CREATE_RESULT_TABLE_SQL))
+        _ensure_column(conn, "resolved", "resolved TINYINT(1) NULL AFTER changed_flag")
+        _ensure_column(conn, "reason", "reason TEXT NULL AFTER resolved")
 
 
 def save_results(df: pd.DataFrame, region: str = "india") -> int:

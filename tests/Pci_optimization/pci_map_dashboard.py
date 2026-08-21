@@ -1650,24 +1650,29 @@ def build_neighbor_graph(
     df = df.dropna(subset=["site_pci", "site_earfcn", "site_lat", "site_lon"])
 
     graph = nx.Graph()
-    node_by_site_pci: dict[tuple, tuple] = {}
+    # Keyed by (site, pci, earfcn) -- NOT (site, pci) alone. A dual-band
+    # site can legitimately reuse the same PCI number on two different
+    # EARFCNs; a 2-field key would let the second overwrite the first,
+    # silently dropping one real sector from every lookup below.
+    node_by_site_pci_earfcn: dict[tuple, tuple] = {}
     node_latlon: dict[tuple, tuple] = {}
     for row in df.itertuples():
         node = (row.site_id_inferred, int(row.site_pci), int(row.site_earfcn))
         graph.add_node(node)
-        node_by_site_pci[(row.site_id_inferred, int(row.site_pci))] = node
+        node_by_site_pci_earfcn[node] = node
         node_latlon[node] = (row.site_lat, row.site_lon)
 
-    required = {"from_site_id_inferred", "to_site_id_inferred", "from_pci", "to_pci"}
+    required = {"from_site_id_inferred", "to_site_id_inferred", "from_pci", "to_pci", "from_site_earfcn", "to_site_earfcn"}
     if not events_df.empty and required.issubset(events_df.columns):
         events = events_df.dropna(subset=list(required)).copy()
         for row in events.itertuples():
             try:
                 from_pci, to_pci = int(float(row.from_pci)), int(float(row.to_pci))
+                from_earfcn, to_earfcn = int(float(row.from_site_earfcn)), int(float(row.to_site_earfcn))
             except (TypeError, ValueError):
                 continue
-            u = node_by_site_pci.get((row.from_site_id_inferred, from_pci))
-            v = node_by_site_pci.get((row.to_site_id_inferred, to_pci))
+            u = node_by_site_pci_earfcn.get((row.from_site_id_inferred, from_pci, from_earfcn))
+            v = node_by_site_pci_earfcn.get((row.to_site_id_inferred, to_pci, to_earfcn))
             if u is None or v is None or u == v:
                 continue
             if graph.has_edge(u, v):
@@ -1727,6 +1732,23 @@ def _make_pci_pair_cost(check_exact: bool, mod_values: list, check_grouped: bool
         return total
 
     return cost
+
+
+def _cost_for_single_rule(rule_label: str):
+    """Isolates ONE rule's own contribution to the pair-cost. A sector
+    touched by two rules at once (e.g. Collision AND Mod3 on the same
+    physical sector) needs its own per-rule pass/fail, not just the
+    combined total -- a sector can genuinely clear Collision (504 values
+    of room) while still being stuck on Mod3 (3 buckets), and reporting
+    only the combined cost would wrongly call the Collision side
+    unresolved too."""
+    if rule_label in ("Collision", "Confusion"):
+        return _make_pci_pair_cost(check_exact=True, mod_values=[], check_grouped=False)
+    if rule_label == "Grouped":
+        return _make_pci_pair_cost(check_exact=False, mod_values=[], check_grouped=True)
+    if rule_label.startswith("Mod"):
+        return _make_pci_pair_cost(check_exact=False, mod_values=[int(rule_label[3:])], check_grouped=False)
+    raise ValueError(f"Unknown rule label: {rule_label}")
 
 
 def _apply_pci_assignments(
@@ -1893,20 +1915,26 @@ def recommend_pci_reassignment(
     iterations/converged/remaining_conflicts/verified_clean/
     remaining_by_iteration/infeasible_rules/stopped_reason).
     """
+    # Keyed by (site, pci, earfcn) -- NOT (site, pci) alone. A site can
+    # legitimately reuse the same PCI on two different EARFCNs (dual-band);
+    # a 2-field key collapses those into one, silently dropping whichever
+    # one loses the dict-overwrite race from ever being optimized at all
+    # (confirmed on project 196: 22 of 50 touched (site, pci) pairs were
+    # actually two distinct sectors on different EARFCNs sharing a number).
     touched_types: dict[tuple, set] = {}
     for c in collision_conflicts:
         for s in c["sites"]:
-            touched_types.setdefault((s, c["pci"]), set()).add("Collision")
+            touched_types.setdefault((s, c["pci"], c["earfcn"]), set()).add("Collision")
     for c in confusion_conflicts:
         for s in c["neighbor_sites"]:
-            touched_types.setdefault((s, c["pci"]), set()).add("Confusion")
+            touched_types.setdefault((s, c["pci"], c["earfcn"]), set()).add("Confusion")
     for n, conflicts in mod_conflicts_by_n.items():
         for c in conflicts:
             for s, p in c["members"]:
-                touched_types.setdefault((s, p), set()).add(f"Mod{n}")
+                touched_types.setdefault((s, p, c["earfcn"]), set()).add(f"Mod{n}")
     for c in grouped_conflicts:
         for s, p in c["members"]:
-            touched_types.setdefault((s, p), set()).add("Grouped")
+            touched_types.setdefault((s, p, c["earfcn"]), set()).add("Grouped")
 
     if not touched_types:
         return pd.DataFrame(), {
@@ -1916,8 +1944,10 @@ def recommend_pci_reassignment(
 
     pair_cost = _make_pci_pair_cost(check_collision or check_confusion, mod_values, check_grouped)
 
-    node_by_site_pci = {(n[0], n[1]): n for n in graph.nodes}
-    target_nodes = [node_by_site_pci[k] for k in touched_types if k in node_by_site_pci]
+    # touched_types keys are already (site, pci, earfcn) -- exactly the
+    # graph's own node shape -- so a node is touched iff it's a key here,
+    # no separate lookup dict needed (and no risk of it re-colliding).
+    target_nodes = [node for node in touched_types if node in graph.nodes]
     target_nodes.sort(key=lambda n: graph.degree(n), reverse=True)
 
     def neighbors_of(node):
@@ -2008,7 +2038,18 @@ def recommend_pci_reassignment(
     for node in target_nodes:
         site_id, current_pci, earfcn = node
         neighbors = neighbors_of(node)
-        final_cost = sum(pair_cost(assignments[node], assignments.get(n, n[1])) for n in neighbors)
+        neighbor_final_pcis = [assignments.get(n, n[1]) for n in neighbors]
+        final_cost = sum(pair_cost(assignments[node], npci) for npci in neighbor_final_pcis)
+        conflict_types = touched_types.get((site_id, current_pci, earfcn), set())
+        # Per-rule cost, not just the combined total -- a sector touched by
+        # two rules at once can genuinely clear one while the other stays
+        # stuck (e.g. Collision resolved, Mod3 still capacity-limited on
+        # the same sector); reporting only `after_cost` would call both
+        # unresolved just because the total isn't exactly zero.
+        rule_costs = {
+            rule_label: sum(_cost_for_single_rule(rule_label)(assignments[node], npci) for npci in neighbor_final_pcis)
+            for rule_label in conflict_types
+        }
         rows.append(
             {
                 "site": site_id,
@@ -2018,7 +2059,8 @@ def recommend_pci_reassignment(
                 "before_cost": before_costs[node],
                 "after_cost": final_cost,
                 "num_same_earfcn_sectors": len(neighbors),
-                "conflict_types": touched_types.get((site_id, current_pci), set()),
+                "conflict_types": conflict_types,
+                "rule_costs": rule_costs,
             }
         )
 

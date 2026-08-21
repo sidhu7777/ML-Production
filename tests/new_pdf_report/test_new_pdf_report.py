@@ -111,6 +111,10 @@ def _load_report_data(project_id: int):
     modified anywhere in this chain; we're just calling its public
     functions in a corrected order/combination.
     """
+    from shapely import contains as shp_contains, points as shp_points
+    from shapely.ops import transform as shp_transform
+    from shapely.wkt import loads as load_wkt, dumps as dump_wkt
+
     from tools.report_engine.load_data_db import (
         load_project_data,
         filter_known_band_rows,
@@ -121,16 +125,65 @@ def _load_report_data(project_id: int):
     raw_df, _production_filtered_df, project_meta = load_project_data(project_id)
     polygon_wkt = project_meta.get("region")
 
+    # Detect and correct a lat/lon axis-order mismatch in the stored region
+    # polygon (test-case only). Confirmed root cause for project 348: the
+    # polygon is stored as "lat lon" pairs instead of WKT-standard "lon lat".
+    # Production's own load_project_data() has a swap-and-retry fallback for
+    # this (load_data_db.py's swapped_polygons block), but that fallback
+    # lives inside the direct-DB branch only -- bridge-prefiltered projects
+    # (see bridge_prefiltered below) skip that whole branch, so
+    # project_meta["region"] comes back un-corrected. This affects every
+    # downstream consumer of project_meta["region"], not just row filtering
+    # (e.g. grid_rsrp_map_test.build_polygon_lattice, which parses the WKT
+    # directly), so it's corrected once here rather than at each call site.
+    if polygon_wkt:
+        poly = load_wkt(polygon_wkt)
+        geo = raw_df.dropna(subset=["lat", "lon"])
+        if not geo.empty:
+            lon = pd.to_numeric(geo["lon"], errors="coerce").to_numpy(dtype=float)
+            lat = pd.to_numeric(geo["lat"], errors="coerce").to_numpy(dtype=float)
+            pts = shp_points(lon, lat)
+            inside_as_is = int(shp_contains(poly, pts).sum())
+
+            def _swap_xy(x, y, z=None):
+                return (y, x) if z is None else (y, x, z)
+
+            swapped_poly = shp_transform(_swap_xy, poly)
+            inside_swapped = int(shp_contains(swapped_poly, pts).sum())
+            if inside_swapped > inside_as_is:
+                polygon_wkt = dump_wkt(swapped_poly)
+                project_meta["region"] = polygon_wkt
+                print(
+                    f"[data] NOTE: project {project_id}'s stored region polygon was in "
+                    f"(lat, lon) axis order -- corrected to standard WKT (lon, lat) order "
+                    f"({inside_as_is} -> {inside_swapped} of {len(geo)} rows contained)."
+                )
+
     # All cells, polygon-filtered only — production's own dataframe, used
     # here as the base for both handover detection (unchanged use) and the
     # corrected primary-row filter below.
-    handover_df = polygon_filter_all_cells(raw_df, polygon_wkt)
+    #
+    # Bridge-prefiltered projects (see production's main.py, same check) have
+    # already had polygon + primary filtering applied server-side by
+    # GetDriveTestRows before Python ever sees the rows. In that mode,
+    # load_project_data() skips its own polygon step entirely and leaves
+    # project_meta["region"] as the raw, un-swap-corrected WKT (its
+    # swap-detection retry only runs in the direct-DB branch), so calling
+    # polygon_filter_all_cells() here would test bridge-prefiltered points
+    # against a polygon in the wrong axis order and silently zero everything
+    # out. Mirror production and trust the bridge output as-is instead.
+    bridge_prefiltered = bool(project_meta.get("report_data_prefiltered"))
+    if bridge_prefiltered:
+        handover_df = raw_df.reset_index(drop=True)
+    else:
+        handover_df = polygon_filter_all_cells(raw_df, polygon_wkt)
 
     nr_aware_primary_df = filter_primary_rows_including_nr(handover_df)
     report_df = filter_known_band_rows(nr_aware_primary_df)
 
     print(f"[data] raw rows                                    : {len(raw_df)}")
     print(f"[data] production's primary+polygon rows (for ref) : {len(_production_filtered_df)}")
+    print(f"[data] bridge_prefiltered                          : {bridge_prefiltered}")
     print(f"[data] all-cells, polygon rows                     : {len(handover_df)}")
     print(f"[data] NR-aware primary rows                       : {len(nr_aware_primary_df)}")
     print(f"[data] report rows (+ known band, NR-aware)        : {len(report_df)}")
@@ -244,7 +297,7 @@ def _render_base_route_map(
     from tests.new_pdf_report.new_report_sections import (
         generate_base_route_map_polygon_aware, generate_base_route_grid_map,
     )
-    from tools.report_engine.playwright_utils import html_to_png
+    from tests.new_pdf_report.local_tiles import html_to_png_verified as html_to_png
 
     html_path = out_dir / "html" / "base_route.html"
     png_path = out_dir / "images" / "kpi_maps" / "base_route_map.png"
@@ -297,7 +350,7 @@ def _render_kpi_map_per_technology(
     """
     from tools.report_engine.threshold_resolver import resolve_kpi_ranges
     from tools.report_engine.map_generator import generate_kpi_map, has_valid_numeric_data
-    from tools.report_engine.playwright_utils import html_to_png
+    from tests.new_pdf_report.local_tiles import html_to_png_verified as html_to_png
     from tests.new_pdf_report.new_report_sections import _technology_groups, _tech_slug
     from tests.new_pdf_report.grid_rsrp_map_test import aggregate_grid_cells, generate_kpi_grid_map
 
@@ -402,7 +455,7 @@ def _render_coverage_kpi_images(
     single blended distribution per KPI.
     """
     from tests.new_pdf_report.new_report_sections import generate_categorical_kpi_map_polygon_aware
-    from tools.report_engine.playwright_utils import html_to_png
+    from tests.new_pdf_report.local_tiles import html_to_png_verified as html_to_png
     from tools.report_engine.kpi_config import rsrp_colour_manual, rsrq_color_manual, sinr_color_manual
     from tools.report_engine import kpi_analysis
 
@@ -549,7 +602,7 @@ def _render_mobility_kpi_images(report_df, polygon_wkt, out_dir: Path) -> None:
     from tools.report_engine import kpi_analysis
     from tools.report_engine.map_generator import has_valid_categorical_data
     from tests.new_pdf_report.new_report_sections import generate_categorical_kpi_map_polygon_aware
-    from tools.report_engine.playwright_utils import html_to_png
+    from tests.new_pdf_report.local_tiles import html_to_png_verified as html_to_png
 
     html_dir = out_dir / "html"
     maps_dir = out_dir / "images" / "kpi_maps"
@@ -583,7 +636,7 @@ def _render_mobility_kpi_images(report_df, polygon_wkt, out_dir: Path) -> None:
         print(f"[map] WARNING: failed to generate PCI map: {exc}")
 
 
-def _render_handover_kpi_images(handover_df, band_events, tech_events, polygon_wkt, out_dir: Path) -> None:
+def _render_handover_kpi_images(handover_df, band_events, tech_events, polygon_wkt, out_dir: Path, grid_size_meters: float = 50.0) -> None:
     """
     Section 6 visuals: the band-handover route map (test-case-only
     generate_handover_map_with_session_legend, which duplicates production's
@@ -599,7 +652,7 @@ def _render_handover_kpi_images(handover_df, band_events, tech_events, polygon_w
     Inter-RAT technology-transition map (test-case only, see
     new_report_sections.generate_tech_handover_map).
     """
-    from tools.report_engine.playwright_utils import html_to_png
+    from tests.new_pdf_report.local_tiles import html_to_png_verified as html_to_png
     from tests.new_pdf_report.new_report_sections import (
         generate_tech_handover_map, generate_handover_map_with_session_legend,
     )
@@ -613,7 +666,10 @@ def _render_handover_kpi_images(handover_df, band_events, tech_events, polygon_w
     else:
         try:
             html_path = html_dir / "handover_map.html"
-            generate_handover_map_with_session_legend(handover_df, band_events, str(html_path), polygon_wkt=polygon_wkt)
+            generate_handover_map_with_session_legend(
+                handover_df, band_events, str(html_path), polygon_wkt=polygon_wkt,
+                grid_size_meters=grid_size_meters,
+            )
             html_to_png(str(html_path), str(band_png), width=1200, height=900, device_scale_factor=1)
             print(f"[map] generated handover_map.png ({len(band_events)} band events)")
         except Exception as exc:
@@ -627,6 +683,7 @@ def _render_handover_kpi_images(handover_df, band_events, tech_events, polygon_w
             html_path = html_dir / "tech_handover_map.html"
             ok = generate_tech_handover_map(
                 tech_events, str(html_path), str(tech_png), polygon_wkt=polygon_wkt,
+                grid_size_meters=grid_size_meters,
             )
             if ok:
                 print(f"[map] generated tech_handover_map.png ({len(tech_events)} tech events)")
@@ -896,6 +953,7 @@ def run_report(project_id: int = DEFAULT_PROJECT_ID, use_llm: bool = True) -> Pa
     _render_handover_kpi_images(
         handover_df, handover_data["band_events"], handover_data["tech_events"],
         project_meta.get("region"), out_dir,
+        grid_size_meters=grid_size_meters or 50.0,
     )
 
     # ---------- 4d. SERVICE KPI IMAGES (Section 7: DL/UL/MOS maps +
@@ -1009,7 +1067,9 @@ def run_report(project_id: int = DEFAULT_PROJECT_ID, use_llm: bool = True) -> Pa
     not os.getenv("DATABASE_URL"), reason="DATABASE_URL not configured"
 )
 def test_new_format_report_pages_1_to_5():
-    run_report(DEFAULT_PROJECT_ID)
+    from tests.new_pdf_report.local_tiles import use_local_tiles
+    with use_local_tiles():
+        run_report(DEFAULT_PROJECT_ID)
 
 
 # ------------------------------------------------------------------
@@ -1023,4 +1083,6 @@ if __name__ == "__main__":
                         help="Skip the LLM call and use the production rule-based fallback")
     args = parser.parse_args()
 
-    run_report(args.project_id, use_llm=not args.no_llm)
+    from tests.new_pdf_report.local_tiles import use_local_tiles
+    with use_local_tiles():
+        run_report(args.project_id, use_llm=not args.no_llm)

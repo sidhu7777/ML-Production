@@ -11,21 +11,24 @@ from openpyxl.utils import get_column_letter
 from .engine import severity_label
 
 
-def _build_reason(row: dict[str, Any], infeasible_rules: list[dict[str, Any]]) -> tuple[bool, str]:
-    """Every touched sector gets an honest reason -- resolved and what
-    changed, or not resolved and exactly why (backed by the same
-    pigeonhole proof the closed-loop optimizer itself used, wherever that
-    applies), never a silent blank."""
-    conflict_types = sorted(row.get("conflict_types") or [])
-    types_label = ", ".join(conflict_types) if conflict_types else "unknown rule"
-    resolved = row["after_cost"] == 0
+def build_reason(
+    rule_label: str, rule_cost: float, current_pci: int, suggested_pci: int, earfcn: Any, infeasible_rules: list[dict[str, Any]]
+) -> tuple[bool, str]:
+    """Per-RULE outcome, not per-sector. A sector touched by two rules at
+    once (e.g. Collision AND Mod3 on the same physical sector) can clear
+    one while the other stays capacity-limited -- judging by the combined
+    cost would wrongly call the resolved side unresolved too, just
+    because a different, co-occurring rule couldn't be satisfied. Always
+    a genuine reason, backed by the same pigeonhole proof the closed-loop
+    optimizer itself used wherever it applies, never a silent blank."""
+    resolved = rule_cost == 0
 
     if resolved:
-        if row["current_pci"] != row["suggested_pci"]:
-            return True, f"Resolved: PCI changed {row['current_pci']} -> {row['suggested_pci']} to clear {types_label}."
-        return True, f"Already optimal for {types_label} -- no PCI change needed."
+        if current_pci != suggested_pci:
+            return True, f"Resolved: PCI changed {current_pci} -> {suggested_pci} to clear {rule_label}."
+        return True, f"Already optimal for {rule_label} -- no PCI change needed."
 
-    matches = [p for p in infeasible_rules if p["rule"] in conflict_types and p["earfcn"] == row["earfcn"]]
+    matches = [p for p in infeasible_rules if p["rule"] == rule_label and p["earfcn"] == earfcn]
     if matches:
         p = matches[0]
         return False, (
@@ -33,13 +36,16 @@ def _build_reason(row: dict[str, Any], infeasible_rules: list[dict[str, Any]]) -
             f"but {p['rule']} only offers {p['capacity']} distinct value(s) -- mathematically proven "
             "(pigeonhole principle), not a search limitation."
         )
-    return False, f"Not resolved: no better PCI found for {types_label} given the current neighbor state."
+    return False, f"Not resolved: no better PCI found for {rule_label} given the current neighbor state."
 
 
 def build_export_rows(result: dict[str, Any]) -> pd.DataFrame:
-    """One row per sector actually touched by a checked rule -- never the
-    whole project's sector list. Every row states whether it was resolved
-    and what changed, or exactly why it could not be resolved."""
+    """One row per (sector, rule) actually touched by a checked rule --
+    never the whole project's sector list, and never one row combining
+    multiple rules' outcomes into a single misleading total. Every row
+    states whether THAT rule was resolved on THAT sector, and what
+    changed or exactly why it could not be -- same shape as the DB save
+    (services.py._build_result_rows), so Excel and DB never disagree."""
     recs = result.get("recommendations")
     if recs is None or recs.empty:
         return pd.DataFrame()
@@ -50,22 +56,24 @@ def build_export_rows(result: dict[str, Any]) -> pd.DataFrame:
     rows = []
     for _, r in recs.iterrows():
         row = r.to_dict()
-        resolved, reason = _build_reason(row, infeasible_rules)
-        conflict_types = sorted(row.get("conflict_types") or [])
-        rows.append(
-            {
-                "Site": row["site"],
-                "EARFCN": row["earfcn"],
-                "Rule(s)": ", ".join(conflict_types),
-                "Severity": severity_label(set(conflict_types)),
-                "Current PCI": row["current_pci"],
-                "Suggested PCI": row["suggested_pci"],
-                "Changed": bool(row["current_pci"] != row["suggested_pci"]),
-                "Resolved": resolved,
-                "Reason": reason,
-                "Same-EARFCN Sectors Considered": row["num_same_earfcn_sectors"],
-            }
-        )
+        rule_costs = row.get("rule_costs") or {}
+        for rule_label in sorted(row.get("conflict_types") or []):
+            rule_cost = rule_costs.get(rule_label, row["after_cost"])
+            resolved, reason = build_reason(rule_label, rule_cost, row["current_pci"], row["suggested_pci"], row["earfcn"], infeasible_rules)
+            rows.append(
+                {
+                    "Site": row["site"],
+                    "EARFCN": row["earfcn"],
+                    "Rule": rule_label,
+                    "Severity": severity_label({rule_label}),
+                    "Current PCI": row["current_pci"],
+                    "Suggested PCI": row["suggested_pci"],
+                    "Changed": bool(row["current_pci"] != row["suggested_pci"]),
+                    "Resolved": resolved,
+                    "Reason": reason,
+                    "Same-EARFCN Sectors Considered": row["num_same_earfcn_sectors"],
+                }
+            )
     df = pd.DataFrame(rows)
     return df.sort_values(by=["Resolved", "Severity"], ascending=[True, False]).reset_index(drop=True)
 

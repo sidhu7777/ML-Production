@@ -11,7 +11,7 @@ import pandas as pd
 
 from . import db
 from .engine import run_pci_optimization, severity_label
-from .export import export_pci_optimization_excel
+from .export import build_reason, export_pci_optimization_excel
 
 
 ML_ROOT = Path(__file__).resolve().parents[2]
@@ -70,6 +70,27 @@ def _build_result_rows(result: dict[str, Any], project_id: int, job_id: str, reg
             if not match.empty:
                 rec_row = match.iloc[0]
 
+        # Per-row, dynamic, per-RULE outcome -- NOT the job-level
+        # stopped_reason/verified_clean fields (those describe the whole
+        # combined run), and NOT the sector's combined after_cost either
+        # (a sector touched by both Collision and Mod3 can genuinely clear
+        # Collision while Mod3 stays capacity-limited on that same
+        # sector -- judging by the combined total would call the resolved
+        # rule unresolved too). Same build_reason logic the Excel export
+        # uses, so DB and Excel never disagree about what happened.
+        if rec_row is not None:
+            rec_dict = rec_row.to_dict()
+            rule_cost = (rec_dict.get("rule_costs") or {}).get(rule_type, rec_dict["after_cost"])
+            resolved, reason = build_reason(
+                rule_type, rule_cost, rec_dict["current_pci"], rec_dict["suggested_pci"], rec_dict["earfcn"],
+                verification.get("infeasible_rules", []),
+            )
+        else:
+            resolved, reason = None, (
+                "Not evaluated: flagged by detection but the optimizer did not produce a recommendation "
+                "for this exact (site, PCI, EARFCN) combination."
+            )
+
         rows.append(
             {
                 "project_id": project_id,
@@ -87,6 +108,8 @@ def _build_result_rows(result: dict[str, Any], project_id: int, job_id: str, reg
                 "current_pci": int(current_pci),
                 "suggested_pci": int(rec_row["suggested_pci"]) if rec_row is not None else None,
                 "changed_flag": bool(rec_row["current_pci"] != rec_row["suggested_pci"]) if rec_row is not None else None,
+                "resolved": resolved,
+                "reason": reason,
                 "conflict_cost_before": float(rec_row["before_cost"]) if rec_row is not None else None,
                 "conflict_cost_after": float(rec_row["after_cost"]) if rec_row is not None else None,
                 "same_earfcn_sectors_considered": int(rec_row["num_same_earfcn_sectors"]) if rec_row is not None else None,
@@ -143,8 +166,24 @@ class PciOptimizationService:
             saved_rows = db.save_results(result_df, region=region)
 
             self._update(job_id, "running", "Exporting Excel report")
-            output_dir = OUTPUT_ROOT / f"project_{project_id}"
-            excel_path = export_pci_optimization_excel(result, output_dir)
+            # Job-scoped, not project-scoped -- same reason tilt recommendation
+            # writes to outputs/temp_<job_id>/: a fixed, reused-per-project
+            # path collides with itself if the user still has last run's file
+            # open in Excel (confirmed: Windows PermissionError on overwrite).
+            # A fresh folder per run means every run's file is untouched by
+            # whatever the user is doing with a previous one.
+            output_dir = OUTPUT_ROOT / f"project_{project_id}" / f"job_{job_id}"
+            excel_path = None
+            excel_error = None
+            try:
+                excel_path = export_pci_optimization_excel(result, output_dir)
+            except OSError as exc:
+                # DB results are already saved by this point -- a file-write
+                # problem (locked file, permissions, disk full) shouldn't
+                # fail the whole job when the actual optimization result is
+                # already safely persisted. Surface it, don't hide it.
+                excel_error = str(exc)
+                print(f"[PCI_OPTIMIZATION][{job_id[:8]}] Excel export failed (non-fatal): {excel_error}", flush=True)
 
             runtime_sec = (dt.datetime.utcnow() - started).total_seconds()
             verification = result.get("verification") or {}
@@ -171,6 +210,7 @@ class PciOptimizationService:
                 infeasible_rules=verification.get("infeasible_rules"),
                 saved_rows=saved_rows,
                 excel_path=str(excel_path) if excel_path else None,
+                excel_error=excel_error,
                 runtime_sec=round(runtime_sec, 3),
             )
         except Exception as exc:

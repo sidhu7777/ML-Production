@@ -38,8 +38,7 @@ def cdf_trace(values: pd.Series, name: str) -> go.Scatter:
     return go.Scatter(x=arr, y=y, mode="lines", name=f"{name} (n={len(arr):,})")
 
 
-def main() -> None:
-    st.set_page_config(page_title="Project 210 Phase 11/12", layout="wide")
+def render() -> None:
     st.title("Project 210 Taiwan - Phase 11 / Phase 12 Residual Blending")
 
     summary = load_summary()
@@ -128,6 +127,11 @@ def main() -> None:
         use_container_width=True,
         height=320,
     )
+
+
+def main() -> None:
+    st.set_page_config(page_title="Project 210 Phase 11/12", layout="wide")
+    render()
 
 
 if __name__ == "__main__":

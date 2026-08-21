@@ -370,8 +370,7 @@ def add_raster_to_map(
     return result
 
 
-def main() -> None:
-    st.set_page_config(page_title="Taiwan Mapdata Viewer", layout="wide")
+def render() -> None:
     st.title("Taiwan Project 210 Mapdata Viewer")
 
     inventory = build_inventory()
@@ -458,6 +457,11 @@ def main() -> None:
         st.dataframe(pd.DataFrame(results), use_container_width=True)
     else:
         st.info("Select one or more layers to render them on the map.")
+
+
+def main() -> None:
+    st.set_page_config(page_title="Taiwan Mapdata Viewer", layout="wide")
+    render()
 
 
 if __name__ == "__main__":
