@@ -46,6 +46,7 @@ for p in (ML_ROOT, THIS_DIR, BASELINE_DIR):
 import streamlit_project210_phase13_beam_check as phase13
 import streamlit_project210_phase15_radius_progression as phase15
 import test_project210_phase17_full_polygon_geo_dt_comparison as phase17  # reused read-only, not modified
+from phase_rsrp_guard import display_rsrp, valid_model_rsrp
 
 MIN_DT_FOR_REPRESENTATIVE_CLASS = phase17.MIN_DT_FOR_REPRESENTATIVE_CLASS  # 8, same threshold as Phase 11/12/17
 RSRP_MIN, RSRP_MAX = phase17.RSRP_MIN, phase17.RSRP_MAX
@@ -159,6 +160,7 @@ def _compute_phase19_candidates(
         identity[["Node_Cell_ID", "Etilt", "Mtilt", "Height", "tx_power"]],
         left_on="strict_cell_key", right_on="Node_Cell_ID", how="left",
     )
+    candidates["physical_rsrp_unclipped"] = np.nan
     candidates["physical_rsrp"] = np.nan
     candidates["geo_correction_db"] = 0.0
     candidates["obstruction_branch"] = "unknown"
@@ -202,7 +204,8 @@ def _compute_phase19_candidates(
             float(bias_lookup.get((c, b), 0.0)) if c else 0.0 for c, b in zip(cls, branch)
         ], dtype=float)
 
-        candidates.loc[group.index, "physical_rsrp"] = np.clip(physical + correction, RSRP_MIN, RSRP_MAX)
+        candidates.loc[group.index, "physical_rsrp_unclipped"] = physical + correction
+        candidates.loc[group.index, "physical_rsrp"] = valid_model_rsrp(physical + correction)
         candidates.loc[group.index, "geo_correction_db"] = correction
         candidates.loc[group.index, "obstruction_branch"] = branch
         candidates.loc[group.index, "clutter_class"] = cls
@@ -210,19 +213,21 @@ def _compute_phase19_candidates(
         if (idx + 1) % 10 == 0 or idx == n_cells - 1:
             print(f"[PHASE19] geo-corrected+branch-biased cells {idx + 1}/{n_cells} ({len(group)} points)", flush=True)
 
-    missing = candidates["physical_rsrp"].isna()
+    missing = candidates["physical_rsrp_unclipped"].isna()
     if missing.any():
-        candidates.loc[missing, "physical_rsrp"] = np.clip(candidates.loc[missing, "raw_cost231_rsrp"], RSRP_MIN, RSRP_MAX)
+        candidates.loc[missing, "physical_rsrp_unclipped"] = pd.to_numeric(
+            candidates.loc[missing, "raw_cost231_rsrp"], errors="coerce"
+        )
+        candidates.loc[missing, "physical_rsrp"] = valid_model_rsrp(candidates.loc[missing, "raw_cost231_rsrp"])
         print(f"[PHASE19] {int(missing.sum())} candidate rows had no identity match - fell back to raw_cost231_rsrp only")
 
-    candidates["phase19_rsrp_no_lock"] = np.clip(
-        candidates["physical_rsrp"] + candidates["bias_db"], RSRP_MIN, RSRP_MAX
-    )
+    candidates["phase19_rsrp_no_lock_unclipped"] = candidates["physical_rsrp"] + candidates["bias_db"]
+    candidates["phase19_rsrp_no_lock"] = valid_model_rsrp(candidates["phase19_rsrp_no_lock_unclipped"])
     lock = candidates["dt_replaced"].fillna(False).astype(bool) if "dt_replaced" in candidates.columns else pd.Series(False, index=candidates.index)
     candidates["candidate_phase19_rsrp"] = np.where(
         lock, candidates.get("dt_replacement_rsrp", np.nan), candidates["phase19_rsrp_no_lock"]
     )
-    candidates["candidate_phase19_rsrp"] = np.clip(candidates["candidate_phase19_rsrp"].astype(float), RSRP_MIN, RSRP_MAX)
+    candidates["candidate_phase19_rsrp"] = display_rsrp(candidates["candidate_phase19_rsrp"].astype(float))
     return candidates
 
 
@@ -255,8 +260,8 @@ def main() -> None:
             on="grid_id", how="left",
         )
         serving = serving.merge(agg, on="grid_id", how="left")
-        serving["phase19_rsrp"] = np.clip(serving["phase19_rsrp_agg"].astype(float), RSRP_MIN, RSRP_MAX)
-        serving["phase19_frontend_mean_rsrp"] = np.clip(serving["phase19_frontend_mean_rsrp"].astype(float), RSRP_MIN, RSRP_MAX)
+        serving["phase19_rsrp"] = valid_model_rsrp(serving["phase19_rsrp_agg"].astype(float))
+        serving["phase19_frontend_mean_rsrp"] = valid_model_rsrp(serving["phase19_frontend_mean_rsrp"].astype(float))
 
         out_path = OUT_DIR / f"phase19_serving_grid_{technology.lower()}_project210.parquet"
         serving.to_parquet(out_path, index=False)

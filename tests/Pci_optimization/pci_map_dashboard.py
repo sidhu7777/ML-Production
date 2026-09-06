@@ -602,6 +602,43 @@ def detect_pci_order_conflicts(graph: nx.Graph, max_order: int = 5) -> dict[int,
     return results
 
 
+# Weights the optimizer's cost function uses for Order 2-5 reuse (same
+# PCI+EARFCN at that exact hop distance in the neighbor graph). Order 1 is
+# deliberately NOT listed here -- it's already exactly what Collision's
+# check_exact=100 weight covers (see detect_pci_order_conflicts' own
+# docstring: "Order 1 = direct neighbor reuse, the same pairs
+# detect_pci_collisions flags"), so adding it again here would double the
+# penalty when Collision is checked, and would silently re-enable a check
+# the user explicitly turned off when Collision is unchecked. Order 2 sits
+# just under Collision's weight because it's structurally what Confusion is
+# (two cells 2 hops apart via a shared serving neighbor). Orders 3-5 have no
+# 3GPP/RF meaning, so they get a small, strictly decreasing nudge -- enough
+# that the greedy search prefers a candidate that doesn't create one when a
+# same-cost alternative exists, never enough to outweigh a real checked rule.
+ORDER_2_TO_5_WEIGHTS: dict[int, int] = {2: 50, 3: 10, 4: 5, 5: 2}
+
+
+def _multi_hop_same_earfcn_by_order(graph: nx.Graph, node: tuple, max_order: int = 5) -> dict[int, list]:
+    """
+    Same-EARFCN nodes reachable from `node` within max_order hops,
+    bucketed by their EXACT hop distance -- a static fact about the graph's
+    TOPOLOGY, unaffected by which PCI any node currently holds (node
+    identity in this graph is (site, pci, earfcn), but a PCI reassignment
+    during the optimizer's search is tracked in a separate `assignments`
+    dict, never by mutating the graph -- see recommend_pci_reassignment).
+    So this only needs to be computed ONCE per node, up front, exactly like
+    the existing 1-hop `neighbors_of` closure.
+    """
+    earfcn = node[2]
+    hop_lengths = nx.single_source_shortest_path_length(graph, node, cutoff=max_order)
+    by_order: dict[int, list] = {order: [] for order in range(1, max_order + 1)}
+    for other, hops in hop_lengths.items():
+        if hops == 0 or other[2] != earfcn:
+            continue
+        by_order[hops].append(other)
+    return by_order
+
+
 def build_order_conflict_table(
     order_conflicts_by_order: dict[int, list[dict]],
     confusion_conflicts: list[dict],
@@ -1788,12 +1825,23 @@ def _count_remaining_conflicts(
     check_confusion: bool,
     mod_values: list,
     check_grouped: bool,
+    max_order: int = 5,
 ) -> int:
     """Runs the ACTUAL detector functions (not the cost formula) against a
-    hypothetical graph/events state and counts conflicts for only the
+    hypothetical graph/events state and counts conflicts for the
     currently-checked rules — the real verification step of the closed
     loop, independent of whatever the greedy search's own cost function
-    assumed."""
+    assumed.
+
+    Orders 2-max_order are counted UNCONDITIONALLY here, regardless of
+    which named rule checkboxes are active. This is the actual fix for the
+    gap the manager flagged: previously the loop only re-verified whichever
+    rule(s) were checked, so it could report "converged" while silently
+    having created a brand-new Order-3/4/5 reuse conflict that nothing
+    would ever look at again. Order 1 is excluded here on purpose -- it IS
+    Collision (see detect_pci_order_conflicts), so it's already covered by
+    the check_collision branch above and must not be double-counted or
+    force-enabled when the user turned Collision off."""
     total = 0
     if check_collision:
         total += len(detect_pci_collisions(graph))
@@ -1803,6 +1851,9 @@ def _count_remaining_conflicts(
         total += len(detect_pci_mod_conflicts(graph, mod_n))
     if check_grouped:
         total += len(detect_pci_group_conflicts(graph))
+    order_conflicts = detect_pci_order_conflicts(graph, max_order=max_order)
+    for order in range(2, max_order + 1):
+        total += len(order_conflicts.get(order, []))
     return total
 
 
@@ -1902,10 +1953,26 @@ def recommend_pci_reassignment(
     size instead of a flat magic number, so a genuinely solvable case
     isn't cut off early just because it took a while.
 
-    Only optimizes for rules actually checked in the sidebar: pass an
-    empty list for any conflict type that's unchecked, and False/empty
-    for the matching check_*/mod_values flag. `mod_conflicts_by_n` is
-    {mod_n: conflicts} for each checked Mod value only.
+    Named rules (Collision/Confusion/Mod-N/Grouped) are only optimized for
+    when actually checked in the sidebar: pass an empty list for any
+    conflict type that's unchecked, and False/empty for the matching
+    check_*/mod_values flag. `mod_conflicts_by_n` is {mod_n: conflicts}
+    for each checked Mod value only.
+
+    Order 1-5 reuse-distance conflicts (same PCI+EARFCN at that exact hop
+    distance in `graph`) are the one exception: Orders 2-5 are ALWAYS
+    included as an objective and ALWAYS re-verified after optimization,
+    regardless of which named rules are checked. This closes the gap the
+    manager identified: fixing a Collision (Order 1) could previously
+    create a brand-new Order 3/4/5 conflict with nothing ever checking for
+    it again. Order 1 itself is never double-counted here -- it IS
+    Collision (same pairs, same definition), so it's covered whenever
+    check_collision is True and left alone (not force-enabled) when it's
+    False. The FINAL suggested state is validated as one complete network,
+    not order-by-order: verification["order_conflicts_before_counts"] and
+    ["order_conflicts_after_counts"] (both {1: n, 2: n, ..., 5: n}) let you
+    prove nothing got worse anywhere, and ["order_verified_clean"] is True
+    only when the final state has zero conflicts across ALL five orders.
 
     Collision/Mod-N/Grouped conflicts are defined by detect_pci_collisions/
     detect_pci_mod_conflicts/detect_pci_group_conflicts over NEIGHBOR
@@ -1913,7 +1980,9 @@ def recommend_pci_reassignment(
     threshold — see build_neighbor_graph), including same-site pairs.
     Returns (recommendation DataFrame, verification dict with keys
     iterations/converged/remaining_conflicts/verified_clean/
-    remaining_by_iteration/infeasible_rules/stopped_reason).
+    remaining_by_iteration/infeasible_rules/stopped_reason/
+    order_conflicts_before_counts/order_conflicts_after_counts/
+    order_verified_clean).
     """
     # Keyed by (site, pci, earfcn) -- NOT (site, pci) alone. A site can
     # legitimately reuse the same PCI on two different EARFCNs (dual-band);
@@ -1936,10 +2005,27 @@ def recommend_pci_reassignment(
         for s, p in c["members"]:
             touched_types.setdefault((s, p, c["earfcn"]), set()).add("Grouped")
 
+    # Order 1-5 reuse-distance conflicts, checked UNCONDITIONALLY -- this is
+    # the actual fix for the manager's finding: previously only whichever
+    # named rule(s) were checked got optimized/re-verified, so fixing
+    # Collision (Order 1) could silently create a brand-new Order 3
+    # conflict that nothing would ever look at again. Order 1 is skipped
+    # when adding to touched_types -- it IS Collision (same pairs, same
+    # definition), already handled above; adding it again here would just
+    # duplicate the same nodes under a second label.
+    order_conflicts_before = detect_pci_order_conflicts(graph, max_order=5)
+    for order in range(2, 6):
+        for pair in order_conflicts_before.get(order, []):
+            for s in pair["sites"]:
+                touched_types.setdefault((s, pair["pci"], pair["earfcn"]), set()).add(f"Order{order}")
+
     if not touched_types:
         return pd.DataFrame(), {
             "iterations": 0, "converged": True, "remaining_conflicts": 0, "verified_clean": True,
             "remaining_by_iteration": [], "infeasible_rules": [], "stopped_reason": "nothing_to_do",
+            "order_conflicts_before_counts": {o: 0 for o in range(1, 6)},
+            "order_conflicts_after_counts": {o: 0 for o in range(1, 6)},
+            "order_verified_clean": True,
         }
 
     pair_cost = _make_pci_pair_cost(check_collision or check_confusion, mod_values, check_grouped)
@@ -1953,10 +2039,30 @@ def recommend_pci_reassignment(
     def neighbors_of(node):
         return [n for n in graph.neighbors(node) if n[2] == node[2]]
 
+    # Static topology fact per target node -- who's reachable at hop
+    # distance 2-5 on the same EARFCN. Computed once, up front, exactly
+    # like neighbors_of's 1-hop equivalent, since reassigning a node's PCI
+    # never changes the graph's topology (see build_neighbor_graph / the
+    # assignments dict pattern already used throughout this function).
+    multi_hop_by_order_per_node = {node: _multi_hop_same_earfcn_by_order(graph, node, max_order=5) for node in target_nodes}
+
     # True baseline cost -- against the ORIGINAL, never-reassigned neighbor
     # PCIs, so "before" always means the real starting state, not whatever
-    # a previous node happened to already be reassigned to.
-    before_costs = {node: sum(pair_cost(node[1], n[1]) for n in neighbors_of(node)) for node in target_nodes}
+    # a previous node happened to already be reassigned to. Includes the
+    # Order 2-5 penalty against original PCIs too, not just 1-hop pairs.
+    def order_cost_for(node: tuple, candidate_pci: int, pcis_of) -> int:
+        total = 0
+        node_multi_hop = multi_hop_by_order_per_node.get(node, {})
+        for order, weight in ORDER_2_TO_5_WEIGHTS.items():
+            for other in node_multi_hop.get(order, []):
+                if candidate_pci == pcis_of(other):
+                    total += weight
+        return total
+
+    before_costs = {
+        node: sum(pair_cost(node[1], n[1]) for n in neighbors_of(node)) + order_cost_for(node, node[1], lambda n: n[1])
+        for node in target_nodes
+    }
 
     # Prove (not guess) whether the checked Mod-N/Grouped rule(s) can ever
     # reach zero on this graph at all, once, up front -- it's a structural
@@ -1991,6 +2097,7 @@ def recommend_pci_reassignment(
             neighbor_pcis = [assignments.get(n, n[1]) for n in neighbors]
             current_pci = assignments[node]
             current_cost = sum(pair_cost(current_pci, npci) for npci in neighbor_pcis)
+            current_cost += order_cost_for(node, current_pci, lambda n: assignments.get(n, n[1]))
             if current_cost == 0:
                 continue
 
@@ -2003,6 +2110,7 @@ def recommend_pci_reassignment(
             best_pci, best_cost = current_pci, current_cost
             for candidate in search_order:
                 cost = sum(pair_cost(candidate, npci) for npci in neighbor_pcis)
+                cost += order_cost_for(node, candidate, lambda n: assignments.get(n, n[1]))
                 if cost < best_cost:
                     best_cost, best_pci = cost, candidate
                 if cost == 0:
@@ -2011,12 +2119,17 @@ def recommend_pci_reassignment(
 
         # Verification pass: substitute the CURRENT full proposal into
         # real data and rerun the actual detectors -- ground truth, not
-        # the cost formula grading its own homework.
+        # the cost formula grading its own homework. max_order=5 means
+        # Order 2-5 are re-verified here too, unconditionally (see
+        # _count_remaining_conflicts) -- so the loop won't report
+        # "converged" while it silently left a new higher-order conflict
+        # behind; it keeps iterating until that's clean too, or patience
+        # runs out on the same terms as every other rule.
         substitution = {(node[0], node[1]): assignments[node] for node in target_nodes}
         hyp_site_df, hyp_events_df = _apply_pci_assignments(selected_sites_df, events_df, substitution)
         hyp_graph = build_neighbor_graph(hyp_site_df, hyp_events_df, distance_threshold_m=distance_threshold_m)
         remaining = _count_remaining_conflicts(
-            hyp_graph, hyp_events_df, selected_site_ids, check_collision, check_confusion, mod_values, check_grouped
+            hyp_graph, hyp_events_df, selected_site_ids, check_collision, check_confusion, mod_values, check_grouped, max_order=5
         )
         remaining_by_iteration.append(int(remaining))
         if remaining == 0:
@@ -2034,22 +2147,44 @@ def recommend_pci_reassignment(
             stopped_reason = "proven_infeasible" if infeasible_rules else "no_improvement_exhausted"
             break
 
+    # Final validation, per the manager's diagram: treat the FINAL suggested
+    # state as one complete network and recalculate ALL of Order 1-5 on it
+    # again (not just whichever named rule was checked) -- this is the
+    # "recalculate ALL conflicts again" step, proving (not assuming) that
+    # nothing got worse anywhere. Reuses hyp_graph from the loop's last
+    # verification pass (the graph already reflects the final assignments).
+    order_conflicts_after = detect_pci_order_conflicts(hyp_graph, max_order=5)
+    order_conflicts_before_counts = {o: len(order_conflicts_before.get(o, [])) for o in range(1, 6)}
+    order_conflicts_after_counts = {o: len(order_conflicts_after.get(o, [])) for o in range(1, 6)}
+    order_verified_clean = sum(order_conflicts_after_counts.values()) == 0
+
     rows = []
     for node in target_nodes:
         site_id, current_pci, earfcn = node
         neighbors = neighbors_of(node)
         neighbor_final_pcis = [assignments.get(n, n[1]) for n in neighbors]
         final_cost = sum(pair_cost(assignments[node], npci) for npci in neighbor_final_pcis)
+        final_cost += order_cost_for(node, assignments[node], lambda n: assignments.get(n, n[1]))
         conflict_types = touched_types.get((site_id, current_pci, earfcn), set())
         # Per-rule cost, not just the combined total -- a sector touched by
         # two rules at once can genuinely clear one while the other stays
         # stuck (e.g. Collision resolved, Mod3 still capacity-limited on
         # the same sector); reporting only `after_cost` would call both
-        # unresolved just because the total isn't exactly zero.
-        rule_costs = {
-            rule_label: sum(_cost_for_single_rule(rule_label)(assignments[node], npci) for npci in neighbor_final_pcis)
-            for rule_label in conflict_types
-        }
+        # unresolved just because the total isn't exactly zero. OrderN
+        # labels (N=2..5) use the same multi-hop lookup, isolated to that
+        # one order's own weight, not the 1-hop pair_cost machinery.
+        rule_costs = {}
+        for rule_label in conflict_types:
+            if rule_label.startswith("Order"):
+                order_n = int(rule_label[5:])
+                weight = ORDER_2_TO_5_WEIGHTS.get(order_n, 0)
+                rule_costs[rule_label] = sum(
+                    weight
+                    for other in multi_hop_by_order_per_node.get(node, {}).get(order_n, [])
+                    if assignments.get(other, other[1]) == assignments[node]
+                )
+            else:
+                rule_costs[rule_label] = sum(_cost_for_single_rule(rule_label)(assignments[node], npci) for npci in neighbor_final_pcis)
         rows.append(
             {
                 "site": site_id,
@@ -2072,6 +2207,9 @@ def recommend_pci_reassignment(
         "remaining_by_iteration": remaining_by_iteration,
         "infeasible_rules": infeasible_rules,
         "stopped_reason": stopped_reason,
+        "order_conflicts_before_counts": order_conflicts_before_counts,
+        "order_conflicts_after_counts": order_conflicts_after_counts,
+        "order_verified_clean": order_verified_clean,
     }
     return pd.DataFrame(rows), verification
 
@@ -2559,78 +2697,117 @@ def main() -> None:
             + (["Grouped"] if show_grouped else [])
         )
         st.caption(
-            "Only optimizes for the rule(s) currently checked above: "
+            "Optimizes for the rule(s) currently checked above: "
             + (", ".join(active_rule_labels) if active_rule_labels else "none — check a rule first")
             + f". Each candidate PCI is scored against every NEIGHBOR sector (real observed handover OR "
             f"within {int(neighbor_distance_m)}m — same-site sectors included, since they're always ~0m "
-            "apart) on the same EARFCN — the same neighbor graph the rules above use. Closed-loop: after "
-            "every proposal pass, the suggested PCIs are substituted into real copies of the site/event "
-            "data and the ACTUAL Collision/Confusion/Mod/Grouped detectors are rerun against that "
-            "hypothetical state to verify it, not just re-scored on paper — repeated until 0 conflicts "
-            "remain or a max-iteration cap is hit. A first-pass greedy heuristic, not the eventual "
-            "NSGA-II solver. Recommend-only: nothing above (map/tables) changes."
+            "apart) on the same EARFCN — the same neighbor graph the rules above use. PLUS Order 2-5 "
+            "reuse-distance is always included and always re-verified, regardless of what's checked above "
+            "— fixing a checked rule must never be allowed to silently create a new higher-order conflict. "
+            "Closed-loop: after every proposal pass, the suggested PCIs are substituted into real copies of "
+            "the site/event data and the ACTUAL Collision/Confusion/Mod/Grouped detectors, PLUS Order 1-5, "
+            "are rerun against that hypothetical state to verify it, not just re-scored on paper — repeated "
+            "until 0 conflicts remain across everything, or proven infeasible. A first-pass greedy "
+            "heuristic, not the eventual NSGA-II solver. Recommend-only: nothing above (map/tables) changes."
         )
         if not active_rule_labels:
-            st.warning("No PCI rule is checked above — check at least one (Collision, Confusion, a Mod, or Grouped) to run the optimizer.")
+            st.info("No named rule (Collision/Confusion/Mod/Grouped) is checked above — the optimizer will still run to check/fix Order 2-5 reuse-distance conflicts, since those are always on.")
+        mod_conflicts_checked = {n: mod_conflicts.get(n, []) for n in mod_values_checked}
+        t_start = time.perf_counter()
+        recs, verification = recommend_pci_reassignment(
+            selected_sites_df,
+            events_df,
+            selected_site_ids,
+            graph,
+            collision_conflicts if show_collision else [],
+            confusion_conflicts if show_confusion else [],
+            mod_conflicts_checked,
+            grouped_conflicts if show_grouped else [],
+            check_collision=show_collision,
+            check_confusion=show_confusion,
+            mod_values=mod_values_checked,
+            check_grouped=show_grouped,
+            distance_threshold_m=neighbor_distance_m,
+        )
+        elapsed_s = time.perf_counter() - t_start
+        if recs.empty:
+            st.info(f"No conflicts found (checked rule(s) or Order 2-5) among the selected sites — nothing to recommend. ({elapsed_s:.2f}s)")
         else:
-            mod_conflicts_checked = {n: mod_conflicts.get(n, []) for n in mod_values_checked}
-            t_start = time.perf_counter()
-            recs, verification = recommend_pci_reassignment(
-                selected_sites_df,
-                events_df,
-                selected_site_ids,
-                graph,
-                collision_conflicts if show_collision else [],
-                confusion_conflicts if show_confusion else [],
-                mod_conflicts_checked,
-                grouped_conflicts if show_grouped else [],
-                check_collision=show_collision,
-                check_confusion=show_confusion,
-                mod_values=mod_values_checked,
-                check_grouped=show_grouped,
-                distance_threshold_m=neighbor_distance_m,
+            st.dataframe(build_recommendation_table(recs, site_labels), use_container_width=True)
+            total_before = int(recs["before_cost"].sum())
+            total_after = int(recs["after_cost"].sum())
+            st.caption(f"Total conflict cost across recommended sectors: {total_before} -> {total_after}.")
+            st.caption(
+                f"Ran in {elapsed_s:.2f}s over {verification['iterations']} iteration(s) for "
+                f"{len(recs)} touched sector(s). Remaining conflicts per iteration: "
+                f"{verification['remaining_by_iteration']}."
             )
-            elapsed_s = time.perf_counter() - t_start
-            if recs.empty:
-                st.info(f"No conflicts found for the currently checked rule(s) among the selected sites — nothing to recommend. ({elapsed_s:.2f}s)")
-            else:
-                st.dataframe(build_recommendation_table(recs, site_labels), use_container_width=True)
-                total_before = int(recs["before_cost"].sum())
-                total_after = int(recs["after_cost"].sum())
-                st.caption(f"Total conflict cost across recommended sectors: {total_before} -> {total_after}.")
+
+            with st.expander("Order 1-5 final validation (before vs after optimization)", expanded=True):
                 st.caption(
-                    f"Ran in {elapsed_s:.2f}s over {verification['iterations']} iteration(s) for "
-                    f"{len(recs)} touched sector(s). Remaining conflicts per iteration: "
-                    f"{verification['remaining_by_iteration']}."
+                    "Per the correct production approach: treat the final PCI assignment as one complete "
+                    "network state, not a chain of order-by-order fixes. Order 1-5 are recalculated on the "
+                    "state BEFORE optimization and again on the FINAL state AFTER — proving whether fixing "
+                    "one order created a new conflict at a different order, instead of assuming it didn't."
                 )
-                if verification["verified_clean"]:
-                    st.success(
-                        f"Closed-loop verified: after {verification['iterations']} iteration(s), rerunning the "
-                        "real Collision/Confusion/Mod/Grouped detectors on the substituted PCI values found 0 "
-                        "remaining conflicts among the checked rule(s) for these sectors."
-                    )
-                elif verification["infeasible_rules"]:
-                    proofs = "; ".join(
-                        f"{p['rule']} on EARFCN {p['earfcn']}: {p['clique_size']} sectors are all mutual "
-                        f"neighbors of each other, but {p['rule']} only offers {p['capacity']} distinct bucket(s)"
-                        for p in verification["infeasible_rules"]
-                    )
+                order_before = verification["order_conflicts_before_counts"]
+                order_after = verification["order_conflicts_after_counts"]
+                order_df = pd.DataFrame(
+                    [
+                        {
+                            "Order": o,
+                            "Pairs BEFORE optimization": order_before[o],
+                            "Pairs AFTER optimization": order_after[o],
+                            "Change": order_after[o] - order_before[o],
+                        }
+                        for o in range(1, 6)
+                    ]
+                )
+                st.dataframe(order_df, use_container_width=True, hide_index=True)
+                worsened = [o for o in range(1, 6) if order_after[o] > order_before[o]]
+                if verification["order_verified_clean"]:
+                    st.success("Final validation PASSED: 0 conflicts remain across Order 1-5 in the final state.")
+                elif worsened:
                     st.error(
-                        f"Mathematically unsolvable, not a heuristic failure: {proofs}. By the pigeonhole "
-                        "principle, no PCI assignment can avoid at least one same-bucket pair there — ran "
-                        f"{verification['iterations']} iteration(s) to reach the best achievable state "
-                        f"({verification['remaining_conflicts']} conflict(s) remaining), then stopped because "
-                        "further looping cannot change a proven mathematical fact. The table above shows that "
-                        "best-achievable state, not a guaranteed-clean fix. Reduce the neighbor distance "
-                        "threshold, narrow which sectors are selected, or uncheck this rule to resolve it."
+                        f"Final validation FAILED: Order {', '.join(map(str, worsened))} got WORSE after "
+                        "optimization — fixing a checked rule introduced a new higher/lower-order conflict "
+                        "that was not there before."
                     )
                 else:
-                    st.error(
-                        f"NOT fully resolved after {verification['iterations']} iteration(s) — gave up after "
-                        f"{verification['remaining_conflicts']} conflict(s) stopped improving with no proof "
-                        "it's mathematically impossible; this heuristic simply couldn't find a better state. "
-                        "The table above shows the best state found, but this is NOT a guaranteed-clean fix."
+                    st.warning(
+                        "Final validation: no order got worse, but some Order 1-5 conflicts remain "
+                        f"unresolved in the final state ({sum(order_after.values())} total pair(s))."
                     )
+
+            if verification["verified_clean"] and verification["order_verified_clean"]:
+                st.success(
+                    f"Closed-loop verified: after {verification['iterations']} iteration(s), rerunning the "
+                    "real Collision/Confusion/Mod/Grouped detectors AND Order 1-5 on the substituted PCI "
+                    "values found 0 remaining conflicts anywhere in the final state."
+                )
+            elif verification["infeasible_rules"]:
+                proofs = "; ".join(
+                    f"{p['rule']} on EARFCN {p['earfcn']}: {p['clique_size']} sectors are all mutual "
+                    f"neighbors of each other, but {p['rule']} only offers {p['capacity']} distinct bucket(s)"
+                    for p in verification["infeasible_rules"]
+                )
+                st.error(
+                    f"Mathematically unsolvable, not a heuristic failure: {proofs}. By the pigeonhole "
+                    "principle, no PCI assignment can avoid at least one same-bucket pair there — ran "
+                    f"{verification['iterations']} iteration(s) to reach the best achievable state "
+                    f"({verification['remaining_conflicts']} conflict(s) remaining), then stopped because "
+                    "further looping cannot change a proven mathematical fact. The table above shows that "
+                    "best-achievable state, not a guaranteed-clean fix. Reduce the neighbor distance "
+                    "threshold, narrow which sectors are selected, or uncheck this rule to resolve it."
+                )
+            else:
+                st.error(
+                    f"NOT fully resolved after {verification['iterations']} iteration(s) — gave up after "
+                    f"{verification['remaining_conflicts']} conflict(s) (named rules) / "
+                    f"{sum(order_after.values())} conflict(s) (Order 1-5) stopped improving with no proof "
+                    "it's mathematically impossible; this heuristic simply couldn't find a better state. "
+                    "The table above shows the best state found, but this is NOT a guaranteed-clean fix."
+                )
 
 
 if __name__ == "__main__":

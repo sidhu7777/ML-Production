@@ -41,6 +41,20 @@ def _build_result_rows(result: dict[str, Any], project_id: int, job_id: str, reg
     for g in result["co_centric_groups"]:
         for earfcn, pci in g["members"]:
             findings.append({"site_id": g["site"], "current_pci": pci, "earfcn": earfcn, "rule_type": "Co-centric"})
+    # Order 2-5 reuse-distance conflicts, ALWAYS included regardless of
+    # which named rule(s) were checked -- engine.run_pci_optimization
+    # always computes order_conflicts_by_order, and recommend_pci_
+    # reassignment always optimizes/re-verifies against it (see engine.py).
+    # Without this, a sector the optimizer touched and changed ONLY because
+    # of an Order 3/4/5 conflict would have no row here at all, since it'd
+    # never appear in any of the named-rule conflict lists above -- a
+    # silent gap between what the optimizer actually did and what got
+    # reported. Order 1 is skipped -- it IS Collision, already covered.
+    order_conflicts_by_order = result.get("order_conflicts_by_order") or {}
+    for order in range(2, 6):
+        for pair in order_conflicts_by_order.get(order, []):
+            for site in pair["sites"]:
+                findings.append({"site_id": site, "current_pci": pair["pci"], "earfcn": pair["earfcn"], "rule_type": f"Order{order}"})
 
     if not findings:
         return pd.DataFrame()

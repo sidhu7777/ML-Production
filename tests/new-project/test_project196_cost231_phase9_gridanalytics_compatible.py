@@ -24,6 +24,7 @@ ML_ROOT = THIS_DIR.parents[1]
 if str(ML_ROOT) not in sys.path:
     sys.path.insert(0, str(ML_ROOT))
 
+from phase_rsrp_guard import RSRP_MAX_DBM, RSRP_NO_COVERAGE_DBM, display_rsrp, valid_model_rsrp
 from tools.lte_prediction.Sector_wise_prediction_code_copy import compute_sector_rsrp
 
 
@@ -39,10 +40,20 @@ WORK_DIR = DATA_DIR / "work"
 
 GRID_SIZE_M = float(os.getenv("PHASE9_GRID_SIZE_M", "25"))
 COVERAGE_RADIUS_M = float(os.getenv("PHASE9_COVERAGE_RADIUS_M", "500"))
-MIN_CANDIDATE_RSRP_DBM = float(os.getenv("PHASE9_MIN_CANDIDATE_RSRP_DBM", "-128"))
+MIN_CANDIDATE_RSRP_DBM = float(os.getenv("PHASE9_MIN_CANDIDATE_RSRP_DBM", str(RSRP_NO_COVERAGE_DBM)))
+PHASE9_CANDIDATE_MODE = os.getenv("PHASE9_CANDIDATE_MODE", "safe_radius").strip().lower()
+PHASE9_ENABLE_OUT_OF_RADIUS_BACKFILL = os.getenv("PHASE9_ENABLE_OUT_OF_RADIUS_BACKFILL", "1").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+}
+# Backfill keeps the k nearest sectors per uncovered cell (not just the single best-raw sector)
+# so downstream phases can apply antenna/obstruction/terrain/bias per candidate and pick the
+# true serving cell after all corrections. Same candidate schema as the in-radius path.
+PHASE9_BACKFILL_K_NEAREST = max(1, int(float(os.getenv("PHASE9_BACKFILL_K_NEAREST", "8"))))
 DT_REPLACE_RADIUS_M = float(os.getenv("PHASE9_DT_REPLACE_RADIUS_M", "25"))
 EARTH_RADIUS_M = 6371000.0
-CLIP_RSRP = (-140.0, -44.0)
+CLIP_RSRP = (RSRP_NO_COVERAGE_DBM, RSRP_MAX_DBM)
 ANTENNA_PATTERN_LOGIC = (
     "Cost231 helper compute_sector_rsrp uses 3GPP antenna gain: "
     "horizontal HPBW=65 deg, vertical HPBW=6 deg, max attenuation=30 dB, SLA_v=20 dB. "
@@ -147,6 +158,8 @@ def _prepare_dt(drive_df: pd.DataFrame) -> pd.DataFrame:
     out = out.dropna(subset=["lat", "lon", "rsrp"]).copy()
     out = out[(out["rsrp"] >= -150.0) & (out["rsrp"] <= -30.0)].copy()
     out = out.rename(columns={"rsrp": "rsrp_measured"})
+    network_text = _clean_text(out.get("network", pd.Series(index=out.index))).astype("string").str.upper()
+    out["measured_technology"] = np.where(network_text.str.contains("5G|NR", na=False), "5G", "4G")
     out["dt_row_id"] = np.arange(len(out))
     return out.reset_index(drop=True)
 
@@ -326,7 +339,7 @@ def _cost231_for_points(site: dict, lat_values: np.ndarray, lon_values: np.ndarr
         compute_sector_rsrp(site, float(lat), float(lon), float(freq_mhz), params)
         for lat, lon in zip(lat_values, lon_values)
     ]
-    return np.clip(np.asarray(values, dtype=float), *CLIP_RSRP)
+    return np.minimum(np.asarray(values, dtype=float), RSRP_MAX_DBM)
 
 
 def _run_directional_surface(site_df: pd.DataFrame, grid_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
@@ -339,21 +352,20 @@ def _run_directional_surface(site_df: pd.DataFrame, grid_df: pd.DataFrame) -> tu
         dist_m = _haversine_m(float(row["lat"]), float(row["lon"]), grid_lat, grid_lon)
         bearing = _bearing_deg(float(row["lat"]), float(row["lon"]), grid_lat, grid_lon)
         az_delta = _azimuth_delta_deg(bearing, float(row["azimuth"]))
-        candidate_pre = dist_m <= COVERAGE_RADIUS_M
+        full_cell_grid = PHASE9_CANDIDATE_MODE in {"full", "full_cell_grid", "all", "all_cells"}
+        candidate_pre = np.ones(len(grid_df), dtype=bool) if full_cell_grid else dist_m <= COVERAGE_RADIUS_M
 
         raw = np.full(len(grid_df), np.nan, dtype=float)
         if candidate_pre.any():
-            raw[candidate_pre] = _cost231_for_points(
+            raw_unadjusted = _cost231_for_points(
                 _site_record(row),
                 grid_lat[candidate_pre],
                 grid_lon[candidate_pre],
                 float(row["frequency_mhz"]),
             )
-            raw[candidate_pre] = np.clip(
-                raw[candidate_pre] + float(row.get("model_rsrp_adjust_db", 0.0)),
-                *CLIP_RSRP,
-            )
-        candidate = candidate_pre & np.isfinite(raw) & (raw >= MIN_CANDIDATE_RSRP_DBM)
+            raw[candidate_pre] = raw_unadjusted + float(row.get("model_rsrp_adjust_db", 0.0))
+        raw_valid = valid_model_rsrp(raw)
+        candidate = candidate_pre & np.isfinite(raw)
         selected = grid_df.loc[candidate, ["grid_id", "center_lat", "center_lon"]].copy()
 
         cell_stats.append(
@@ -365,10 +377,13 @@ def _run_directional_surface(site_df: pd.DataFrame, grid_df: pd.DataFrame) -> tu
                 "azimuth": float(row["azimuth"]),
                 "candidate_within_radius": int(candidate_pre.sum()),
                 "candidate_saved_pixels": int(candidate.sum()),
+                "candidate_mode": PHASE9_CANDIDATE_MODE,
                 "coverage_grid_pct": float(candidate.sum() / len(grid_df) * 100.0),
-                "min_raw_rsrp": float(np.nanmin(raw[candidate])) if candidate.any() else None,
-                "max_raw_rsrp": float(np.nanmax(raw[candidate])) if candidate.any() else None,
-                "mean_raw_rsrp": float(np.nanmean(raw[candidate])) if candidate.any() else None,
+                "valid_model_pixels": int(np.isfinite(raw_valid).sum()),
+                "no_coverage_pixels": int(np.isnan(raw_valid).sum()),
+                "min_raw_rsrp_unclipped": float(np.nanmin(raw[candidate])) if candidate.any() else None,
+                "max_raw_rsrp_unclipped": float(np.nanmax(raw[candidate])) if candidate.any() else None,
+                "mean_raw_rsrp_unclipped": float(np.nanmean(raw[candidate])) if candidate.any() else None,
             }
         )
         if not selected.empty:
@@ -394,7 +409,9 @@ def _run_directional_surface(site_df: pd.DataFrame, grid_df: pd.DataFrame) -> tu
                         "distance_m": dist_m[candidate],
                         "bearing_deg": bearing[candidate],
                         "azimuth_delta_deg": az_delta[candidate],
-                        "raw_cost231_rsrp": raw[candidate],
+                        "raw_cost231_rsrp_unclipped": raw[candidate],
+                        "raw_cost231_rsrp": raw_valid[candidate],
+                        "phase9_no_coverage": ~np.isfinite(raw_valid[candidate]),
                     }
                 )
             )
@@ -422,6 +439,8 @@ def _run_directional_surface(site_df: pd.DataFrame, grid_df: pd.DataFrame) -> tu
         )
         missing_grid = grid_df.loc[~grid_df["grid_id"].astype(str).isin(existing_grid_ids)].copy()
         total_missing_tech_pixels += len(missing_grid)
+        if not PHASE9_ENABLE_OUT_OF_RADIUS_BACKFILL:
+            continue
         for grid_row in missing_grid.itertuples(index=False):
             lat = float(grid_row.center_lat)
             lon = float(grid_row.center_lon)
@@ -436,45 +455,53 @@ def _run_directional_surface(site_df: pd.DataFrame, grid_df: pd.DataFrame) -> tu
                     np.asarray([lon], dtype=float),
                     float(site_row["frequency_mhz"]),
                 )[0]
-                raw = float(np.clip(raw + float(site_row.get("model_rsrp_adjust_db", 0.0)), *CLIP_RSRP))
+                raw = float(raw + float(site_row.get("model_rsrp_adjust_db", 0.0)))
                 bearing = float(_bearing_deg(float(site_row["lat"]), float(site_row["lon"]), np.asarray([lat]), np.asarray([lon]))[0])
                 raw_values.append(float(raw))
                 distances.append(float(_haversine_m(float(site_row["lat"]), float(site_row["lon"]), lat, lon)))
                 bearings.append(bearing)
                 deltas.append(float(_azimuth_delta_deg(np.asarray([bearing]), float(site_row["azimuth"]))[0]))
 
-            best_idx = int(np.nanargmax(np.asarray(raw_values, dtype=float)))
-            row = tech_sites.iloc[best_idx]
-            fallback_rows.append(
-                {
-                    "project_id": PROJECT_ID,
-                    "grid_id": str(grid_row.grid_id),
-                    "lat": lat,
-                    "lon": lon,
-                    "strict_cell_key": str(row["strict_cell_key"]),
-                    "site_sector_band_key": str(row["site_sector_band_key"]),
-                    "site": str(row["site_key"]),
-                    "sector": str(row["sector_key"]),
-                    "band": str(row["band_key"]),
-                    "technology": str(row["technology_key"]),
-                    "operator": str(row["operator_key"]),
-                    "original_cell_id": str(row["original_cell_id"]),
-                    "original_frequency_mhz": float(row.get("original_frequency_mhz", row["frequency_mhz"])),
-                    "frequency_mhz": float(row["frequency_mhz"]),
-                    "model_rsrp_adjust_db": float(row.get("model_rsrp_adjust_db", 0.0)),
-                    "azimuth": float(row["azimuth"]),
-                    "distance_m": distances[best_idx],
-                    "bearing_deg": bearings[best_idx],
-                    "azimuth_delta_deg": deltas[best_idx],
-                    "raw_cost231_rsrp": raw_values[best_idx],
-                    "ensure_all_cells_backfill": True,
-                }
-            )
+            # Keep the k nearest sectors as candidates (same schema as the in-radius path),
+            # not just argmax(raw); downstream phases score antenna/obstruction/terrain/bias
+            # per candidate and select the true serving cell after all corrections.
+            order = list(np.argsort(np.asarray(distances, dtype=float)))
+            keep_idx = order[: min(PHASE9_BACKFILL_K_NEAREST, len(order))]
+            for cand_idx in keep_idx:
+                row = tech_sites.iloc[int(cand_idx)]
+                raw_valid = valid_model_rsrp(np.asarray([raw_values[cand_idx]], dtype=float))[0]
+                fallback_rows.append(
+                    {
+                        "project_id": PROJECT_ID,
+                        "grid_id": str(grid_row.grid_id),
+                        "lat": lat,
+                        "lon": lon,
+                        "strict_cell_key": str(row["strict_cell_key"]),
+                        "site_sector_band_key": str(row["site_sector_band_key"]),
+                        "site": str(row["site_key"]),
+                        "sector": str(row["sector_key"]),
+                        "band": str(row["band_key"]),
+                        "technology": str(row["technology_key"]),
+                        "operator": str(row["operator_key"]),
+                        "original_cell_id": str(row["original_cell_id"]),
+                        "original_frequency_mhz": float(row.get("original_frequency_mhz", row["frequency_mhz"])),
+                        "frequency_mhz": float(row["frequency_mhz"]),
+                        "model_rsrp_adjust_db": float(row.get("model_rsrp_adjust_db", 0.0)),
+                        "azimuth": float(row["azimuth"]),
+                        "distance_m": distances[cand_idx],
+                        "bearing_deg": bearings[cand_idx],
+                        "azimuth_delta_deg": deltas[cand_idx],
+                        "raw_cost231_rsrp_unclipped": raw_values[cand_idx],
+                        "raw_cost231_rsrp": raw_valid,
+                        "phase9_no_coverage": not np.isfinite(raw_valid),
+                        "ensure_all_cells_backfill": True,
+                    }
+                )
     if total_missing_tech_pixels:
         print(
             "[PHASE9][ENSURE_ALL_CELLS] "
             f"missing_grid_technology_pixels={total_missing_tech_pixels} "
-            "action=best_raw_cost231_backfill_per_technology"
+            f"action={f'k{PHASE9_BACKFILL_K_NEAREST}_nearest_sector_backfill_per_technology' if PHASE9_ENABLE_OUT_OF_RADIUS_BACKFILL else 'left_as_no_coverage'}"
         )
     if fallback_rows:
         fallback_df = pd.DataFrame.from_records(fallback_rows)
@@ -488,20 +515,31 @@ def _run_directional_surface(site_df: pd.DataFrame, grid_df: pd.DataFrame) -> tu
 def _run_cost231_at_dt(site_df: pd.DataFrame, dt_df: pd.DataFrame) -> pd.DataFrame:
     dt_lat = dt_df["lat"].to_numpy(dtype=float)
     dt_lon = dt_df["lon"].to_numpy(dtype=float)
-    pred_matrix = np.empty((len(dt_df), len(site_df)), dtype=float)
-    for idx, row in site_df.iterrows():
-        site = _site_record(row)
-        pred_matrix[:, idx] = np.clip(
-            _cost231_for_points(site, dt_lat, dt_lon, float(row["frequency_mhz"]))
-            + float(row.get("model_rsrp_adjust_db", 0.0)),
-            *CLIP_RSRP,
-        )
-    best_idx = np.argmax(pred_matrix, axis=1)
-    assigned = site_df.iloc[best_idx].reset_index(drop=True)
     out = dt_df.reset_index(drop=True).copy()
-    out["assigned_strict_cell_key"] = assigned["strict_cell_key"].astype(str).to_numpy()
-    out["assigned_technology"] = assigned["technology_key"].astype(str).to_numpy()
-    out["raw_cost231_at_dt_rsrp"] = pred_matrix[np.arange(len(out)), best_idx]
+    out["assigned_strict_cell_key"] = pd.NA
+    out["assigned_technology"] = pd.NA
+    out["raw_cost231_at_dt_rsrp_unclipped"] = np.nan
+    out["raw_cost231_at_dt_rsrp"] = np.nan
+
+    for tech, dt_idx in out.groupby("measured_technology", dropna=False).groups.items():
+        tech_sites = site_df[site_df["technology_key"].astype(str) == str(tech)].reset_index(drop=True)
+        if tech_sites.empty:
+            tech_sites = site_df.reset_index(drop=True)
+        pred_matrix = np.empty((len(dt_idx), len(tech_sites)), dtype=float)
+        group_pos = out.index.get_indexer(dt_idx)
+        for idx, row in tech_sites.iterrows():
+            site = _site_record(row)
+            pred_matrix[:, idx] = (
+                _cost231_for_points(site, dt_lat[group_pos], dt_lon[group_pos], float(row["frequency_mhz"]))
+                + float(row.get("model_rsrp_adjust_db", 0.0))
+            )
+        best_idx = np.nanargmax(pred_matrix, axis=1)
+        assigned = tech_sites.iloc[best_idx].reset_index(drop=True)
+        best_raw = pred_matrix[np.arange(len(group_pos)), best_idx]
+        out.loc[dt_idx, "assigned_strict_cell_key"] = assigned["strict_cell_key"].astype(str).to_numpy()
+        out.loc[dt_idx, "assigned_technology"] = assigned["technology_key"].astype(str).to_numpy()
+        out.loc[dt_idx, "raw_cost231_at_dt_rsrp_unclipped"] = best_raw
+        out.loc[dt_idx, "raw_cost231_at_dt_rsrp"] = valid_model_rsrp(best_raw)
     out["dt_minus_cost231_db"] = out["rsrp_measured"] - out["raw_cost231_at_dt_rsrp"]
     return out
 
@@ -554,26 +592,36 @@ def _apply_offset_and_dt(surface: pd.DataFrame, offsets: pd.DataFrame, dt_with_g
         how="left",
     )
     out["offset_db"] = pd.to_numeric(out["offset_db"], errors="coerce").fillna(0.0)
-    out["offset_corrected_rsrp"] = (out["raw_cost231_rsrp"] + out["offset_db"]).clip(*CLIP_RSRP)
+    out["offset_corrected_rsrp_unclipped"] = out["raw_cost231_rsrp"] + out["offset_db"]
+    out["offset_corrected_rsrp"] = valid_model_rsrp(out["offset_corrected_rsrp_unclipped"])
     replacements = (
         dt_with_grid.loc[dt_with_grid["dt_replacement_eligible"]]
-        .groupby("nearest_grid_id", dropna=False)
+        .groupby(["assigned_technology", "nearest_grid_id"], dropna=False)
         .agg(dt_replacement_rsrp=("rsrp_measured", "mean"), dt_replacement_count=("rsrp_measured", "size"))
         .reset_index()
-        .rename(columns={"nearest_grid_id": "grid_id"})
+        .rename(columns={"assigned_technology": "technology", "nearest_grid_id": "grid_id"})
     )
-    out = out.merge(replacements, on="grid_id", how="left")
+    out = out.merge(replacements, on=["technology", "grid_id"], how="left")
     out["dt_replaced"] = out["dt_replacement_rsrp"].notna()
     out["corrected_rsrp"] = out["offset_corrected_rsrp"].where(~out["dt_replaced"], out["dt_replacement_rsrp"])
-    out["corrected_rsrp"] = pd.to_numeric(out["corrected_rsrp"], errors="coerce").clip(*CLIP_RSRP)
+    out["corrected_rsrp"] = display_rsrp(out["corrected_rsrp"])
     out["dt_replacement_count"] = out["dt_replacement_count"].fillna(0).astype(int)
     return out
 
 
 def _serving_grid(surface: pd.DataFrame, grid_df: pd.DataFrame) -> pd.DataFrame:
-    best_idx = surface.groupby("grid_id", dropna=False)["corrected_rsrp"].idxmax()
-    serving = surface.loc[best_idx].copy()
-    serving = grid_df[["grid_id", "center_lat", "center_lon"]].merge(serving, on="grid_id", how="left")
+    valid = surface.dropna(subset=["corrected_rsrp"]).copy()
+    technologies = sorted(surface["technology"].astype(str).dropna().unique()) if "technology" in surface.columns else []
+    tech_grid = pd.concat(
+        [grid_df[["grid_id", "center_lat", "center_lon"]].assign(technology=tech) for tech in technologies],
+        ignore_index=True,
+    ) if technologies else grid_df[["grid_id", "center_lat", "center_lon"]].copy()
+    if valid.empty:
+        serving = tech_grid.copy()
+    else:
+        best_idx = valid.groupby(["technology", "grid_id"], dropna=False)["corrected_rsrp"].idxmax()
+        serving = valid.loc[best_idx].copy()
+        serving = tech_grid.merge(serving, on=["technology", "grid_id"], how="left")
     serving["has_directional_candidate"] = serving["corrected_rsrp"].notna()
     return serving
 
@@ -670,14 +718,26 @@ def main() -> None:
         "prepared_at": datetime.now().isoformat(timespec="seconds"),
         "project_id": PROJECT_ID,
         "production_code_modified": False,
-        "phase_label": "Cost231 Phase 9 GridAnalytics-compatible grid + ensure_all_cells backfill",
+        "phase_label": "Cost231 Phase 9 GridAnalytics-compatible safe-radius candidates",
         "grid_source": "GridAnalyticsController-compatible active map_regions bounding rectangle grid generated inside test case",
         "grid_meta": grid_meta,
         "grid_size_m": GRID_SIZE_M,
+        "candidate_mode": PHASE9_CANDIDATE_MODE,
         "coverage_radius_m": COVERAGE_RADIUS_M,
         "antenna_pattern_logic": ANTENNA_PATTERN_LOGIC,
         "hard_azimuth_cutoff_used": False,
         "min_candidate_rsrp_dbm": MIN_CANDIDATE_RSRP_DBM,
+        "candidate_filter_rule": (
+            "distance <= coverage_radius_m only; no fixed candidate-count cap and no pre-loss RSRP cutoff"
+        ),
+        "out_of_radius_backfill_enabled": PHASE9_ENABLE_OUT_OF_RADIUS_BACKFILL,
+        "out_of_radius_backfill_k_nearest": PHASE9_BACKFILL_K_NEAREST,
+        "out_of_radius_backfill_rule": (
+            f"cells with no sector within {COVERAGE_RADIUS_M:.0f} m keep their {PHASE9_BACKFILL_K_NEAREST} "
+            "nearest same-technology sectors as candidates, scored by the same COST231+antenna model; "
+            "downstream phases apply obstruction/terrain/bias per candidate and pick the serving cell"
+        ),
+        "coverage_threshold_dbm": RSRP_NO_COVERAGE_DBM,
         "dt_replace_radius_m": DT_REPLACE_RADIUS_M,
         "strict_cells": int(len(site_df)),
         "gridanalytics_grid_pixels": int(len(grid_df)),

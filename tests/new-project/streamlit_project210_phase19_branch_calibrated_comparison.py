@@ -53,7 +53,12 @@ def load_serving(tech: str) -> pd.DataFrame:
         return pd.DataFrame()
     p19 = pd.read_parquet(p19_path)
     p17 = pd.read_parquet(p17_path)[["grid_id", "phase17_rsrp", "phase17_frontend_mean_rsrp"]]
-    return p19.merge(p17, on="grid_id", how="left")
+    serving = p19.merge(p17, on="grid_id", how="left")
+    if not {"min_lat", "max_lat", "min_lon", "max_lon"}.issubset(serving.columns):
+        bounds = load_grid_bounds()
+        if not bounds.empty:
+            serving = serving.merge(bounds, on="grid_id", how="left")
+    return serving
 
 
 @st.cache_data(show_spinner=False)
@@ -107,7 +112,13 @@ def _build_grid_map_html(serving: pd.DataFrame, value_col: str, title: str) -> s
     cache_data candidate. prefer_canvas=True switches Leaflet to canvas
     rendering instead of one SVG element per rectangle - the standard fix
     for maps with thousands of shapes, much faster to paint/pan/zoom."""
-    df = serving.dropna(subset=["min_lat", "max_lat", "min_lon", "max_lon"])
+    required = ["min_lat", "max_lat", "min_lon", "max_lon", value_col]
+    missing = [col for col in required if col not in serving.columns]
+    if missing:
+        return f"<p>Map cannot render because columns are missing: {', '.join(missing)}</p>"
+    df = serving.dropna(subset=required)
+    if df.empty:
+        return "<p>Map cannot render because no grid cells have bounds and valid values.</p>"
     center = [float(df["lat"].mean()), float(df["lon"].mean())]
     fmap = folium.Map(
         location=center, zoom_start=14, tiles="CartoDB positron", control_scale=True, prefer_canvas=True,

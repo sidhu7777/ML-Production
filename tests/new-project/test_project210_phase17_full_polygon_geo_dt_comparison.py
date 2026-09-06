@@ -53,6 +53,7 @@ for p in (ML_ROOT, THIS_DIR, BASELINE_DIR):
 
 import streamlit_project210_phase13_beam_check as phase13
 import streamlit_project210_phase15_radius_progression as phase15
+from phase_rsrp_guard import RSRP_MAX_DBM, RSRP_NO_COVERAGE_DBM, display_rsrp, valid_model_rsrp
 from test_project210_cost231_phase11_12_residual_blending import (  # reused, not reimplemented
     _idw_residual,
     _serving_by_technology,
@@ -66,7 +67,7 @@ CLUTTER_TILES_PATH = BASELINE_DATA_DIR / "clutter_tiles_final_v2.geojson"
 
 N78_TECHNOLOGY_OFFSET_DB = -2.58  # established Phase 2/3 baseline logic for Taiwan 5G n78
 MIN_DT_FOR_REPRESENTATIVE_CLASS = 8
-RSRP_MIN, RSRP_MAX = -147.0, -44.0
+RSRP_MIN, RSRP_MAX = RSRP_NO_COVERAGE_DBM, RSRP_MAX_DBM
 
 
 def _ensure_dirs() -> None:
@@ -113,6 +114,7 @@ def _compute_physical_and_geo_all_candidates(
         identity[["Node_Cell_ID", "Etilt", "Mtilt", "Height", "tx_power"]],
         left_on="strict_cell_key", right_on="Node_Cell_ID", how="left",
     )
+    candidates["physical_rsrp_unclipped"] = np.nan
     candidates["physical_rsrp"] = np.nan
     candidates["geo_correction_db"] = 0.0
 
@@ -152,14 +154,18 @@ def _compute_physical_and_geo_all_candidates(
             clutter_weights=clutter_weights, building_area_weight=phase15.DEFAULT_BUILDING_AREA_WEIGHT,
             diffraction_multiplier=1.0, entry_loss_db=-15.0, entry_depth_slope_db_per_m=-0.5,
         )
-        candidates.loc[group.index, "physical_rsrp"] = np.clip(physical + correction, RSRP_MIN, RSRP_MAX)
+        candidates.loc[group.index, "physical_rsrp_unclipped"] = physical + correction
+        candidates.loc[group.index, "physical_rsrp"] = valid_model_rsrp(physical + correction)
         candidates.loc[group.index, "geo_correction_db"] = correction
         if (idx + 1) % 10 == 0 or idx == n_cells - 1:
             print(f"[PHASE17] geo-corrected cells {idx + 1}/{n_cells} (all-candidates pass, {len(group)} points this cell)", flush=True)
 
-    missing = candidates["physical_rsrp"].isna()
+    missing = candidates["physical_rsrp_unclipped"].isna()
     if missing.any():
-        candidates.loc[missing, "physical_rsrp"] = np.clip(candidates.loc[missing, "raw_cost231_rsrp"], RSRP_MIN, RSRP_MAX)
+        candidates.loc[missing, "physical_rsrp_unclipped"] = pd.to_numeric(
+            candidates.loc[missing, "raw_cost231_rsrp"], errors="coerce"
+        )
+        candidates.loc[missing, "physical_rsrp"] = valid_model_rsrp(candidates.loc[missing, "raw_cost231_rsrp"])
         print(f"[PHASE17] {int(missing.sum())} candidate rows had no identity match - fell back to raw_cost231_rsrp only")
     return candidates
 
@@ -216,14 +222,13 @@ def _aggregate_candidates(candidates: pd.DataFrame, dt_residual_by_grid: pd.Data
     values, not a mean of just the raw physical prediction."""
     candidates = candidates.merge(dt_residual_by_grid, on="grid_id", how="left")
     candidates["dt_residual_db"] = candidates["dt_residual_db"].fillna(0.0)
-    candidates["candidate_rsrp_no_lock"] = np.clip(
-        candidates["physical_rsrp"] + candidates["dt_residual_db"], RSRP_MIN, RSRP_MAX
-    )
+    candidates["candidate_rsrp_no_lock_unclipped"] = candidates["physical_rsrp"] + candidates["dt_residual_db"]
+    candidates["candidate_rsrp_no_lock"] = valid_model_rsrp(candidates["candidate_rsrp_no_lock_unclipped"])
     lock = candidates["dt_replaced"].fillna(False).astype(bool) if "dt_replaced" in candidates.columns else pd.Series(False, index=candidates.index)
     candidates["candidate_phase17_rsrp"] = np.where(
         lock, candidates.get("dt_replacement_rsrp", np.nan), candidates["candidate_rsrp_no_lock"]
     )
-    candidates["candidate_phase17_rsrp"] = np.clip(candidates["candidate_phase17_rsrp"].astype(float), RSRP_MIN, RSRP_MAX)
+    candidates["candidate_phase17_rsrp"] = display_rsrp(candidates["candidate_phase17_rsrp"].astype(float))
 
     agg = candidates.groupby("grid_id")["candidate_phase17_rsrp"].agg(["max", "mean"]).reset_index()
     agg = agg.rename(columns={"max": "phase17_rsrp_agg", "mean": "phase17_frontend_mean_rsrp"})
@@ -313,8 +318,8 @@ def main() -> None:
         )
         serving = serving.merge(winner_detail[["grid_id", "physical_rsrp", "geo_correction_db", "dt_residual_db"]], on="grid_id", how="left")
         serving = serving.merge(agg, on="grid_id", how="left")
-        serving["phase17_rsrp"] = np.clip(serving["phase17_rsrp_agg"].astype(float), RSRP_MIN, RSRP_MAX)
-        serving["phase17_frontend_mean_rsrp"] = np.clip(serving["phase17_frontend_mean_rsrp"].astype(float), RSRP_MIN, RSRP_MAX)
+        serving["phase17_rsrp"] = valid_model_rsrp(serving["phase17_rsrp_agg"].astype(float))
+        serving["phase17_frontend_mean_rsrp"] = valid_model_rsrp(serving["phase17_frontend_mean_rsrp"].astype(float))
 
         out_path = OUT_DIR / f"phase17_serving_grid_{technology.lower()}_project210.parquet"
         serving.to_parquet(out_path, index=False)

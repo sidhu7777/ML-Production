@@ -53,6 +53,7 @@ for p in (ML_ROOT, THIS_DIR, BASELINE_DIR):
 
 import streamlit_project210_phase13_beam_check as phase13
 import streamlit_project210_phase15_radius_progression as phase15
+from phase_rsrp_guard import valid_model_rsrp
 from test_project210_phase17_full_polygon_geo_dt_comparison import (  # reused, not reimplemented
     BASELINE_DATA_DIR,
     CLUTTER_TILES_PATH,
@@ -83,6 +84,7 @@ def _compute_physical_rsrp_per_dt_point(
     params_common = {"ue_height": 1.5, "k1": 0, "k2": 0, "cable_loss": 2.0, "antenna_gain": 18.0}
     clutter_weights = dict(phase15.DEFAULT_CLUTTER_WEIGHTS)
 
+    physical_rsrp_unclipped = np.full(len(dt), np.nan)
     physical_rsrp = np.full(len(dt), np.nan)
     branch = np.array(["unknown"] * len(dt), dtype=object)
 
@@ -109,13 +111,16 @@ def _compute_physical_rsrp_per_dt_point(
             clutter_weights=clutter_weights, building_area_weight=phase15.DEFAULT_BUILDING_AREA_WEIGHT,
             diffraction_multiplier=1.0, entry_loss_db=-15.0, entry_depth_slope_db_per_m=-0.5,
         )
-        physical_rsrp[i] = float(np.clip(raw + correction[0], RSRP_MIN, RSRP_MAX))
+        physical_rsrp_unclipped[i] = float(raw + correction[0])
+        clipped = valid_model_rsrp(np.array([raw + correction[0]], dtype=float))[0]
+        physical_rsrp[i] = float(clipped) if np.isfinite(clipped) else np.nan
         branch[i] = "indoor" if counts["indoor"] else ("obstructed" if counts["obstructed"] else "clear")
 
         if (i + 1) % 1000 == 0 or i == n - 1:
             print(f"[PHASE18] scored {i + 1}/{n} DT points", flush=True)
 
     out = dt.copy()
+    out["physical_rsrp_unclipped"] = physical_rsrp_unclipped
     out["physical_rsrp"] = physical_rsrp
     out["obstruction_branch"] = branch
     return out

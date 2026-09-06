@@ -366,6 +366,43 @@ def detect_pci_order_conflicts(graph: nx.Graph, max_order: int = 5) -> dict[int,
     return results
 
 
+# Weights the optimizer's cost function uses for Order 2-5 reuse (same
+# PCI+EARFCN at that exact hop distance in the neighbor graph). Order 1 is
+# deliberately NOT listed here -- it's already exactly what Collision's
+# check_exact=100 weight covers (see detect_pci_order_conflicts' own
+# docstring: "Order 1 = direct neighbor reuse, the same pairs
+# detect_pci_collisions flags"), so adding it again here would double the
+# penalty when Collision is checked, and would silently re-enable a check
+# the user explicitly turned off when Collision is unchecked. Order 2 sits
+# just under Collision's weight because it's structurally what Confusion is
+# (two cells 2 hops apart via a shared serving neighbor). Orders 3-5 have no
+# 3GPP/RF meaning, so they get a small, strictly decreasing nudge -- enough
+# that the greedy search prefers a candidate that doesn't create one when a
+# same-cost alternative exists, never enough to outweigh a real checked rule.
+ORDER_2_TO_5_WEIGHTS: dict[int, int] = {2: 50, 3: 10, 4: 5, 5: 2}
+
+
+def _multi_hop_same_earfcn_by_order(graph: nx.Graph, node: tuple, max_order: int = 5) -> dict[int, list]:
+    """
+    Same-EARFCN nodes reachable from `node` within max_order hops,
+    bucketed by their EXACT hop distance -- a static fact about the graph's
+    TOPOLOGY, unaffected by which PCI any node currently holds (node
+    identity in this graph is (site, pci, earfcn), but a PCI reassignment
+    during the optimizer's search is tracked in a separate `assignments`
+    dict, never by mutating the graph -- see recommend_pci_reassignment).
+    So this only needs to be computed ONCE per node, up front, exactly like
+    the existing 1-hop `neighbors_of` closure.
+    """
+    earfcn = node[2]
+    hop_lengths = nx.single_source_shortest_path_length(graph, node, cutoff=max_order)
+    by_order: dict[int, list] = {order: [] for order in range(1, max_order + 1)}
+    for other, hops in hop_lengths.items():
+        if hops == 0 or other[2] != earfcn:
+            continue
+        by_order[hops].append(other)
+    return by_order
+
+
 def detect_pci_confusion(events_df: pd.DataFrame, site_ids_filter: set | None = None) -> list[dict]:
     required_cols = {"from_site_id_inferred", "to_site_id_inferred", "to_pci", "to_site_earfcn"}
     if events_df.empty or not required_cols.issubset(events_df.columns):
@@ -533,7 +570,16 @@ def _apply_pci_assignments(selected_sites_df: pd.DataFrame, events_df: pd.DataFr
 def _count_remaining_conflicts(
     graph: nx.Graph, events_df: pd.DataFrame, selected_site_ids: list,
     check_collision: bool, check_confusion: bool, mod_values: list, check_grouped: bool,
+    max_order: int = 5,
 ) -> int:
+    """Orders 2-max_order are counted UNCONDITIONALLY here, regardless of
+    which named rule checkboxes are active. This closes the gap where the
+    closed loop could report "converged" while it silently created a new
+    Order 3/4/5 reuse conflict that nothing would ever re-check. Order 1 is
+    excluded -- it IS Collision (see detect_pci_order_conflicts), already
+    covered by check_collision above; counting it again here would
+    double-count when Collision is checked and force-enable it when it's
+    not."""
     total = 0
     if check_collision:
         total += len(detect_pci_collisions(graph))
@@ -543,6 +589,9 @@ def _count_remaining_conflicts(
         total += len(detect_pci_mod_conflicts(graph, mod_n))
     if check_grouped:
         total += len(detect_pci_group_conflicts(graph))
+    order_conflicts = detect_pci_order_conflicts(graph, max_order=max_order)
+    for order in range(2, max_order + 1):
+        total += len(order_conflicts.get(order, []))
     return total
 
 
@@ -620,10 +669,25 @@ def recommend_pci_reassignment(
         for s, p in c["members"]:
             touched_types.setdefault((s, p, c["earfcn"]), set()).add("Grouped")
 
+    # Order 1-5 reuse-distance conflicts, checked UNCONDITIONALLY -- fixing
+    # Collision (Order 1) must never be allowed to silently create a new
+    # Order 3/4/5 conflict with nothing ever re-checking for it. Order 1 is
+    # skipped when adding to touched_types -- it IS Collision, already
+    # handled above; adding it again would just duplicate the same nodes
+    # under a second label.
+    order_conflicts_before = detect_pci_order_conflicts(graph, max_order=5)
+    for order in range(2, 6):
+        for pair in order_conflicts_before.get(order, []):
+            for s in pair["sites"]:
+                touched_types.setdefault((s, pair["pci"], pair["earfcn"]), set()).add(f"Order{order}")
+
     if not touched_types:
         return pd.DataFrame(), {
             "iterations": 0, "converged": True, "remaining_conflicts": 0, "verified_clean": True,
             "remaining_by_iteration": [], "infeasible_rules": [], "stopped_reason": "nothing_to_do",
+            "order_conflicts_before_counts": {o: 0 for o in range(1, 6)},
+            "order_conflicts_after_counts": {o: 0 for o in range(1, 6)},
+            "order_verified_clean": True,
         }
 
     pair_cost = _make_pci_pair_cost(check_collision or check_confusion, mod_values, check_grouped)
@@ -637,7 +701,25 @@ def recommend_pci_reassignment(
     def neighbors_of(node):
         return [n for n in graph.neighbors(node) if n[2] == node[2]]
 
-    before_costs = {node: sum(pair_cost(node[1], n[1]) for n in neighbors_of(node)) for node in target_nodes}
+    # Static topology fact per target node -- who's reachable at hop
+    # distance 2-5 on the same EARFCN. Computed once, up front, same as
+    # neighbors_of's 1-hop equivalent (reassigning a PCI never changes the
+    # graph's topology -- see the assignments dict pattern below).
+    multi_hop_by_order_per_node = {node: _multi_hop_same_earfcn_by_order(graph, node, max_order=5) for node in target_nodes}
+
+    def order_cost_for(node: tuple, candidate_pci: int, pcis_of) -> int:
+        total = 0
+        node_multi_hop = multi_hop_by_order_per_node.get(node, {})
+        for order, weight in ORDER_2_TO_5_WEIGHTS.items():
+            for other in node_multi_hop.get(order, []):
+                if candidate_pci == pcis_of(other):
+                    total += weight
+        return total
+
+    before_costs = {
+        node: sum(pair_cost(node[1], n[1]) for n in neighbors_of(node)) + order_cost_for(node, node[1], lambda n: n[1])
+        for node in target_nodes
+    }
 
     infeasible_rules = _check_rule_infeasibility(graph, target_nodes, mod_values, check_grouped)
     patience = 5 if infeasible_rules else max(30, 5 * len(target_nodes))
@@ -661,6 +743,7 @@ def recommend_pci_reassignment(
             neighbor_pcis = [assignments.get(n, n[1]) for n in neighbors]
             current_pci = assignments[node]
             current_cost = sum(pair_cost(current_pci, npci) for npci in neighbor_pcis)
+            current_cost += order_cost_for(node, current_pci, lambda n: assignments.get(n, n[1]))
             if current_cost == 0:
                 continue
 
@@ -673,17 +756,21 @@ def recommend_pci_reassignment(
             best_pci, best_cost = current_pci, current_cost
             for candidate in search_order:
                 cost = sum(pair_cost(candidate, npci) for npci in neighbor_pcis)
+                cost += order_cost_for(node, candidate, lambda n: assignments.get(n, n[1]))
                 if cost < best_cost:
                     best_cost, best_pci = cost, candidate
                 if cost == 0:
                     break
             assignments[node] = best_pci
 
+        # max_order=5 re-verifies Order 2-5 unconditionally here too, so
+        # the loop won't call itself "converged" while a new higher-order
+        # conflict was silently left behind.
         substitution = {(node[0], node[1]): assignments[node] for node in target_nodes}
         hyp_site_df, hyp_events_df = _apply_pci_assignments(selected_sites_df, events_df, substitution)
         hyp_graph = build_neighbor_graph(hyp_site_df, hyp_events_df, distance_threshold_m=distance_threshold_m)
         remaining = _count_remaining_conflicts(
-            hyp_graph, hyp_events_df, selected_site_ids, check_collision, check_confusion, mod_values, check_grouped
+            hyp_graph, hyp_events_df, selected_site_ids, check_collision, check_confusion, mod_values, check_grouped, max_order=5
         )
         remaining_by_iteration.append(int(remaining))
         if remaining == 0:
@@ -701,22 +788,43 @@ def recommend_pci_reassignment(
             stopped_reason = "proven_infeasible" if infeasible_rules else "no_improvement_exhausted"
             break
 
+    # Final validation: treat the FINAL suggested state as one complete
+    # network and recalculate ALL of Order 1-5 on it again -- proving (not
+    # assuming) that fixing whichever rule was checked didn't create a new
+    # conflict at a different order anywhere. Reuses hyp_graph from the
+    # loop's last verification pass (already reflects the final assignments).
+    order_conflicts_after = detect_pci_order_conflicts(hyp_graph, max_order=5)
+    order_conflicts_before_counts = {o: len(order_conflicts_before.get(o, [])) for o in range(1, 6)}
+    order_conflicts_after_counts = {o: len(order_conflicts_after.get(o, [])) for o in range(1, 6)}
+    order_verified_clean = sum(order_conflicts_after_counts.values()) == 0
+
     rows = []
     for node in target_nodes:
         site_id, current_pci, earfcn = node
         neighbors = neighbors_of(node)
         neighbor_final_pcis = [assignments.get(n, n[1]) for n in neighbors]
         final_cost = sum(pair_cost(assignments[node], npci) for npci in neighbor_final_pcis)
+        final_cost += order_cost_for(node, assignments[node], lambda n: assignments.get(n, n[1]))
         conflict_types = touched_types.get((site_id, current_pci, earfcn), set())
         # Per-rule cost, not just the combined total -- a sector touched by
         # two rules at once can genuinely clear one while the other stays
         # stuck (e.g. Collision resolved, Mod3 still capacity-limited on
         # the same sector); reporting only `after_cost` would call both
-        # unresolved just because the total isn't exactly zero.
-        rule_costs = {
-            rule_label: sum(_cost_for_single_rule(rule_label)(assignments[node], npci) for npci in neighbor_final_pcis)
-            for rule_label in conflict_types
-        }
+        # unresolved just because the total isn't exactly zero. OrderN
+        # labels (N=2..5) use the multi-hop lookup, isolated to that one
+        # order's own weight, not the 1-hop pair_cost machinery.
+        rule_costs = {}
+        for rule_label in conflict_types:
+            if rule_label.startswith("Order"):
+                order_n = int(rule_label[5:])
+                weight = ORDER_2_TO_5_WEIGHTS.get(order_n, 0)
+                rule_costs[rule_label] = sum(
+                    weight
+                    for other in multi_hop_by_order_per_node.get(node, {}).get(order_n, [])
+                    if assignments.get(other, other[1]) == assignments[node]
+                )
+            else:
+                rule_costs[rule_label] = sum(_cost_for_single_rule(rule_label)(assignments[node], npci) for npci in neighbor_final_pcis)
         rows.append(
             {
                 "site": site_id,
@@ -739,6 +847,9 @@ def recommend_pci_reassignment(
         "remaining_by_iteration": remaining_by_iteration,
         "infeasible_rules": infeasible_rules,
         "stopped_reason": stopped_reason,
+        "order_conflicts_before_counts": order_conflicts_before_counts,
+        "order_conflicts_after_counts": order_conflicts_after_counts,
+        "order_verified_clean": order_verified_clean,
     }
     return pd.DataFrame(rows), verification
 

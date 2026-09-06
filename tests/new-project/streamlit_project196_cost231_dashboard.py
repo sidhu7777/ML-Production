@@ -29,7 +29,9 @@ import streamlit_project210_phase15_radius_progression as phase15_view
 import streamlit_project210_phase16_site_local_geo as phase16_view
 import streamlit_project210_phase17_full_polygon_comparison as phase17_view
 import streamlit_project210_phase19_branch_calibrated_comparison as phase19_view
+import streamlit_project210_phase20_21_22_dashboard as phase20_21_22_view
 import streamlit_taiwan_mapdata_dashboard as mapdata_view
+import streamlit_debug_frequency_only as debug_freq_view
 
 DATA_DIR = THIS_DIR / "data"
 
@@ -43,6 +45,12 @@ PROJECT_CONFIG = {
         "project_id": 210,
         "region": "Taiwan",
         "dir": DATA_DIR / "project_210_taiwan",
+    },
+    "Taiwan Debug (frequency-only 4G/5G)": {
+        "project_id": 210,
+        "region": "Taiwan",
+        "dir": DATA_DIR / "project_210_taiwan",
+        "debug_frequency_only": True,
     },
 }
 
@@ -677,6 +685,12 @@ def main() -> None:
         st.header("Filters")
         project_key = st.selectbox("Project", list(PROJECT_CONFIG.keys()), index=0)
         project = _project_cfg(project_key)
+
+    if project.get("debug_frequency_only"):
+        debug_freq_view.render()
+        return
+
+    with st.sidebar:
         section_options = ["Propagation model comparison"]
         if project_key == "Project 210 Taiwan":
             if (phase11_12_view.OUT_DIR / "phase11_12_summary.json").exists():
@@ -693,6 +707,8 @@ def main() -> None:
                 section_options.append("Phase 17 full-polygon comparison")
             if phase19_view.OUT_DIR.exists():
                 section_options.append("Phase 19 branch-calibrated comparison")
+            if phase20_21_22_view.PHASE22_DIR.exists():
+                section_options.append("Phase 20/22/24/25 validation")
         section = st.selectbox("Section", section_options, index=0)
 
     if section == "Phase 11/12 residual blending":
@@ -718,6 +734,9 @@ def main() -> None:
         return
     if section == "Phase 19 branch-calibrated comparison":
         phase19_view.render()
+        return
+    if section == "Phase 20/22/24/25 validation":
+        phase20_21_22_view.render()
         return
 
     with st.sidebar:

@@ -199,7 +199,10 @@ def compute_sector_rsrp(site, p_lat, p_lon, freq, params):
     k2          = params.get('k2', 0)
 
     d_m  = haversine_vectorized(s_lat, s_lon, p_lat, p_lon)
-    d_m  = max(d_m, 1.0)
+    # np.maximum (not the Python builtin max) so p_lat/p_lon may be arrays.
+    # Identical result for scalars; lets callers score every point in one call
+    # instead of looping one point at a time.
+    d_m  = np.maximum(d_m, 1.0)
     d_km = d_m / 1000.0
 
     # ---------- COST-231 Hata path loss ----------

@@ -236,7 +236,6 @@ def _apply_dt_lock(surface: pd.DataFrame, source_col: str, output_col: str) -> p
 
 
 def _serving_by_technology(surface: pd.DataFrame, grid: pd.DataFrame, phase_col: str) -> pd.DataFrame:
-    idx = surface.groupby(["technology", "grid_id"], dropna=False)[phase_col].idxmax()
     cols = [
         "project_id",
         "grid_id",
@@ -258,8 +257,18 @@ def _serving_by_technology(surface: pd.DataFrame, grid: pd.DataFrame, phase_col:
         "dt_replacement_rsrp",
     ]
     cols = [c for c in cols if c in surface.columns]
-    serving = surface.loc[idx, cols].copy()
-    serving = grid.merge(serving, on="grid_id", how="right")
+    technologies = sorted(surface["technology"].astype(str).dropna().unique()) if "technology" in surface.columns else []
+    tech_grid = pd.concat(
+        [grid[["grid_id", "center_lat", "center_lon"]].assign(technology=tech) for tech in technologies],
+        ignore_index=True,
+    ) if technologies else grid[["grid_id", "center_lat", "center_lon"]].copy()
+    valid = surface.dropna(subset=[phase_col]).copy()
+    if valid.empty:
+        serving = tech_grid.copy()
+    else:
+        idx = valid.groupby(["technology", "grid_id"], dropna=False)[phase_col].idxmax()
+        serving_values = valid.loc[idx, cols].copy()
+        serving = tech_grid.merge(serving_values, on=["technology", "grid_id"], how="left")
     serving["phase_value_col"] = phase_col
     serving["rsrp"] = serving[phase_col]
     return serving.sort_values(["technology", "grid_id"]).reset_index(drop=True)
