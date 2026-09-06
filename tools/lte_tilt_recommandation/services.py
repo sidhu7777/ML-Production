@@ -168,6 +168,29 @@ def _rf_identity_series(series: pd.Series) -> pd.Series:
     return out
 
 
+def _normalise_technology_series(
+    primary: pd.Series | None,
+    index,
+    fallback: pd.Series | None = None,
+    band: pd.Series | None = None,
+) -> pd.Series:
+    if primary is None:
+        out = pd.Series(pd.NA, index=index, dtype="string")
+    else:
+        out = primary.astype("string").str.strip()
+    if fallback is not None:
+        fb = fallback.astype("string").str.strip()
+        out = out.mask(out.isna() | out.eq("") | out.str.lower().isin(["nan", "none", "null", "<na>"]), fb)
+    upper = out.astype("string").str.upper()
+    normalised = pd.Series(pd.NA, index=index, dtype="string")
+    normalised = normalised.mask(upper.str.contains("5G|NR", na=False), "5G")
+    normalised = normalised.mask(upper.str.contains("4G|LTE", na=False), "4G")
+    if band is not None:
+        band_text = band.astype("string").str.strip().str.upper()
+        normalised = normalised.mask(normalised.isna() & band_text.isin(["78", "N78", "NR78"]), "5G")
+    return normalised.fillna(out).fillna("UNKNOWN")
+
+
 def _build_node_cell_id(nodeb_series: pd.Series, cell_series: pd.Series) -> pd.Series:
     nodeb = _clean_id_series(nodeb_series)
     cell = _clean_id_series(cell_series)
@@ -260,6 +283,10 @@ def _prepare_tilt_antenna_df(antenna_df: pd.DataFrame) -> pd.DataFrame:
         out["dashboard_site_id"] = _clean_id_series(out["nodeb_id"])
     if "Node_Cell_ID" in out.columns:
         out["Node_Cell_ID"] = _rf_identity_series(out["Node_Cell_ID"])
+    tech_source = out["Technology"] if "Technology" in out.columns else None
+    tech_fallback = out["technology"] if "technology" in out.columns else None
+    band_source = out["band"] if "band" in out.columns else None
+    out["Technology"] = _normalise_technology_series(tech_source, out.index, tech_fallback, band_source)
     alias_cols = {
         "latitude": "lat",
         "longitude": "lon",
@@ -330,10 +357,16 @@ def _prepare_tilt_log_df(log_df: pd.DataFrame, antenna_df: pd.DataFrame) -> pd.D
         if merge_cols:
             ant = ant[merge_cols].drop_duplicates(subset=["Node_Cell_ID"], keep="last")
             out = out.merge(ant, on="Node_Cell_ID", how="left", suffixes=("", "_site"))
-    if "Technology" not in out.columns:
-        out["Technology"] = "4G"
-    else:
-        out["Technology"] = out["Technology"].fillna("4G")
+    tech_source = out["Technology"] if "Technology" in out.columns else None
+    tech_fallback = None
+    for candidate in ["technology", "Technology_site", "technology_site", "network", "rat"]:
+        if candidate in out.columns:
+            tech_fallback = out[candidate] if tech_fallback is None else tech_fallback.fillna(out[candidate])
+    band_source = out["band"] if "band" in out.columns else None
+    if band_source is None and "serving_frequency_mhz" in out.columns:
+        band_source = out["serving_frequency_mhz"]
+    out["Technology"] = _normalise_technology_series(tech_source, out.index, tech_fallback, band_source)
+    out["technology"] = out["Technology"]
     if "operator" not in out.columns:
         out["operator"] = "Unknown"
     return out
@@ -1019,8 +1052,8 @@ class RFOptimizationService:
                 baseline_job_id=baseline_job_id,
                 coordinate_passes=int(cfg.get("coordinate_passes", 2)),
                 candidate_workers=int(cfg.get("candidate_workers", 1)),
-                bad_grid_coverage_pct=float(cfg.get("bad_grid_coverage_pct", 80.0)),
-                max_group_cells=int(cfg.get("max_group_cells", 0)),
+                bad_grid_coverage_pct=float(cfg.get("bad_grid_coverage_pct", 60.0)),
+                max_group_cells=int(cfg.get("max_group_cells", 20)),
                 max_neighbors_per_update_cell=int(cfg.get("max_neighbors_per_update_cell", 2)),
                 etilt_candidate_max_delta_deg=_parse_positive_float_from_keys(
                     cfg,

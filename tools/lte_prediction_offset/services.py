@@ -2,10 +2,13 @@ import math
 import os
 import sys
 import threading
+import time
 import traceback
 import uuid
 from contextlib import contextmanager, nullcontext
 from datetime import datetime
+from pathlib import Path
+from urllib.parse import unquote, urlparse
 
 import numpy as np
 import pandas as pd
@@ -15,6 +18,7 @@ from shapely.ops import transform, unary_union
 from shapely.wkt import loads as load_wkt
 from sklearn.neighbors import BallTree
 from sqlalchemy import create_engine, text
+from sqlalchemy.exc import DBAPIError, OperationalError
 
 from extensions import db
 
@@ -30,6 +34,13 @@ from tools.lte_prediction.ml_engine import (
     fetch_site_data,
 )
 from tools.lte_prediction.services import LTEPredictionService
+from tools.lte_prediction.dem_utils import ensure_project_dem
+from tools.lte_prediction_offset.phase27_calibration import add_features, apply_outdoor, fit_outdoor
+from tools.lte_prediction_offset.phase27_physical import _DemSampler, score_candidates
+from tools.lte_prediction_offset import phase27_calibration as _calib
+from tools.lte_prediction_offset import phase36_physical_upgrades as _p36
+from tools.lte_prediction_offset import phase37_quality as _p37
+from tools.lte_prediction_offset.geo_inputs import load_or_build_phase27_clutter
 from utils.python_bridge import PythonBridgeError, get_bridge_client
 
 
@@ -38,6 +49,65 @@ EARTH_RADIUS_M = 6371000.0
 CLIP_RSRP = (-140.0, -44.0)
 BRIDGE_ENV_KEYS = ("PYTHON_BRIDGE_BASE_URL", "SIGNAL_TRACKERS_BRIDGE_URL")
 _SAVE_ENGINES = {}
+ML_ROOT = Path(__file__).resolve().parents[2]
+
+# --- TEMPORARY: fixed tx_power override (Phase 39 equal-power) ---------------
+# Per-cell tx_power fetched from the antenna table is not trusted right now.
+# Until real per-cell power is confirmed, every cell (4G and 5G) is forced to
+# this value instead of its fetched tx_power, matching Phase 39's equal-power
+# diagnostic assumption. Remove this override (set to None) once real per-cell
+# tx_power is validated and should drive the RF math again.
+FIXED_TX_POWER_DBM_OVERRIDE = 46.0
+
+# --- Phase 39: dynamic COST-231 frequency-anchor offset -----------------------
+# COST-231/Hata is only calibrated at specific reference frequencies. When a
+# cell's real/deployed frequency is not one of those, COST231 is run at the
+# nearest valid anchor instead and the output is corrected back with the
+# COST-231 frequency term: offset_db = -COST231_FREQ_COEFF * log10(f_real/f_anchor).
+# Anchors are the frequencies validated so far; add to this list (not a new
+# hardcoded band branch) as more get validated against drive test.
+COST231_FREQ_COEFF = 33.9
+COST231_VALID_ANCHORS_MHZ = (1500.0, 2600.0)
+# Real deployed frequency for (technology, band, region) combinations where the
+# antenna table's label does not match the true physical frequency (e.g.
+# Taiwan's 5G N78 is labelled/stored as 2600 MHz but is actually deployed at
+# 3300 MHz). Anything not listed here uses _frequency_from_site's value as-is
+# (label already equals real for that band).
+COST231_REAL_FREQUENCY_OVERRIDE_MHZ = {
+    ("5G", "78", "taiwan"): 3300.0,
+}
+
+
+def _cost231_resolve_anchor_mhz(freq_mhz: pd.Series) -> pd.Series:
+    """COST-231 is treated as directly valid across [min(anchors), max(anchors)]
+    (today 1500-2600 MHz) -- a frequency inside that window runs at its own
+    value, unchanged, exactly like before this function existed. Only a
+    frequency outside the window is clamped to the nearest edge anchor, with
+    _cost231_frequency_offset_db correcting the model output back to what
+    freq_mhz itself should read."""
+    lo, hi = min(COST231_VALID_ANCHORS_MHZ), max(COST231_VALID_ANCHORS_MHZ)
+    freq = pd.to_numeric(freq_mhz, errors="coerce")
+    return freq.clip(lower=lo, upper=hi)
+
+
+def _cost231_frequency_offset_db(freq_real_mhz, freq_anchor_mhz) -> pd.Series:
+    ratio = pd.to_numeric(freq_real_mhz, errors="coerce") / pd.to_numeric(freq_anchor_mhz, errors="coerce")
+    return -COST231_FREQ_COEFF * np.log10(ratio)
+
+
+def _with_db_retry(db_engine, action, stage: str):
+    """Reconnect on transient remote-MySQL failures, without masking data errors."""
+    for attempt in range(1, 4):
+        try:
+            return action()
+        except (OperationalError, DBAPIError):
+            if attempt == 3:
+                raise
+            if db_engine is not None:
+                db_engine.dispose()
+            delay_s = attempt * 2
+            print(f"[LTE_OFFSET][DB_RETRY] stage={stage} attempt={attempt}/3 delay_s={delay_s}", flush=True)
+            time.sleep(delay_s)
 
 
 @contextmanager
@@ -100,6 +170,9 @@ def _prepare_site_rows(site_df, region):
     if "nodeb_id" not in out.columns:
         out["nodeb_id"] = out.get("site", out.get("Site ID", pd.Series(index=out.index)))
 
+    _am_col = _first_present(out, ["antenna_model", "antenna_type", "antenna", "antenna_name"])
+    out["antenna_model"] = _clean_text(out[_am_col]) if _am_col else pd.Series(pd.NA, index=out.index, dtype="string")
+
     out["strict_cell_key"] = _clean_text(out.get("Node_Cell_ID", pd.Series(index=out.index)))
     if "rf_identity_key" in out.columns:
         out["strict_cell_key"] = out["strict_cell_key"].fillna(_clean_text(out["rf_identity_key"]))
@@ -143,12 +216,34 @@ def _prepare_site_rows(site_df, region):
         if default is not None:
             out[col] = out[col].fillna(default)
 
+    # Keep the real per-cell power BEFORE any equal-power override. The DT-side
+    # normalisation needs it to shift measured RSRP into the same equal-power
+    # space as the model (see _equal_power_shift_for_dt).
+    out["original_tx_power_dbm"] = out["tx_power"]
+    if FIXED_TX_POWER_DBM_OVERRIDE is not None:
+        # TEMPORARY -- see FIXED_TX_POWER_DBM_OVERRIDE docstring above.
+        out["tx_power"] = float(FIXED_TX_POWER_DBM_OVERRIDE)
+
     out["frequency_mhz"] = _frequency_from_site(out)
     out["original_frequency_mhz"] = out["frequency_mhz"]
-    taiwan_n78 = out["band_key"].astype(str).eq("78") & (str(region).lower() == "taiwan")
-    out.loc[taiwan_n78, "frequency_mhz"] = 2600.0
-    out["model_rsrp_adjust_db"] = 0.0
-    out.loc[taiwan_n78, "model_rsrp_adjust_db"] = -2.58
+
+    # Phase 39: real deployed frequency, for the (technology, band, region)
+    # combinations where the antenna table's label doesn't match reality.
+    freq_real = out["frequency_mhz"].copy()
+    for (tech, band, override_region), real_mhz in COST231_REAL_FREQUENCY_OVERRIDE_MHZ.items():
+        mask = (
+            out["technology_key"].astype(str).eq(tech)
+            & out["band_key"].astype(str).eq(band)
+            & (str(region).lower() == str(override_region).lower())
+        )
+        freq_real.loc[mask] = real_mhz
+
+    # Run COST231 at whichever frequency is valid (own frequency if already
+    # inside the calibrated window, else the nearest edge anchor), and correct
+    # the output back to freq_real with the analytic COST-231 frequency term.
+    freq_anchor = _cost231_resolve_anchor_mhz(freq_real)
+    out["frequency_mhz"] = freq_anchor
+    out["model_rsrp_adjust_db"] = _cost231_frequency_offset_db(freq_real, freq_anchor).fillna(0.0)
 
     out = out.dropna(subset=["lat", "lon", "strict_cell_key"]).copy()
     return out.drop_duplicates(subset=["strict_cell_key"], keep="first").reset_index(drop=True)
@@ -170,11 +265,22 @@ def _site_record(row):
 
 def _cost231_for_points(site, lat_values, lon_values, freq_mhz):
     params = {"k1": 0, "k2": 0, "antenna_gain": 18.0, "cable_loss": 2.0, "ue_height": 1.5}
-    values = [
-        compute_sector_rsrp(site, float(lat), float(lon), float(freq_mhz), params)
-        for lat, lon in zip(lat_values, lon_values)
-    ]
-    return np.clip(np.asarray(values, dtype=float), *CLIP_RSRP)
+    # compute_sector_rsrp is fully vectorised internally (haversine_vectorized,
+    # compute_bearing_vectorized, compute_3gpp_antenna_gain_vectorized, numpy
+    # throughout), so score every point in ONE call. The previous per-point
+    # list comprehension drove a vectorised function one scalar at a time and
+    # was ~99% of every RF evaluation's runtime. Same math, same result.
+    values = compute_sector_rsrp(
+        site,
+        np.asarray(lat_values, dtype=float),
+        np.asarray(lon_values, dtype=float),
+        float(freq_mhz),
+        params,
+    )
+    # Keep the physical value below the display/no-coverage threshold.  A
+    # candidate must not disappear before obstruction and calibration are
+    # evaluated; only the upper display ceiling is applied here.
+    return np.minimum(np.asarray(values, dtype=float), CLIP_RSRP[1])
 
 
 def _haversine_m(lat1, lon1, lat2, lon2):
@@ -350,15 +456,10 @@ def _surface_frame_for_site(
     )
 
 
-def _best_backfill_row(site_df, grid_row):
+def _nearest_backfill_rows(site_df, grid_row, k_nearest):
     lat = float(grid_row["center_lat"])
     lon = float(grid_row["center_lon"])
-    best = None
-    best_raw = -np.inf
-    best_distance = np.nan
-    best_bearing = np.nan
-    best_delta = np.nan
-
+    candidates = []
     for _, row in site_df.iterrows():
         raw = _cost231_for_points(
             _site_record(row),
@@ -366,28 +467,18 @@ def _best_backfill_row(site_df, grid_row):
             np.asarray([lon], dtype=float),
             float(row["frequency_mhz"]),
         )[0]
-        raw = float(np.clip(raw + float(row.get("model_rsrp_adjust_db", 0.0)), *CLIP_RSRP))
-        if raw > best_raw:
-            bearing = float(_bearing_deg(float(row["lat"]), float(row["lon"]), np.asarray([lat]), np.asarray([lon]))[0])
-            best = row
-            best_raw = raw
-            best_distance = float(_haversine_m(float(row["lat"]), float(row["lon"]), lat, lon))
-            best_bearing = bearing
-            best_delta = float(_azimuth_delta_deg(np.asarray([bearing]), float(row["azimuth"]))[0])
+        raw = float(raw + float(row.get("model_rsrp_adjust_db", 0.0)))
+        bearing = float(_bearing_deg(float(row["lat"]), float(row["lon"]), np.asarray([lat]), np.asarray([lon]))[0])
+        distance = float(_haversine_m(float(row["lat"]), float(row["lon"]), lat, lon))
+        candidates.append((distance, row, raw, bearing, float(_azimuth_delta_deg(np.asarray([bearing]), float(row["azimuth"]))[0])))
 
-    if best is None:
+    if not candidates:
         return pd.DataFrame()
-
     grid_one = pd.DataFrame([grid_row])
-    return _surface_frame_for_site(
-        best,
-        grid_one,
-        [best_raw],
-        [best_distance],
-        [best_bearing],
-        [best_delta],
-        ensure_all_cells_backfill=True,
-    )
+    frames = []
+    for distance, row, raw, bearing, delta in sorted(candidates, key=lambda item: item[0])[: max(1, int(k_nearest))]:
+        frames.append(_surface_frame_for_site(row, grid_one, [raw], [distance], [bearing], [delta], ensure_all_cells_backfill=True))
+    return pd.concat(frames, ignore_index=True)
 
 
 def _grid_id_row_col(series):
@@ -447,7 +538,7 @@ def _run_raw_surface(site_df, grid_df, cfg=None):
     frames = []
     total = len(site_df)
     radius_m = float(cfg.get("radius_m") or cfg.get("coverage_radius_m") or 500.0)
-    min_candidate_rsrp = float(cfg.get("min_candidate_rsrp_dbm", -128.0))
+    backfill_k_nearest = max(1, int(cfg.get("out_of_radius_backfill_k_nearest", 8)))
     for idx, row in site_df.iterrows():
         distance_m = _haversine_m(float(row["lat"]), float(row["lon"]), grid_lat, grid_lon)
         candidate_pre = distance_m <= radius_m
@@ -462,8 +553,11 @@ def _run_raw_surface(site_df, grid_df, cfg=None):
             grid_lon[candidate_pre],
             float(row["frequency_mhz"]),
         )
-        raw = np.clip(raw + float(row.get("model_rsrp_adjust_db", 0.0)), *CLIP_RSRP)
-        candidate = np.isfinite(raw) & (raw >= min_candidate_rsrp)
+        raw = raw + float(row.get("model_rsrp_adjust_db", 0.0))
+        # Distance is the candidate eligibility criterion. Do not use a raw
+        # RSRP cutoff here: later physical layers may validly change a weak
+        # raw candidate into the serving sector.
+        candidate = np.isfinite(raw)
         if not candidate.any():
             if idx == 0 or (idx + 1) % 10 == 0 or idx + 1 == total:
                 print(f"[LTE_OFFSET][COST231_DIRECTIONAL] cells_done={idx + 1}/{total} rows_so_far={sum(len(f) for f in frames)}", flush=True)
@@ -510,14 +604,28 @@ def _run_raw_surface(site_df, grid_df, cfg=None):
             total_missing += len(missing_grid)
             if missing_grid.empty:
                 continue
-            backfill_frames.extend(
-                _best_backfill_row(tech_sites, grid_row)
-                for grid_row in missing_grid.to_dict("records")
-            )
+            # Select nearest sectors in one distance matrix, then calculate RF
+            # only for the selected sector-grid pairs.  This preserves Phase 9
+            # nearest-eight behaviour without evaluating every sector for every
+            # uncovered grid.
+            grid_lat_m = missing_grid["center_lat"].to_numpy(dtype=float)
+            grid_lon_m = missing_grid["center_lon"].to_numpy(dtype=float)
+            site_lat_m = tech_sites["lat"].to_numpy(dtype=float)
+            site_lon_m = tech_sites["lon"].to_numpy(dtype=float)
+            distances = _haversine_m(grid_lat_m[:, None], grid_lon_m[:, None], site_lat_m[None, :], site_lon_m[None, :])
+            nearest = np.argsort(distances, axis=1)[:, : min(backfill_k_nearest, len(tech_sites))]
+            for site_pos in np.unique(nearest):
+                grid_pos = np.flatnonzero(np.any(nearest == site_pos, axis=1))
+                row = tech_sites.iloc[int(site_pos)]
+                candidate_grid = missing_grid.iloc[grid_pos].copy()
+                raw = _cost231_for_points(_site_record(row), candidate_grid["center_lat"].to_numpy(float), candidate_grid["center_lon"].to_numpy(float), float(row["frequency_mhz"])) + float(row.get("model_rsrp_adjust_db", 0.0))
+                bearing = _bearing_deg(float(row["lat"]), float(row["lon"]), candidate_grid["center_lat"].to_numpy(float), candidate_grid["center_lon"].to_numpy(float))
+                delta = _azimuth_delta_deg(bearing, float(row["azimuth"]))
+                backfill_frames.append(_surface_frame_for_site(row, candidate_grid, raw, distances[grid_pos, site_pos], bearing, delta, ensure_all_cells_backfill=True))
         if total_missing:
             print(
                 f"[LTE_OFFSET][ENSURE_ALL_CELLS] missing_grid_technology_pixels={total_missing} "
-                "action=best_raw_cost231_backfill_per_technology",
+                f"action=k{backfill_k_nearest}_nearest_sector_backfill_per_technology",
                 flush=True,
             )
             backfill_frames = [frame for frame in backfill_frames if not frame.empty]
@@ -547,22 +655,25 @@ def _prepare_dt(drive_df):
 
 
 def _run_cost231_at_dt(site_df, dt_df):
-    dt_lat = dt_df["lat"].to_numpy(dtype=float)
-    dt_lon = dt_df["lon"].to_numpy(dtype=float)
-    pred_matrix = np.empty((len(dt_df), len(site_df)), dtype=float)
-    for idx, row in site_df.iterrows():
-        pred_matrix[:, idx] = np.clip(
-            _cost231_for_points(_site_record(row), dt_lat, dt_lon, float(row["frequency_mhz"]))
-            + float(row.get("model_rsrp_adjust_db", 0.0)),
-            *CLIP_RSRP,
-        )
-    best_idx = np.argmax(pred_matrix, axis=1)
-    assigned = site_df.iloc[best_idx].reset_index(drop=True)
     out = dt_df.reset_index(drop=True).copy()
-    out["assigned_strict_cell_key"] = assigned["strict_cell_key"].astype(str).to_numpy()
-    out["assigned_technology"] = assigned["technology_key"].astype(str).to_numpy()
-    out["raw_cost231_at_dt_rsrp"] = pred_matrix[np.arange(len(out)), best_idx]
-    out["dt_minus_cost231_db"] = out["rsrp_measured"] - out["raw_cost231_at_dt_rsrp"]
+    network = _clean_text(out.get("network", out.get("technology", pd.Series(index=out.index)))).astype("string").str.upper()
+    out["measured_technology"] = np.where(network.str.contains("5G|NR", na=False), "5G", "4G")
+    out["assigned_strict_cell_key"] = pd.NA
+    out["assigned_technology"] = pd.NA
+    out["raw_cost231_at_dt_rsrp"] = np.nan
+    for tech, positions in out.groupby("measured_technology", dropna=False).groups.items():
+        sites = site_df.loc[site_df["technology_key"].astype(str).eq(str(tech))].reset_index(drop=True)
+        if sites.empty:
+            continue
+        pos = np.asarray(list(positions), dtype=int)
+        matrix = np.empty((len(pos), len(sites)), dtype=float)
+        for col, (_, row) in enumerate(sites.iterrows()):
+            matrix[:, col] = _cost231_for_points(_site_record(row), out.loc[pos, "lat"].to_numpy(float), out.loc[pos, "lon"].to_numpy(float), float(row["frequency_mhz"])) + float(row.get("model_rsrp_adjust_db", 0.0))
+        best = np.nanargmax(matrix, axis=1)
+        assigned = sites.iloc[best].reset_index(drop=True)
+        out.loc[pos, "assigned_strict_cell_key"] = assigned["strict_cell_key"].astype(str).to_numpy()
+        out.loc[pos, "assigned_technology"] = assigned["technology_key"].astype(str).to_numpy()
+        out.loc[pos, "raw_cost231_at_dt_rsrp"] = matrix[np.arange(len(pos)), best]
     return out
 
 
@@ -768,8 +879,30 @@ def _save_offset_baseline_results(save_delegate, final_df, project_id, job_id, o
         flush=True,
     )
     written_rows = save_delegate._replace_baseline_results(save_engine, out, project_id=int(project_id))
+    geo_out = final_df.copy()
+    geo_out["nodeb_id_cell_id"] = geo_out.get("rf_identity_key", geo_out.get("strict_cell_key"))
+    geo_out["proxy_site_id"] = geo_out.get("site", geo_out.get("nodeb_id"))
+    geo_out["building_count"] = geo_out.get("obstruction_branch", pd.Series("clear", index=geo_out.index)).isin(["indoor", "obstructed"]).astype(int)
+    geo_out["los_blocker_count"] = geo_out["building_count"]
+    geo_out["nlos_flag"] = geo_out["building_count"]
+    geo_out["diffraction_proxy_db"] = (
+        -pd.to_numeric(geo_out.get("building_obstruction_loss_db", 0.0), errors="coerce").fillna(0.0)
+        + pd.to_numeric(geo_out.get("terrain_diffraction_loss_db", 0.0), errors="coerce").fillna(0.0)
+    )
+    geo_out["serving_distance_m"] = pd.to_numeric(geo_out.get("distance_m"), errors="coerce")
+    geo_out["azimuth_delta_deg"] = pd.to_numeric(geo_out.get("azimuth_delta_deg"), errors="coerce")
+    with _without_python_bridge():
+        save_delegate._save_geo_features(
+            geo_out,
+            project_id=int(project_id),
+            baseline_job_id=str(job_id),
+            region=region,
+            operator=operator,
+            save_engine=save_engine,
+            production_summary={"building_alignment": "phase27_dynamic", "polygon_alignment": "production_grid"},
+        )
     print(
-        f"[LTE_OFFSET][BASELINE_ONLY_SAVE_DONE] baseline_rows={written_rows} geo_feature_rows=0",
+        f"[LTE_OFFSET][BASELINE_ONLY_SAVE_DONE] baseline_rows={written_rows} geo_feature_rows={len(geo_out)}",
         flush=True,
     )
     return written_rows
@@ -826,6 +959,148 @@ class LTEPredictionOffsetService:
         JOBS[job_id]["status"] = status
         JOBS[job_id]["progress"] = msg
 
+    def _storage_uri_to_path(self, storage_uri):
+        raw = str(storage_uri or "").strip()
+        if not raw:
+            return None
+
+        parsed = urlparse(raw)
+        if parsed.scheme.lower() == "file":
+            raw = unquote(parsed.path or "")
+            if os.name == "nt" and raw.startswith("/") and len(raw) >= 4 and raw[2] == ":":
+                raw = raw[1:]
+
+        candidate = Path(raw).expanduser()
+        if candidate.is_file():
+            return candidate
+        if candidate.is_absolute():
+            return candidate
+
+        for base in (ML_ROOT, ML_ROOT.parent):
+            resolved = (base / raw).resolve()
+            if resolved.is_file():
+                return resolved
+        return candidate
+
+    def _validate_dem_path(self, dem_path, site_df):
+        path = Path(dem_path).expanduser()
+        if not path.is_file():
+            return False, None, "file_missing"
+
+        dem = None
+        try:
+            dem = _DemSampler(path)
+            lat = pd.to_numeric(site_df.get("lat"), errors="coerce")
+            lon = pd.to_numeric(site_df.get("lon"), errors="coerce")
+            valid = lat.notna() & lon.notna()
+            if valid.any():
+                sample = site_df.loc[valid, ["lat", "lon"]].drop_duplicates().head(100)
+                values = dem.sample(sample["lat"].to_numpy(float), sample["lon"].to_numpy(float))
+                finite_share = float(np.isfinite(values).mean()) if len(values) else 0.0
+                if finite_share <= 0.0:
+                    return False, dem.band, "no_site_samples_inside_dem"
+            return True, dem.band, "ok"
+        except Exception as exc:
+            return False, None, str(exc)
+        finally:
+            if dem is not None:
+                dem.close()
+
+    def _active_dem_asset_rows(self, db_engine, project_id):
+        if db_engine is None:
+            return []
+
+        def action():
+            with db_engine.connect() as connection:
+                table_exists = connection.execute(text("""
+                    SELECT COUNT(*)
+                    FROM information_schema.TABLES
+                    WHERE TABLE_SCHEMA = DATABASE()
+                      AND TABLE_NAME = 'tbl_project_dem_asset'
+                """)).scalar()
+                if not table_exists:
+                    return []
+                return connection.execute(text("""
+                    SELECT id, source_name, storage_uri, selected_elevation_band,
+                           crs, resolution_m, created_at
+                    FROM tbl_project_dem_asset
+                    WHERE project_id = :project_id
+                      AND is_active = 1
+                    ORDER BY created_at DESC, id DESC
+                """), {"project_id": int(project_id)}).mappings().all()
+
+        try:
+            return _with_db_retry(db_engine, action, "dem_asset_lookup")
+        except Exception as exc:
+            print(f"[LTE_OFFSET][DEM_RESOLVE] source=project_dem_asset status=lookup_failed reason={exc}", flush=True)
+            return []
+
+    def _local_project_dem_candidates(self, project_id, region):
+        candidates = []
+        if int(project_id) == 210 or str(region).lower() == "taiwan":
+            mapdata_root = ML_ROOT / "tests" / "new-project" / "data" / "mapdata"
+            if mapdata_root.exists():
+                candidates.extend(sorted(mapdata_root.rglob("height_5m.grd")))
+        return candidates
+
+    def _resolve_dem_path(self, project_id, region, site_df, db_engine, requested_path=None):
+        requested = str(requested_path or "").strip()
+        if requested:
+            path = self._storage_uri_to_path(requested)
+            ok, band, reason = self._validate_dem_path(path, site_df)
+            print(
+                f"[LTE_OFFSET][DEM_RESOLVE] source=request path={path} valid={ok} "
+                f"selected_band={band} reason={reason}",
+                flush=True,
+            )
+            if ok:
+                return str(path)
+            raise RuntimeError(f"Configured terrain DEM is unusable: {reason}")
+
+        for row in self._active_dem_asset_rows(db_engine, project_id):
+            path = self._storage_uri_to_path(row.get("storage_uri"))
+            ok, band, reason = self._validate_dem_path(path, site_df)
+            print(
+                f"[LTE_OFFSET][DEM_RESOLVE] source=project_dem_asset asset_id={row.get('id')} "
+                f"storage_uri={row.get('storage_uri')} path={path} valid={ok} "
+                f"declared_band={row.get('selected_elevation_band')} selected_band={band} reason={reason}",
+                flush=True,
+            )
+            if ok:
+                return str(path)
+
+        for path in self._local_project_dem_candidates(project_id, region):
+            ok, band, reason = self._validate_dem_path(path, site_df)
+            print(
+                f"[LTE_OFFSET][DEM_RESOLVE] source=local_project_mapdata path={path} "
+                f"valid={ok} selected_band={band} reason={reason}",
+                flush=True,
+            )
+            if ok:
+                return str(path)
+
+        try:
+            path = ensure_project_dem(
+                project_id=int(project_id),
+                region=str(region).lower(),
+                site_df=site_df,
+                timeout_sec=60,
+                force=False,
+            )
+            ok, band, reason = self._validate_dem_path(path, site_df)
+            print(
+                f"[LTE_OFFSET][DEM_RESOLVE] source=auto_generated path={path} "
+                f"valid={ok} selected_band={band} reason={reason}",
+                flush=True,
+            )
+            if ok:
+                return str(path)
+        except Exception as exc:
+            print(f"[LTE_OFFSET][DEM_RESOLVE] source=auto_generated valid=False reason={exc}", flush=True)
+
+        print("[LTE_OFFSET][DEM_RESOLVE] source=none valid=False action=terrain_disabled", flush=True)
+        return None
+
     def _run(self, job_id, cfg):
         try:
             region = str(cfg.get("region", "india")).lower()
@@ -851,11 +1126,15 @@ class LTEPredictionOffsetService:
                 force_direct_db = True
                 print(f"[LTE_OFFSET][BRIDGE_FALLBACK] stage=site_data reason={exc}", flush=True)
                 with _without_python_bridge():
-                    site_df_raw, operator = fetch_site_data(
-                        cfg["project_id"],
-                        region=region,
-                        polygon_ids=cfg.get("polygon_ids"),
-                        operator=cfg.get("operator"),
+                    site_df_raw, operator = _with_db_retry(
+                        current_engine,
+                        lambda: fetch_site_data(
+                            cfg["project_id"],
+                            region=region,
+                            polygon_ids=cfg.get("polygon_ids"),
+                            operator=cfg.get("operator"),
+                        ),
+                        "site_data",
                     )
             bridge_context = _without_python_bridge() if force_direct_db else nullcontext()
             with bridge_context:
@@ -873,6 +1152,14 @@ class LTEPredictionOffsetService:
             if site_df_raw.empty:
                 raise ValueError("No site rows found inside project polygon")
             site_df = _prepare_site_rows(site_df_raw, region)
+            dem_raster_path = self._resolve_dem_path(
+                project_id=cfg["project_id"],
+                region=region,
+                site_df=site_df,
+                db_engine=current_engine,
+                requested_path=cfg.get("dem_raster_path"),
+            )
+            cfg["dem_raster_path"] = dem_raster_path
 
             self._update(job_id, "running", "Fetching drive data")
             bridge_context = _without_python_bridge() if force_direct_db else nullcontext()
@@ -887,6 +1174,17 @@ class LTEPredictionOffsetService:
                 )
             dt_df = _prepare_dt(drive_df)
 
+            self._update(job_id, "running", "Fetching building geometry")
+            with (_without_python_bridge() if force_direct_db else nullcontext()):
+                building_df = (
+                    _with_db_retry(
+                        current_engine,
+                        lambda: fetch_building_data(cfg["project_id"], region=region),
+                        "building_geometry",
+                    )
+                    if cfg.get("building", True) else pd.DataFrame()
+                )
+
             self._update(job_id, "running", "Fetching grid pixels")
             grid_df = _grid_from_bridge_or_db(cfg, current_engine, polygons, force_direct_db=force_direct_db)
             print(
@@ -894,23 +1192,171 @@ class LTEPredictionOffsetService:
                 flush=True,
             )
 
-            self._update(job_id, "running", "Running Cost231 offset baseline")
+            self._update(job_id, "running", "Running Phase 9/26/27 production baseline")
             surface = _run_raw_surface(site_df, grid_df, cfg)
+            with (_without_python_bridge() if force_direct_db else nullcontext()):
+                grid_clutter, resolved_building_df, clutter_summary = load_or_build_phase27_clutter(
+                    grid_df, building_df, cfg["project_id"], current_engine, cfg.get("ghs_obat_csv_path")
+                )
+            clutter_by_grid = grid_clutter.set_index("grid_id")["clutter_class"].to_dict() if not grid_clutter.empty else {}
+            print(f"[LTE_OFFSET][PHASE27_CLUTTER] {clutter_summary}", flush=True)
+            raw_best = surface.groupby(["Technology", "grid_id"], dropna=False)["raw_cost231_rsrp"].transform("max")
+            physical_mask = (surface["raw_cost231_rsrp"] >= raw_best - 20.0) & (surface["raw_cost231_rsrp"] >= -145.0)
+            surface = surface.loc[physical_mask].copy().reset_index(drop=True)
+            print(f"[LTE_OFFSET][PHASE26_CANDIDATES] retained={len(surface)} margin_db=20 min_raw_dbm=-145", flush=True)
             dt_assigned = _run_cost231_at_dt(site_df, dt_df)
-            dt_with_grid = _attach_nearest_grid(dt_assigned, grid_df, cfg.get("dt_replace_radius_m", 25))
-            offsets = _offset_table(site_df, dt_with_grid)
-            final_df = _apply_offset_and_replacement(surface, offsets, dt_with_grid)
+            surface = score_candidates(
+                surface, site_df, resolved_building_df, cfg["project_id"], region,
+                dem_raster_path=dem_raster_path,
+                clutter_by_grid=clutter_by_grid,
+                allow_auto_dem=False,
+            )
+            surface["technology"] = surface["Technology"].astype(str)
+            surface = add_features(surface, "strict_cell_key")
+
+            dt_points = dt_assigned.rename(columns={"assigned_strict_cell_key": "strict_cell_key"}).copy()
+            dt_points["grid_id"] = "DT_" + dt_points["dt_row_id"].astype(str)
+            dt_points["Technology"] = dt_points["assigned_technology"].astype(str)
+            dt_points["technology"] = dt_points["Technology"]
+            dt_points = dt_points.drop(columns=["band"], errors="ignore")
+            dt_points = dt_points.merge(
+                site_df[["strict_cell_key", "band_key", "sector_key", "frequency_mhz", "original_tx_power_dbm"]],
+                on="strict_cell_key", how="left"
+            ).rename(columns={"band_key": "band", "frequency_mhz": "serving_frequency_mhz"})
+
+            # EQUAL-POWER: the model is forced to FIXED_TX_POWER_DBM_OVERRIDE, but the
+            # drive test was recorded at each cell's REAL power. Every calibration below
+            # (g5_anchor, fit_outdoor, fit_local) minimises (measured - model), so if only
+            # the model side is normalised the calibration simply adds the real-power
+            # difference straight back and the equal-power rule is cancelled. Shift the
+            # measured RSRP into the same equal-power space first, so the residual carries
+            # no power term. This mirrors Phase 39's _apply_equal_power_assumptions, which
+            # shifts BOTH the DT rows and the candidates before fitting.
+            if FIXED_TX_POWER_DBM_OVERRIDE is not None:
+                _real_tx = pd.to_numeric(dt_points.get("original_tx_power_dbm"), errors="coerce")
+                _dt_power_shift = (float(FIXED_TX_POWER_DBM_OVERRIDE) - _real_tx).fillna(0.0)
+                dt_points["equal_power_shift_db"] = _dt_power_shift
+                dt_points["rsrp_measured_real_power"] = pd.to_numeric(dt_points["rsrp_measured"], errors="coerce")
+                dt_points["rsrp_measured"] = dt_points["rsrp_measured_real_power"] + _dt_power_shift
+                print(
+                    "[LTE_OFFSET][EQUAL_POWER_DT_NORMALISED] target_dbm="
+                    f"{float(FIXED_TX_POWER_DBM_OVERRIDE):.1f} "
+                    + "; ".join(
+                        f"{t}: n={len(g)} median_shift_db={pd.to_numeric(g['equal_power_shift_db']).median():+.2f}"
+                        for t, g in dt_points.groupby(dt_points["technology"].astype(str))
+                    ),
+                    flush=True,
+                )
+
+            dt_points["raw_cost231_rsrp"] = pd.to_numeric(dt_points["raw_cost231_at_dt_rsrp"], errors="coerce")
+            dt_points = score_candidates(
+                dt_points, site_df, resolved_building_df, cfg["project_id"], region,
+                dem_raster_path=dem_raster_path,
+                clutter_by_grid={},
+                allow_auto_dem=False,
+            )
+            dt_points["technology"] = dt_points["Technology"].astype(str)
+            dt_points = add_features(dt_points, "strict_cell_key")
+
+            phase36_v2 = bool(cfg.get("enable_phase36_v2", True))
+            quality_cal = pd.DataFrame()
+            if phase36_v2:
+                # --- Phase 36 v2 RSRP: per-RE reference + real antenna + Water override + local IDW field ---
+                _ant_cols = [c for c in ("strict_cell_key", "Etilt", "Mtilt", "Height", "antenna_model",
+                                         "lat", "lon", "azimuth") if c in site_df.columns]
+                _ant = site_df[_ant_cols].drop_duplicates("strict_cell_key").rename(
+                    columns={"lat": "_site_lat", "lon": "_site_lon", "azimuth": "_site_az"})
+                surface = surface.drop(columns=[c for c in ("Etilt", "Mtilt", "Height", "antenna_model") if c in surface.columns],
+                                       errors="ignore").merge(_ant, on="strict_cell_key", how="left")
+                dt_points = dt_points.drop(columns=[c for c in ("Etilt", "Mtilt", "Height", "antenna_model") if c in dt_points.columns],
+                                           errors="ignore").merge(_ant, on="strict_cell_key", how="left")
+                # DT geometry (surface already carries distance_m / azimuth_delta_deg)
+                _slat = pd.to_numeric(dt_points["_site_lat"], errors="coerce").to_numpy(float)
+                _slon = pd.to_numeric(dt_points["_site_lon"], errors="coerce").to_numpy(float)
+                _dlat = pd.to_numeric(dt_points["lat"], errors="coerce").to_numpy(float)
+                _dlon = pd.to_numeric(dt_points["lon"], errors="coerce").to_numpy(float)
+                dt_points["distance_m"] = np.maximum(_haversine_m(_slat, _slon, _dlat, _dlon), 1.0)
+                _brg = _bearing_deg(_slat, _slon, _dlat, _dlon)
+                _az = pd.to_numeric(dt_points["_site_az"], errors="coerce").fillna(0.0).to_numpy(float)
+                dt_points["azimuth_delta_deg"] = np.abs((_brg - _az + 180.0) % 360.0 - 180.0)
+                dt_points["rsrp_measured"] = pd.to_numeric(dt_points.get("rsrp_measured"), errors="coerce")
+                dt_points = _p36.apply_reference_and_water(dt_points, "physical_rsrp_unclipped", g5_level_anchor_db=0.0)
+                surface = _p36.apply_reference_and_water(surface, "physical_rsrp_unclipped", g5_level_anchor_db=0.0)
+                clean5 = dt_points[
+                    (dt_points["technology"].astype(str) == "5G")
+                    & (dt_points["obstruction_branch"].astype(str) == "clear")
+                    & (dt_points.get("clutter_class", pd.Series("", index=dt_points.index)).astype(str).str.lower() != "water")
+                ]
+                g5_anchor = float(
+                    (pd.to_numeric(clean5["rsrp_measured"], errors="coerce")
+                     - pd.to_numeric(clean5["phase36_physical_rsrp"], errors="coerce")).median()
+                ) if len(clean5) >= 20 else 0.0
+                g5_anchor = 0.0 if not np.isfinite(g5_anchor) else g5_anchor
+                if g5_anchor:
+                    for f in (dt_points, surface):
+                        m5 = (f["technology"].astype(str) == "5G").to_numpy()
+                        f.loc[m5, "phase36_physical_rsrp"] = pd.to_numeric(f.loc[m5, "phase36_physical_rsrp"], errors="coerce") + g5_anchor
+
+                # DT train/validation split for the calibration + quality
+                _h = pd.util.hash_pandas_object(dt_points.get("nearest_grid_id", dt_points["dt_row_id"]).astype(str),
+                                                index=False).astype("uint64")
+                dt_points["split"] = np.where((_h % 10) < 7, "train", "validation")
+                dt_fit = dt_points[dt_points["split"].eq("train")]
+
+                layers = fit_outdoor(dt_fit, "phase36_physical_rsrp")
+                local_models = _calib.fit_local(dt_fit, layers, "phase36_physical_rsrp")
+                final_df = _calib.apply_outdoor_v2(surface, layers, "phase36_physical_rsrp", local_models)
+
+                # --- Phase 37 RSRQ / SINR ---
+                try:
+                    dt_scored_q = _calib.apply_outdoor_v2(dt_points, layers, "phase36_physical_rsrp", local_models)
+                    dt_scored_q["rsrq_measured"] = pd.to_numeric(dt_points.get("rsrq"), errors="coerce")
+                    dt_scored_q["sinr_measured"] = pd.to_numeric(dt_points.get("sinr"), errors="coerce")
+                    # Authoritative carrier identity (technology + real/deployed
+                    # frequency) straight from the prepared site rows, keyed by
+                    # strict_cell_key. final_df / dt_scored_q don't reliably carry
+                    # the same frequency column all the way through their own
+                    # separate join paths (dt_scored_q in particular can end up
+                    # with only the COST-231 model anchor for an out-of-range
+                    # band), so compute_quality is given this instead of trusting
+                    # either frame's own frequency column for the join key.
+                    cell_carrier_map = site_df[["strict_cell_key", "technology_key", "original_frequency_mhz"]].drop_duplicates(
+                        "strict_cell_key"
+                    ).copy()
+                    cell_carrier_map["carrier_key"] = (
+                        cell_carrier_map["technology_key"].astype(str) + "|"
+                        + pd.to_numeric(cell_carrier_map["original_frequency_mhz"], errors="coerce").round(1).astype("string")
+                    )
+                    final_df, quality_cal = _p37.compute_quality(
+                        final_df, dt_scored_q, serving_col="final_rsrp", cell_carrier_map=cell_carrier_map
+                    )
+                except Exception as exc:  # quality is best-effort; RSRP must still ship
+                    print(f"[LTE_OFFSET][PHASE37] disabled reason={exc}", flush=True)
+                    final_df["pred_rsrq"] = np.nan
+                    final_df["pred_sinr"] = np.nan
+                model_tag = "cost231_phase9_phase26_phase36v2_phase37"
+            else:
+                layers = fit_outdoor(dt_points, "physical_rsrp_unclipped")
+                final_df = apply_outdoor(surface, layers, "physical_rsrp_unclipped")
+                model_tag = "cost231_phase9_phase26_phase27"
+
+            final_df["pred_rsrp"] = final_df["final_rsrp"].fillna(-140.0)
+            final_df["pred_rsrp_smoothed"] = final_df["pred_rsrp"]
+            if "pred_rsrq" in final_df.columns:
+                final_df["pred_rsrq_smoothed"] = final_df["pred_rsrq"]
+            if "pred_sinr" in final_df.columns:
+                final_df["pred_sinr_smoothed"] = final_df["pred_sinr"]
+            final_df["dt_replaced"] = False
             final_df.attrs["production_summary"] = {
-                "model": "cost231_offset_directional_full_surface",
+                "model": model_tag,
                 "coverage_radius_m": float(cfg.get("radius_m") or cfg.get("coverage_radius_m") or 500.0),
-                "min_candidate_rsrp_dbm": float(cfg.get("min_candidate_rsrp_dbm", -128.0)),
+                "candidate_filter_rule": "distance <= safe search radius; no pre-loss RSRP cutoff",
+                "out_of_radius_backfill_k_nearest": int(cfg.get("out_of_radius_backfill_k_nearest", 8)),
                 "ensure_all_cells": bool(cfg.get("ensure_all_cells", True)),
                 "ensure_all_cells_backfill_rows": int(final_df.get("ensure_all_cells_backfill", pd.Series(False, index=final_df.index)).sum()),
-                "offset_source_counts": offsets["offset_source"].value_counts(dropna=False).to_dict(),
-                "cells_with_dt_offset": int((offsets["dt_count"] > 0).sum()),
-                "cells_using_technology_offset": int((offsets["offset_source"] == "technology_dt_median").sum()),
-                "cells_using_global_offset": int((offsets["offset_source"] == "global_dt_median").sum()),
-                "dt_replaced_pixels": int(final_df["dt_replaced"].sum()),
+                "dynamic_layers": [str(layer["layer"].iloc[0]) for layer in layers if not layer.empty],
+                "phase27_clutter": clutter_summary,
+                "dt_replaced_pixels": 0,
                 "raw_directional_rows": int(len(final_df)),
                 "grid_pixels": int(final_df["grid_id"].nunique(dropna=False)),
                 "missing_grid_pixels_after_backfill": int(len(grid_df) - final_df["grid_id"].nunique(dropna=False)),

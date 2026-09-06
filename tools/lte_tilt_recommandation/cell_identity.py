@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+from functools import lru_cache
 from typing import Iterable
 
 import pandas as pd
@@ -9,7 +10,14 @@ import pandas as pd
 _EMPTY_VALUES = {"", "none", "nan", "null", "<na>"}
 
 
-def clean_cell_token(value: object) -> str:
+# These are pure scalar functions called tens of millions of times per RF
+# evaluation to normalise a few hundred distinct cell ids (profiled: 8.8M
+# clean_cell_token + 29M str.strip calls for ~112 unique ids). Memoise the
+# str case -- str hashes exactly, so a cached lookup is identical to
+# recomputing. Non-str values fall through uncached, which avoids the
+# int/float/bool hash-equality collisions (hash(1)==hash(True)) that a blanket
+# cache would introduce.
+def _clean_cell_token_impl(value: object) -> str:
     if pd.isna(value):
         return ""
     text = str(value).strip()
@@ -20,7 +28,16 @@ def clean_cell_token(value: object) -> str:
     return text.strip()
 
 
-def canonical_cell_id(value: object) -> str:
+_clean_cell_token_cached = lru_cache(maxsize=200_000)(_clean_cell_token_impl)
+
+
+def clean_cell_token(value: object) -> str:
+    if type(value) is str:
+        return _clean_cell_token_cached(value)
+    return _clean_cell_token_impl(value)
+
+
+def _canonical_cell_id_impl(value: object) -> str:
     """Return the canonical client/reporting cell id: nodeb_sector."""
     text = clean_cell_token(value).replace("p0", "")
     if not text:
@@ -36,6 +53,16 @@ def canonical_cell_id(value: object) -> str:
     if len(parts) == 2:
         return f"{parts[0]}_{parts[1]}"
     return text
+
+
+_canonical_cell_id_cached = lru_cache(maxsize=200_000)(_canonical_cell_id_impl)
+
+
+def canonical_cell_id(value: object) -> str:
+    """Return the canonical client/reporting cell id: nodeb_sector."""
+    if type(value) is str:
+        return _canonical_cell_id_cached(value)
+    return _canonical_cell_id_impl(value)
 
 
 def canonical_pair(nodeb: object, cell: object) -> str:

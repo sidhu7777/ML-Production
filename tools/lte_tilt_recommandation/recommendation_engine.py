@@ -39,8 +39,8 @@ class TiltEngineConfig:
     baseline_job_id: Optional[str] = None
     coordinate_passes: int = 2
     candidate_workers: int = 1
-    bad_grid_coverage_pct: float = 80.0
-    max_group_cells: int = 0
+    bad_grid_coverage_pct: float = 60.0
+    max_group_cells: int = 20  # applied per technology (4G and 5G each get this budget)
     max_neighbors_per_update_cell: int = 2
     etilt_candidate_max_delta_deg: float = 4.0
     azimuth_fallback_max_delta_deg: float = 30.0

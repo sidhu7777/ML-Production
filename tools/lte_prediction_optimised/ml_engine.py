@@ -1,6 +1,8 @@
 import os
 import time
 import json
+from functools import lru_cache
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -12,6 +14,20 @@ from .Sector_wise_prediction_code_copy import (
     compute_predictions_parallel,
     generate_grid,
     haversine_vectorized,
+)
+from ..lte_prediction_offset.services import (
+    _azimuth_delta_deg as _offset_azimuth_delta_deg,
+    _bearing_deg as _offset_bearing_deg,
+    _cost231_for_points as _offset_cost231_for_points,
+    _haversine_m as _offset_haversine_m,
+    _prepare_site_rows as _offset_prepare_site_rows,
+    _site_record as _offset_site_record,
+)
+from ..lte_prediction_offset.phase27_calibration import add_features as _offset_add_features
+from ..lte_prediction_offset.phase27_physical import score_candidates as _offset_score_candidates
+from ..lte_prediction_offset.phase36_physical_upgrades import (
+    apply_reference_and_water as _offset_apply_phase36,
+    n_rb_for as _offset_n_rb_for,
 )
 from ..lte_prediction.geo_correction_pipeline import (
     load_geo_weights,
@@ -28,6 +44,9 @@ from ..lte_tilt_recommandation.cell_identity import (
     canonical_pair,
 )
 from utils.python_bridge import _filter_complete_site_prediction_identity, get_bridge_client
+
+
+ML_ROOT = Path(__file__).resolve().parents[2]
 
 
 load_dotenv()
@@ -61,7 +80,11 @@ def _safe_minmax(df, col):
     return f"{series.min():.4f}..{series.max():.4f}"
 
 
-def _clean_token(value) -> str:
+# Pure scalar id-normalisers, called millions of times per RF evaluation over a
+# few hundred distinct ids (profiled: 5.9M _rf_cell_id calls). Memoise the str
+# case only -- str hashes exactly so the cached result is identical, while
+# non-str falls through uncached to avoid hash(1)==hash(True) style collisions.
+def _clean_token_impl(value) -> str:
     if pd.isna(value):
         return ""
     text = str(value).strip()
@@ -72,13 +95,31 @@ def _clean_token(value) -> str:
     return text
 
 
-def _rf_cell_id(value) -> str:
+_clean_token_cached = lru_cache(maxsize=200_000)(_clean_token_impl)
+
+
+def _clean_token(value) -> str:
+    if type(value) is str:
+        return _clean_token_cached(value)
+    return _clean_token_impl(value)
+
+
+def _rf_cell_id_impl(value) -> str:
     text = _clean_token(value).replace("|", "_")
     while ".0_" in text:
         text = text.replace(".0_", "_")
     if text.endswith(".0"):
         text = text[:-2]
     return text.strip("_")
+
+
+_rf_cell_id_cached = lru_cache(maxsize=200_000)(_rf_cell_id_impl)
+
+
+def _rf_cell_id(value) -> str:
+    if type(value) is str:
+        return _rf_cell_id_cached(value)
+    return _rf_cell_id_impl(value)
 
 
 def _site_prefixed_cell_id(site, cell) -> str:
@@ -96,6 +137,19 @@ def _pick_col(df: pd.DataFrame, candidates: list[str]):
         if col in df.columns:
             return col
     return None
+
+
+def _technology_series(df: pd.DataFrame) -> pd.Series:
+    tech_col = _pick_col(df, ["Technology", "technology", "network_type", "rat", "tech"])
+    if tech_col:
+        tech = df[tech_col].astype("string").str.strip().str.upper()
+    else:
+        tech = pd.Series(pd.NA, index=df.index, dtype="string")
+
+    tech = tech.mask(tech.str.contains("5G|NR", na=False), "5G")
+    tech = tech.mask(tech.str.contains("4G|LTE", na=False), "4G")
+    tech = tech.mask(tech.isna() | tech.isin(["", "NAN", "NONE", "NULL", "<NA>"]), "4G")
+    return tech.astype(str)
 
 
 def _clean_identity_series(series: pd.Series) -> pd.Series:
@@ -260,16 +314,50 @@ def _row_identity_aliases(row) -> set[str]:
     return {alias for alias in aliases if alias}
 
 
+def _identity_specificity(value: object) -> int:
+    text = _rf_cell_id(value)
+    if not text:
+        return 0
+    return len([part for part in text.split("_") if part])
+
+
+def _identity_without_operator_suffix(value: object) -> str:
+    text = _rf_cell_id(value)
+    parts = [part for part in text.split("_") if part]
+    if len(parts) >= 4 and not parts[-1].isdigit():
+        return "_".join(parts[:-1])
+    return text
+
+
+def _tilt_degrees(series: pd.Series) -> pd.Series:
+    values = pd.to_numeric(series, errors="coerce")
+    return values.where(values.abs().le(20.0), values / 10.0)
+
+
+def _operator_suffix_match(values: pd.Series, target: str) -> pd.Series:
+    if _identity_specificity(target) < 3:
+        return pd.Series(False, index=values.index)
+    text = values.astype("string").fillna("")
+    target_base = _identity_without_operator_suffix(target)
+    value_base = text.map(_identity_without_operator_suffix)
+    return text.eq(target) | text.eq(target_base) | value_base.eq(target) | value_base.eq(target_base)
+
+
 def _identity_match_mask(df: pd.DataFrame, identity: object) -> pd.Series:
     target = _rf_cell_id(identity)
     if df.empty or not target:
         return pd.Series(False, index=df.index)
-    target_aliases = {target, canonical_cell_id(target)}
+    target_is_rich = _identity_specificity(target) >= 3
+    target_aliases = {target} if target_is_rich else {target, canonical_cell_id(target)}
     for col in [c for c in _IDENTITY_ALIAS_COLS if c in df.columns]:
         values = df[col].map(_rf_cell_id)
         mask = values.isin(target_aliases)
+        if not bool(mask.any()) and target_is_rich:
+            mask = _operator_suffix_match(values, target)
         if bool(mask.any()):
             return mask
+        if target_is_rich:
+            continue
         canonical_mask = values.map(canonical_cell_id).isin(target_aliases)
         if bool(canonical_mask.any()):
             return canonical_mask
@@ -481,6 +569,11 @@ def fetch_baseline(project_id, region="india", operator=None, baseline_job_id=No
     base_cols = ["lat", "lon", "pred_rsrp", "pred_rsrq", "pred_sinr", "cell_id", "nodeb_id_cell_id", "job_id"]
     optional_identity_cols = [
         "operator",
+        "Technology",
+        "technology",
+        "serving_frequency_mhz",
+        "serving_earfcn",
+        "serving_pci",
         "rf_identity_key",
         "sector_identity_key",
         "site_sector_band_key",
@@ -1378,16 +1471,45 @@ def _compute_affected_cells(
 ):
     site_work = site_df.copy()
     identity_col = _shared_identity_column(site_work, baseline_df if isinstance(baseline_df, pd.DataFrame) else pd.DataFrame())
+    site_work["_scope_technology"] = _technology_series(site_work)
     changed_mask = _build_change_mask(site_work)
     changed_rows = site_work.loc[changed_mask].copy()
     if changed_rows.empty:
         raise ValueError("No effective optimized site change detected")
 
     changed_cell_ids = sorted(changed_rows[identity_col].astype(str).unique().tolist())
-    changed_site_ids = sorted(changed_rows["dashboard_site_id"].astype(str).unique().tolist())
+    changed_technologies = sorted(changed_rows["_scope_technology"].astype(str).unique().tolist())
+    changed_site_technologies = (
+        changed_rows.groupby(changed_rows["dashboard_site_id"].astype(str))["_scope_technology"]
+        .agg(lambda values: set(values.astype(str)))
+        .to_dict()
+    )
+    cell_technology = {}
+    for _, row in site_work.iterrows():
+        tech = str(row.get("_scope_technology", "")).strip()
+        if not tech:
+            continue
+        aliases = set(_row_identity_aliases(row))
+        aliases.add(_rf_cell_id(row.get(identity_col)))
+        for alias in aliases:
+            if alias:
+                cell_technology.setdefault(alias, tech)
+
+    def _cell_matches_technology(cell_id, allowed_technologies):
+        allowed = {str(value) for value in allowed_technologies if str(value).strip()}
+        if not allowed:
+            return True
+        cell = _clean_cell_id(cell_id)
+        tech = cell_technology.get(cell) or cell_technology.get(canonical_cell_id(cell))
+        return tech in allowed if tech else False
+
     selected_cells = set(changed_cell_ids)
 
-    same_site_rows = site_work.loc[site_work["dashboard_site_id"].astype(str).isin(changed_site_ids)].copy()
+    same_site_mask = [
+        str(row.get("_scope_technology", "")) in changed_site_technologies.get(str(row.get("dashboard_site_id", "")), set())
+        for _, row in site_work.iterrows()
+    ]
+    same_site_rows = site_work.loc[same_site_mask].copy()
     selected_cells.update(same_site_rows[identity_col].astype(str).tolist())
 
     available_cells = set(site_work[identity_col].astype(str).tolist())
@@ -1432,26 +1554,35 @@ def _compute_affected_cells(
             if col in baseline_work.columns
         ]
         if topology_cols and identity_col in baseline_work.columns:
+            baseline_work["_scope_technology"] = _technology_series(baseline_work)
             focus = baseline_work.loc[baseline_work[identity_col].astype(str).isin(changed_cell_ids)]
-            for col in topology_cols:
-                for value in focus[col].dropna().astype(str):
+            for _, focus_row in focus.iterrows():
+                source_tech = str(focus_row.get("_scope_technology", "")).strip()
+                allowed_for_row = {source_tech} if source_tech else set(changed_technologies)
+                for col in topology_cols:
+                    value = focus_row.get(col)
                     cell = _clean_cell_id(value)
-                    if cell and cell not in selected_cells:
+                    if cell and cell not in selected_cells and _cell_matches_technology(cell, allowed_for_row):
                         neighbor_counts[cell] = neighbor_counts.get(cell, 0) + 1
 
     selected_neighbor_cells = [
         cell for cell, _ in sorted(neighbor_counts.items(), key=lambda item: (-item[1], item[0]))
-        if cell in available_cells
+        if cell in available_cells and _cell_matches_technology(cell, changed_technologies)
     ][:max_neighbors]
     selected_cells.update(selected_neighbor_cells)
 
     if not topology_cols or not selected_neighbor_cells:
-        candidate_rows = site_work.loc[~site_work[identity_col].astype(str).isin(selected_cells)].copy()
+        candidate_rows = site_work.loc[
+            ~site_work[identity_col].astype(str).isin(selected_cells)
+            & site_work["_scope_technology"].astype(str).isin(changed_technologies)
+        ].copy()
         candidate_rows["lat"] = pd.to_numeric(candidate_rows["lat"], errors="coerce")
         candidate_rows["lon"] = pd.to_numeric(candidate_rows["lon"], errors="coerce")
         ranked_parts = []
         for _, row in changed_rows.iterrows():
-            if candidate_rows.empty:
+            row_tech = str(row.get("_scope_technology", "")).strip()
+            tech_candidate_rows = candidate_rows.loc[candidate_rows["_scope_technology"].astype(str).eq(row_tech)].copy()
+            if tech_candidate_rows.empty:
                 continue
             # Search neighbours around BOTH the new location and the original
             # location. When a site is moved (or removed), the cells surrounding
@@ -1476,7 +1607,7 @@ def _compute_affected_cells(
                 centers.append((float(orig_lat), float(orig_lon)))
 
             for center_lat, center_lon in centers:
-                ranked = candidate_rows.copy()
+                ranked = tech_candidate_rows.copy()
                 ranked["distance_m"] = haversine_vectorized(
                     center_lat,
                     center_lon,
@@ -1510,9 +1641,10 @@ def _compute_affected_cells(
         f"same_site_cells={same_site_rows[identity_col].nunique()} "
         f"topology_neighbor_cells={len(selected_neighbor_cells)} "
         f"distance_neighbor_cells={len(distance_neighbors)} affected_cells={len(affected_ids)} "
-        f"scope=changed_cells_plus_same_site_cells_plus_neighbor_cells"
+        f"technologies={changed_technologies} "
+        f"scope=changed_cells_plus_same_site_cells_plus_neighbor_cells_technology_filtered"
     )
-    return affected_ids, affected_site_ids, changed_rows
+    return affected_ids, affected_site_ids, changed_rows.drop(columns=["_scope_technology"], errors="ignore")
 
 
 def _build_local_interference_records(full_site_df, site_rows, max_interference_sites):
@@ -1557,6 +1689,7 @@ def _attach_serving_identity_to_points(pts: pd.DataFrame, site_rows: pd.DataFram
     node_b_id = _first_clean_value(site_rows, ["node_b_id", "nodeb_id"])
     site_id = _first_clean_value(site_rows, ["site_id", "dashboard_site_id", "site"])
     local_cell_id = _first_clean_value(site_rows, ["cell_id", "local_cell_id"])
+    band = _first_clean_value(site_rows, ["band", "Band", "frequency_band", "carrier"])
     operator = _first_clean_value(site_rows, ["operator", "Operator", "cluster", "network"])
     technology = _first_clean_value(site_rows, ["Technology", "technology"])
 
@@ -1568,12 +1701,656 @@ def _attach_serving_identity_to_points(pts: pd.DataFrame, site_rows: pd.DataFram
         out["site_id"] = site_id
     if local_cell_id:
         out["cell_id"] = local_cell_id
+    if band:
+        out["band"] = band
     if operator:
         out["operator"] = operator
     if technology:
         out["Technology"] = technology
     out["canonical_cell_id"] = canonical_cell_id(str(node_cell_id))
     return out
+
+
+def _restore_original_site_state(site_df: pd.DataFrame) -> pd.DataFrame:
+    out = site_df.copy()
+    for col in [
+        "lat",
+        "lon",
+        "azimuth",
+        "electrical_tilt",
+        "mechanical_tilt",
+        "tx_power",
+        "antenna_height",
+        "frequency_mhz",
+    ]:
+        orig_col = f"orig_{col}"
+        if orig_col in out.columns and col in out.columns:
+            before = pd.to_numeric(out[orig_col], errors="coerce")
+            out[col] = before.where(before.notna(), out[col])
+    return out
+
+
+def _offset_ready_site_df(site_df: pd.DataFrame, region: str) -> pd.DataFrame:
+    out = site_df.copy()
+    rename_pairs = {
+        "electrical_tilt": "Etilt",
+        "mechanical_tilt": "Mtilt",
+        "antenna_height": "Height",
+        "technology": "Technology",
+        "operator": "operator",
+    }
+    for src, dst in rename_pairs.items():
+        if src in out.columns and dst not in out.columns:
+            out[dst] = out[src]
+        elif src in out.columns and dst in out.columns:
+            out[dst] = out[dst].combine_first(out[src])
+    if "frequency_mhz" not in out.columns and "serving_frequency_mhz" in out.columns:
+        out["frequency_mhz"] = out["serving_frequency_mhz"]
+    if "Node_Cell_ID" not in out.columns and "rf_identity_key" in out.columns:
+        out["Node_Cell_ID"] = out["rf_identity_key"]
+    if "Etilt" in out.columns:
+        out["Etilt"] = _tilt_degrees(out["Etilt"])
+    if "Mtilt" in out.columns:
+        out["Mtilt"] = _tilt_degrees(out["Mtilt"])
+    return _offset_prepare_site_rows(out, region)
+
+
+def _baseline_points_for_cells(baseline_df: pd.DataFrame, cell_ids) -> pd.DataFrame:
+    baseline_work = _ensure_canonical_identity(baseline_df)
+    frames = []
+    for cid in cell_ids:
+        rows = baseline_work.loc[_identity_match_mask(baseline_work, cid)].copy()
+        if rows.empty:
+            continue
+        rows["target_node_cell_id"] = str(cid)
+        frames.append(rows)
+    if not frames:
+        return pd.DataFrame()
+    pts = pd.concat(frames, ignore_index=True)
+    pts["lat"] = pd.to_numeric(pts.get("lat"), errors="coerce")
+    pts["lon"] = pd.to_numeric(pts.get("lon"), errors="coerce")
+    pts = pts.dropna(subset=["lat", "lon"]).copy()
+    if pts.empty:
+        return pts
+    if "grid_id" not in pts.columns:
+        pts["grid_id"] = pd.NA
+    clean_grid = pts["grid_id"].astype("string").str.strip()
+    missing_grid = clean_grid.isna() | clean_grid.eq("") | clean_grid.str.lower().isin(["nan", "none", "null", "<na>"])
+    pts.loc[missing_grid, "grid_id"] = [
+        f"OPT_{cell}_{idx}"
+        for idx, cell in zip(pts.index[missing_grid], pts.loc[missing_grid, "target_node_cell_id"].astype(str))
+    ]
+    pts["center_lat"] = pts["lat"]
+    pts["center_lon"] = pts["lon"]
+    pts["baseline_pred_rsrp"] = pd.to_numeric(pts.get("pred_rsrp"), errors="coerce")
+    pts["baseline_pred_rsrq"] = pd.to_numeric(pts.get("pred_rsrq"), errors="coerce")
+    pts["baseline_pred_sinr"] = pd.to_numeric(pts.get("pred_sinr"), errors="coerce")
+    keep = ["grid_id", "center_lat", "center_lon", "target_node_cell_id", "baseline_pred_rsrp", "baseline_pred_rsrq", "baseline_pred_sinr"]
+    for col in ["clutter_class", "Technology", "operator", "cell_id", "node_b_id", "nodeb_id", "site_id", "nodeb_id_cell_id"]:
+        if col in pts.columns:
+            keep.append(col)
+    return pts[keep].drop_duplicates(subset=["grid_id", "target_node_cell_id"]).reset_index(drop=True)
+
+
+def _generated_points_for_cell(site_rows: pd.DataFrame, cid: str, params: dict) -> pd.DataFrame:
+    pts = generate_grid(site_rows, params.get("radius", 500), params.get("grid_resolution", 10))
+    if pts.empty:
+        return pts
+    pts = pts.copy()
+    pts["grid_id"] = [f"GEN_{cid}_{idx}" for idx in range(len(pts))]
+    pts["center_lat"] = pd.to_numeric(pts["lat"], errors="coerce")
+    pts["center_lon"] = pd.to_numeric(pts["lon"], errors="coerce")
+    pts["target_node_cell_id"] = str(cid)
+    pts["baseline_pred_rsrp"] = np.nan
+    pts["baseline_pred_rsrq"] = np.nan
+    pts["baseline_pred_sinr"] = np.nan
+    return pts[["grid_id", "center_lat", "center_lon", "target_node_cell_id", "baseline_pred_rsrp", "baseline_pred_rsrq", "baseline_pred_sinr"]]
+
+
+def _first_numeric_value(df: pd.DataFrame, col: str):
+    if col not in df.columns or df.empty:
+        return np.nan
+    series = pd.to_numeric(df[col], errors="coerce").dropna()
+    if series.empty:
+        return np.nan
+    return float(series.iloc[0])
+
+
+def _location_change_summary(site_rows: pd.DataFrame) -> tuple[bool, float, float, float, float, float]:
+    new_lat = _first_numeric_value(site_rows, "lat")
+    new_lon = _first_numeric_value(site_rows, "lon")
+    old_lat = _first_numeric_value(site_rows, "orig_lat")
+    old_lon = _first_numeric_value(site_rows, "orig_lon")
+    if not all(np.isfinite(value) for value in [new_lat, new_lon, old_lat, old_lon]):
+        return False, 0.0, old_lat, old_lon, new_lat, new_lon
+    moved_m = float(haversine_vectorized(old_lat, old_lon, new_lat, new_lon))
+    return moved_m > 1.0, moved_m, old_lat, old_lon, new_lat, new_lon
+
+
+def _local_project_dem_candidate(project_id, region) -> str | None:
+    if int(project_id or 0) != 210 and str(region).lower() != "taiwan":
+        return None
+    mapdata_root = ML_ROOT / "tests" / "new-project" / "data" / "mapdata"
+    if not mapdata_root.exists():
+        return None
+    for path in sorted(mapdata_root.rglob("height_5m.grd")):
+        if path.is_file():
+            return str(path)
+    return None
+
+
+def _manual_physical_context(params: dict) -> tuple[pd.DataFrame, str | None, dict]:
+    building_df = params.get("building_df")
+    if not isinstance(building_df, pd.DataFrame):
+        building_df = pd.DataFrame()
+    if building_df.empty and bool(params.get("building", True)) and params.get("project_id"):
+        try:
+            from ..lte_prediction.ml_engine import fetch_building_data as _fetch_building_data
+
+            building_df = _fetch_building_data(
+                int(params.get("project_id")),
+                region=str(params.get("region", "india")).lower(),
+            )
+            print(
+                f"[LTE_OPT][PHASE26_CONTEXT] building_rows={len(building_df)} source=project_buildings",
+                flush=True,
+            )
+        except Exception as exc:
+            print(f"[LTE_OPT][PHASE26_CONTEXT] building_rows=0 reason={exc}", flush=True)
+            building_df = pd.DataFrame()
+
+    dem_raster_path = params.get("dem_raster_path") or params.get("demRasterPath")
+    if not dem_raster_path:
+        dem_raster_path = _local_project_dem_candidate(
+            params.get("project_id"),
+            str(params.get("region", "india")).lower(),
+        )
+    if dem_raster_path:
+        print(f"[LTE_OPT][PHASE26_CONTEXT] dem_raster_path={dem_raster_path}", flush=True)
+
+    clutter_by_grid = params.get("clutter_by_grid")
+    if not isinstance(clutter_by_grid, dict):
+        clutter_by_grid = {}
+    return building_df, dem_raster_path, clutter_by_grid
+
+
+# Columns produced by phase27_physical.score_candidates (Phase 26 physical scoring).
+_PHASE26_OUTPUT_COLS = [
+    "building_obstruction_loss_db",
+    "terrain_diffraction_loss_db",
+    "terrain_fresnel_excess_m",
+    "terrain_peak_clearance_m",
+    "terrain_decision",
+    "obstruction_branch",
+    "clutter_class",
+]
+
+
+def _phase36_surface_for_points(
+    site_df: pd.DataFrame,
+    points_df: pd.DataFrame,
+    project_id=None,
+    region: str = "india",
+    building_df: pd.DataFrame | None = None,
+    dem_raster_path: str | None = None,
+    clutter_by_grid: dict | None = None,
+    phase26_cache: dict | None = None,
+) -> pd.DataFrame:
+    if site_df.empty or points_df.empty:
+        return pd.DataFrame()
+    grid = points_df[["grid_id", "center_lat", "center_lon"]].drop_duplicates("grid_id").copy()
+    grid_lat = pd.to_numeric(grid["center_lat"], errors="coerce").to_numpy(float)
+    grid_lon = pd.to_numeric(grid["center_lon"], errors="coerce").to_numpy(float)
+    frames = []
+    for _, row in site_df.iterrows():
+        distance = _offset_haversine_m(float(row["lat"]), float(row["lon"]), grid_lat, grid_lon)
+        raw = _offset_cost231_for_points(_offset_site_record(row), grid_lat, grid_lon, float(row["frequency_mhz"]))
+        raw = raw + float(row.get("model_rsrp_adjust_db", 0.0))
+        bearing = _offset_bearing_deg(float(row["lat"]), float(row["lon"]), grid_lat, grid_lon)
+        az_delta = _offset_azimuth_delta_deg(bearing, float(row["azimuth"]))
+        frames.append(pd.DataFrame({
+            "grid_id": grid["grid_id"].astype(str).to_numpy(),
+            "lat": grid_lat,
+            "lon": grid_lon,
+            "center_lat": grid_lat,
+            "center_lon": grid_lon,
+            "Node_Cell_ID": str(row["strict_cell_key"]),
+            "node_cell_id": str(row["strict_cell_key"]),
+            "strict_cell_key": str(row["strict_cell_key"]),
+            "site": str(row["site_key"]),
+            "nodeb_id": str(row.get("nodeb_id", row["site_key"])),
+            "cell_id": str(row["original_cell_id"]),
+            "sector": str(row["sector_key"]),
+            "band": str(row["band_key"]),
+            "Technology": str(row["technology_key"]),
+            "technology": str(row["technology_key"]),
+            "operator": str(row["operator_key"]),
+            "rf_identity_key": str(row["strict_cell_key"]),
+            "sector_identity_key": str(row["sector_identity_key"]),
+            "site_sector_band_key": str(row["site_sector_band_key"]),
+            "legacy_nodeb_id_cell_id": str(row["original_cell_id"]),
+            "serving_frequency_mhz": float(row["frequency_mhz"]),
+            "original_frequency_mhz": float(row.get("original_frequency_mhz", row["frequency_mhz"])),
+            "model_rsrp_adjust_db": float(row.get("model_rsrp_adjust_db", 0.0)),
+            "distance_m": np.asarray(distance, dtype=float),
+            "bearing_deg": np.asarray(bearing, dtype=float),
+            "azimuth_delta_deg": np.asarray(az_delta, dtype=float),
+            "Height": float(row.get("Height", row.get("antenna_height", 30.0))),
+            "Etilt": float(row.get("Etilt", row.get("electrical_tilt", 3.0))),
+            "Mtilt": float(row.get("Mtilt", row.get("mechanical_tilt", 0.0))),
+            "antenna_model": str(row.get("antenna_model", "")),
+            "raw_cost231_rsrp": np.asarray(raw, dtype=float),
+            "building_obstruction_loss_db": 0.0,
+            "terrain_diffraction_loss_db": 0.0,
+            "terrain_decision": "baseline_delta_preserved",
+            "obstruction_branch": "clear",
+            "clutter_class": "Open",
+            "physical_rsrp_unclipped": np.asarray(raw, dtype=float),
+        }))
+    surface = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+    if surface.empty:
+        return surface
+    if not isinstance(clutter_by_grid, dict):
+        clutter_by_grid = {}
+    if "clutter_class" in points_df.columns:
+        point_clutter = (
+            points_df[["grid_id", "clutter_class"]]
+            .dropna(subset=["grid_id"])
+            .drop_duplicates("grid_id")
+            .set_index("grid_id")["clutter_class"]
+            .astype(str)
+            .to_dict()
+        )
+        clutter_by_grid = {**point_clutter, **clutter_by_grid}
+    # Phase 26 physical scoring (building obstruction + terrain diffraction +
+    # clutter) depends ONLY on tx position/height, rx position and frequency --
+    # phase27_physical.score_candidates takes (site.lat, site.lon, site.Height,
+    # row.lat, row.lon, row.serving_frequency_mhz) and never reads tilt, azimuth
+    # or the antenna pattern. All of those are fixed per (strict_cell_key,
+    # grid_id) for the whole job, so trialling a tilt/azimuth delta cannot change
+    # the result. Cache on that key and reuse across a cell's candidates instead
+    # of re-running the per-row building/DEM intersection every candidate, which
+    # profiled at ~279s of a 296s RF evaluation.
+    cache = phase26_cache if isinstance(phase26_cache, dict) else None
+    cache_keys = None
+    if cache is not None:
+        site_physical_key = {}
+        for _, site_row in site_df.iterrows():
+            strict_key = str(site_row.get("strict_cell_key", "")).strip()
+            if not strict_key:
+                continue
+            site_physical_key[strict_key] = (
+                round(float(site_row.get("lat", np.nan)), 7),
+                round(float(site_row.get("lon", np.nan)), 7),
+                round(float(site_row.get("Height", site_row.get("antenna_height", 30.0)) or 30.0), 2),
+                round(float(site_row.get("frequency_mhz", np.nan)), 3),
+            )
+
+        cache_keys = []
+        for surf_row in surface[["strict_cell_key", "grid_id", "center_lat", "center_lon"]].itertuples(index=False):
+            grid_id = str(surf_row.grid_id)
+            cache_keys.append((
+                site_physical_key.get(str(surf_row.strict_cell_key), (str(surf_row.strict_cell_key),)),
+                round(float(surf_row.center_lat), 7),
+                round(float(surf_row.center_lon), 7),
+                str(clutter_by_grid.get(grid_id, "")),
+            ))
+    if cache is not None and cache_keys and all(k in cache for k in cache_keys):
+        cached_rows = [cache[k] for k in cache_keys]
+        for pos, col in enumerate(_PHASE26_OUTPUT_COLS):
+            surface[col] = [row[pos] for row in cached_rows]
+        print(
+            f"[LTE_OPT][PHASE26_PHYSICAL] rows={len(surface)} source=cache_hit",
+            flush=True,
+        )
+    else:
+        try:
+            surface = _offset_score_candidates(
+                surface,
+                site_df,
+                building_df if isinstance(building_df, pd.DataFrame) else pd.DataFrame(),
+                int(project_id) if project_id is not None else 0,
+                str(region).lower(),
+                dem_raster_path=dem_raster_path,
+                clutter_by_grid=clutter_by_grid,
+                allow_auto_dem=False,
+            )
+            print(
+                "[LTE_OPT][PHASE26_PHYSICAL] "
+                f"rows={len(surface)} building_nonzero="
+                f"{int((pd.to_numeric(surface.get('building_obstruction_loss_db'), errors='coerce').fillna(0.0) != 0.0).sum())} "
+                f"terrain_nonzero={int((pd.to_numeric(surface.get('terrain_diffraction_loss_db'), errors='coerce').fillna(0.0) > 0.0).sum())} "
+                f"source=computed",
+                flush=True,
+            )
+            if cache is not None and all(col in surface.columns for col in _PHASE26_OUTPUT_COLS):
+                stored = surface[_PHASE26_OUTPUT_COLS].to_numpy(dtype=object)
+                for key, values in zip(cache_keys or [], stored):
+                    cache[key] = tuple(values)
+        except Exception as exc:
+            print(f"[LTE_OPT][PHASE26_PHYSICAL] disabled reason={exc}", flush=True)
+    surface = _offset_add_features(surface, "strict_cell_key")
+    return _offset_apply_phase36(surface, "physical_rsrp_unclipped", g5_level_anchor_db=0.0)
+
+
+def _carrier_key_for_quality(frame: pd.DataFrame) -> pd.Series:
+    freq = pd.to_numeric(
+        frame.get("original_frequency_mhz", frame.get("serving_frequency_mhz", frame.get("frequency_mhz"))),
+        errors="coerce",
+    ).round(1)
+    return frame["technology"].astype(str) + "|" + freq.astype("string")
+
+
+def _mw_from_dbm(values):
+    return np.power(10.0, np.asarray(values, dtype=float) / 10.0)
+
+
+def _row_matches_identity(row, identity_value) -> bool:
+    target = _rf_cell_id(identity_value)
+    if not target:
+        return False
+    if _identity_specificity(target) >= 3:
+        target_base = _identity_without_operator_suffix(target)
+        target_aliases = {target, target_base}
+        for col in [
+            "Node_Cell_ID",
+            "node_cell_id",
+            "strict_cell_key",
+            "rf_identity_key",
+            "nodeb_id_cell_id",
+        ]:
+            value = _rf_cell_id(row.get(col))
+            if not value:
+                continue
+            value_base = _identity_without_operator_suffix(value)
+            if value in target_aliases or value_base in target_aliases:
+                return True
+        return False
+    return bool(_row_identity_aliases(row) & {target, canonical_cell_id(target)})
+
+
+def _quality_from_signal(signal_dbm, interference_mw, technology):
+    if not np.isfinite(signal_dbm):
+        return np.nan, np.nan
+    s = float(_mw_from_dbm(signal_dbm))
+    noise = float(_mw_from_dbm(-104.0))
+    rssi = s + max(float(interference_mw), 0.0) + noise
+    sinr = 10.0 * np.log10(s / (max(float(interference_mw), 0.0) + noise))
+    rsrq = 10.0 * np.log10(_offset_n_rb_for(str(technology), None)) + float(signal_dbm) - 10.0 * np.log10(rssi)
+    return sinr, rsrq
+
+
+def _apply_baseline_rsrp_residual(surface: pd.DataFrame, points_df: pd.DataFrame, residual_source: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
+    joined = residual_source.merge(
+        points_df[["grid_id", "target_node_cell_id", "baseline_pred_rsrp"]],
+        on="grid_id",
+        how="inner",
+    )
+    target_mask = joined.apply(lambda row: _row_matches_identity(row, row.get("target_node_cell_id")), axis=1)
+    target = joined.loc[target_mask].copy()
+    target["rsrp_residual_db"] = pd.to_numeric(target["baseline_pred_rsrp"], errors="coerce") - pd.to_numeric(target["phase36_physical_rsrp"], errors="coerce")
+    target = target.dropna(subset=["rsrp_residual_db"])
+    by_cell = target.groupby("strict_cell_key")["rsrp_residual_db"].median().to_dict()
+    by_tech = target.groupby("technology")["rsrp_residual_db"].median().to_dict()
+
+    out = surface.copy()
+    cell_resid = out["strict_cell_key"].astype(str).map(by_cell)
+    tech_resid = out["technology"].astype(str).map(by_tech)
+    out["optimized_baseline_residual_db"] = pd.to_numeric(cell_resid, errors="coerce").fillna(
+        pd.to_numeric(tech_resid, errors="coerce")
+    ).fillna(0.0)
+    out["optimized_final_rsrp_unclipped"] = pd.to_numeric(out["phase36_physical_rsrp"], errors="coerce") + out["optimized_baseline_residual_db"]
+    out["optimized_final_rsrp"] = out["optimized_final_rsrp_unclipped"].clip(-140.0, -44.0)
+    return out, {"cell_residuals": len(by_cell), "tech_residuals": len(by_tech)}
+
+
+def _target_quality(surface: pd.DataFrame, points_df: pd.DataFrame, activity=None, corrections=None) -> pd.DataFrame:
+    if surface.empty or points_df.empty:
+        return pd.DataFrame()
+    activity = activity or {}
+    corrections = corrections or {}
+    work = surface.copy()
+    work["carrier_key"] = _carrier_key_for_quality(work)
+    grouped = {key: grp for key, grp in work.groupby(["grid_id", "carrier_key"], sort=False)}
+
+    point_targets = points_df[
+        ["grid_id", "target_node_cell_id", "baseline_pred_rsrq", "baseline_pred_sinr"]
+    ].drop_duplicates(["grid_id", "target_node_cell_id"]).copy()
+    target_rows = work.merge(point_targets, on="grid_id", how="inner")
+    target_mask = target_rows.apply(lambda row: _row_matches_identity(row, row.get("target_node_cell_id")), axis=1)
+    target_rows = target_rows.loc[target_mask].copy()
+    rows = []
+    for _, row in target_rows.iterrows():
+        key = (row["grid_id"], row["carrier_key"])
+        grp = grouped.get(key)
+        if grp is None or grp.empty:
+            continue
+        signal = float(row["optimized_final_rsrp"])
+        others = grp.loc[grp["strict_cell_key"].astype(str) != str(row["strict_cell_key"]), "optimized_final_rsrp"]
+        others = pd.to_numeric(others, errors="coerce").dropna().to_numpy(float)
+        gate = others >= max(-125.0, signal - 20.0)
+        raw_interference = float(_mw_from_dbm(others[gate]).sum()) if gate.any() else 0.0
+        factor = float(activity.get(str(row["carrier_key"]), 1.0))
+        base_sinr, base_rsrq = _quality_from_signal(signal, raw_interference * factor, row["technology"])
+        corr = corrections.get(str(row["carrier_key"]), {})
+        rows.append({
+            "grid_id": row["grid_id"],
+            "Node_Cell_ID": str(row["strict_cell_key"]),
+            "pred_sinr": base_sinr + float(corr.get("sinr", 0.0) or 0.0),
+            "pred_rsrq": base_rsrq + float(corr.get("rsrq", 0.0) or 0.0),
+            "base_sinr": base_sinr,
+            "base_rsrq": base_rsrq,
+            "signal_mw": float(_mw_from_dbm(signal)),
+            "raw_interference_mw": raw_interference,
+            "carrier_key": str(row["carrier_key"]),
+            "interfering_sector_count": int(gate.sum()),
+            "baseline_pred_rsrq": row.get("baseline_pred_rsrq"),
+            "baseline_pred_sinr": row.get("baseline_pred_sinr"),
+        })
+    return pd.DataFrame(rows)
+
+
+def _fit_quality_delta(old_surface: pd.DataFrame, points_df: pd.DataFrame) -> tuple[dict, dict]:
+    initial = _target_quality(old_surface, points_df)
+    activity = {}
+    for carrier, grp in initial.groupby("carrier_key", dropna=False):
+        sinr = pd.to_numeric(grp["baseline_pred_sinr"], errors="coerce").to_numpy(float)
+        sig = pd.to_numeric(grp["signal_mw"], errors="coerce").to_numpy(float)
+        intf = pd.to_numeric(grp["raw_interference_mw"], errors="coerce").to_numpy(float)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            needed = sig / (np.power(10.0, sinr / 10.0) * intf)
+        needed = needed[np.isfinite(needed) & (needed > 0.0)]
+        activity[str(carrier)] = float(np.clip(np.median(needed), 0.03, 1.0)) if needed.size else 1.0
+
+    corrected_base = _target_quality(old_surface, points_df, activity=activity)
+    corrections = {}
+    for carrier, grp in corrected_base.groupby("carrier_key", dropna=False):
+        sinr_res = pd.to_numeric(grp["baseline_pred_sinr"], errors="coerce") - pd.to_numeric(grp["base_sinr"], errors="coerce")
+        rsrq_res = pd.to_numeric(grp["baseline_pred_rsrq"], errors="coerce") - pd.to_numeric(grp["base_rsrq"], errors="coerce")
+        corrections[str(carrier)] = {
+            "sinr": float(sinr_res.dropna().median()) if sinr_res.dropna().size else 0.0,
+            "rsrq": float(rsrq_res.dropna().median()) if rsrq_res.dropna().size else 0.0,
+        }
+    return activity, corrections
+
+
+def run_prediction_only_offset_manual(opt_sites, k1k2_map, params):
+    """Manual optimization recompute using the Phase36/37 production baseline as
+    the anchor.  The affected-cell selection remains in services/_compute_affected_cells;
+    only the RF math for affected rows is replaced."""
+    if opt_sites.empty:
+        return pd.DataFrame(columns=["lat", "lon", "pred_rsrp", "pred_rsrq", "pred_sinr", "Node_Cell_ID"])
+
+    region = str(params.get("region", "india")).lower()
+    work_df = _normalize_site_df(opt_sites, log_stage="OPTIMIZED_OFFSET_RUN")
+    affected_cells = params.get("recompute_cells")
+    if affected_cells is None:
+        affected_cells, _, _ = _compute_affected_cells(
+            work_df,
+            float(params.get("impact_radius_m", params.get("radius", 500)) or 500),
+            int(params.get("neighbor_site_count", 2) or 2),
+            baseline_df=params.get("baseline_df"),
+            max_neighbors_per_update_cell=params.get("max_neighbors_per_update_cell"),
+        )
+    affected_cells = sorted({str(cell).strip() for cell in affected_cells if str(cell).strip()})
+    baseline_df = _ensure_canonical_identity(params.get("baseline_df", pd.DataFrame()))
+    max_interference_sites = int(params.get("max_interference_sites", 10) or 10)
+    site_scope_cells_raw = params.get("site_scope_cells") or affected_cells
+    site_scope_cells = sorted({str(cell).strip() for cell in site_scope_cells_raw if str(cell).strip()})
+    if not site_scope_cells:
+        site_scope_cells = affected_cells
+    affected_mask = pd.Series(False, index=work_df.index)
+    for scope_cell in site_scope_cells:
+        affected_mask = affected_mask | _identity_match_mask(work_df, scope_cell)
+    scoped_work_df = work_df.loc[affected_mask].copy()
+    if scoped_work_df.empty:
+        print("[LTE_OPT][OFFSET_MANUAL_SCOPE] no affected site rows matched; using full site table")
+        scoped_work_df = work_df
+    else:
+        print(
+            f"[LTE_OPT][OFFSET_MANUAL_SCOPE] full_site_rows={len(work_df)} "
+            f"scoped_site_rows={len(scoped_work_df)} affected_cells={len(affected_cells)} "
+            f"site_scope_cells={len(site_scope_cells)}"
+        )
+
+    physical_building_df, physical_dem_path, physical_clutter_by_grid = _manual_physical_context(params)
+    # Per-job Phase 26 cache (see _phase36_surface_for_points). Callers that
+    # evaluate many candidates against the same cells (tilt coordinate search,
+    # manual/recommendation optimisation) pass a dict in params and pay the
+    # building/DEM scoring once per (cell, grid) instead of once per candidate.
+    phase26_cache = params.get("phase26_cache")
+    final_list = []
+    for cid in affected_cells:
+        site_rows = scoped_work_df.loc[_identity_match_mask(scoped_work_df, cid)].copy()
+        if site_rows.empty:
+            continue
+        cell_technology = _technology_series(site_rows).iloc[0] if not site_rows.empty else ""
+        same_technology_scope = scoped_work_df.loc[
+            _technology_series(scoped_work_df).astype(str).eq(str(cell_technology))
+        ].copy() if cell_technology else scoped_work_df
+        if same_technology_scope.empty:
+            same_technology_scope = scoped_work_df
+        local_mod_records = _build_local_interference_records(same_technology_scope, site_rows, max_interference_sites)
+        local_mod = pd.DataFrame(local_mod_records)
+        local_old = _restore_original_site_state(local_mod)
+
+        local_cell_ids = sorted(local_mod["Node_Cell_ID"].astype(str).dropna().unique().tolist())
+        residual_points = _baseline_points_for_cells(baseline_df, local_cell_ids)
+        location_changed, moved_m, old_lat, old_lon, new_lat, new_lon = _location_change_summary(site_rows)
+        target_point_source = "baseline_prediction_points"
+        if location_changed:
+            target_points = _generated_points_for_cell(site_rows, cid, params)
+            target_point_source = "generated_moved_site_grid"
+        else:
+            target_points = _baseline_points_for_cells(baseline_df, [cid])
+        if target_points.empty:
+            target_points = _generated_points_for_cell(site_rows, cid, params)
+            target_point_source = "generated_grid_fallback"
+        if target_points.empty:
+            print(f"[LTE_OPT][OFFSET_MANUAL] cell={cid} skipped_reason=no_points")
+            continue
+        print(
+            f"[LTE_OPT][OFFSET_MANUAL_TARGET_POINTS] cell={cid} "
+            f"source={target_point_source} points={len(target_points)} "
+            f"location_changed={location_changed} moved_m={moved_m:.2f} "
+            f"old_lat={old_lat} old_lon={old_lon} new_lat={new_lat} new_lon={new_lon} "
+            f"azimuth={_first_numeric_value(site_rows, 'azimuth')} "
+            f"orig_azimuth={_first_numeric_value(site_rows, 'orig_azimuth')}"
+        )
+        all_points = pd.concat([target_points, residual_points], ignore_index=True).drop_duplicates(["grid_id", "target_node_cell_id"])
+
+        # The "old" (pre-change) reference surface for cid depends only on the fixed
+        # geographic neighbor set (local_old is always _restore_original_site_state,
+        # i.e. the true production tilt/azimuth) and the static baseline points for
+        # cid+neighbors. It does NOT depend on which tilt/azimuth trial is being
+        # evaluated, so across many candidate calls in one job it is identical every
+        # time. When the caller supplies old_surface_cache (candidate_validation.py's
+        # per-job dict; None for the manual-optimization / recommendation-optimization
+        # callers, which keep the original always-recompute behavior), reuse it instead
+        # of re-running the COST231/phase36 surface + residual + quality-delta fit for
+        # cid on every single candidate.
+        old_surface_cache = params.get("old_surface_cache")
+        cached_old = old_surface_cache.get(cid) if isinstance(old_surface_cache, dict) else None
+        if cached_old is not None:
+            old_surface_raw, old_surface, residual_summary, activity, quality_corrections = cached_old
+        else:
+            offset_old_sites = _offset_ready_site_df(local_old, region)
+            old_surface_raw = _phase36_surface_for_points(
+                offset_old_sites,
+                all_points,
+                project_id=params.get("project_id"),
+                region=region,
+                building_df=physical_building_df,
+                dem_raster_path=physical_dem_path,
+                clutter_by_grid=physical_clutter_by_grid,
+                phase26_cache=phase26_cache,
+            )
+            if old_surface_raw.empty:
+                print(f"[LTE_OPT][OFFSET_MANUAL] cell={cid} skipped_reason=no_surface")
+                continue
+            old_surface, residual_summary = _apply_baseline_rsrp_residual(old_surface_raw, all_points, old_surface_raw)
+            activity, quality_corrections = _fit_quality_delta(old_surface, all_points)
+            if isinstance(old_surface_cache, dict):
+                old_surface_cache[cid] = (old_surface_raw, old_surface, residual_summary, activity, quality_corrections)
+
+        offset_mod_sites = _offset_ready_site_df(local_mod, region)
+        mod_surface_raw = _phase36_surface_for_points(
+            offset_mod_sites,
+            target_points,
+            project_id=params.get("project_id"),
+            region=region,
+            building_df=physical_building_df,
+            dem_raster_path=physical_dem_path,
+            clutter_by_grid=physical_clutter_by_grid,
+            phase26_cache=phase26_cache,
+        )
+        if mod_surface_raw.empty:
+            print(f"[LTE_OPT][OFFSET_MANUAL] cell={cid} skipped_reason=no_surface")
+            continue
+
+        mod_surface, _ = _apply_baseline_rsrp_residual(mod_surface_raw, all_points, old_surface_raw)
+        quality = _target_quality(mod_surface, target_points, activity=activity, corrections=quality_corrections)
+
+        target_rows = mod_surface.merge(
+            target_points[["grid_id", "target_node_cell_id"]],
+            on="grid_id",
+            how="inner",
+        )
+        target_mask = target_rows.apply(lambda row: _row_matches_identity(row, row.get("target_node_cell_id")), axis=1)
+        target_rows = target_rows.loc[target_mask].copy()
+        if target_rows.empty:
+            print(f"[LTE_OPT][OFFSET_MANUAL] cell={cid} skipped_reason=no_target_candidate")
+            continue
+        pts = target_rows.copy()
+        pts["pred_rsrp"] = pd.to_numeric(pts["optimized_final_rsrp"], errors="coerce").clip(-140, -44)
+        pts = pts.merge(quality[["grid_id", "Node_Cell_ID", "pred_rsrq", "pred_sinr", "interfering_sector_count"]], on=["grid_id", "Node_Cell_ID"], how="left")
+        pts["pred_rsrq"] = pd.to_numeric(pts["pred_rsrq"], errors="coerce").clip(-20, -3)
+        pts["pred_sinr"] = pd.to_numeric(pts["pred_sinr"], errors="coerce").clip(-10, 30)
+        pts = _attach_serving_identity_to_points(pts, site_rows, str(cid))
+        print(
+            f"[LTE_OPT][OFFSET_MANUAL] cell={cid} points={len(pts)} "
+            f"technology={_first_clean_value(site_rows, ['Technology', 'technology']) or 'UNKNOWN'} "
+            f"cell_residuals={residual_summary.get('cell_residuals')} "
+            f"quality_carriers={len(activity)}"
+        )
+        final_list.append(pts)
+
+    if not final_list:
+        return pd.DataFrame(columns=["lat", "lon", "pred_rsrp", "pred_rsrq", "pred_sinr", "Node_Cell_ID"])
+    final_df = pd.concat(final_list, ignore_index=True)
+    _print_fetch_summary(
+        "OPTIMIZED_OFFSET_RF_OUTPUT",
+        "phase36v2_phase37_baseline_delta",
+        {"cells_processed": len(affected_cells)},
+        final_df,
+        extra={
+            "distinct_node_cell_id": _safe_nunique(final_df, "Node_Cell_ID"),
+            "pred_rsrp_range": _safe_minmax(final_df, "pred_rsrp"),
+            "pred_rsrq_range": _safe_minmax(final_df, "pred_rsrq"),
+            "pred_sinr_range": _safe_minmax(final_df, "pred_sinr"),
+        },
+    )
+    return final_df
 
 
 def run_prediction_only_optimized(opt_sites, k1k2_map, params):

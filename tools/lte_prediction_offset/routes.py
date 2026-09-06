@@ -43,6 +43,12 @@ def run_prediction():
             "radius_m": float(data.get("radius", data.get("radius_m", 500))),
             "grid_resolution": float(data.get("grid_resolution", 25)),
             "building": bool(data.get("building", True)),
+            # An approved project DEM asset. The physical scorer chooses its
+            # elevation band dynamically; this only identifies the raster.
+            "dem_raster_path": data.get("dem_raster_path") or data.get("demRasterPath"),
+            # Optional project GHS-OBAT extract. When present it is used for
+            # Phase-27 building-height matching before documented imputation.
+            "ghs_obat_csv_path": data.get("ghs_obat_csv_path") or data.get("ghsObatCsvPath"),
             "n_workers": int(data.get("n_workers", max(1, cpu_count - 1))),
             "max_interference_sites": int(data.get("max_interference_sites", 10)),
             "use_frontend_grid_sampling": bool(data.get("use_frontend_grid_sampling", True)),
@@ -51,8 +57,11 @@ def run_prediction():
             "min_cells_per_grid": int(data.get("min_cells_per_grid", 1)),
             "ensure_all_cells": bool(data.get("ensure_all_cells", True)),
             "min_grids_per_cell": int(data.get("min_grids_per_cell", 1)),
-            "min_candidate_rsrp_dbm": float(data.get("min_candidate_rsrp_dbm", -128)),
-            "candidate_safety_cap": int(data.get("candidate_safety_cap", data.get("max_viable_candidates_per_grid", 20))),
+            # Candidate eligibility is distance based.  No pre-loss RSRP
+            # filter/candidate-count cap may decide serving coverage.
+            "min_candidate_rsrp_dbm": data.get("min_candidate_rsrp_dbm"),
+            "candidate_safety_cap": data.get("candidate_safety_cap"),
+            "out_of_radius_backfill_k_nearest": int(data.get("out_of_radius_backfill_k_nearest", 8)),
             "grid_analytics_scenario_id": data.get("grid_analytics_scenario_id"),
             "grid_analytics_auth_header": request.headers.get("Authorization") or data.get("grid_analytics_auth_header"),
             "grid_analytics_cookie_header": request.headers.get("Cookie") or data.get("grid_analytics_cookie_header"),

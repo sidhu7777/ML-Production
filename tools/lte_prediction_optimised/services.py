@@ -14,12 +14,11 @@ from .ml_engine import (
     fetch_site_data,
     fetch_optimized_sites,
     resolve_site_prediction_scenario_operator,
-    compute_k1k2_for_cells,
     _compute_affected_cells,
     _bridge_region_params,
     _country_code_for_region,
     _normalize_site_df,
-    run_prediction_only_optimized,
+    run_prediction_only_offset_manual,
     replace_cells,
 )
 from ..lte_tilt_recommandation.cell_identity import canonical_cell_id
@@ -907,7 +906,7 @@ class LTEPredictionService_optimised:
                 )
             _df_summary("OPTIMIZED_SITE_DF", opt_sites)
 
-            self._update(job_id, "running", "Calculating local K1/K2 from optimized DB changes")
+            self._update(job_id, "running", "Resolving affected manual optimization cells")
             affected_cells, _, changed_rows = _compute_affected_cells(
                 opt_sites,
                 float(cfg.get("impact_radius_m", cfg.get("radius", 500)) or cfg.get("radius", 500) or 500),
@@ -918,12 +917,12 @@ class LTEPredictionService_optimised:
             changed_cells = sorted(changed_rows["Node_Cell_ID"].astype(str).unique().tolist())
             calibration_cells = sorted(affected_cells)
             print(
-                f"[LTE_OPT][K1K2_LOCAL_SCOPE] changed_cells={len(changed_cells)} "
-                f"affected_cells={len(affected_cells)} calibration_cells={calibration_cells}"
+                f"[LTE_OPT][MANUAL_OFFSET_SCOPE] changed_cells={len(changed_cells)} "
+                f"affected_cells={len(affected_cells)} recompute_cells={calibration_cells}"
             )
-            k1k2_map = compute_k1k2_for_cells(baseline_df, opt_sites, calibration_cells)
-            if not k1k2_map:
-                raise ValueError("No calibrated cells found from DB-driven optimized site changes")
+            k1k2_map = {}
+            phase26_cache = {}
+            old_surface_cache = {}
 
             params = {
                 "radius": cfg.get("radius", 500),
@@ -943,12 +942,14 @@ class LTEPredictionService_optimised:
                 "max_neighbors_per_update_cell": cfg.get("max_neighbors_per_update_cell", cfg.get("neighbor_site_count", 2) or 2),
                 "baseline_df": baseline_df,
                 "recompute_cells": affected_cells,
+                "phase26_cache": phase26_cache,
+                "old_surface_cache": old_surface_cache,
                 "progress_label": "optimized prediction",
                 "progress_callback": partial(_prediction_progress_callback, job_id),
             }
 
-            self._update(job_id, "running", "Running prediction")
-            optimized_df = run_prediction_only_optimized(
+            self._update(job_id, "running", "Running Phase 36/37 manual optimized prediction")
+            optimized_df = run_prediction_only_offset_manual(
                 opt_sites,
                 k1k2_map,
                 params
@@ -1003,12 +1004,32 @@ class LTEPredictionService_optimised:
                 self._update_scenario_status(int(scenario_row_id), "running", region=region, job_id=job_id)
 
             self._update(job_id, "running", "Loading recommendation rows")
-            recommendation_scenario_id, reco_df = _fetch_recommendation_rows(
-                project_id,
-                region,
-                operator=operator,
-                recommendation_scenario_id=recommendation_scenario_id,
-            )
+            try:
+                recommendation_scenario_id, reco_df = _fetch_recommendation_rows(
+                    project_id,
+                    region,
+                    operator=operator,
+                    recommendation_scenario_id=recommendation_scenario_id,
+                )
+            except FileNotFoundError as exc:
+                print(
+                    f"[LTE_OPT][RECOMMENDATION_NOOP] project_id={project_id} "
+                    f"scenario_id={recommendation_scenario_id} reason={exc}"
+                )
+                JOBS[job_id].update({
+                    "rows": 0,
+                    "optimized_rows": 0,
+                    "merged_rows": 0,
+                    "recommendation_scenario_id": int(recommendation_scenario_id or 0),
+                    "actionable_recommendation_rows": 0,
+                    "applied_recommendation_rows": 0,
+                    "saved_site_prediction_rows": 0,
+                    "noop_reason": str(exc),
+                })
+                if scenario_row_id:
+                    self._update_scenario_status(int(scenario_row_id), "done", region=region, job_id=job_id)
+                self._update(job_id, "done", "No recommendation rows to optimize")
+                return
             actionable_df = _actionable_recommendations(reco_df)
             _df_summary("RECOMMENDATION_ROWS", reco_df)
             _df_summary("RECOMMENDATION_ACTIONABLE_ROWS", actionable_df)
@@ -1064,10 +1085,10 @@ class LTEPredictionService_optimised:
                 f"recommendation_scenario_id={recommendation_scenario_id}"
             )
 
-            self._update(job_id, "running", "Calculating local K1/K2")
-            k1k2_map = compute_k1k2_for_cells(baseline_df, modified_site_df, calibration_cells)
-            if not k1k2_map:
-                raise ValueError("No calibrated cells found after applying recommendation changes")
+            self._update(job_id, "running", "Preparing Phase 36/37 recommendation optimization")
+            k1k2_map = {}
+            phase26_cache = {}
+            old_surface_cache = {}
 
             params = {
                 "radius": cfg.get("radius", 500),
@@ -1089,23 +1110,25 @@ class LTEPredictionService_optimised:
                 "max_interference_sites": cfg.get("max_interference_sites", 10) or 10,
                 "max_neighbors_per_update_cell": cfg.get("max_neighbors_per_update_cell", cfg.get("neighbor_site_count", 2) or 2),
                 "recompute_cells": affected_cells,
+                "phase26_cache": phase26_cache,
+                "old_surface_cache": old_surface_cache,
             }
 
-            self._update(job_id, "running", "Running recommendation baseline RF prediction")
+            self._update(job_id, "running", "Running Phase 36/37 recommendation baseline RF prediction")
             baseline_params = params.copy()
             baseline_params.update({
                 "progress_label": "recommendation baseline RF",
                 "progress_callback": partial(_prediction_progress_callback, job_id),
             })
-            baseline_rf_df = run_prediction_only_optimized(site_df, k1k2_map, baseline_params)
+            baseline_rf_df = run_prediction_only_offset_manual(site_df, k1k2_map, baseline_params)
 
-            self._update(job_id, "running", "Running recommendation optimized RF prediction")
+            self._update(job_id, "running", "Running Phase 36/37 recommendation optimized RF prediction")
             optimized_params = params.copy()
             optimized_params.update({
                 "progress_label": "recommendation optimized RF",
                 "progress_callback": partial(_prediction_progress_callback, job_id),
             })
-            optimized_df = run_prediction_only_optimized(modified_site_df, k1k2_map, optimized_params)
+            optimized_df = run_prediction_only_offset_manual(modified_site_df, k1k2_map, optimized_params)
             if optimized_df.empty:
                 raise RuntimeError("Recommendation optimization produced no prediction rows")
             merged_df, rf_delta_metrics = _apply_recommendation_rf_delta(
@@ -1189,6 +1212,7 @@ class LTEPredictionService_optimised:
                         "node_b_id": row.get("node_b_id"),
                         "cell_id": row.get("cell_id"),
                         "Technology": row.get("Technology"),
+                        "band": row.get("band"),
                         "operator": row.get("Operator"),
                         "operator_name": row.get("Operator"),
                         "created_at": row.get("created_at").isoformat() if hasattr(row.get("created_at"), "isoformat") else row.get("created_at"),
@@ -1229,22 +1253,37 @@ class LTEPredictionService_optimised:
         print(" Data saved to DB")
 
     def _ensure_public_scenario_id_column(self, current_engine):
-        check_sql = text("""
+        public_check_sql = text("""
             SELECT COUNT(*)
             FROM information_schema.columns
             WHERE table_schema = DATABASE()
               AND table_name = 'lte_prediction_optimised_results'
               AND column_name = 'public_scenario_id'
         """)
-        alter_sql = text("""
+        public_alter_sql = text("""
             ALTER TABLE lte_prediction_optimised_results
             ADD COLUMN public_scenario_id INT NULL AFTER scenario_id
         """)
+        band_check_sql = text("""
+            SELECT COUNT(*)
+            FROM information_schema.columns
+            WHERE table_schema = DATABASE()
+              AND table_name = 'lte_prediction_optimised_results'
+              AND column_name = 'band'
+        """)
+        band_alter_sql = text("""
+            ALTER TABLE lte_prediction_optimised_results
+            ADD COLUMN band VARCHAR(100) NULL AFTER cell_id
+        """)
         with current_engine.begin() as conn:
-            exists = int(conn.execute(check_sql).scalar() or 0)
+            exists = int(conn.execute(public_check_sql).scalar() or 0)
             if not exists:
-                conn.execute(alter_sql)
+                conn.execute(public_alter_sql)
                 print("[LTE_OPT][SCHEMA] added lte_prediction_optimised_results.public_scenario_id")
+            band_exists = int(conn.execute(band_check_sql).scalar() or 0)
+            if not band_exists:
+                conn.execute(band_alter_sql)
+                print("[LTE_OPT][SCHEMA] added lte_prediction_optimised_results.band")
     
     def _format_for_db(self, df, project_id, job_id, operator, scenario_id=None, public_scenario_id=None):
         import datetime
@@ -1256,11 +1295,11 @@ class LTEPredictionService_optimised:
             else:
                 raise ValueError("Missing Node_Cell_ID/nodeb_id_cell_id in optimized output")
 
-        raw_node_cell = (
-            df["nodeb_id_cell_id"].map(_clean_id)
-            if "nodeb_id_cell_id" in df.columns
-            else df["Node_Cell_ID"].map(_clean_id)
-        )
+        raw_node_cell = df["Node_Cell_ID"].map(_rf_id).replace("", pd.NA)
+        for candidate in ["rf_identity_key", "site_prediction_key", "site_cell_sector_band_operator_key", "nodeb_id_cell_id"]:
+            if candidate in df.columns:
+                raw_node_cell = raw_node_cell.fillna(df[candidate].map(_rf_id).replace("", pd.NA))
+        raw_node_cell = raw_node_cell.fillna("")
         canonical = (
             df["canonical_cell_id"].map(_clean_id)
             if "canonical_cell_id" in df.columns
@@ -1281,29 +1320,52 @@ class LTEPredictionService_optimised:
             if fallback_canonical is not None:
                 canonical = canonical.fillna(fallback_canonical)
         canonical = canonical.fillna(raw_node_cell.map(_clean_id))
-        split_cols = canonical.astype(str).str.split("_", expand=True)
+        split_source = raw_node_cell.where(raw_node_cell.astype(str).str.contains("_", na=False), canonical)
+        split_cols = split_source.astype(str).str.split("_", expand=True)
         if split_cols.shape[1] < 2:
             raise ValueError("Invalid canonical cell identity format")
 
         node_b_series = (
-            df["node_b_id"].map(_clean_id)
+            df["node_b_id"].map(_rf_id)
             if "node_b_id" in df.columns
             else pd.Series(pd.NA, index=df.index, dtype="object")
         )
         cell_series = (
-            df["cell_id"].map(_clean_id)
+            df["cell_id"].map(_rf_id)
             if "cell_id" in df.columns
             else pd.Series(pd.NA, index=df.index, dtype="object")
         )
-        df["node_b_id"] = node_b_series.where(node_b_series.astype(str).str.strip().ne(""), split_cols[0].astype(str))
-        df["cell_id"] = cell_series.where(cell_series.astype(str).str.strip().ne(""), split_cols[1].astype(str))
+        node_b_missing = node_b_series.astype("string").str.strip().str.lower().isin(["", "nan", "none", "null", "<na>"]) | node_b_series.isna()
+        cell_missing = cell_series.astype("string").str.strip().str.lower().isin(["", "nan", "none", "null", "<na>"]) | cell_series.isna()
+        df["node_b_id"] = node_b_series.mask(node_b_missing, split_cols[0].astype(str))
+        df["cell_id"] = cell_series.mask(cell_missing, split_cols[1].astype(str))
         df["nodeb_id_cell_id"] = raw_node_cell.astype(str)
         df["canonical_cell_id"] = canonical.astype(str)
 
         df["project_id"] = project_id
         df["job_id"] = job_id
         
-        df["Technology"] = "4G"
+        if "Technology" in df.columns:
+            tech = df["Technology"].astype("string").str.strip()
+        elif "technology" in df.columns:
+            tech = df["technology"].astype("string").str.strip()
+        else:
+            tech = pd.Series("4G", index=df.index, dtype="string")
+        tech_upper = tech.str.upper()
+        df["Technology"] = tech.where(~tech_upper.str.contains("5G|NR", na=False), "5G")
+        df["Technology"] = df["Technology"].where(~tech_upper.str.contains("4G|LTE", na=False), "4G")
+        df["Technology"] = df["Technology"].fillna("4G")
+        band_series = None
+        for candidate in ["band", "Band", "frequency_band", "carrier"]:
+            if candidate in df.columns:
+                candidate_series = df[candidate].astype("string").str.strip()
+                candidate_series = candidate_series.mask(candidate_series.isin(["", "nan", "NaN", "None", "<NA>"]))
+                band_series = candidate_series
+                break
+        if band_series is None:
+            band_series = split_source.astype("string").str.split("_").str[-1].str.strip()
+            band_series = band_series.mask(band_series.isin(["", "nan", "NaN", "None", "<NA>"]))
+        df["band"] = band_series
         df["Operator"] = operator  
         df["created_at"] = datetime.datetime.now()
         if "site_id" in df.columns:
@@ -1338,6 +1400,7 @@ class LTEPredictionService_optimised:
             "pred_sinr",
             "node_b_id",
             "cell_id",
+            "band",
             "Technology",
             "created_at",
             "site_id",
