@@ -361,7 +361,19 @@ def _identity_match_mask(df: pd.DataFrame, identity: object) -> pd.Series:
         canonical_mask = values.map(canonical_cell_id).isin(target_aliases)
         if bool(canonical_mask.any()):
             return canonical_mask
-    return df.apply(lambda row: bool(_row_identity_aliases(row) & target_aliases), axis=1)
+    # Baseline frames repeat the same identity across thousands of coordinates.
+    # Evaluate the full fallback once per distinct identity, preserving its
+    # matching semantics without rebuilding identical alias sets per point.
+    identity_cols = [col for col in dict.fromkeys(
+        _IDENTITY_ALIAS_COLS + ["site", "sector", "dashboard_site_id", "site_id"]
+    ) if col in df.columns]
+    if not identity_cols:
+        return pd.Series(False, index=df.index)
+    keys = pd.MultiIndex.from_frame(df[identity_cols])
+    unique = ~keys.duplicated()
+    matches = df.loc[unique].apply(lambda row: bool(_row_identity_aliases(row) & target_aliases), axis=1)
+    lookup = pd.Series(matches.to_numpy(), index=keys[unique])
+    return pd.Series(lookup.reindex(keys).to_numpy(dtype=bool), index=df.index)
 
 
 def _normalize_site_df(site_df, log_stage="SITE_INPUT"):
@@ -1999,6 +2011,15 @@ def _phase36_surface_for_points(
         cached_rows = [cache[k] for k in cache_keys]
         for pos, col in enumerate(_PHASE26_OUTPUT_COLS):
             surface[col] = [row[pos] for row in cached_rows]
+        # score_candidates does not only attach the loss columns -- its final
+        # statement rebuilds physical_rsrp_unclipped from them. Reproduce that
+        # exactly, or the cached path returns un-attenuated COST231 (measured
+        # as a 23.7 dB error before this line existed).
+        surface["physical_rsrp_unclipped"] = (
+            pd.to_numeric(surface["raw_cost231_rsrp"], errors="coerce")
+            + pd.to_numeric(surface["building_obstruction_loss_db"], errors="coerce")
+            - pd.to_numeric(surface["terrain_diffraction_loss_db"], errors="coerce")
+        )
         print(
             f"[LTE_OPT][PHASE26_PHYSICAL] rows={len(surface)} source=cache_hit",
             flush=True,
@@ -2238,7 +2259,12 @@ def run_prediction_only_offset_manual(opt_sites, k1k2_map, params):
         residual_points = _baseline_points_for_cells(baseline_df, local_cell_ids)
         location_changed, moved_m, old_lat, old_lon, new_lat, new_lon = _location_change_summary(site_rows)
         target_point_source = "baseline_prediction_points"
-        if location_changed:
+        if params.get("strict_prediction_points", False):
+            target_points = _baseline_points_for_cells(baseline_df, [cid])
+            if target_points.empty:
+                print(f"[LTE_OPT][OFFSET_MANUAL] cell={cid} skipped_reason=no_baseline_points", flush=True)
+                continue
+        elif location_changed:
             target_points = _generated_points_for_cell(site_rows, cid, params)
             target_point_source = "generated_moved_site_grid"
         else:

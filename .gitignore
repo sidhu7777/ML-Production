@@ -111,6 +111,14 @@ commands.*.local.txt
 # Non-code research materials (slides, archives, etc.)
 Research/
 
+# Generated PowerPoint reports (keep the required Mobility DT template)
+/tools/Ppt_report_Automation/Mobility_DT_Project_*.pptx
+/tools/Ppt_report_Automation/Mobility_DT_Output*.pptx
+/tools/Ppt_report_Automation/Mobility_DT_Automated_Output*.pptx
+
+# Microsoft Office temporary lock files
+~$*
+
 # ML experiment scratch artifacts
 _tmp_evidently*.html
 

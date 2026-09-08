@@ -312,15 +312,40 @@ def _actionable_recommendations(reco_df):
     return work
 
 
+def _identity_without_operator_suffix(value):
+    """Drop a trailing non-numeric operator token, e.g.
+    'GA20000535_GA20000535mC6_36_78_Taiwan' -> 'GA20000535_GA20000535mC6_36_78'.
+
+    rf_optimization_results stores cell ids WITH the operator suffix (that is
+    what the tilt engine writes), while this module's fetch_site_data builds
+    Node_Cell_ID WITHOUT it. Comparing the two verbatim matches nothing, so the
+    suffix-stripped form is used as an additional fallback.
+    """
+    text = _rf_id(value)
+    parts = [part for part in text.split("_") if part]
+    if len(parts) >= 4 and not parts[-1].isdigit():
+        return "_".join(parts[:-1])
+    return text
+
+
 def _site_match_mask(site_df, recommendation_cell_id):
     rec_rf_id = _rf_id(recommendation_cell_id)
     rec_id = _clean_id(recommendation_cell_id)
     rec_suffix = _cell_suffix(rec_id)
+    rec_no_operator = _identity_without_operator_suffix(recommendation_cell_id)
     node_cell_rf = site_df["Node_Cell_ID"].astype(str).map(_rf_id)
     mask = node_cell_rf == rec_rf_id
     if not mask.any() and "cell_id" in site_df.columns:
         cell_rf = site_df["cell_id"].astype(str).map(_rf_id)
         mask = cell_rf == rec_rf_id
+    # Operator-suffix tolerant comparison, both directions: the recommendation
+    # may carry '_Taiwan' while the site row does not, or vice versa.
+    if not mask.any() and rec_no_operator:
+        node_cell_no_op = site_df["Node_Cell_ID"].astype(str).map(_identity_without_operator_suffix)
+        mask = node_cell_no_op == rec_no_operator
+    if not mask.any() and rec_no_operator and "cell_id" in site_df.columns:
+        cell_no_op = site_df["cell_id"].astype(str).map(_identity_without_operator_suffix)
+        mask = cell_no_op == rec_no_operator
     if not mask.any():
         node_cell = site_df["Node_Cell_ID"].astype(str).map(_clean_id)
         mask = node_cell == rec_id
@@ -424,12 +449,12 @@ def _build_site_prediction_update_rows(project_id, public_scenario_id, modified_
         return []
 
     applied_cells = {
-        _clean_id(value)
+        _identity_without_operator_suffix(value)
         for value in applied["matched_node_cell_id"].dropna().astype(str)
         if str(value).strip()
     }
     work = modified_site_df.copy()
-    work["_recommendation_cell_key"] = work["Node_Cell_ID"].astype(str).map(_clean_id)
+    work["_recommendation_cell_key"] = work["Node_Cell_ID"].astype(str).map(_identity_without_operator_suffix)
     work = work.loc[work["_recommendation_cell_key"].isin(applied_cells)].copy()
     if work.empty:
         return []
@@ -1490,6 +1515,9 @@ class LTEPredictionService_optimised:
         return pruned
 
     def _create_scenario(self, cfg, job_id, region):
+        requested_slot = cfg.get("requested_public_scenario_id")
+        if requested_slot is not None and not 1 <= int(requested_slot) <= 6:
+            raise ValueError("Scenario must be between 1 and 6")
         bridge = get_bridge_client()
         if bridge:
             baseline_job_id = cfg.get("baseline_job_id") or _latest_baseline_job_id(

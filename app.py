@@ -26,6 +26,7 @@ from tools.cell_site.routes import cell_site_bp
 from tools.prediction.routes import prediction_bp
 from tools.area_breakup.routes import area_breakup_bp
 from tools.report.routes import report_bp
+from tools.Ppt_report_Automation.routes import ppt_report_bp
 from tools.lte_prediction.routes import lte_prediction_bp
 from tools.lte_prediction_offset.routes import lte_prediction_offset_bp
 from tools.lte_prediction_optimised.routes import lte_prediction_op
@@ -100,6 +101,7 @@ def create_app(config_name='default'):
     app.register_blueprint(prediction_bp, url_prefix='/api/prediction')
     app.register_blueprint(area_breakup_bp, url_prefix='/api/area-breakup')
     app.register_blueprint(report_bp, url_prefix='/api/report')
+    app.register_blueprint(ppt_report_bp, url_prefix='/api/ppt-report')
     app.register_blueprint(lte_prediction_bp, url_prefix="/api/lte-prediction")
     app.register_blueprint(lte_prediction_offset_bp, url_prefix="/api/lte-prediction-offset")
     app.register_blueprint(lte_prediction_op, url_prefix="/api/lte-prediction-optimised")
@@ -120,6 +122,7 @@ def create_app(config_name='default'):
                 "prediction": "/api/prediction",
                 "area_breakup": "/api/area-breakup",
                 "report": "/api/report",
+                "ppt_report": "/api/ppt-report",
                 "site_prediction": "/api/lte-prediction/run",
                 "site_prediction_offset": "/api/lte-prediction-offset/run",
                 "optimized_prediction": "/api/lte-prediction-optimised/run",

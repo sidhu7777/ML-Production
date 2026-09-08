@@ -733,6 +733,20 @@ def _apply_constraint_ranges(reco_df: pd.DataFrame, constraint_df: pd.DataFrame)
         if is_azimuth:
             constrained_value = _clamp_azimuth(rec_value, float(min_allowed), float(max_allowed))
             changed = not _azimuth_in_range(rec_value, float(min_allowed), float(max_allowed))
+        elif param == "etilt":
+            scale = pd.to_numeric(pd.Series([row.get("Value Scale")]), errors="coerce").fillna(1.0).iloc[0]
+            scale = float(scale) if float(scale) > 0.0 else 1.0
+            rec_deg = pd.to_numeric(pd.Series([row.get("Recommended Value Deg")]), errors="coerce").iloc[0]
+            if pd.isna(rec_deg):
+                rec_deg = float(rec_value) / scale
+            constrained_deg = float(min(max(float(rec_deg), float(min_allowed)), float(max_allowed)))
+            constrained_value = constrained_deg * scale
+            changed = float(constrained_value) != float(rec_value)
+            out.at[idx, "Recommended Value Deg"] = constrained_deg
+            if "Current Value Deg" in out.columns:
+                current_deg = pd.to_numeric(pd.Series([row.get("Current Value Deg")]), errors="coerce").iloc[0]
+                if pd.isna(current_deg):
+                    out.at[idx, "Current Value Deg"] = pd.to_numeric(pd.Series([row.get("Current Value")]), errors="coerce").iloc[0] / scale
         else:
             constrained_value = float(min(max(rec_value, float(min_allowed)), float(max_allowed)))
             changed = not pd.isna(rec_value) and float(constrained_value) != float(rec_value)

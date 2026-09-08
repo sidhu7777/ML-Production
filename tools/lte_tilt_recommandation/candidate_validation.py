@@ -61,6 +61,7 @@ class CandidateValidationConfig:
     azimuth_fallback_steps_deg: Optional[tuple[float, ...]] = None
     rf_debug_log_path: Optional[str] = None
     constraint_map: Optional[Dict[str, Dict[str, object]]] = None
+    etilt_value_scale: Optional[float] = None
 
 
 def normalize_grid_id_series(series: pd.Series) -> pd.Series:
@@ -139,6 +140,31 @@ def _safe_float(value: object, default: float = 0.0) -> float:
 def _tilt_storage_scale(value: object) -> float:
     current = _safe_float(value, np.nan)
     return 10.0 if np.isfinite(current) and abs(current) > 20.0 else 1.0
+
+
+def _infer_project_tilt_storage_scale(antenna_df: pd.DataFrame) -> float:
+    if not isinstance(antenna_df, pd.DataFrame) or antenna_df.empty or "electrical_tilt" not in antenna_df.columns:
+        return 1.0
+    values = pd.to_numeric(antenna_df["electrical_tilt"], errors="coerce").dropna().abs()
+    values = values[np.isfinite(values)]
+    if values.empty:
+        return 1.0
+    p95 = float(values.quantile(0.95))
+    max_value = float(values.max())
+    scale = 10.0 if p95 > 20.0 or max_value > 30.0 else 1.0
+    print(
+        "[TILT_ETILT_SCALE] "
+        f"source=project_distribution scale={scale:.1f} "
+        f"rows={len(values)} p95={p95:.2f} max={max_value:.2f}"
+    )
+    return scale
+
+
+def _config_etilt_scale(config: CandidateValidationConfig, current_value: object) -> float:
+    configured = _safe_float(getattr(config, "etilt_value_scale", np.nan), np.nan)
+    if np.isfinite(configured) and configured > 0.0:
+        return float(configured)
+    return _tilt_storage_scale(current_value)
 
 
 def _is_export_scalar(value: object) -> bool:
@@ -1113,7 +1139,7 @@ def _make_etilt_update(
     current = pd.to_numeric(pd.Series([row.iloc[0].get("electrical_tilt")]), errors="coerce").iloc[0]
     if pd.isna(current):
         return None
-    scale = _tilt_storage_scale(current)
+    scale = _config_etilt_scale(config, current)
     current_deg = float(current) / scale
     target_deg = current_deg + float(delta)
     constraint = (config.constraint_map or {}).get(_threshold_cell_id(cell_id))
@@ -1436,19 +1462,25 @@ def _evaluate_update_set(
         if missing_cells:
             base_site = _rf_base_site_df(antenna_work)
             baseline_rf_start = time.perf_counter()
+            batch_params = _rf_prediction_params(
+                config=config,
+                baseline_work=scoped_rf_points,
+                geo_df=scoped_geo_df,
+                recompute_cells=missing_cells,
+                site_scope_cells=effective_site_scope_cells,
+                old_surface_cache=old_surface_cache,
+                phase26_cache=phase26_cache,
+            )
+            with _rf_debug_capture(config):
+                batch_rf = opt_ml.run_prediction_only_offset_manual(base_site, k1k2_map, batch_params)
             for cid in missing_cells:
-                cell_params = _rf_prediction_params(
-                    config=config,
-                    baseline_work=scoped_rf_points,
-                    geo_df=scoped_geo_df,
-                    recompute_cells=[cid],
-                    site_scope_cells=effective_site_scope_cells,
-                    old_surface_cache=old_surface_cache,
-                    phase26_cache=phase26_cache,
-                )
-                with _rf_debug_capture(config):
-                    cell_rf = opt_ml.run_prediction_only_offset_manual(base_site, k1k2_map, cell_params)
-                baseline_rf_cell_cache[cid] = cell_rf
+                cell_rf = _filter_identity_rows(batch_rf, [cid]) if isinstance(batch_rf, pd.DataFrame) and not batch_rf.empty else pd.DataFrame()
+                baseline_rf_cell_cache[cid] = cell_rf.copy()
+            print(
+                "[TILT_BASELINE_RF_BATCH_CACHE] "
+                f"missing_cells={len(missing_cells)} rows={len(batch_rf) if isinstance(batch_rf, pd.DataFrame) else 0} "
+                f"site_scope_cells={len(effective_site_scope_cells)}"
+            )
             baseline_rf_sec = time.perf_counter() - baseline_rf_start
         baseline_parts = [
             baseline_rf_cell_cache[cid]
@@ -1596,6 +1628,8 @@ def coordinate_search_recommendations(
         _prepare_optimizer_site_df(antenna_df),
         log_stage="TILT_COORDINATE_RF_ANTENNA_PREPARED",
     )
+    if not (_safe_float(getattr(config, "etilt_value_scale", np.nan), np.nan) > 0.0):
+        config.etilt_value_scale = _infer_project_tilt_storage_scale(prepared_antenna_work)
     stable_site_scope_cells = _build_recompute_cells(
         antenna_df,
         prepared_baseline_work,
@@ -2099,6 +2133,9 @@ def coordinate_search_recommendations(
                 "Parameter": parameter,
                 "Current Value": float(update["current_value"]),
                 "Recommended Value": float(update["target_value"]),
+                "Current Value Deg": float(update.get("current_value_deg", update["current_value"])),
+                "Recommended Value Deg": float(update.get("target_value_deg", update["target_value"])),
+                "Value Scale": float(update.get("value_scale", 1.0)),
                 "Reason": reason,
                 "Swap Sector Detected": "No",
                 "Bad Sample Count": int(float(current_metrics.get("baseline_bad_grid_count", 0.0))),
