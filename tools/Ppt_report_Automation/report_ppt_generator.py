@@ -30,6 +30,7 @@ LOCAL_ENV_PATH = os.path.join(os.path.dirname(__file__), ".env")
 if os.path.exists(LOCAL_ENV_PATH):
     load_dotenv(LOCAL_ENV_PATH)
 
+# Add ML-Production root to sys.path
 # Add the ML root for direct CLI execution as well as package imports.
 ML_PROD_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 if ML_PROD_DIR not in sys.path:
@@ -38,22 +39,42 @@ if ML_PROD_DIR not in sys.path:
 from tools.report_engine.load_data_db import load_project_data, filter_known_band_rows, polygon_filter_all_cells
 from tools.report_engine.kpi_config import KPI_CONFIG
 from tools.report_engine.threshold_resolver import resolve_kpi_ranges
-from tools.report_engine.map_generator import (
-    generate_kpi_map,
-    generate_categorical_kpi_map,
-    generate_poor_region_maps,
-    generate_base_route_map,
-    generate_handover_map,
-    detect_handover_events,
-    new_report_map,
-    add_fullscreen_css,
-    draw_polygon_overlay,
-    fit_data_bounds,
-    has_valid_numeric_data,
-    has_valid_categorical_data,
-    normalize_band_name,
-    build_report_band_color_map,
-)
+if __package__:
+    from .ppt_map_generator import (
+        generate_kpi_map,
+        generate_categorical_kpi_map,
+        generate_poor_region_maps,
+        generate_base_route_map,
+        generate_handover_map,
+        detect_handover_events,
+        new_report_map,
+        add_fullscreen_css,
+        draw_polygon_overlay,
+        fit_data_bounds,
+        get_df_bounds,
+        has_valid_numeric_data,
+        has_valid_categorical_data,
+        normalize_band_name,
+        build_report_band_color_map,
+    )
+else:
+    from ppt_map_generator import (
+        generate_kpi_map,
+        generate_categorical_kpi_map,
+        generate_poor_region_maps,
+        generate_base_route_map,
+        generate_handover_map,
+        detect_handover_events,
+        new_report_map,
+        add_fullscreen_css,
+        draw_polygon_overlay,
+        fit_data_bounds,
+        get_df_bounds,
+        has_valid_numeric_data,
+        has_valid_categorical_data,
+        normalize_band_name,
+        build_report_band_color_map,
+    )
 from tools.report_engine.playwright_utils import html_to_png
 from tools.report_engine.kpi_analysis import run_kpi_analysis
 from tools.report_engine.metadata_generator import build_metadata
@@ -216,7 +237,7 @@ DEFAULT_TEMPLATE_PATH = os.path.join(
     "Mobility DT-美濃區(After)-20260729.pptx"
 )
 
-REPORT_RENDER_WIDTH = 1200
+REPORT_RENDER_WIDTH = 1370
 REPORT_RENDER_HEIGHT = 900
 REPORT_DEVICE_SCALE = 1
 MAX_RENDER_POINTS = 15000
@@ -512,7 +533,7 @@ def build_numeric_legend_items(values, ranges):
 # ─────────────────────────────────────────────────────────────────
 
 
-def generate_blank_basemap(report_df, output_png, tmp_html, polygon_wkt=None):
+def generate_blank_basemap(report_df, output_png, tmp_html, polygon_wkt=None, fixed_bounds=None):
     """
     Generate a clean basemap of the project region with NO route / data points.
     Used for slides where a band was not tested / locked out (e.g. Slide 11, 13, 14).
@@ -521,7 +542,7 @@ def generate_blank_basemap(report_df, output_png, tmp_html, polygon_wkt=None):
     fmap = new_report_map()
     add_fullscreen_css(fmap)
     draw_polygon_overlay(fmap, polygon_wkt)
-    fit_data_bounds(fmap, df if not df.empty else report_df, reserve_legend_space=False)
+    fit_data_bounds(fmap, fixed_bounds if fixed_bounds is not None else (df if not df.empty else report_df), reserve_legend_space=False)
     fmap.save(tmp_html)
     try:
         _html_to_png_no_legend(tmp_html, output_png)
@@ -532,7 +553,7 @@ def generate_blank_basemap(report_df, output_png, tmp_html, polygon_wkt=None):
         return False
 
 
-def generate_technology_mode_map(report_df, output_png, tmp_html, polygon_wkt=None):
+def generate_technology_mode_map(report_df, output_png, tmp_html, polygon_wkt=None, fixed_bounds=None):
     """
     Technology-mode map coloured by technology (5G/4G/3G/2G).
     For NSA dual-connectivity (where 5G NR and 4G LTE Anchor coexist at the same coordinates),
@@ -588,7 +609,7 @@ def generate_technology_mode_map(report_df, output_png, tmp_html, polygon_wkt=No
                 radius=3.5, color="#1a6fcc", weight=1.5, fill=True, fill_color="#1a6fcc", fill_opacity=0.95,
             ).add_to(fmap)
 
-    fit_data_bounds(fmap, df, reserve_legend_space=False)
+    fit_data_bounds(fmap, fixed_bounds if fixed_bounds is not None else df, reserve_legend_space=False)
     fmap.save(tmp_html)
 
     try:
@@ -600,7 +621,7 @@ def generate_technology_mode_map(report_df, output_png, tmp_html, polygon_wkt=No
         return False
 
 
-def generate_5g_kpi_map(report_df, kpi_col, color_func, ranges, output_png, tmp_html, title, polygon_wkt=None):
+def generate_5g_kpi_map(report_df, kpi_col, color_func, ranges, output_png, tmp_html, title, polygon_wkt=None, fixed_bounds=None):
     """
     KPI map (RSRP, SINR, or DL) filtered to 5G-only rows.
     Color ranges come from resolve_kpi_ranges (thresholds DB).
@@ -630,6 +651,7 @@ def generate_5g_kpi_map(report_df, kpi_col, color_func, ranges, output_png, tmp_
         generate_kpi_map(
             df=df_5g, kpi_column=kpi_col, color_func=color_func,
             ranges=ranges, output_html=tmp_html, polygon_wkt=polygon_wkt,
+            fixed_bounds=fixed_bounds,
         )
         _html_to_png_no_legend(tmp_html, output_png)
         print(f"[PPT Pipeline] {title} map -> {os.path.basename(output_png)}")
@@ -639,7 +661,7 @@ def generate_5g_kpi_map(report_df, kpi_col, color_func, ranges, output_png, tmp_
         return False
 
 
-def generate_4g_kpi_map(report_df, kpi_col, color_func, ranges, output_png, tmp_html, title, polygon_wkt=None, band_filter=None):
+def generate_4g_kpi_map(report_df, kpi_col, color_func, ranges, output_png, tmp_html, title, polygon_wkt=None, band_filter=None, fixed_bounds=None):
     """
     KPI map (RSRP, SINR, or DL) filtered to 4G rows or specific LTE band rows.
     When band_filter is provided (e.g. ['B1'] for L2100, ['B3'] for L1800), filters all rows matching that LTE band.
@@ -669,6 +691,7 @@ def generate_4g_kpi_map(report_df, kpi_col, color_func, ranges, output_png, tmp_
         generate_kpi_map(
             df=df_target, kpi_column=kpi_col, color_func=color_func,
             ranges=ranges, output_html=tmp_html, polygon_wkt=polygon_wkt,
+            fixed_bounds=fixed_bounds,
         )
         _html_to_png_no_legend(tmp_html, output_png)
         print(f"[PPT Pipeline] {title} map -> {os.path.basename(output_png)}")
@@ -689,7 +712,7 @@ CA_CC_COLORS = {
 }
 
 
-def generate_ca_map(report_df, output_png, tmp_html, polygon_wkt=None, band_filter=None):
+def generate_ca_map(report_df, output_png, tmp_html, polygon_wkt=None, band_filter=None, fixed_bounds=None):
     """
     CA (Carrier Aggregation) configuration map.
     Reads 'ca_cc' (component-carrier count) from extra_json ONLY.
@@ -701,22 +724,38 @@ def generate_ca_map(report_df, output_png, tmp_html, polygon_wkt=None, band_filt
     """
     ca_df = pd.DataFrame()
 
+    # Filter strictly to 4G / LTE technology rows so companion 5G rows do not double-count 4G CA.
+    # Note: Do not do a raw technology != '5G' check because 4G LTE Anchor rows in NSA sessions
+    # have technology='5G' logged while network='4G (LTE Anchor - NSA)' and band='B3'/'B7'.
+    # Use _filter_4g() which robustly evaluates band, network, and technology.
+    df_input = _filter_4g(report_df)
+    if df_input.empty:
+        df_input = report_df.copy()
+        if "band" in df_input.columns:
+            df_input = df_input[~df_input["band"].astype(str).str.lower().str.startswith("n")]
+
     # ── Extract ca_cc from extra_json ─────────────────────────────────────
-    if "extra_json" in report_df.columns and report_df["extra_json"].notna().any():
+    if "extra_json" in df_input.columns and df_input["extra_json"].notna().any():
         def _extract_ca_cc(val):
             if pd.isna(val) or val is None:
                 return None
             try:
                 d = json.loads(val) if isinstance(val, str) else val
                 if isinstance(d, dict):
-                    cc = d.get("ca_cc")
+                    # Genuine 4G Carrier Aggregation ONLY (ca_cc >= 2 or ca_cc_count >= 2)
+                    cc = d.get("ca_cc") or d.get("ca_cc_count")
                     if cc is not None:
-                        return str(int(cc))   # normalise -> "1", "2", etc.
+                        try:
+                            cc_int = int(cc)
+                            if cc_int >= 2:
+                                return str(cc_int)   # normalise -> "2", "3", etc.
+                        except (ValueError, TypeError):
+                            pass
             except Exception:
                 pass
             return None
 
-        tmp = report_df.copy()
+        tmp = df_input.copy()
         tmp["__ca_label"] = tmp["extra_json"].apply(_extract_ca_cc)
         ca_df = tmp.dropna(subset=["lat", "lon", "__ca_label"]).copy()
         ca_df["lat"] = pd.to_numeric(ca_df["lat"], errors="coerce")
@@ -746,7 +785,7 @@ def generate_ca_map(report_df, output_png, tmp_html, polygon_wkt=None, band_filt
             fill=True, fill_opacity=0.85,
         ).add_to(fmap)
 
-    fit_data_bounds(fmap, ca_df, reserve_legend_space=False)
+    fit_data_bounds(fmap, fixed_bounds if fixed_bounds is not None else ca_df, reserve_legend_space=False)
     fmap.save(tmp_html)
     try:
         _html_to_png_no_legend(tmp_html, output_png)
@@ -757,10 +796,10 @@ def generate_ca_map(report_df, output_png, tmp_html, polygon_wkt=None, band_filt
         return False
 
 
-def generate_nr_ca_map(report_df, output_png, tmp_html, polygon_wkt=None):
+def generate_nr_ca_map(report_df, output_png, tmp_html, polygon_wkt=None, fixed_bounds=None):
     """
     5G NR CA (Carrier Aggregation) configuration map.
-    Reads 'nr_ca_count', 'nr_ca_cc_count', 'nr_ca_cc', or 'ca_cc_count' from extra_json.
+    Reads 'nr_ca_count', 'nr_ca_cc_count', or 'nr_ca_cc' from extra_json.
     Each cc value (2, 3 …) gets a distinct fixed color from CA_CC_COLORS.
     Returns (ca_df, CA_CC_COLORS) on success, or False.
     """
@@ -775,20 +814,15 @@ def generate_nr_ca_map(report_df, output_png, tmp_html, polygon_wkt=None):
         tech_val = str(row.get("technology", "")).strip().upper()
         band_val = str(row.get("band", "")).strip().lower()
         is_5g = ("5G" in net_val or "NR" in net_val or tech_val == "5G" or band_val.startswith("n"))
+        if not is_5g:
+            return None
         try:
             d = json.loads(val) if isinstance(val, str) else val
             if isinstance(d, dict):
+                # Genuine 5G NR Carrier Aggregation ONLY (nr_ca_count, nr_ca_cc_count, nr_ca_cc > 1)
+                # Do NOT check ca_cc or ca_cc_count (those are LTE carrier aggregation counts)
                 for k in ["nr_ca_count", "nr_ca_cc_count", "nr_ca_cc"]:
                     c = d.get(k)
-                    if c is not None:
-                        try:
-                            c_int = int(c)
-                            if c_int > 1:
-                                return str(c_int)
-                        except (ValueError, TypeError):
-                            pass
-                if is_5g and "LTE ANCHOR" not in net_val:
-                    c = d.get("ca_cc_count")
                     if c is not None:
                         try:
                             c_int = int(c)
@@ -808,7 +842,7 @@ def generate_nr_ca_map(report_df, output_png, tmp_html, polygon_wkt=None):
     ca_df = ca_df.dropna(subset=["lat", "lon"])
 
     if ca_df.empty:
-        print("[PPT Pipeline] 5G NR CA map: no nr_ca_count/ca_cc_count data found in extra_json — map/legend will be blank")
+        print("[PPT Pipeline] 5G NR CA map: no nr_ca_count data found in extra_json — map/legend will be blank")
         return False
 
     counts = ca_df["__nr_ca_label"].value_counts()
@@ -826,7 +860,7 @@ def generate_nr_ca_map(report_df, output_png, tmp_html, polygon_wkt=None):
             fill=True, fill_opacity=0.85,
         ).add_to(fmap)
 
-    fit_data_bounds(fmap, ca_df, reserve_legend_space=False)
+    fit_data_bounds(fmap, fixed_bounds if fixed_bounds is not None else ca_df, reserve_legend_space=False)
     fmap.save(tmp_html)
     try:
         _html_to_png_no_legend(tmp_html, output_png)
@@ -841,7 +875,7 @@ def generate_nr_ca_map(report_df, output_png, tmp_html, polygon_wkt=None):
 
 
 
-def generate_poor_dl_50_map(report_df, output_png, tmp_html, threshold=50, polygon_wkt=None):
+def generate_poor_dl_50_map(report_df, output_png, tmp_html, threshold=50, polygon_wkt=None, fixed_bounds=None):
     """
     Map showing ONLY points where dl_tpt < threshold Mbps.
     No legend injected.
@@ -865,7 +899,7 @@ def generate_poor_dl_50_map(report_df, output_png, tmp_html, threshold=50, polyg
         ).add_to(fmap)
 
     draw_polygon_overlay(fmap, polygon_wkt)
-    fit_data_bounds(fmap, df_geo if not df_geo.empty else report_df, reserve_legend_space=False)
+    fit_data_bounds(fmap, fixed_bounds if fixed_bounds is not None else (df_geo if not df_geo.empty else report_df), reserve_legend_space=False)
     fmap.save(tmp_html)
 
     try:
@@ -1149,12 +1183,21 @@ def generate_ppt_for_project(
     sinr_cfg = KPI_CONFIG.get("SINR", {})
     dl_cfg   = KPI_CONFIG.get("DL",   {})
 
+    # ── Unified Route Viewport Bounds across ALL slides ──────────────────
+    overall_bounds = None
+    if not report_df.empty and "lat" in report_df.columns and "lon" in report_df.columns:
+        try:
+            overall_bounds = get_df_bounds(report_df)
+            _log("Bounds", f"Computed unified route bounds for all map slides: {overall_bounds}")
+        except Exception as e:
+            _log("Bounds", f"Could not compute unified route bounds: {e}")
+
     # ── 4. Base Route Map ─────────────────────────────────────────────────
     _log("Base Route", "Generating base route map ...")
     base_html = os.path.join(html_dir, "base_route.html")
     base_png  = os.path.join(kpi_maps_dir, "base_route_map.png")
     try:
-        generate_base_route_map(report_df, polygon_wkt, base_html)
+        generate_base_route_map(report_df, polygon_wkt, base_html, fixed_bounds=overall_bounds)
         _html_to_png_no_legend(base_html, base_png)
         _log("Base Route", "OK -> base_route_map.png")
     except Exception as e:
@@ -1197,6 +1240,7 @@ def generate_ppt_for_project(
             os.path.join(kpi_maps_dir, "technology_map.png"),
             os.path.join(html_dir, "technology_map.html"),
             polygon_wkt=polygon_wkt,
+            fixed_bounds=overall_bounds,
         )
 
     def _render_5g_rsrp():
@@ -1206,6 +1250,7 @@ def generate_ppt_for_project(
             os.path.join(kpi_maps_dir, "rsrp_5g_map.png"),
             os.path.join(html_dir, "rsrp_5g_map.html"),
             "5G RSRP", polygon_wkt=polygon_wkt,
+            fixed_bounds=overall_bounds,
         )
 
     def _render_5g_sinr():
@@ -1215,27 +1260,32 @@ def generate_ppt_for_project(
             os.path.join(kpi_maps_dir, "sinr_5g_map.png"),
             os.path.join(html_dir, "sinr_5g_map.html"),
             "5G SINR", polygon_wkt=polygon_wkt,
+            fixed_bounds=overall_bounds,
         )
 
     def _render_5g_ca_map():
         _log("Maps | 5G CA", "Rendering 5G CA Configuration Map (Slide 8) ...")
-        _log("Maps | 5G CA", "  Source: tbl_network_log.extra_json -> 'nr_ca_count' / 'nr_ca_cc_count' / 'ca_cc_count' key")
+        _log("Maps | 5G CA", "  Source: tbl_network_log.extra_json -> 'nr_ca_count' / 'nr_ca_cc_count' / 'nr_ca_cc' key")
+        df_target_5g = df_5g if (df_5g is not None and not df_5g.empty) else report_df
         return generate_nr_ca_map(
-            report_df,
+            df_target_5g,
             os.path.join(kpi_maps_dir, "nr_ca_map.png"),
             os.path.join(html_dir, "nr_ca_map.html"),
             polygon_wkt=polygon_wkt,
+            fixed_bounds=overall_bounds,
         )
 
     def _render_ca_map():
         _log("Maps | CA", "Rendering CA Configuration Map (Slide 16) ...")
         _log("Maps | CA", "  Source: tbl_network_log.extra_json -> 'ca_cc' key (Component Carriers)")
+        df_target_4g = df_4g if (df_4g is not None and not df_4g.empty) else report_df
         return generate_ca_map(
-            report_df,
+            df_target_4g,
             os.path.join(kpi_maps_dir, "ca_map.png"),
             os.path.join(html_dir, "ca_map.html"),
             polygon_wkt=polygon_wkt,
             band_filter=list(locked_lte) if locked_lte else None,
+            fixed_bounds=overall_bounds,
         )
 
     def _render_5g_mac_dl():
@@ -1255,6 +1305,7 @@ def generate_ppt_for_project(
             os.path.join(kpi_maps_dir, "dl_5g_map.png"),
             os.path.join(html_dir, "dl_5g_map.html"),
             "5G MAC DL", polygon_wkt=polygon_wkt,
+            fixed_bounds=overall_bounds,
         )
 
     def _render_handover():
@@ -1266,7 +1317,7 @@ def generate_ppt_for_project(
         try:
             h_html = os.path.join(html_dir, "handover_map.html")
             h_png  = os.path.join(kpi_maps_dir, "handover_map.png")
-            generate_handover_map(handover_df, events, h_html, polygon_wkt=polygon_wkt)
+            generate_handover_map(handover_df, events, h_html, polygon_wkt=polygon_wkt, fixed_bounds=overall_bounds)
             _html_to_png_no_legend(h_html, h_png)
             _log("Maps | Handover", f"OK -> handover_map.png")
             return True
@@ -1289,6 +1340,7 @@ def generate_ppt_for_project(
             os.path.join(html_dir, "rsrp_4g_l700.html"),
             "4G RSRP (L700/L900)", polygon_wkt=polygon_wkt,
             band_filter=["B28", "B8", "n28"],
+            fixed_bounds=overall_bounds,
         )
 
     def _render_4g_l1800():
@@ -1306,6 +1358,7 @@ def generate_ppt_for_project(
             os.path.join(html_dir, "rsrp_4g_1800.html"),
             "4G RSRP (L1800)", polygon_wkt=polygon_wkt,
             band_filter=["B3"],
+            fixed_bounds=overall_bounds,
         )
 
     def _render_4g_l2100():
@@ -1323,6 +1376,7 @@ def generate_ppt_for_project(
             os.path.join(html_dir, "rsrp_4g_2100.html"),
             "4G RSRP (L2100)", polygon_wkt=polygon_wkt,
             band_filter=["B1"],
+            fixed_bounds=overall_bounds,
         )
 
     def _render_4g_l2600():
@@ -1340,6 +1394,7 @@ def generate_ppt_for_project(
             os.path.join(html_dir, "rsrp_4g_2600.html"),
             "4G RSRP (L2600)", polygon_wkt=polygon_wkt,
             band_filter=["B7", "B38", "B41"],
+            fixed_bounds=overall_bounds,
         )
 
     def _render_4g_sinr():
@@ -1350,6 +1405,7 @@ def generate_ppt_for_project(
             os.path.join(html_dir, "sinr_4g.html"),
             "4G SINR", polygon_wkt=polygon_wkt,
             band_filter=list(locked_lte) if locked_lte else None,
+            fixed_bounds=overall_bounds,
         )
 
     def _render_4g_mac_dl():
@@ -1366,6 +1422,7 @@ def generate_ppt_for_project(
             os.path.join(html_dir, "dl_4g.html"),
             "4G MAC DL", polygon_wkt=polygon_wkt,
             band_filter=list(locked_lte) if locked_lte else None,
+            fixed_bounds=overall_bounds,
         )
 
 
@@ -1383,6 +1440,7 @@ def generate_ppt_for_project(
                 ranges=dl_app_ranges,
                 output_html=os.path.join(html_dir, "dl_app.html"),
                 polygon_wkt=polygon_wkt,
+                fixed_bounds=overall_bounds,
             )
             _html_to_png_no_legend(
                 os.path.join(html_dir, "dl_app.html"),
@@ -1401,6 +1459,7 @@ def generate_ppt_for_project(
                 report_df, output_dir=kpi_maps_dir, tmp_dir=html_dir,
                 polygon_wkt=polygon_wkt, render_width=REPORT_RENDER_WIDTH,
                 render_height=REPORT_RENDER_HEIGHT, device_scale_factor=REPORT_DEVICE_SCALE,
+                fixed_bounds=overall_bounds,
             )
         except Exception as e:
             _log("Maps | Poor", f"WARNING: poor region map failed: {e}")
@@ -1409,6 +1468,7 @@ def generate_ppt_for_project(
             os.path.join(kpi_maps_dir, "poor_dl_50.png"),
             os.path.join(html_dir, "poor_dl_50.html"),
             threshold=50, polygon_wkt=polygon_wkt,
+            fixed_bounds=overall_bounds,
         )
 
     def _render_blank_basemap():
@@ -1418,6 +1478,7 @@ def generate_ppt_for_project(
             os.path.join(kpi_maps_dir, "blank_basemap.png"),
             os.path.join(html_dir, "blank_basemap.html"),
             polygon_wkt=polygon_wkt,
+            fixed_bounds=overall_bounds,
         )
 
     # Submit all map renders concurrently (Playwright is I/O-bound → safe to thread)
@@ -1521,7 +1582,8 @@ def generate_ppt_for_project(
     # Determine which of the no-fallback maps actually produced a real PNG
     _single_lte_locked = bool(locked_lte and len(locked_lte) == 1)
 
-    # 5G CA requires: genuine 5G NR Carrier Aggregation (nr_ca_count / nr_ca_cc_count / ca_cc_count > 1).
+    # 5G CA requires: genuine 5G NR Carrier Aggregation (nr_ca_count / nr_ca_cc_count / nr_ca_cc > 1).
+    # Do NOT check ca_cc or ca_cc_count (those are LTE carrier aggregation counts from companion LTE anchor)
     def _extract_nr_ca_count(row):
         val = row.get("extra_json")
         if not val or pd.isna(val):
@@ -1530,6 +1592,8 @@ def generate_ppt_for_project(
         tech_val = str(row.get("technology", "")).strip().upper()
         band_val = str(row.get("band", "")).strip().lower()
         is_5g = ("5G" in net_val or "NR" in net_val or tech_val == "5G" or band_val.startswith("n"))
+        if not is_5g:
+            return None
         try:
             d = json.loads(val) if isinstance(val, str) else val
             if isinstance(d, dict):
@@ -1542,21 +1606,12 @@ def generate_ppt_for_project(
                                 return c_int
                         except (ValueError, TypeError):
                             pass
-                if is_5g and "LTE ANCHOR" not in net_val:
-                    c = d.get("ca_cc_count")
-                    if c is not None:
-                        try:
-                            c_int = int(c)
-                            if c_int > 1:
-                                return c_int
-                        except (ValueError, TypeError):
-                            pass
         except Exception:
             pass
         return None
 
-    nr_ca_series = report_df.apply(_extract_nr_ca_count, axis=1) if "extra_json" in report_df.columns else pd.Series([], dtype=float)
-    _5g_ca_has_data = bool((nr_ca_df is not None and not nr_ca_df.empty) or nr_ca_series.notna().any())
+    nr_ca_series = df_5g.apply(_extract_nr_ca_count, axis=1) if (df_5g is not None and not df_5g.empty and "extra_json" in df_5g.columns) else pd.Series([], dtype=float)
+    _5g_ca_has_data = bool((nr_ca_df is not None and not nr_ca_df.empty) and nr_ca_series.notna().any())
 
     # 5G MAC DL: True ONLY if real nr_mac_dl_mbps samples exist on 5G NR carriers (n*)
     nr_carrier_check = df_5g if (df_5g is not None and not df_5g.empty) else (
@@ -1903,6 +1958,32 @@ def generate_ppt_for_project(
                 ej_records.append(ej)
         df_ej = pd.DataFrame(ej_records) if ej_records else pd.DataFrame()
 
+        # Build 5G-specific extra_json DataFrame for 5G metrics
+        ej_5g_records = []
+        if not df_5g.empty and "extra_json" in df_5g.columns:
+            for ej in df_5g["extra_json"]:
+                if ej and isinstance(ej, str) and ej.strip():
+                    try:
+                        ej_5g_records.append(json.loads(ej))
+                    except Exception:
+                        pass
+                elif isinstance(ej, dict):
+                    ej_5g_records.append(ej)
+        df_ej_5g = pd.DataFrame(ej_5g_records) if ej_5g_records else df_ej
+
+        # Build 4G-specific extra_json DataFrame for LTE metrics
+        ej_4g_records = []
+        if not df_4g.empty and "extra_json" in df_4g.columns:
+            for ej in df_4g["extra_json"]:
+                if ej and isinstance(ej, str) and ej.strip():
+                    try:
+                        ej_4g_records.append(json.loads(ej))
+                    except Exception:
+                        pass
+                elif isinstance(ej, dict):
+                    ej_4g_records.append(ej)
+        df_ej_4g = pd.DataFrame(ej_4g_records) if ej_4g_records else pd.DataFrame()
+
         # ── Slide 3 Table 0 (5G Summary) ─────────────────────────────────
         # 5G Ratio (%)
         if "timestamp" in report_df.columns and not df_5g.empty:
@@ -1946,20 +2027,20 @@ def generate_ppt_for_project(
                 _log("PPTX", f"Slide 3 Table 0: 5G SINR average = {s.mean():.1f}")
 
         # 5G Modulation (QPSK, 16QAM, 64QAM, 256QAM)
-        if not df_ej.empty:
-            if "nr_dl_qpsk_pct" in df_ej.columns and "nr_dl_64qam_pct" in df_ej.columns:
-                qpsk = pd.to_numeric(df_ej["nr_dl_qpsk_pct"], errors="coerce").dropna()
-                qam16 = pd.to_numeric(df_ej.get("nr_dl_16qam_pct", pd.Series([], dtype=float)), errors="coerce").dropna()
-                qam64 = pd.to_numeric(df_ej["nr_dl_64qam_pct"], errors="coerce").dropna()
-                qam256 = pd.to_numeric(df_ej.get("nr_dl_256qam_pct", pd.Series([], dtype=float)), errors="coerce").dropna()
+        if not df_ej_5g.empty:
+            if "nr_dl_qpsk_pct" in df_ej_5g.columns and "nr_dl_64qam_pct" in df_ej_5g.columns:
+                qpsk = pd.to_numeric(df_ej_5g["nr_dl_qpsk_pct"], errors="coerce").dropna()
+                qam16 = pd.to_numeric(df_ej_5g.get("nr_dl_16qam_pct", pd.Series([], dtype=float)), errors="coerce").dropna()
+                qam64 = pd.to_numeric(df_ej_5g["nr_dl_64qam_pct"], errors="coerce").dropna()
+                qam256 = pd.to_numeric(df_ej_5g.get("nr_dl_256qam_pct", pd.Series([], dtype=float)), errors="coerce").dropna()
                 if not qpsk.empty and not qam64.empty:
                     automator.update_table_row_by_key(3, 0, "QPSK", f"{qpsk.mean():.0f}%")
                     automator.update_table_row_by_key(3, 0, "16QAM", f"{qam16.mean():.0f}%")
                     automator.update_table_row_by_key(3, 0, "64QAM", f"{qam64.mean():.0f}%")
                     automator.update_table_row_by_key(3, 0, "256QAM", f"{qam256.mean():.0f}%")
                     _log("PPTX", f"Slide 3 Table 0: 5G Modulation = QPSK:{qpsk.mean():.0f}%, 16QAM:{qam16.mean():.0f}%, 64QAM:{qam64.mean():.0f}%, 256QAM:{qam256.mean():.0f}%")
-            elif "nr_dl_mod" in df_ej.columns:
-                mod_c = df_ej["nr_dl_mod"].dropna().value_counts(normalize=True) * 100.0
+            elif "nr_dl_mod" in df_ej_5g.columns:
+                mod_c = df_ej_5g["nr_dl_mod"].dropna().value_counts(normalize=True) * 100.0
                 automator.update_table_row_by_key(3, 0, "QPSK", f"{mod_c.get('QPSK', 0.0):.0f}%")
                 automator.update_table_row_by_key(3, 0, "16QAM", f"{mod_c.get('16QAM', 0.0):.0f}%")
                 automator.update_table_row_by_key(3, 0, "64QAM", f"{mod_c.get('64QAM', 0.0):.0f}%")
@@ -1967,31 +2048,31 @@ def generate_ppt_for_project(
                 _log("PPTX", f"Slide 3 Table 0: 5G Modulation from nr_dl_mod = QPSK:{mod_c.get('QPSK', 0.0):.0f}%, 16QAM:{mod_c.get('16QAM', 0.0):.0f}%, 64QAM:{mod_c.get('64QAM', 0.0):.0f}%, 256QAM:{mod_c.get('256QAM', 0.0):.0f}%")
 
         # NR Rank
-        if not df_ej.empty and "nr_rank" in df_ej.columns:
-            s = pd.to_numeric(df_ej["nr_rank"], errors="coerce").dropna()
+        if not df_ej_5g.empty and "nr_rank" in df_ej_5g.columns:
+            s = pd.to_numeric(df_ej_5g["nr_rank"], errors="coerce").dropna()
             if not s.empty:
                 automator.update_table_row_by_key(3, 0, "NR Rank", f"{s.mean():.1f}")
                 _log("PPTX", f"Slide 3 Table 0: NR Rank = {s.mean():.1f}")
 
         # 5G SLOT Usage DL
-        if not df_ej.empty and "nr_dl_slot_usage_pct" in df_ej.columns:
-            s = pd.to_numeric(df_ej["nr_dl_slot_usage_pct"], errors="coerce").dropna()
+        if not df_ej_5g.empty and "nr_dl_slot_usage_pct" in df_ej_5g.columns:
+            s = pd.to_numeric(df_ej_5g["nr_dl_slot_usage_pct"], errors="coerce").dropna()
             if not s.empty:
                 automator.update_table_row_by_key(3, 0, "5G SLOT Usage DL", f"{s.mean():.1f}")
                 _log("PPTX", f"Slide 3 Table 0: 5G SLOT Usage DL = {s.mean():.1f}")
 
         # 5G RB Num DL
-        if not df_ej.empty and "nr_dl_rb" in df_ej.columns:
-            s = pd.to_numeric(df_ej["nr_dl_rb"], errors="coerce").dropna()
+        if not df_ej_5g.empty and "nr_dl_rb" in df_ej_5g.columns:
+            s = pd.to_numeric(df_ej_5g["nr_dl_rb"], errors="coerce").dropna()
             if not s.empty:
                 automator.update_table_row_by_key(3, 0, "5G RB Num DL", f"{s.mean():.1f}")
                 _log("PPTX", f"Slide 3 Table 0: 5G RB Num DL = {s.mean():.1f}")
 
         # 5G TX Power
-        if not df_ej.empty:
+        if not df_ej_5g.empty:
             for tx_col in ["pusch_tx", "pucch_tx_dbm", "srs_tx_dbm", "ul_tx"]:
-                if tx_col in df_ej.columns:
-                    cleaned = df_ej[tx_col].astype(str).str.replace(" dBm", "", case=False)
+                if tx_col in df_ej_5g.columns:
+                    cleaned = df_ej_5g[tx_col].astype(str).str.replace(" dBm", "", case=False)
                     s = pd.to_numeric(cleaned, errors="coerce").dropna()
                     if not s.empty:
                         automator.update_table_row_by_key(3, 0, "5G TX Power", f"{s.mean():.1f}")
@@ -2006,18 +2087,18 @@ def generate_ppt_for_project(
                 _log("PPTX", f"Slide 3 Table 0: 5G CQI WB DL = {s.mean():.1f}")
 
         # 5G MCS DL
-        if not df_ej.empty:
+        if not df_ej_5g.empty:
             for mcs_col in ["dl_mcs", "nr_mcs_dl", "nr_mcd_dl"]:
-                if mcs_col in df_ej.columns:
-                    s = pd.to_numeric(df_ej[mcs_col], errors="coerce").dropna()
+                if mcs_col in df_ej_5g.columns:
+                    s = pd.to_numeric(df_ej_5g[mcs_col], errors="coerce").dropna()
                     if not s.empty:
                         automator.update_table_row_by_key(3, 0, "5G MCS DL", f"{s.mean():.1f}")
                         _log("PPTX", f"Slide 3 Table 0: 5G MCS DL ({mcs_col}) = {s.mean():.1f}")
                         break
 
         # 5G MAC DL TP
-        if not df_ej.empty and "nr_mac_dl_mbps" in df_ej.columns:
-            s = pd.to_numeric(df_ej["nr_mac_dl_mbps"], errors="coerce").dropna()
+        if not df_ej_5g.empty and "nr_mac_dl_mbps" in df_ej_5g.columns:
+            s = pd.to_numeric(df_ej_5g["nr_mac_dl_mbps"], errors="coerce").dropna()
             if not s.empty:
                 automator.update_table_row_by_key(3, 0, "5G MAC DL TP", f"{s.mean():.1f}")
                 _log("PPTX", f"Slide 3 Table 0: 5G MAC DL TP = {s.mean():.1f}")
@@ -2071,32 +2152,37 @@ def generate_ppt_for_project(
                 automator.update_table_row_by_key(3, 1, "4G CQI WB DL", f"{s.mean():.1f}")
                 _log("PPTX", f"Slide 3 Table 1: 4G CQI WB DL = {s.mean():.1f}")
 
-        # LTE Carrier Num (2CA, 3CA, 4CA, 5CA)
+        # LTE Carrier Num (2CA, 3CA, 4CA, 5CA) — strictly 4G LTE samples
         ca_col = None
-        if not df_ej.empty:
+        if not df_ej_4g.empty:
             for col_cand in ["ca_cc", "ca_cc_count"]:
-                if col_cand in df_ej.columns:
+                if col_cand in df_ej_4g.columns:
                     ca_col = col_cand
                     break
-        if ca_col and not df_ej.empty:
-            s_ca = pd.to_numeric(df_ej[ca_col], errors="coerce").dropna()
-            total_ca = len(df_ej)
+        if ca_col and not df_ej_4g.empty:
+            s_ca = pd.to_numeric(df_ej_4g[ca_col], errors="coerce").dropna()
+            total_ca = len(df_4g) if not df_4g.empty else len(df_ej_4g)
             if total_ca > 0:
                 automator.update_table_row_by_key(3, 1, "2CA", f"{(s_ca == 2).sum() / total_ca * 100.0:.0f}%")
                 automator.update_table_row_by_key(3, 1, "3CA", f"{(s_ca == 3).sum() / total_ca * 100.0:.0f}%")
                 automator.update_table_row_by_key(3, 1, "4CA", f"{(s_ca == 4).sum() / total_ca * 100.0:.0f}%")
                 automator.update_table_row_by_key(3, 1, "5CA", f"{(s_ca >= 5).sum() / total_ca * 100.0:.0f}%")
                 _log("PPTX", f"Slide 3 Table 1: 2CA = {(s_ca == 2).sum() / total_ca * 100.0:.0f}% (from {ca_col})")
+        else:
+            automator.update_table_row_by_key(3, 1, "2CA", "0%")
+            automator.update_table_row_by_key(3, 1, "3CA", "0%")
+            automator.update_table_row_by_key(3, 1, "4CA", "0%")
+            automator.update_table_row_by_key(3, 1, "5CA", "0%")
 
         # 4G RB Num DL
-        if not df_ej.empty and "scell1_rb" in df_ej.columns:
-            s = pd.to_numeric(df_ej["scell1_rb"], errors="coerce").dropna()
+        if not df_ej_4g.empty and "scell1_rb" in df_ej_4g.columns:
+            s = pd.to_numeric(df_ej_4g["scell1_rb"], errors="coerce").dropna()
             if not s.empty:
                 automator.update_table_row_by_key(3, 1, "4G RB Num DL", f"{s.mean():.1f}")
 
         # 4G MAC DL TP
-        if not df_ej.empty and "lte_mac_dl_mbps" in df_ej.columns:
-            s = pd.to_numeric(df_ej["lte_mac_dl_mbps"], errors="coerce").dropna()
+        if not df_ej_4g.empty and "lte_mac_dl_mbps" in df_ej_4g.columns:
+            s = pd.to_numeric(df_ej_4g["lte_mac_dl_mbps"], errors="coerce").dropna()
             if not s.empty:
                 automator.update_table_row_by_key(3, 1, "4G MAC DL TP", f"{s.mean():.1f}")
                 _log("PPTX", f"Slide 3 Table 1: 4G MAC DL TP = {s.mean():.1f}")
@@ -2117,8 +2203,8 @@ def generate_ppt_for_project(
         try:
             automator.update_table_cell(4, 0, 6, 2, "100.0%")
             automator.update_table_cell(4, 0, 6, 3, "0.0%")
-            if not df_ej.empty and "nr_mac_dl_mbps" in df_ej.columns:
-                s = pd.to_numeric(df_ej["nr_mac_dl_mbps"], errors="coerce").dropna()
+            if not df_ej_5g.empty and "nr_mac_dl_mbps" in df_ej_5g.columns:
+                s = pd.to_numeric(df_ej_5g["nr_mac_dl_mbps"], errors="coerce").dropna()
                 if not s.empty:
                     automator.update_table_cell(4, 0, 4, 2, f"{s.mean():.1f}")
             automator.update_table_cell(4, 0, 4, 3, "0.0")

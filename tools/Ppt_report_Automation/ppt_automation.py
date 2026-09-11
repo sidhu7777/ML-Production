@@ -8,6 +8,9 @@ import os
 import io
 from pptx import Presentation
 from pptx.enum.shapes import MSO_SHAPE_TYPE
+from pptx.util import Pt
+from pptx.dml.color import RGBColor
+from pptx.enum.text import PP_ALIGN
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -274,14 +277,61 @@ class PPTAutomator:
 
         if target_type.lower() == "main":
             target_pic = pictures[0]
+            # Standardize main map dimensions and position across all slides
+            # Standard: Left=1.67" (1527048), Top=0.83" (758952), Width=6.35" (5806440), Height=4.17" (3813048)
+            target_pic.left = 1527048
+            target_pic.top = 758952
+            target_pic.width = 5806440
+            target_pic.height = 3813048
+
+            # Standardize title position and styling on Slide 20 to match Slides 5-18
+            for shape in slide.shapes:
+                if shape.has_text_frame and "DL<50" in shape.text_frame.text.replace(" ", ""):
+                    shape.left = 905256    # 0.99"
+                    shape.top = 155448     # 0.17"
+                    shape.width = 6693408  # 7.32" (match standard slide title width)
+                    shape.height = 374904  # 0.41"
+                    tf = shape.text_frame
+                    tf.word_wrap = False
+                    tf.text = "APP DL < 50Mbps"
+                    if tf.paragraphs:
+                        p = tf.paragraphs[0]
+                        p.alignment = PP_ALIGN.CENTER
+                        for r in p.runs:
+                            r.font.name = "微軟正黑體"
+                            r.font.size = Pt(20)
+                            r.font.color.rgb = RGBColor(0x33, 0x33, 0xFF)
+                            r.font.underline = True
         elif target_type.lower() == "legend":
+            # Map right/bottom edges to anchor legend to the bottom-right corner of the map:
+            # Map left=1527048, width=5806440 -> right=7333488
+            # Map top=758952, height=3813048 -> bottom=4572000
+            anchor_right = 7333488
+            anchor_bottom = 4572000
+
+            # Calculate natural dimensions in EMU from image file
+            from PIL import Image as _PILImage
+            try:
+                with _PILImage.open(new_image_path) as _im:
+                    img_w, img_h = _im.size
+                # 3175 EMU per pixel (scale=3, pt_to_px=4.0, 12700 EMU/pt)
+                leg_w = int(img_w * 3175)
+                leg_h = int(img_h * 3175)
+            except Exception:
+                leg_w = 1270000
+                leg_h = 1000000
+
+            leg_left = anchor_right - leg_w
+            leg_top = anchor_bottom - leg_h
+
             if pic_count < 2:
                 try:
                     slide.shapes.add_picture(
                         new_image_path,
-                        left=6057900,
-                        top=3508502,
-                        width=1270000,
+                        left=leg_left,
+                        top=leg_top,
+                        width=leg_w,
+                        height=leg_h,
                     )
                     print(
                         f"  [PPT | Slide {slide_target} | legend] OK — added new legend picture shape "
@@ -294,6 +344,10 @@ class PPTAutomator:
                     )
                     return False
             target_pic = pictures[1]
+            target_pic.left = leg_left
+            target_pic.top = leg_top
+            target_pic.width = leg_w
+            target_pic.height = leg_h
         else:
             try:
                 target_pic = pictures[int(target_type)]
