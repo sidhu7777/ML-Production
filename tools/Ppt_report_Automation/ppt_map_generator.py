@@ -744,34 +744,61 @@ def get_frontend_band_color(band):
     return _frontend_hash_color(normalized)
 
 
-def normalize_tech_name(tech, band=None):
-    if band is not None:
-        band_str = str(band).strip().lower()
-        if re.match(r"^n\d+", band_str):
-            return "5G"
-        if band_str in {
-            "n78", "n77", "n41", "n1", "n28", "n3", "n5", "n7",
-            "n8", "n20", "n38", "n40", "n66", "n71", "n257",
-            "n258", "n260", "n261"
-        }:
-            return "5G"
+def normalize_tech_name(tech, band=None, network=None):
+    tech_str = str(tech).strip() if tech is not None else ""
+    net_str = str(network).strip().upper() if network is not None else ""
+    t = tech_str.upper()
+    combined = f"{t} {net_str}"
 
-    if tech is None:
-        return "Unknown"
-
-    tech_str = str(tech).strip()
     if tech_str in {
         "000", "00", "Unknown/No Service", "Unknown / No Service",
         "UNKNOWN / NO SERVICE", "Unknown", "undefined", "null",
         "404440", "404011"
-    }:
+    } and not net_str and not band:
         return "Unknown"
 
-    t = tech_str.upper()
-    if "LTE ANCHOR" in t or "LTE-ANCHOR" in t or "LTE_ANCHOR" in t or "ENDC" in t or "EN-DC" in t:
-        return "4G" if ("4G" in t or "LTE" in t) else "5G"
-    if "5G" in t or "NR" in t or "NSA" in t or "SA" in t:
+    # 1. 4G(LTE Anchor NSA), NSA, and EN-DC are considered 5G
+    if (
+        "LTE ANCHOR" in combined
+        or "LTE-ANCHOR" in combined
+        or "LTE_ANCHOR" in combined
+        or "ANCHOR" in combined
+        or "NSA" in combined
+        or "ENDC" in combined
+        or "EN-DC" in combined
+        or "5G" in combined
+        or "NR" in combined
+    ):
         return "5G"
+
+    # 2. Check band (5G NR vs 4G LTE)
+    if band is not None:
+        band_str = str(band).strip().lower()
+        if re.match(r"^n\d+", band_str) or band_str in {
+            "n78", "n77", "n41", "n1", "n28", "n3", "n5", "n7",
+            "n8", "n20", "n38", "n40", "n66", "n71", "n257", "n258", "n260", "n261"
+        }:
+            return "5G"
+        if re.match(r"^[bl]\d+", band_str) or band_str in {
+            "b1", "b2", "b3", "b4", "b5", "b7", "b8", "b12", "b13", "b17", "b18", "b19",
+            "b20", "b25", "b26", "b28", "b38", "b39", "b40", "b41",
+            "1800", "2600", "700", "2100", "900", "850", "2300", "2500"
+        }:
+            return "4G"
+
+    # 3. Check network string for 4G / 3G / 2G
+    if net_str:
+        if "4G" in net_str or "LTE" in net_str:
+            return "4G"
+        if "3G" in net_str or "WCDMA" in net_str or "UMTS" in net_str:
+            return "3G"
+        if "2G" in net_str or "GSM" in net_str or "EDGE" in net_str or "GPRS" in net_str:
+            return "2G"
+
+    # 4. Check tech string
+    if not tech_str:
+        return "Unknown"
+
     if "LTE" in t or "4G" in t or "4G+" in t:
         return "4G"
     if "3G" in t or "WCDMA" in t or "UMTS" in t or "HSPA" in t:
@@ -922,6 +949,426 @@ def detect_handover_events(df: pd.DataFrame, use_global_detection=True, min_run_
     """
     frontend_events = _detect_frontend_style_handover_events(df)
     return frontend_events
+
+
+def detect_endc_setup_events(session_ids, db_conn_or_engine=None, route_df=None, region=None, country_code=None):
+    """
+    Detect ENDC Setup events from tbl_l3_log and tbl_event_log for given session_id(s).
+
+    Logic:
+    1. In tbl_l3_log, check if message contains 'RRC Connection Reconfiguration Complete'
+       (or 'RRCConnectionReconfigurationComplete').
+    2. Check if 'ENDC AVAILABILITY' is also present (in message, detail, or in tbl_event_log).
+    3. Category transition must be from LTE-RRC to NSA_SA.
+       If LTE-RRC to LTE-RRC, it is NOT considered an ENDC Setup.
+    4. Return event objects with icon_type='hand' and type='endc_setup'.
+    """
+    if isinstance(session_ids, (int, str)):
+        session_ids = [int(session_ids)]
+    elif isinstance(session_ids, (list, tuple, set)):
+        session_ids = [int(s) for s in session_ids if pd.notna(s)]
+    else:
+        return []
+
+    if not session_ids:
+        return []
+
+    df_l3 = pd.DataFrame()
+    df_evt = pd.DataFrame()
+
+    # 1. Fetch L3 logs via Python Bridge if available
+    try:
+        import sys
+        ml_prod_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "ML-Production"))
+        if os.path.isdir(ml_prod_dir) and ml_prod_dir not in sys.path:
+            sys.path.insert(0, ml_prod_dir)
+        ml_prod_dir2 = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+        if os.path.isdir(os.path.join(ml_prod_dir2, "utils")) and ml_prod_dir2 not in sys.path:
+            sys.path.insert(0, ml_prod_dir2)
+        from utils.python_bridge import get_bridge_client, _bridge_region_body
+        bridge_client = get_bridge_client()
+    except Exception:
+        bridge_client = None
+
+    if bridge_client is not None:
+        try:
+            body = {"SessionIds": session_ids, **_bridge_region_body(region, country_code)}
+            df_l3 = bridge_client.post_rows("GetL3LogRows", body, limit=50000)
+            if not df_l3.empty:
+                for col in ["latitude", "longitude", "session_id", "row_no"]:
+                    if col in df_l3.columns:
+                        df_l3[col] = pd.to_numeric(df_l3[col], errors="coerce")
+        except Exception as e:
+            print(f"[detect_endc_setup_events] PythonBridge GetL3LogRows error: {e}")
+
+    # 2. Query direct DB if df_l3 is empty or to fetch tbl_event_log
+    from sqlalchemy import create_engine, text, bindparam
+
+    conn = None
+    close_when_done = False
+    if db_conn_or_engine is not None:
+        if hasattr(db_conn_or_engine, "connect") and not hasattr(db_conn_or_engine, "execute"):
+            conn = db_conn_or_engine.connect()
+            close_when_done = True
+        else:
+            conn = db_conn_or_engine
+    else:
+        norm_reg = str(region or country_code or "").strip().lower()
+        if norm_reg in {"tw", "twn", "taiwan"}:
+            db_url = os.getenv("DATABASE_URL_Taiwan") or os.getenv("DATABASE_URL_TAIWAN")
+        else:
+            db_url = os.getenv("DATABASE_URL")
+
+        if db_url:
+            try:
+                engine = create_engine(db_url)
+                conn = engine.connect()
+                close_when_done = True
+            except Exception as e:
+                print(f"[detect_endc_setup_events] DB connection error: {e}")
+                conn = None
+
+    if conn is not None:
+        try:
+            if df_l3.empty:
+                q_l3 = text("""
+                    SELECT id, session_id, row_no, timestamp_text, latitude, longitude, category, message, detail
+                    FROM tbl_l3_log
+                    WHERE session_id IN :sids
+                    ORDER BY session_id ASC, id ASC
+                """).bindparams(bindparam("sids", expanding=True))
+                df_l3 = pd.read_sql(q_l3, conn, params={"sids": session_ids})
+
+            q_evt = text("""
+                SELECT id, session_id, row_no, timestamp_text, latitude, longitude, category, event_name as message, detail
+                FROM tbl_event_log
+                WHERE session_id IN :sids
+                ORDER BY session_id ASC, id ASC
+            """).bindparams(bindparam("sids", expanding=True))
+            df_evt = pd.read_sql(q_evt, conn, params={"sids": session_ids})
+        except Exception as e:
+            print(f"[detect_endc_setup_events] DB query error: {e}")
+        finally:
+            if close_when_done and conn is not None:
+                conn.close()
+
+    if df_l3.empty and df_evt.empty:
+        return []
+
+    all_events = []
+    for sid in session_ids:
+        s_l3 = df_l3[df_l3["session_id"] == sid].copy() if not df_l3.empty else pd.DataFrame()
+        s_evt = df_evt[df_evt["session_id"] == sid].copy() if not df_evt.empty else pd.DataFrame()
+
+        if s_l3.empty:
+            continue
+
+        s_l3["src"] = "L3"
+        if not s_evt.empty:
+            s_evt["src"] = "EVT"
+            combined = pd.concat([s_l3, s_evt], ignore_index=True)
+        else:
+            combined = s_l3
+
+        sort_cols = [c for c in ["timestamp_text", "row_no", "id"] if c in combined.columns]
+        combined = combined.sort_values(by=sort_cols).reset_index(drop=True)
+
+        session_events = []
+        for i, row in combined.iterrows():
+            msg = str(row.get("message") or "")
+            cat = str(row.get("category") or "")
+
+            if "RRC Connection Reconfiguration Complete" in msg or "RRCConnectionReconfigurationComplete" in msg:
+                t_str = str(row.get("timestamp_text") or "")
+                window_ahead = combined.iloc[i + 1 : min(len(combined), i + 20)]
+                window_behind = combined.iloc[max(0, i - 10) : i]
+
+                has_endc_avail = (
+                    window_ahead["message"].str.contains("ENDC_AVAILABILITY|ENDC AVAILABILITY", case=False, na=False).any()
+                    or window_behind["message"].str.contains("ENDC_AVAILABILITY|ENDC AVAILABILITY", case=False, na=False).any()
+                    or "ENDC AVAILABILITY" in str(row.get("detail") or "").upper()
+                )
+
+                next_tech_cats = [
+                    r["category"]
+                    for _, r in window_ahead.iterrows()
+                    if r.get("category") in ["LTE-RRC", "NSA_SA", "NR-RRC"]
+                ]
+                is_nsa_transition = ("NSA_SA" in next_tech_cats)
+
+                if has_endc_avail and is_nsa_transition:
+                    lat = row.get("latitude")
+                    lon = row.get("longitude")
+
+                    # Fallback to route_df if coords missing in L3
+                    if (pd.isna(lat) or pd.isna(lon) or float(lat or 0) == 0) and route_df is not None:
+                        s_route = route_df[route_df["session_id"] == sid] if "session_id" in route_df.columns else route_df
+                        if not s_route.empty and "lat" in s_route.columns:
+                            valid_coords = s_route.dropna(subset=["lat", "lon"])
+                            if not valid_coords.empty:
+                                lat = valid_coords.iloc[0]["lat"]
+                                lon = valid_coords.iloc[0]["lon"]
+
+                    if pd.isna(lat) or pd.isna(lon) or float(lat or 0) == 0:
+                        continue
+
+                    session_events.append({
+                        "type": "endc_setup",
+                        "icon_type": "hand",
+                        "time": t_str,
+                        "lat": float(lat),
+                        "lon": float(lon),
+                        "session_id": sid,
+                        "from_value": cat,
+                        "to_value": "NSA_SA",
+                        "tooltip": f"ENDC Setup ({t_str}): {cat} -> NSA_SA",
+                    })
+
+        # Debounce events occurring in close succession
+        last_t = None
+        for ev in session_events:
+            t = str(ev.get("time") or "")
+            t_key = t[:8] if len(t) >= 8 else t
+            last_key = last_t[:8] if (last_t and len(last_t) >= 8) else last_t
+            if last_key is None or t_key != last_key:
+                all_events.append(ev)
+                last_t = t
+
+    return all_events
+
+
+def detect_endc_setup_from_network_logs(
+    network_log_df=None,
+    session_ids=None,
+    db_conn_or_engine=None,
+    region=None,
+    country_code=None,
+):
+    """
+    Detect ENDC Setup events from tbl_network_log.extra_json.
+
+    The extra_json column stores a JSON blob per row, e.g.:
+        '{"endc_setup": "ok",     "nr_mac_dl_mbps": 45.2, ...}'
+        '{"endc_setup": "failed", ...}'
+
+    Rows where extra_json["endc_setup"] is recognised:
+      - 'ok'     → green hand marker  (#22c55e)
+      - 'failed' → red   hand marker  (#ef4444)
+
+    TWO-STAGE approach:
+      1. Parse network_log_df in-memory first (fast — no extra DB call).
+         report_df is polygon-filtered, so some rows with endc_setup may be
+         absent. If no events are found here, fall through to stage 2.
+      2. Direct unfiltered DB query — fetches ALL rows for the session IDs
+         where extra_json IS NOT NULL, then extracts endc_setup from JSON.
+         This catches events that were filtered out of report_df.
+
+    Args:
+        network_log_df    : Already-loaded DataFrame (has 'extra_json', 'lat',
+                            'lon', 'session_id', 'timestamp').  Tried first.
+        session_ids       : list[int] used for direct DB fallback when
+                            network_log_df yields no events.
+        db_conn_or_engine : SQLAlchemy connection/engine for the DB fallback.
+        region / country_code : Multi-region DB selection.
+
+    Returns:
+        list of event dicts for generate_handover_map().
+        Each event has 'endc_status' ('ok'|'failed') and 'color' (green|red).
+    """
+    import json as _json
+
+    COLOR_OK     = "#22c55e"   # green hand  ✅
+    COLOR_FAILED = "#ef4444"   # red   hand  ❌
+
+    def _parse_endc_status(extra_json_val):
+        """Return 'ok'|'failed' or None if not present / unparseable.
+
+        Keys checked (in priority order):
+          endc_setup  – explicit 'ok' / 'failed'
+          ENDC_SETUP, endcSetup, ENDCSetup – camelCase / upper variants
+          endc_event  – used in Taiwan data: 'ok', 'setup', 'fail', 'failed', etc.
+        """
+        if extra_json_val is None:
+            return None
+        try:
+            blob = _json.loads(extra_json_val) if isinstance(extra_json_val, str) else extra_json_val
+            if not isinstance(blob, dict):
+                return None
+            # ── Try dedicated endc_setup key first ────────────────────────
+            raw = (
+                blob.get("endc_setup")
+                or blob.get("ENDC_SETUP")
+                or blob.get("endcSetup")
+                or blob.get("ENDCSetup")
+            )
+            # ── Fallback to endc_event key (Taiwan / other regions) ───────
+            if raw is None:
+                raw = blob.get("endc_event") or blob.get("ENDC_EVENT") or blob.get("endcEvent")
+            if raw is None:
+                return None
+            norm = str(raw).strip().lower()
+            # Normalise to 'ok' | 'failed'
+            # NOTE: 'setup' is intentionally NOT mapped — it means an ENDC
+            # attempt is in progress and should NOT be plotted on the map.
+            if norm in {"ok", "success"}:
+                return "ok"
+            if norm in {"failed", "fail", "failure", "error", "nok"}:
+                return "failed"
+            return None
+        except Exception:
+            return None
+
+
+    def _df_to_events(df):
+        """Parse extra_json from a DataFrame and return event list (may be [])."""
+        if df is None or df.empty or "extra_json" not in df.columns:
+            return []
+
+        work = df.copy()
+
+        # Normalise lat/lon aliases
+        for alias, candidates in [
+            ("lat", ["lat", "latitude", "gps_lat"]),
+            ("lon", ["lon", "longitude", "gps_lon"]),
+        ]:
+            if alias not in work.columns:
+                for cand in candidates:
+                    if cand in work.columns:
+                        work[alias] = work[cand]
+                        break
+        for col in ["lat", "lon"]:
+            if col in work.columns:
+                work[col] = pd.to_numeric(work[col], errors="coerce")
+
+        work["_endc_status"] = work["extra_json"].apply(_parse_endc_status)
+        df_endc = work[work["_endc_status"].notna()].copy()
+
+        if df_endc.empty:
+            return []
+
+        # Deduplicate companion carrier rows (e.g. LTE Anchor + 5G NR companion rows)
+        # that share the same timestamp/session_id so an ENDC event is counted
+        # exactly once per event timestamp, not duplicated across RF carrier rows.
+        if "timestamp" in df_endc.columns:
+            ts_norm = df_endc["timestamp"].astype(str).str.strip().str[:19]
+            df_endc = df_endc.assign(_ts_dedup=ts_norm)
+            dedup_cols = ["_ts_dedup"]
+            if "session_id" in df_endc.columns:
+                dedup_cols.insert(0, "session_id")
+            df_endc = df_endc.drop_duplicates(subset=dedup_cols)
+
+        events = []
+        for _, row in df_endc.iterrows():
+            lat = row.get("lat")
+            lon = row.get("lon")
+            if pd.isna(lat) or pd.isna(lon) or float(lat or 0) == 0:
+                continue
+            status = row["_endc_status"]
+            color  = COLOR_OK if status == "ok" else COLOR_FAILED
+            t_str  = str(row.get("timestamp") or "")
+            sid    = row.get("session_id", "")
+            events.append({
+                "type":        "endc_setup",
+                "icon_type":   "hand",
+                "endc_status": status,
+                "color":       color,
+                "time":        t_str,
+                "lat":         float(lat),
+                "lon":         float(lon),
+                "session_id":  sid,
+                "from_value":  "LTE",
+                "to_value":    "NSA_SA",
+                "tooltip":     f"ENDC Setup ({t_str}): {status.upper()}",
+            })
+        return events
+
+    # ── STAGE 1: in-memory parse from network_log_df ──────────────────────
+    if network_log_df is not None and not network_log_df.empty:
+        events = _df_to_events(network_log_df)
+        if events:
+            ok_n     = sum(1 for e in events if e["endc_status"] == "ok")
+            failed_n = sum(1 for e in events if e["endc_status"] == "failed")
+            print(
+                f"[detect_endc_setup_from_network_logs] stage=in_memory "
+                f"total={len(events)} ok={ok_n} failed={failed_n}"
+            )
+            return events
+        print(
+            "[detect_endc_setup_from_network_logs] stage=in_memory "
+            "no endc_setup found in report_df extra_json — trying direct DB query"
+        )
+
+    # ── STAGE 2: direct DB query (unfiltered — all rows for session IDs) ──
+    # resolve session_ids
+    sids = []
+    if session_ids is not None:
+        if isinstance(session_ids, (int, str)):
+            sids = [int(session_ids)]
+        elif isinstance(session_ids, (list, tuple, set)):
+            sids = [int(s) for s in session_ids if pd.notna(s)]
+    elif network_log_df is not None and "session_id" in network_log_df.columns:
+        # derive from the df that was passed
+        sids = [int(s) for s in network_log_df["session_id"].dropna().unique()]
+
+    if not sids:
+        print("[detect_endc_setup_from_network_logs] stage=db no session_ids — giving up")
+        return []
+
+    from sqlalchemy import create_engine, text, bindparam
+
+    conn = None
+    close_when_done = False
+    if db_conn_or_engine is not None:
+        if hasattr(db_conn_or_engine, "connect") and not hasattr(db_conn_or_engine, "execute"):
+            conn = db_conn_or_engine.connect()
+            close_when_done = True
+        else:
+            conn = db_conn_or_engine
+    else:
+        norm_reg = str(region or country_code or "").strip().lower()
+        db_url = (
+            (os.getenv("DATABASE_URL_Taiwan") or os.getenv("DATABASE_URL_TAIWAN"))
+            if norm_reg in {"tw", "twn", "taiwan"}
+            else os.getenv("DATABASE_URL")
+        )
+        if db_url:
+            try:
+                engine = create_engine(db_url)
+                conn = engine.connect()
+                close_when_done = True
+            except Exception as e:
+                print(f"[detect_endc_setup_from_network_logs] DB connection error: {e}")
+
+    if conn is None:
+        print("[detect_endc_setup_from_network_logs] stage=db no DB connection — giving up")
+        return []
+
+    try:
+        q = text("""
+            SELECT session_id, timestamp, lat, lon, extra_json
+            FROM tbl_network_log
+            WHERE session_id IN :sids
+              AND extra_json IS NOT NULL
+              AND extra_json != ''
+            ORDER BY session_id ASC, id ASC
+        """).bindparams(bindparam("sids", expanding=True))
+        df_db = pd.read_sql(q, conn, params={"sids": sids})
+    except Exception as e:
+        print(f"[detect_endc_setup_from_network_logs] DB query error: {e}")
+        return []
+    finally:
+        if close_when_done and conn is not None:
+            conn.close()
+
+    events = _df_to_events(df_db)
+    ok_n     = sum(1 for e in events if e["endc_status"] == "ok")
+    failed_n = sum(1 for e in events if e["endc_status"] == "failed")
+    print(
+        f"[detect_endc_setup_from_network_logs] stage=db "
+        f"rows_with_extra_json={len(df_db)} total_events={len(events)} "
+        f"ok={ok_n} failed={failed_n}"
+    )
+    return events
 
 
 def _first_present(row, candidates):
@@ -1285,7 +1732,10 @@ def generate_handover_map(filtered_df, events, output_html, polygon_wkt=None, fi
         raise ValueError("No GPS data to plot for handover map")
     events = [
         ev for ev in (events or [])
-        if str(ev.get("type") or "").lower() == "band"
+        if (
+            str(ev.get("type") or "").lower() in ["band", "endc_setup", "handover"]
+            or ev.get("icon_type") == "hand"
+        )
         and pd.notna(ev.get("lat"))
         and pd.notna(ev.get("lon"))
     ]
@@ -1319,7 +1769,8 @@ def generate_handover_map(filtered_df, events, output_html, polygon_wkt=None, fi
         else:
             df_route = df.sort_values(["__session_sort"]).copy()
 
-        colors = generate_distinct_colors(len(sessions)) if sessions else ["#2b8cbe"]
+        route_palette = ["#2b8cbe", "#0284c7", "#6366f1", "#059669", "#d97706", "#7c3aed", "#0891b2"]
+        colors = [route_palette[i % len(route_palette)] for i in range(len(sessions))] if sessions else ["#2b8cbe"]
 
         # Draw each session
         for i, sid in enumerate(sessions):
@@ -1358,27 +1809,36 @@ def generate_handover_map(filtered_df, events, output_html, polygon_wkt=None, fi
         if route_step > 1:
             layer["points"] = layer["points"][::route_step]
 
-    # Add handover sparks
-    event_colors = {
-        "band": "#3b82f6",
+    # Add handover sparks / ENDC setup markers
+    # Default color map for non-network-log events that don't carry a 'color' key
+    event_default_colors = {
+        "band": "#ef4444",
+        "endc_setup": "#ef4444",
+        "handover": "#ef4444",
     }
     event_points = []
     for ev in events:
-        event_type = str(ev.get("type") or "handover").lower()
+        event_type = str(ev.get("type") or "endc_setup").lower()
+        # Use per-event color if available (e.g. green/red from network logs)
+        # otherwise fall back to the type-based default (always red)
+        point_color = ev.get("color") or event_default_colors.get(event_type, "#ef4444")
         if ev.get("from_value") is not None and ev.get("to_value") is not None:
-            tooltip = (
+            tooltip = ev.get("tooltip") or (
                 f"{event_type.title()}: {ev.get('from_value')} -> {ev.get('to_value')} "
                 f"(Session {ev.get('session_id')})"
             )
         else:
-            tooltip = f"{ev.get('from_provider')} -> {ev.get('to_provider')} (Session {ev.get('session_id')})"
+            tooltip = ev.get("tooltip") or (
+                f"{ev.get('from_provider')} -> {ev.get('to_provider')} (Session {ev.get('session_id')})"
+            )
         event_points.append({
             "lat": ev["lat"],
             "lon": ev["lon"],
-            "color": event_colors.get(event_type, "#ff9933"),
+            "color": point_color,
             "tooltip": tooltip,
             "type": event_type,
-            "icon_type": ev.get("icon_type", "circle"),
+            "icon_type": ev.get("icon_type", "hand"),
+            "endc_status": ev.get("endc_status", ""),
         })
 
     payload = json.dumps({"routes": route_layers, "events": event_points})
@@ -1412,14 +1872,16 @@ def generate_handover_map(filtered_df, events, output_html, polygon_wkt=None, fi
                     }});
                 }});
                 payload.events.forEach(function(ev) {{
-                    if (ev.icon_type === "hand" || ev.type === "endc_setup") {{
+                    if (ev.icon_type !== "circle_plain") {{
+                        // Use the per-event color for the hand background
+                        var bgColor = ev.color || "#dc2626";
                         var handIcon = L.divIcon({{
                             className: "endc-hand-marker",
-                            html: '<div style="background:#ef4444;border:2px solid #ffffff;border-radius:50%;width:26px;height:26px;display:flex;align-items:center;justify-content:center;font-size:15px;box-shadow:0 2px 6px rgba(0,0,0,0.5);">✋</div>',
-                            iconSize: [26, 26],
-                            iconAnchor: [13, 13]
+                            html: '<div style="background:' + bgColor + ';border:2.5px solid #ffffff;border-radius:50%;width:30px;height:30px;display:flex;align-items:center;justify-content:center;box-shadow:0 2px 8px rgba(0,0,0,0.6);cursor:pointer;"><svg width="18" height="18" viewBox="0 0 24 24" fill="#ffffff" style="display:block;"><path d="M18.5 8c-.83 0-1.5.67-1.5 1.5v4.25l-.47-.21a2.82 2.82 0 0 0-2.31-.08l-.22.09V3.5c0-.83-.67-1.5-1.5-1.5s-1.5.67-1.5 1.5v8.5H10V1.5C10 .67 9.33 0 8.5 0S7 .67 7 1.5v10.5h-.5V4.5C6.5 3.67 5.83 3 5 3s-1.5.67-1.5 1.5v10.74c0 3.73 3.03 6.76 6.76 6.76h3.48c3.73 0 6.76-3.03 6.76-6.76V9.5c0-.83-.67-1.5-1.5-1.5z"/></svg></div>',
+                            iconSize: [30, 30],
+                            iconAnchor: [15, 15]
                         }});
-                        var marker = L.marker([ev.lat, ev.lon], {{icon: handIcon}}).addTo(map);
+                        var marker = L.marker([ev.lat, ev.lon], {{icon: handIcon, zIndexOffset: 1000}}).addTo(map);
                     }} else {{
                         var marker = L.circleMarker([ev.lat, ev.lon], {{
                             radius: 6,
@@ -1444,20 +1906,34 @@ def generate_handover_map(filtered_df, events, output_html, polygon_wkt=None, fi
     m.get_root().html.add_child(folium.Element(render_js))
 
     if events:
-        counts = {}
-        for ev in events:
-            event_type = str(ev.get("type") or "handover").lower()
-            counts[event_type] = counts.get(event_type, 0) + 1
+        # Build legend — separate OK (green) and Failed (red) entries when
+        # the events carry endc_status, otherwise show a single combined entry.
+        ok_count     = sum(1 for e in events if str(e.get("endc_status") or "").lower() == "ok")
+        failed_count = sum(1 for e in events if str(e.get("endc_status") or "").lower() == "failed")
+        other_count  = len(events) - ok_count - failed_count
+
+        legend_items = []
+        if ok_count or failed_count:
+            legend_items.append(("ENDC Setup OK (✋)", "#22c55e", ok_count))
+            legend_items.append(("ENDC Setup Failed (✋)", "#ef4444", failed_count))
+        if other_count:
+            legend_items.append(("Handover (✋)", "#ef4444", other_count))
+
         add_legend(
             m,
-            "Band Handover Events",
-            [
-                (event_type.title(), event_colors.get(event_type, "#ff9933"), count)
-                for event_type, count in counts.items()
-            ],
+            "Handover / ENDC Events",
+            legend_items,
         )
 
     # Fit the viewport to the data only (fractional zoom keeps it tight).
-    fit_data_bounds(m, fixed_bounds if fixed_bounds is not None else df, reserve_legend_space=False)
+    bounds_target = fixed_bounds
+    if bounds_target is None:
+        if events:
+            ev_df = pd.DataFrame([{"lat": e["lat"], "lon": e["lon"]} for e in events])
+            bounds_df = pd.concat([df[["lat", "lon"]], ev_df], ignore_index=True)
+            bounds_target = bounds_df
+        else:
+            bounds_target = df
+    fit_data_bounds(m, bounds_target, reserve_legend_space=False)
 
     m.save(output_html)

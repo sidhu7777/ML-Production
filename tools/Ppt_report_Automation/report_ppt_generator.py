@@ -47,6 +47,8 @@ if __package__:
         generate_base_route_map,
         generate_handover_map,
         detect_handover_events,
+        detect_endc_setup_events,
+        detect_endc_setup_from_network_logs,
         new_report_map,
         add_fullscreen_css,
         draw_polygon_overlay,
@@ -65,6 +67,8 @@ else:
         generate_base_route_map,
         generate_handover_map,
         detect_handover_events,
+        detect_endc_setup_events,
+        detect_endc_setup_from_network_logs,
         new_report_map,
         add_fullscreen_css,
         draw_polygon_overlay,
@@ -162,8 +166,37 @@ TEMPLATE_POOR_DL_RANGES = [
 def normalize_tech_name(tech, band=None, network=None):
     """
     Robustly normalizes technology mode for a log row.
-    Checks band first (n* -> 5G, B*/L* -> 4G), then network string, then technology string.
+    4G(LTE Anchor NSA), NSA, and EN-DC are considered 5G per user requirement.
+    Checks for 5G, NR, NSA, and LTE Anchor across tech and network first,
+    then evaluates band, network, and technology strings.
     """
+    tech_str = str(tech).strip() if tech is not None else ""
+    net_str = str(network).strip().upper() if network is not None else ""
+    t = tech_str.upper()
+    combined = f"{t} {net_str}"
+
+    if tech_str in {
+        "000", "00", "Unknown/No Service", "Unknown / No Service",
+        "UNKNOWN / NO SERVICE", "Unknown", "undefined", "null",
+        "404440", "404011"
+    } and not net_str and not band:
+        return "Unknown"
+
+    # 1. 4G(LTE Anchor NSA), NSA, and EN-DC are considered 5G
+    if (
+        "LTE ANCHOR" in combined
+        or "LTE-ANCHOR" in combined
+        or "LTE_ANCHOR" in combined
+        or "ANCHOR" in combined
+        or "NSA" in combined
+        or "ENDC" in combined
+        or "EN-DC" in combined
+        or "5G" in combined
+        or "NR" in combined
+    ):
+        return "5G"
+
+    # 2. Check band (5G NR vs 4G LTE)
     if band is not None:
         band_str = str(band).strip().lower()
         if re.match(r"^n\d+", band_str) or band_str in {
@@ -178,30 +211,19 @@ def normalize_tech_name(tech, band=None, network=None):
         }:
             return "4G"
 
-    if network is not None:
-        net_str = str(network).strip().upper()
-        if "5G" in net_str or "NR" in net_str or "NSA" in net_str or "SA" in net_str:
-            if "LTE ANCHOR" not in net_str:
-                return "5G"
+    # 3. Check network string for 4G / 3G / 2G
+    if net_str:
         if "4G" in net_str or "LTE" in net_str:
             return "4G"
+        if "3G" in net_str or "WCDMA" in net_str or "UMTS" in net_str:
+            return "3G"
+        if "2G" in net_str or "GSM" in net_str or "EDGE" in net_str or "GPRS" in net_str:
+            return "2G"
 
-    if tech is None:
+    # 4. Check tech string
+    if not tech_str:
         return "Unknown"
 
-    tech_str = str(tech).strip()
-    if tech_str in {
-        "000", "00", "Unknown/No Service", "Unknown / No Service",
-        "UNKNOWN / NO SERVICE", "Unknown", "undefined", "null",
-        "404440", "404011"
-    }:
-        return "Unknown"
-
-    t = tech_str.upper()
-    if "LTE ANCHOR" in t or "LTE-ANCHOR" in t or "LTE_ANCHOR" in t or "ENDC" in t or "EN-DC" in t:
-        return "4G" if ("4G" in t or "LTE" in t) else "5G"
-    if "5G" in t or "NR" in t or "NSA" in t or "SA" in t:
-        return "5G"
     if "LTE" in t or "4G" in t or "4G+" in t:
         return "4G"
     if "3G" in t or "WCDMA" in t or "UMTS" in t or "HSPA" in t:
@@ -244,8 +266,8 @@ MAX_RENDER_POINTS = 15000
 
 # Technology color palette
 TECH_COLORS = {
-    "5G":      "#1a6fcc",   # blue
-    "4G":      "#2ca02c",   # green
+    "5G":      "#7C3AED",   # vibrant purple
+    "4G":      "#00B050",   # vivid emerald green
     "3G":      "#ff7f0e",   # orange
     "2G":      "#d62728",   # red
     "Unknown": "#999999",   # grey
@@ -591,22 +613,24 @@ def generate_technology_mode_map(report_df, output_png, tmp_html, polygon_wkt=No
                 radius=4, color=color, fill=True, fill_color=color, fill_opacity=0.85,
             ).add_to(fmap)
 
-    # 2. 4G points: outer marker / ring (radius=6, weight=2.5, green #2ca02c)
+    # 2. 4G points
+    color_4g = TECH_COLORS.get("4G", "#00B050")
     if not df_4g.empty:
         sub_4g = _subsample(df_4g, key_col="__tech")
         for _, r in sub_4g.iterrows():
             folium.CircleMarker(
                 location=[r["lat"], r["lon"]],
-                radius=6, color="#2ca02c", weight=2.5, fill=True, fill_color="#2ca02c", fill_opacity=0.35,
+                radius=5, color=color_4g, weight=2, fill=True, fill_color=color_4g, fill_opacity=0.85,
             ).add_to(fmap)
 
-    # 3. 5G points: inner core (radius=3.5, blue #1a6fcc)
+    # 3. 5G points
+    color_5g = TECH_COLORS.get("5G", "#7C3AED")
     if not df_5g.empty:
         sub_5g = _subsample(df_5g, key_col="__tech")
         for _, r in sub_5g.iterrows():
             folium.CircleMarker(
                 location=[r["lat"], r["lon"]],
-                radius=3.5, color="#1a6fcc", weight=1.5, fill=True, fill_color="#1a6fcc", fill_opacity=0.95,
+                radius=4, color=color_5g, weight=1.5, fill=True, fill_color=color_5g, fill_opacity=0.95,
             ).add_to(fmap)
 
     fit_data_bounds(fmap, fixed_bounds if fixed_bounds is not None else df, reserve_legend_space=False)
@@ -677,7 +701,12 @@ def generate_4g_kpi_map(report_df, kpi_col, color_func, ranges, output_png, tmp_
             if not lte_b.empty:
                 df_target = lte_b
     else:
-        df_target = _filter_4g(report_df).dropna(subset=["lat", "lon", kpi_col]).copy()
+        # For general 4G KPI (e.g. Slide 15 4G SINR), include all LTE carrier rows (not just pure standalone 4G)
+        if "band" in report_df.columns:
+            lte_b = report_df[~report_df["band"].astype(str).str.lower().str.startswith("n")].dropna(subset=["lat", "lon", kpi_col]).copy()
+            df_target = lte_b if not lte_b.empty else _filter_4g(report_df).dropna(subset=["lat", "lon", kpi_col]).copy()
+        else:
+            df_target = _filter_4g(report_df).dropna(subset=["lat", "lon", kpi_col]).copy()
 
     df_target[kpi_col] = pd.to_numeric(df_target[kpi_col], errors="coerce")
     df_target = df_target.dropna(subset=[kpi_col])
@@ -724,15 +753,12 @@ def generate_ca_map(report_df, output_png, tmp_html, polygon_wkt=None, band_filt
     """
     ca_df = pd.DataFrame()
 
-    # Filter strictly to 4G / LTE technology rows so companion 5G rows do not double-count 4G CA.
-    # Note: Do not do a raw technology != '5G' check because 4G LTE Anchor rows in NSA sessions
-    # have technology='5G' logged while network='4G (LTE Anchor - NSA)' and band='B3'/'B7'.
-    # Use _filter_4g() which robustly evaluates band, network, and technology.
-    df_input = _filter_4g(report_df)
-    if df_input.empty:
+    # Filter to 4G / LTE carriers (including LTE Anchor rows in NSA sessions).
+    # Exclude 5G NR carriers (bands starting with 'n') so companion 5G rows do not double-count 4G CA.
+    if "band" in report_df.columns:
+        df_input = report_df[~report_df["band"].astype(str).str.lower().str.startswith("n")].copy()
+    else:
         df_input = report_df.copy()
-        if "band" in df_input.columns:
-            df_input = df_input[~df_input["band"].astype(str).str.lower().str.startswith("n")]
 
     # ── Extract ca_cc from extra_json ─────────────────────────────────────
     if "extra_json" in df_input.columns and df_input["extra_json"].notna().any():
@@ -742,15 +768,16 @@ def generate_ca_map(report_df, output_png, tmp_html, polygon_wkt=None, band_filt
             try:
                 d = json.loads(val) if isinstance(val, str) else val
                 if isinstance(d, dict):
-                    # Genuine 4G Carrier Aggregation ONLY (ca_cc >= 2 or ca_cc_count >= 2)
-                    cc = d.get("ca_cc") or d.get("ca_cc_count")
-                    if cc is not None:
-                        try:
-                            cc_int = int(cc)
-                            if cc_int >= 2:
-                                return str(cc_int)   # normalise -> "2", "3", etc.
-                        except (ValueError, TypeError):
-                            pass
+                    # 4G Carrier Aggregation: ca_count, ca_cc_count, ca_cc (>= 2 for 4G CA)
+                    for k in ["ca_count", "ca_cc_count", "ca_cc"]:
+                        c = d.get(k)
+                        if c is not None:
+                            try:
+                                cc_int = int(float(c))
+                                if cc_int >= 2:
+                                    return str(cc_int)   # normalise -> "2", "3", etc.
+                            except (ValueError, TypeError):
+                                pass
             except Exception:
                 pass
             return None
@@ -819,17 +846,40 @@ def generate_nr_ca_map(report_df, output_png, tmp_html, polygon_wkt=None, fixed_
         try:
             d = json.loads(val) if isinstance(val, str) else val
             if isinstance(d, dict):
-                # Genuine 5G NR Carrier Aggregation ONLY (nr_ca_count, nr_ca_cc_count, nr_ca_cc > 1)
-                # Do NOT check ca_cc or ca_cc_count (those are LTE carrier aggregation counts)
-                for k in ["nr_ca_count", "nr_ca_cc_count", "nr_ca_cc"]:
-                    c = d.get(k)
-                    if c is not None:
-                        try:
-                            c_int = int(c)
-                            if c_int > 1:
-                                return str(c_int)
-                        except (ValueError, TypeError):
-                            pass
+                nr_serv = str(d.get("nr_serving") or "").strip().upper()
+                # 1. 5G SA: nr_ca_count is used
+                if nr_serv == "SA" or "SA" in net_val:
+                    for k in ["nr_ca_count", "nr_ca_cc_count", "nr_ca_cc"]:
+                        c = d.get(k)
+                        if c is not None:
+                            try:
+                                c_int = int(float(c))
+                                if c_int >= 1:
+                                    return str(c_int)
+                            except (ValueError, TypeError):
+                                pass
+                # 2. 5G NSA: check nr_ca_count, then ca_cc_count / ca_count / ca_cc
+                elif nr_serv == "NSA" or "NSA" in net_val:
+                    for k in ["nr_ca_count", "nr_ca_cc_count", "nr_ca_cc", "ca_cc_count", "ca_count", "ca_cc"]:
+                        c = d.get(k)
+                        if c is not None:
+                            try:
+                                c_int = int(float(c))
+                                if c_int >= 1:
+                                    return str(c_int)
+                            except (ValueError, TypeError):
+                                pass
+                # 3. Fallback
+                else:
+                    for k in ["nr_ca_count", "nr_ca_cc_count", "nr_ca_cc", "ca_cc_count", "ca_count", "ca_cc"]:
+                        c = d.get(k)
+                        if c is not None:
+                            try:
+                                c_int = int(float(c))
+                                if c_int >= 1:
+                                    return str(c_int)
+                            except (ValueError, TypeError):
+                                pass
         except Exception:
             pass
         return None
@@ -1150,7 +1200,17 @@ def generate_ppt_for_project(
         _before_len_nr = len(df_5g)
         df_5g = df_5g[_norm_5g.isin(locked_nr)].copy()
         _log("Data", f"Locked NR bands {sorted(list(locked_nr))} applied -> df_5g filtered from {_before_len_nr} to {len(df_5g)} rows")
-    _log("Data", f"5G samples: {len(df_5g)} | 4G samples: {len(df_4g)} | Total: {len(report_df)}")
+    # LTE carrier subset: all rows on LTE bands (B* or ~band.startswith('n')), including LTE Anchor in NSA sessions
+    if "band" in report_df.columns:
+        df_lte = report_df[~report_df["band"].astype(str).str.lower().str.startswith("n")].copy()
+        if df_lte.empty:
+            df_lte = df_4g.copy()
+    else:
+        df_lte = df_4g.copy()
+    if locked_lte and "band" in df_lte.columns:
+        _norm_lte = df_lte["band"].apply(normalize_band_name)
+        df_lte = df_lte[_norm_lte.isin(locked_lte)].copy()
+    _log("Data", f"5G samples: {len(df_5g)} | 4G pure samples: {len(df_4g)} | LTE carrier samples: {len(df_lte)} | Total: {len(report_df)}")
 
     # ── 2. Enrich with MAC tpt from extra_json (needed for maps + legends) ─
     _log("Enrich", "Extracting nr_mac_dl_mbps and lte_mac_dl_mbps from extra_json ...")
@@ -1160,10 +1220,12 @@ def generate_ppt_for_project(
     _log("Enrich", "  df_5g enriched")
     df_4g     = _enrich_df_with_mac_tpt(df_4g)
     _log("Enrich", "  df_4g enriched")
+    df_lte    = _enrich_df_with_mac_tpt(df_lte)
+    _log("Enrich", "  df_lte enriched")
     nr_valid  = int(df_5g["__nr_mac_dl"].notna().sum())  if "__nr_mac_dl"  in df_5g.columns else 0
-    lte_valid = int(df_4g["__lte_mac_dl"].notna().sum()) if "__lte_mac_dl" in df_4g.columns else 0
+    lte_valid = int(df_lte["__lte_mac_dl"].notna().sum()) if "__lte_mac_dl" in df_lte.columns else 0
     _log("Enrich", f"5G MAC DL (nr_mac_dl_mbps) valid rows: {nr_valid} / {len(df_5g)}")
-    _log("Enrich", f"4G MAC DL (lte_mac_dl_mbps) valid rows: {lte_valid} / {len(df_4g)}")
+    _log("Enrich", f"4G MAC DL (lte_mac_dl_mbps) valid rows: {lte_valid} / {len(df_lte)}")
     if nr_valid == 0:
         _log("Enrich", "WARNING: no nr_mac_dl_mbps in extra_json — 5G MAC DL slide 9 will be blank (no fallback)")
     if lte_valid == 0:
@@ -1203,18 +1265,93 @@ def generate_ppt_for_project(
     except Exception as e:
         _log("Base Route", f"WARNING: failed: {e}")
 
-    # ── 5. Handover events (needed before parallel render) ────────────────
-    _log("Handover", "Detecting band handover / ENDC events ...")
+    # ── 5. Handover / ENDC events (needed before parallel render) ────────
+    _log("Handover", "Detecting ENDC setup / handover events for Slide 10 ...")
     handover_df = report_df.copy()
     events = []
+
+    # 0. PRIMARY: detect ENDC Setup from tbl_network_log.extra_json
+    #    TWO-STAGE: first tries report_df (in-memory), then falls back to
+    #    a direct unfiltered DB query so filtered-out rows are not missed.
+    #    green hand = ok, red hand = failed
     try:
-        events = detect_handover_events(handover_df)
-        _log("Handover", f"Detected {len(events)} band handover events")
-        if len(events) == 0:
-            _log("Handover", "  NOTE: 0 events detected — ENDC slide will show route only. "
-                             "Source column: tbl_network_log.band (band transitions)")
+        sids_for_endc = [int(s) for s in report_df["session_id"].dropna().unique()]
+        _c_endc = None
+        try:
+            from tools.report_engine.db import _connect
+            _c_endc = _connect(region=region, country_code=country_code)
+        except Exception:
+            _c_endc = None
+        try:
+            nl_events = detect_endc_setup_from_network_logs(
+                network_log_df=report_df,        # Stage 1: in-memory (fast)
+                session_ids=sids_for_endc,       # Stage 2: direct DB fallback
+                db_conn_or_engine=_c_endc,       # DB connection for Stage 2
+                region=region,
+                country_code=country_code,
+            )
+            if nl_events:
+                _log(
+                    "Handover",
+                    f"Detected {len(nl_events)} ENDC Setup events from extra_json "
+                    f"(ok={sum(1 for e in nl_events if e.get('endc_status')=='ok')}, "
+                    f"failed={sum(1 for e in nl_events if e.get('endc_status')=='failed')})"
+                )
+                events = nl_events
+        finally:
+            if _c_endc is not None:
+                try:
+                    _c_endc.close()
+                except Exception:
+                    pass
     except Exception as e:
-        _log("Handover", f"WARNING: detection failed: {e}")
+        _log("Handover", f"WARNING: extra_json ENDC detection failed: {e}")
+
+    # 1. Secondary: detect real ENDC Setup events from tbl_l3_log / tbl_event_log
+    if not events:
+        try:
+            sids = [int(s) for s in report_df["session_id"].dropna().unique()]
+            if sids:
+                c = None
+                try:
+                    from tools.report_engine.db import _connect
+                    c = _connect(region=region, country_code=country_code)
+                except Exception:
+                    c = None
+                try:
+                    endc_events = detect_endc_setup_events(sids, c, route_df=handover_df, region=region, country_code=country_code)
+                    if endc_events:
+                        _log("Handover", f"Detected {len(endc_events)} ENDC Setup events from tbl_l3_log / tbl_event_log")
+                        events = endc_events
+                finally:
+                    if c is not None:
+                        c.close()
+        except Exception as e:
+            _log("Handover", f"WARNING: ENDC setup detection failed: {e}")
+
+    # 2. Fallback: if no L3 log events available, detect transitions from network logs
+    if not events:
+        try:
+            raw_events = detect_handover_events(handover_df)
+            debounced_fallback = []
+            last_t = None
+            last_loc = None
+            for ev in raw_events:
+                ev_copy = dict(ev)
+                ev_copy["type"] = "endc_setup"
+                ev_copy["icon_type"] = "hand"
+                t = str(ev.get("timestamp") or "")[:19]
+                lat = round(float(ev.get("lat") or 0), 4)
+                lon = round(float(ev.get("lon") or 0), 4)
+                if (last_t != t) and (last_loc != (lat, lon)):
+                    debounced_fallback.append(ev_copy)
+                    last_t = t
+                    last_loc = (lat, lon)
+            if debounced_fallback:
+                events = debounced_fallback
+                _log("Handover", f"Detected {len(events)} ENDC Setup / Handover events (fallback) for Slide 10")
+        except Exception as e:
+            _log("Handover", f"WARNING: fallback handover detection failed: {e}")
 
     # ── 6. Band availability checks (before parallel render) ─────────────
     has_4g_l700  = False
@@ -1278,9 +1415,8 @@ def generate_ppt_for_project(
     def _render_ca_map():
         _log("Maps | CA", "Rendering CA Configuration Map (Slide 16) ...")
         _log("Maps | CA", "  Source: tbl_network_log.extra_json -> 'ca_cc' key (Component Carriers)")
-        df_target_4g = df_4g if (df_4g is not None and not df_4g.empty) else report_df
         return generate_ca_map(
-            df_target_4g,
+            report_df,
             os.path.join(kpi_maps_dir, "ca_map.png"),
             os.path.join(html_dir, "ca_map.html"),
             polygon_wkt=polygon_wkt,
@@ -1310,9 +1446,8 @@ def generate_ppt_for_project(
 
     def _render_handover():
         _log("Maps | Handover", f"Rendering Handover / ENDC Map (Slide 10) | {len(events)} events ...")
-        _log("Maps | Handover", "  Source: band transitions in tbl_network_log.band column")
-        if len(events) == 0:
-            _log("Maps | Handover", "SKIP — 0 events detected; slide 10 will show blank map")
+        if handover_df is None or handover_df.empty or "lat" not in handover_df.columns:
+            _log("Maps | Handover", "SKIP — no GPS route data")
             return False
         try:
             h_html = os.path.join(html_dir, "handover_map.html")
@@ -1597,21 +1732,46 @@ def generate_ppt_for_project(
         try:
             d = json.loads(val) if isinstance(val, str) else val
             if isinstance(d, dict):
-                for k in ["nr_ca_count", "nr_ca_cc_count", "nr_ca_cc"]:
-                    c = d.get(k)
-                    if c is not None:
-                        try:
-                            c_int = int(c)
-                            if c_int > 1:
-                                return c_int
-                        except (ValueError, TypeError):
-                            pass
+                nr_serv = str(d.get("nr_serving") or "").strip().upper()
+                # 1. 5G SA: nr_ca_count is used
+                if nr_serv == "SA" or "SA" in net_val:
+                    for k in ["nr_ca_count", "nr_ca_cc_count", "nr_ca_cc"]:
+                        c = d.get(k)
+                        if c is not None:
+                            try:
+                                c_int = int(float(c))
+                                if c_int >= 1:
+                                    return c_int
+                            except (ValueError, TypeError):
+                                pass
+                # 2. 5G NSA: check nr_ca_count, then ca_cc_count / ca_count / ca_cc
+                elif nr_serv == "NSA" or "NSA" in net_val:
+                    for k in ["nr_ca_count", "nr_ca_cc_count", "nr_ca_cc", "ca_cc_count", "ca_count", "ca_cc"]:
+                        c = d.get(k)
+                        if c is not None:
+                            try:
+                                c_int = int(float(c))
+                                if c_int >= 1:
+                                    return c_int
+                            except (ValueError, TypeError):
+                                pass
+                # 3. Fallback
+                else:
+                    for k in ["nr_ca_count", "nr_ca_cc_count", "nr_ca_cc", "ca_cc_count", "ca_count", "ca_cc"]:
+                        c = d.get(k)
+                        if c is not None:
+                            try:
+                                c_int = int(float(c))
+                                if c_int >= 1:
+                                    return c_int
+                            except (ValueError, TypeError):
+                                pass
         except Exception:
             pass
         return None
 
     nr_ca_series = df_5g.apply(_extract_nr_ca_count, axis=1) if (df_5g is not None and not df_5g.empty and "extra_json" in df_5g.columns) else pd.Series([], dtype=float)
-    _5g_ca_has_data = bool((nr_ca_df is not None and not nr_ca_df.empty) and nr_ca_series.notna().any())
+    _5g_ca_has_data = bool((nr_ca_df is not None and not nr_ca_df.empty) or nr_ca_series.notna().any())
 
     # 5G MAC DL: True ONLY if real nr_mac_dl_mbps samples exist on 5G NR carriers (n*)
     nr_carrier_check = df_5g if (df_5g is not None and not df_5g.empty) else (
@@ -1704,10 +1864,13 @@ def generate_ppt_for_project(
     tech_counts = df_tech["__tech"].value_counts()
     total_tech = len(df_tech)
     tech_legend_items = []
+    tech_5g_pct = 0.0
     for tech in ["5G", "4G", "3G", "2G"]:
         if tech in tech_counts:
             c = int(tech_counts[tech])
             p = (c / total_tech * 100.0) if total_tech > 0 else 0.0
+            if tech == "5G":
+                tech_5g_pct = p
             tech_legend_items.append({
                 "text": f"{tech} ({c}) {p:.1f}%",
                 "color": TECH_COLORS.get(tech, "#999999"),
@@ -1798,8 +1961,9 @@ def generate_ppt_for_project(
         _log("Legend | 4G RSRP", "  SKIP — no L1800 data; legend will be blank on slide 12")
 
     # 7. 4G SINR Legend (Slide 15)
-    _log("Legend | 4G SINR", "Building 4G SINR legend (Slide 15) | Source: tbl_network_log.sinr (4G rows only)")
-    _sinr_4g_vals = df_4g["sinr"] if not df_4g.empty else pd.Series([], dtype=float)
+    _log("Legend | 4G SINR", "Building 4G SINR legend (Slide 15) | Source: tbl_network_log.sinr (4G/LTE rows)")
+    _sinr_df = df_lte if (df_lte is not None and not df_lte.empty) else df_4g
+    _sinr_4g_vals = _sinr_df["sinr"] if not _sinr_df.empty else pd.Series([], dtype=float)
     sinr_4g_legend = build_numeric_legend_items(_sinr_4g_vals, sinr_4g_ranges)
     _log("Legend | 4G SINR", f"  {len(sinr_4g_legend)} range buckets from {_sinr_4g_vals.notna().sum()} valid samples")
 
@@ -1825,9 +1989,10 @@ def generate_ppt_for_project(
 
     # 9. 4G MAC DL Legend (Slide 17) — ONLY from lte_mac_dl_mbps in extra_json, in kbps
     _log("Legend | 4G MAC DL", "Building 4G MAC DL legend (Slide 17) | Source: extra_json -> 'lte_mac_dl_mbps' (in kbps scale)")
+    _lte_dl_df = df_lte if (df_lte is not None and not df_lte.empty) else df_4g
     _lte_dl_vals = (
-        df_4g["__lte_mac_dl_kbps"].dropna()
-        if (not df_4g.empty and "__lte_mac_dl_kbps" in df_4g.columns)
+        _lte_dl_df["__lte_mac_dl_kbps"].dropna()
+        if (not _lte_dl_df.empty and "__lte_mac_dl_kbps" in _lte_dl_df.columns)
         else pd.Series([], dtype=float)
     )
     if _lte_dl_vals.empty:
@@ -1858,12 +2023,44 @@ def generate_ppt_for_project(
     else:
         poor_dl_legend = []
 
+    # ── Slide 10: Handover / ENDC Setup Legend ─────────────────────────
+    endc_legend_items = []
+    if events:
+        ok_count     = sum(1 for e in events if str(e.get("endc_status") or "").lower() == "ok")
+        failed_count = sum(1 for e in events if str(e.get("endc_status") or "").lower() == "failed")
+        other_count  = len(events) - ok_count - failed_count
+        total_endc   = ok_count + failed_count
+        if total_endc > 0:
+            ok_p   = (ok_count / total_endc * 100.0)
+            fail_p = (failed_count / total_endc * 100.0)
+            endc_legend_items.append({
+                "text": f"ENDC Setup OK ({ok_count}) {ok_p:.1f}%",
+                "color": "#22c55e",
+                "count": ok_count,
+                "pct": ok_p,
+            })
+            endc_legend_items.append({
+                "text": f"ENDC Setup Failed ({failed_count}) {fail_p:.1f}%",
+                "color": "#ef4444",
+                "count": failed_count,
+                "pct": fail_p,
+            })
+        if other_count > 0:
+            other_p = (other_count / len(events) * 100.0)
+            endc_legend_items.append({
+                "text": f"Handover ({other_count}) {other_p:.1f}%",
+                "color": "#ef4444",
+                "count": other_count,
+                "pct": other_p,
+            })
+
     slide_legend_map = {
         5:  ("", tech_legend_items),
         6:  ("", rsrp_5g_legend),
         7:  ("", sinr_5g_legend),
         8:  ("", ca_legend_items),
         9:  ("", dl_5g_legend),
+        10: ("", endc_legend_items),
         12: ("", rsrp_4g_1800_legend),
         15: ("", sinr_4g_legend),
         16: ("", ca_4g_legend_items),
@@ -1932,7 +2129,7 @@ def generate_ppt_for_project(
     empty_slide_checks = [
         (8,  not _5g_ca_has_data),
         (9,  not _5g_dl_has_data),
-        (10, True),  # Always remove static template legend from Slide 10
+        (10, not has_handover or not endc_legend_items),  # Remove template legend only if no handover/endc data
         (11, not has_4g_l700),
         (12, not has_4g_l1800),
         (13, not has_4g_l2100),
@@ -1971,10 +2168,11 @@ def generate_ppt_for_project(
                     ej_5g_records.append(ej)
         df_ej_5g = pd.DataFrame(ej_5g_records) if ej_5g_records else df_ej
 
-        # Build 4G-specific extra_json DataFrame for LTE metrics
+        # Build 4G-specific extra_json DataFrame for LTE metrics (using df_lte to include LTE Anchor in NSA sessions)
+        df_lte_target = df_lte if (df_lte is not None and not df_lte.empty) else df_4g
         ej_4g_records = []
-        if not df_4g.empty and "extra_json" in df_4g.columns:
-            for ej in df_4g["extra_json"]:
+        if not df_lte_target.empty and "extra_json" in df_lte_target.columns:
+            for ej in df_lte_target["extra_json"]:
                 if ej and isinstance(ej, str) and ej.strip():
                     try:
                         ej_4g_records.append(json.loads(ej))
@@ -1985,17 +2183,10 @@ def generate_ppt_for_project(
         df_ej_4g = pd.DataFrame(ej_4g_records) if ej_4g_records else pd.DataFrame()
 
         # ── Slide 3 Table 0 (5G Summary) ─────────────────────────────────
-        # 5G Ratio (%)
-        if "timestamp" in report_df.columns and not df_5g.empty:
-            total_ts = report_df["timestamp"].nunique()
-            ts_5g = df_5g["timestamp"].nunique()
-            ratio_5g = (ts_5g / total_ts * 100.0) if total_ts > 0 else 100.0
-        elif len(report_df) > 0 and not df_5g.empty:
-            ratio_5g = (len(df_5g) / len(report_df) * 100.0)
-        else:
-            ratio_5g = 100.0
+        # 5G Ratio (%) - strictly matches 5G percentage in Technology legend (Slide 5)
+        ratio_5g = tech_5g_pct
         automator.update_table_row_by_key(3, 0, "5G Ratio", f"{ratio_5g:.1f}%")
-        _log("PPTX", f"Slide 3 Table 0: 5G Ratio = {ratio_5g:.1f}%")
+        _log("PPTX", f"Slide 3 Table 0: 5G Ratio = {ratio_5g:.1f}% (matched with Technology legend)")
 
         # NR PCI Count
         if not df_5g.empty and "pci" in df_5g.columns:
@@ -2109,7 +2300,17 @@ def generate_ppt_for_project(
                 _log("PPTX", f"Slide 3 Table 0: 5G MAC DL TP = {s.mean():.1f}")
 
         # ENDC Setup SR
-        automator.update_table_row_by_key(3, 0, "ENDC Setup SR", "100%")
+        if events:
+            ok_cnt = sum(1 for e in events if str(e.get("endc_status") or "").lower() == "ok")
+            fail_cnt = sum(1 for e in events if str(e.get("endc_status") or "").lower() == "failed")
+            if (ok_cnt + fail_cnt) > 0:
+                sr_val = (ok_cnt / (ok_cnt + fail_cnt) * 100.0)
+                automator.update_table_row_by_key(3, 0, "ENDC Setup SR", f"{sr_val:.0f}%")
+                _log("PPTX", f"Slide 3 Table 0: ENDC Setup SR = {sr_val:.0f}% ({ok_cnt}/{ok_cnt+fail_cnt})")
+            else:
+                automator.update_table_row_by_key(3, 0, "ENDC Setup SR", "100%")
+        else:
+            automator.update_table_row_by_key(3, 0, "ENDC Setup SR", "100%")
 
         # ── Slide 3 Table 1 (4G Summary) ─────────────────────────────────
         if locked_bands:
@@ -2117,57 +2318,70 @@ def generate_ppt_for_project(
             automator.update_table_row_by_key(3, 1, "Test Result", f"FET (Lock {lock_str})")
 
         # LTE PCI Count
-        if not df_4g.empty and "pci" in df_4g.columns:
-            lte_pcis = df_4g["pci"].dropna().astype(str).str.strip()
+        if not df_lte_target.empty and "pci" in df_lte_target.columns:
+            lte_pcis = df_lte_target["pci"].dropna().astype(str).str.strip()
             lte_pcis = lte_pcis[~lte_pcis.isin(["", "0", "-1", "null", "None"])]
             if not lte_pcis.empty:
                 automator.update_table_row_by_key(3, 1, "LTE PCI Count", f"{lte_pcis.nunique()}")
                 _log("PPTX", f"Slide 3 Table 1: LTE PCI Count = {lte_pcis.nunique()}")
 
         # 4G RSRP average
-        if not df_4g.empty and "rsrp" in df_4g.columns:
-            s = pd.to_numeric(df_4g["rsrp"], errors="coerce").dropna()
+        if not df_lte_target.empty and "rsrp" in df_lte_target.columns:
+            s = pd.to_numeric(df_lte_target["rsrp"], errors="coerce").dropna()
             if not s.empty:
                 automator.update_table_row_by_key(3, 1, "4G RSRP average", f"{s.mean():.1f}")
                 _log("PPTX", f"Slide 3 Table 1: 4G RSRP average = {s.mean():.1f}")
 
         # 4G RSRQ average
-        if not df_4g.empty and "rsrq" in df_4g.columns:
-            s = pd.to_numeric(df_4g["rsrq"], errors="coerce").dropna()
+        if not df_lte_target.empty and "rsrq" in df_lte_target.columns:
+            s = pd.to_numeric(df_lte_target["rsrq"], errors="coerce").dropna()
             if not s.empty:
                 automator.update_table_row_by_key(3, 1, "4G RSRQ average", f"{s.mean():.1f}")
                 _log("PPTX", f"Slide 3 Table 1: 4G RSRQ average = {s.mean():.1f}")
 
         # 4G SINR average
-        if not df_4g.empty and "sinr" in df_4g.columns:
-            s = pd.to_numeric(df_4g["sinr"], errors="coerce").dropna()
+        if not df_lte_target.empty and "sinr" in df_lte_target.columns:
+            s = pd.to_numeric(df_lte_target["sinr"], errors="coerce").dropna()
             if not s.empty:
                 automator.update_table_row_by_key(3, 1, "4G SINR average", f"{s.mean():.1f}")
                 _log("PPTX", f"Slide 3 Table 1: 4G SINR average = {s.mean():.1f}")
 
         # 4G CQI WB DL
-        if not df_4g.empty and "cqi" in df_4g.columns:
-            s = pd.to_numeric(df_4g["cqi"], errors="coerce").dropna()
+        if not df_lte_target.empty and "cqi" in df_lte_target.columns:
+            s = pd.to_numeric(df_lte_target["cqi"], errors="coerce").dropna()
             if not s.empty:
                 automator.update_table_row_by_key(3, 1, "4G CQI WB DL", f"{s.mean():.1f}")
                 _log("PPTX", f"Slide 3 Table 1: 4G CQI WB DL = {s.mean():.1f}")
 
         # LTE Carrier Num (2CA, 3CA, 4CA, 5CA) — strictly 4G LTE samples
-        ca_col = None
-        if not df_ej_4g.empty:
-            for col_cand in ["ca_cc", "ca_cc_count"]:
+        total_ca = len(df_lte_target) if not df_lte_target.empty else (len(ca_cc_df) if ca_cc_df is not None and not ca_cc_df.empty else len(df_ej_4g))
+        c_2ca, c_3ca, c_4ca, c_5ca = 0, 0, 0, 0
+        has_ca_data = False
+
+        if ca_cc_df is not None and not ca_cc_df.empty and "__ca_label" in ca_cc_df.columns:
+            has_ca_data = True
+            c_2ca = int((ca_cc_df["__ca_label"] == "2").sum())
+            c_3ca = int((ca_cc_df["__ca_label"] == "3").sum())
+            c_4ca = int((ca_cc_df["__ca_label"] == "4").sum())
+            c_5ca = int((pd.to_numeric(ca_cc_df["__ca_label"], errors="coerce") >= 5).sum())
+        elif not df_ej_4g.empty:
+            for col_cand in ["ca_count", "ca_cc_count", "ca_cc"]:
                 if col_cand in df_ej_4g.columns:
-                    ca_col = col_cand
-                    break
-        if ca_col and not df_ej_4g.empty:
-            s_ca = pd.to_numeric(df_ej_4g[ca_col], errors="coerce").dropna()
-            total_ca = len(df_4g) if not df_4g.empty else len(df_ej_4g)
-            if total_ca > 0:
-                automator.update_table_row_by_key(3, 1, "2CA", f"{(s_ca == 2).sum() / total_ca * 100.0:.0f}%")
-                automator.update_table_row_by_key(3, 1, "3CA", f"{(s_ca == 3).sum() / total_ca * 100.0:.0f}%")
-                automator.update_table_row_by_key(3, 1, "4CA", f"{(s_ca == 4).sum() / total_ca * 100.0:.0f}%")
-                automator.update_table_row_by_key(3, 1, "5CA", f"{(s_ca >= 5).sum() / total_ca * 100.0:.0f}%")
-                _log("PPTX", f"Slide 3 Table 1: 2CA = {(s_ca == 2).sum() / total_ca * 100.0:.0f}% (from {ca_col})")
+                    s_ca = pd.to_numeric(df_ej_4g[col_cand], errors="coerce").dropna()
+                    if not s_ca.empty and (s_ca >= 2).any():
+                        has_ca_data = True
+                        c_2ca = int((s_ca == 2).sum())
+                        c_3ca = int((s_ca == 3).sum())
+                        c_4ca = int((s_ca == 4).sum())
+                        c_5ca = int((s_ca >= 5).sum())
+                        break
+
+        if has_ca_data and total_ca > 0:
+            automator.update_table_row_by_key(3, 1, "2CA", f"{c_2ca / total_ca * 100.0:.0f}%")
+            automator.update_table_row_by_key(3, 1, "3CA", f"{c_3ca / total_ca * 100.0:.0f}%")
+            automator.update_table_row_by_key(3, 1, "4CA", f"{c_4ca / total_ca * 100.0:.0f}%")
+            automator.update_table_row_by_key(3, 1, "5CA", f"{c_5ca / total_ca * 100.0:.0f}%")
+            _log("PPTX", f"Slide 3 Table 1: 2CA = {c_2ca / total_ca * 100.0:.0f}% ({c_2ca}/{total_ca}), 3CA = {c_3ca / total_ca * 100.0:.0f}%, 4CA = {c_4ca / total_ca * 100.0:.0f}%, 5CA = {c_5ca / total_ca * 100.0:.0f}%")
         else:
             automator.update_table_row_by_key(3, 1, "2CA", "0%")
             automator.update_table_row_by_key(3, 1, "3CA", "0%")
@@ -2179,6 +2393,18 @@ def generate_ppt_for_project(
             s = pd.to_numeric(df_ej_4g["scell1_rb"], errors="coerce").dropna()
             if not s.empty:
                 automator.update_table_row_by_key(3, 1, "4G RB Num DL", f"{s.mean():.1f}")
+                _log("PPTX", f"Slide 3 Table 1: 4G RB Num DL = {s.mean():.1f}")
+
+        # 4G TX Power
+        if not df_ej_4g.empty:
+            for tx_col in ["pusch_tx", "pucch_tx_dbm", "ul_tx"]:
+                if tx_col in df_ej_4g.columns:
+                    cleaned = df_ej_4g[tx_col].astype(str).str.replace(" dBm", "", case=False)
+                    s = pd.to_numeric(cleaned, errors="coerce").dropna()
+                    if not s.empty:
+                        automator.update_table_row_by_key(3, 1, "4G TX Power", f"{s.mean():.1f}")
+                        _log("PPTX", f"Slide 3 Table 1: 4G TX Power ({tx_col}) = {s.mean():.1f}")
+                        break
 
         # 4G MAC DL TP
         if not df_ej_4g.empty and "lte_mac_dl_mbps" in df_ej_4g.columns:
@@ -2186,8 +2412,8 @@ def generate_ppt_for_project(
             if not s.empty:
                 automator.update_table_row_by_key(3, 1, "4G MAC DL TP", f"{s.mean():.1f}")
                 _log("PPTX", f"Slide 3 Table 1: 4G MAC DL TP = {s.mean():.1f}")
-        elif not df_4g.empty and "__lte_mac_dl" in df_4g.columns:
-            s = pd.to_numeric(df_4g["__lte_mac_dl"], errors="coerce").dropna()
+        elif not df_lte_target.empty and "__lte_mac_dl" in df_lte_target.columns:
+            s = pd.to_numeric(df_lte_target["__lte_mac_dl"], errors="coerce").dropna()
             if not s.empty:
                 automator.update_table_row_by_key(3, 1, "4G MAC DL TP", f"{s.mean():.1f}")
                 _log("PPTX", f"Slide 3 Table 1: 4G MAC DL TP = {s.mean():.1f}")
@@ -2201,8 +2427,23 @@ def generate_ppt_for_project(
 
         # ── Slide 4 Table 0 (NR NonCA vs NR CA) ──────────────────────────
         try:
-            automator.update_table_cell(4, 0, 6, 2, "100.0%")
-            automator.update_table_cell(4, 0, 6, 3, "0.0%")
+            if nr_ca_df is not None and not nr_ca_df.empty and "__nr_ca_label" in nr_ca_df.columns:
+                labels = pd.to_numeric(nr_ca_df["__nr_ca_label"], errors="coerce").dropna()
+                tot_nr = len(labels)
+                c_non_ca = int((labels == 1).sum())
+                c_ca = int((labels >= 2).sum())
+                if tot_nr > 0:
+                    non_ca_p = (c_non_ca / tot_nr * 100.0)
+                    ca_p = (c_ca / tot_nr * 100.0)
+                    automator.update_table_cell(4, 0, 6, 2, f"{non_ca_p:.1f}%")
+                    automator.update_table_cell(4, 0, 6, 3, f"{ca_p:.1f}%")
+                else:
+                    automator.update_table_cell(4, 0, 6, 2, "100.0%")
+                    automator.update_table_cell(4, 0, 6, 3, "0.0%")
+            else:
+                automator.update_table_cell(4, 0, 6, 2, "100.0%")
+                automator.update_table_cell(4, 0, 6, 3, "0.0%")
+
             if not df_ej_5g.empty and "nr_mac_dl_mbps" in df_ej_5g.columns:
                 s = pd.to_numeric(df_ej_5g["nr_mac_dl_mbps"], errors="coerce").dropna()
                 if not s.empty:
@@ -2210,7 +2451,7 @@ def generate_ppt_for_project(
             automator.update_table_cell(4, 0, 4, 3, "0.0")
             automator.update_table_cell(4, 0, 4, 4, "0.0")
             automator.update_table_cell(4, 0, 5, 3, "0.0")
-            _log("PPTX", "Slide 4: Non-NR CA vs NR CA summary table updated (NonCA: 100%, NR CA: 0%, combined CA DL: 0.0)")
+            _log("PPTX", "Slide 4: Non-NR CA vs NR CA summary table updated")
         except Exception as e:
             _log("PPTX", f"Slide 4: Warning updating table: {e}")
 
