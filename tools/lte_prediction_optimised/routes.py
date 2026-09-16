@@ -34,11 +34,27 @@ def run_optimized():
     data = request.get_json()
 
     # Removed "region" from here so it doesn't crash if missing
-    required_fields = ["project_id", "radius", "grid_resolution","operator"]
+    # ``radius`` remains required as the safety-floor/fallback extent.  H-Cell
+    # requests additionally carry an RSRP edge and are interpreted by the
+    # manual engine per cell, rather than as one shared circle.
+    required_fields = ["project_id", "radius", "grid_resolution", "operator"]
 
     for field in required_fields:
         if field not in data:
             return jsonify({"error": f"{field} is required"}), 400
+
+    scope = str(data.get("prediction_scope", "radius")).strip().lower()
+    if scope not in {"radius", "hcell"}:
+        return jsonify({"error": "prediction_scope must be 'radius' or 'hcell'"}), 400
+    data["prediction_scope"] = scope
+    if scope == "hcell":
+        try:
+            edge = float(data.get("cell_edge_rsrp_dbm", -110.0))
+        except (TypeError, ValueError):
+            return jsonify({"error": "cell_edge_rsrp_dbm must be numeric for H Cell"}), 400
+        if not -160.0 <= edge <= -40.0:
+            return jsonify({"error": "cell_edge_rsrp_dbm must be between -160 and -40 dBm"}), 400
+        data["cell_edge_rsrp_dbm"] = edge
 
     data["region"] = _resolve_region(data)
 

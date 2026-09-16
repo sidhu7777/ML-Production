@@ -1,96 +1,109 @@
 """
-Build a synthetic sector-swap test case on top of REAL data.
+Synthetic sector swaps on REAL data -- the ground truth the detector is scored against.
 
-Why synthetic injection is needed here at all: a prior check (real bearing +
-dominant-PCI analysis against project 193's actual DT data, on all 6
-candidate sites) found NO confirmed real sector-swap case -- the sites with
-enough data all matched their configured azimuth->PCI mapping. To validate
-that the detector actually fires on a real swap (a true-positive test, not
-just a true-negative one), we need at least one confirmed case. Rather than
-fabricate physics, we follow the SAME convention already established in
-this codebase for PCI-optimization synthetic testing
-(tests/Pci_optimization/pci_map_dashboard.py:
- inject_synthetic_mod_conflict / inject_synthetic_group_conflict /
- inject_synthetic_collision_confusion): keep everything real (site
- location, azimuth, cell_id, and every DT/RSRP/HO sample) and fabricate
- ONLY the single fact under test -- here, which PCI value a sector's
- config row reports -- exactly mimicking a real wiring/port-swap mistake
- where the physical antenna (fixed lat/lon/azimuth/cell hardware) ends up
- broadcasting a different PCI than intended. Rows are flagged
- is_synthetic=True / site_source_table="synthetic", same as that module,
- so synthetic rows can never be mistaken for real ones downstream.
+No confirmed real swap exists in project 193, so swaps are injected into the CONFIG only: whole
+antenna endpoints (azimuth + electrical / mechanical tilt + antenna model / port) are exchanged
+between sectors of ONE carrier group (same site + operator + technology + EARFCN). This tests
+recovery of crossed configurations, not every physical effect of a feeder swap. Every RSRP
+measurement in measurements.csv stays 100% real.
 
-Only run on the 3 sites from data/site_config.csv that survived
-production's own site-identity filter (site+cell_id+sector+band+operator,
-tools/pci_optimization/engine.py) with a COMPLETE 3-sector config --
-2019, 358, 420162. (1.82, 2012, 430493 were left with 1-2 sectors after
-that filter and are excluded from permutation-style testing here.)
+Eligible group: >= 2 sectors, with at least one pair of sectors whose azimuths are
+>= MIN_AZIMUTH_GAP_DEG apart (a swap between antennas pointing the same way is invisible).
 
-For each of those 3 sites, 2 of its 3 sectors have their `site_pci` values
-exchanged (azimuth/cell_id/lat/lon untouched -- that IS the swap); the
-third sector is left untouched as a normal control. DT samples and HO
-events are NOT touched at all -- they stay exactly as fetched by
-fetch_data.py, so the "observed" side of any future comparison is 100%
-real network behavior.
+Every eligible group first gets a small random azimuth error (+-AZIMUTH_JITTER_DEG per sector),
+because a real config is never exact. Without it, an untouched control would be identical to the
+real config and could never produce a false alarm, so the false-alarm number would be meaningless.
+Then half of the eligible groups (seeded, reproducible) also get a swap; the other half are the
+controls ("azimuths slightly off, but no swap" -- the detector must NOT call a swap there).
+Swap types: 2-sector swap, and 3-sector rotation (groups with a suitable third sector).
 
-Run from the ML/ directory:
+Output: data/cells_synthetic.csv = cells.csv with the test endpoints, plus true_azimuth (the real
+config value), ground_truth (SWAPPED / CONTROL / NOT_ELIGIBLE) and swap_type.
+
+Run from the ML/ directory (after build_dataset.py):
     venv\\Scripts\\python.exe -m tests.swap_sector.make_synthetic_swap
 """
 from __future__ import annotations
 
+from itertools import combinations
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 
 DATA_DIR = Path(__file__).resolve().parent / "data"
 
-# (site_id, cell_id_of_row_A, cell_id_of_row_B) -- PCIs of A and B get swapped.
-SWAP_PLAN = [
-    ("358", "358_6", "358_7"),
-    ("2019", "2019_8", "2019_1"),
-    ("420162", "420162_2", "420162_3"),
-]
+MIN_AZIMUTH_GAP_DEG = 60.0
+AZIMUTH_JITTER_DEG = 15.0
+INJECT_SHARE = 0.5
+RANDOM_SEED = 42
+# Everything that belongs to the physical antenna endpoint moves together; the PCI stays.
+ENDPOINT_COLUMNS = ("azimuth", "e_tilt", "m_tilt", "antenna_model", "pattern_port")
+
+
+def gap_deg(a: float, b: float) -> float:
+    return abs((a - b + 180.0) % 360.0 - 180.0)
+
+
+def exchange_endpoints(cells: pd.DataFrame, targets: list, sources: list) -> None:
+    """cells.loc[targets] receive the antenna endpoints currently on cells.loc[sources] (in place)."""
+    columns = [c for c in ENDPOINT_COLUMNS if c in cells.columns]
+    cells.loc[targets, columns] = cells.loc[sources, columns].to_numpy()
+
+
+def inject_swaps(cells: pd.DataFrame, seed: int = RANDOM_SEED) -> pd.DataFrame:
+    cells = cells.copy()
+    for column in ENDPOINT_COLUMNS[1:]:
+        if column in cells.columns:
+            cells[column] = cells[column].astype(object)
+    cells["true_azimuth"] = cells["azimuth"]
+    cells["ground_truth"] = "NOT_ELIGIBLE"
+    cells["swap_type"] = ""
+
+    eligible = []
+    for group_id, group in cells.groupby("group_id"):
+        az = group["azimuth"]
+        pairs = [(a, b) for a, b in combinations(group.index, 2) if gap_deg(az[a], az[b]) >= MIN_AZIMUTH_GAP_DEG]
+        triples = [
+            t for t in combinations(group.index, 3)
+            if all(gap_deg(az[a], az[b]) >= MIN_AZIMUTH_GAP_DEG for a, b in combinations(t, 2))
+        ]
+        if pairs:
+            eligible.append((group_id, pairs, triples))
+
+    rng = np.random.default_rng(seed)
+    order = rng.permutation(len(eligible))
+    n_inject = int(round(len(eligible) * INJECT_SHARE))
+    for rank, k in enumerate(order):
+        group_id, pairs, triples = eligible[k]
+        members = cells.index[cells["group_id"] == group_id]
+        jitter = rng.uniform(-AZIMUTH_JITTER_DEG, AZIMUTH_JITTER_DEG, len(members))
+        cells.loc[members, "azimuth"] = ((cells.loc[members, "true_azimuth"] + jitter) % 360.0).round(1)
+        if rank >= n_inject:
+            cells.loc[members, "ground_truth"] = "CONTROL"
+            continue
+        if triples and rng.random() < 0.5:
+            a, b, c = triples[rng.integers(len(triples))]
+            exchange_endpoints(cells, [a, b, c], [b, c, a])
+            swap_type = "3-sector rotation"
+        else:
+            a, b = pairs[rng.integers(len(pairs))]
+            exchange_endpoints(cells, [a, b], [b, a])
+            swap_type = "2-sector swap"
+        cells.loc[members, "ground_truth"] = "SWAPPED"
+        cells.loc[members, "swap_type"] = swap_type
+    return cells
 
 
 def main() -> None:
-    site_df = pd.read_csv(DATA_DIR / "site_config.csv")
-    site_df["is_synthetic"] = False
-    site_df["swap_group_id"] = pd.NA
-    site_df["ground_truth_swapped"] = False
-    site_df["ground_truth_original_pci"] = pd.NA
-
-    for group_id, (site_id, cell_a, cell_b) in enumerate(SWAP_PLAN, start=1):
-        idx_a = site_df.index[site_df["site_cell_id_representative"] == cell_a]
-        idx_b = site_df.index[site_df["site_cell_id_representative"] == cell_b]
-        if len(idx_a) != 1 or len(idx_b) != 1:
-            raise ValueError(f"Expected exactly one row each for {cell_a}/{cell_b}, got {len(idx_a)}/{len(idx_b)}")
-        ia, ib = idx_a[0], idx_b[0]
-
-        pci_a, pci_b = site_df.at[ia, "site_pci"], site_df.at[ib, "site_pci"]
-        az_a, az_b = site_df.at[ia, "site_azimuth_deg"], site_df.at[ib, "site_azimuth_deg"]
-
-        site_df.at[ia, "ground_truth_original_pci"] = pci_a
-        site_df.at[ib, "ground_truth_original_pci"] = pci_b
-        site_df.at[ia, "site_pci"] = pci_b
-        site_df.at[ib, "site_pci"] = pci_a
-
-        for i in (ia, ib):
-            site_df.at[i, "is_synthetic"] = True
-            site_df.at[i, "swap_group_id"] = group_id
-            site_df.at[i, "ground_truth_swapped"] = True
-            site_df.at[i, "site_source_table"] = "synthetic"
-
-        print(
-            f"[swap {group_id}] site {site_id}: {cell_a} (azimuth {az_a}) "
-            f"PCI {pci_a}->{pci_b}  |  {cell_b} (azimuth {az_b}) PCI {pci_b}->{pci_a}"
-        )
-
-    out_path = DATA_DIR / "synthetic_swap_site_config.csv"
-    site_df.to_csv(out_path, index=False)
-    n_swapped = int(site_df["ground_truth_swapped"].sum())
-    n_normal = int((~site_df["ground_truth_swapped"]).sum())
-    print(f"\nSaved {out_path.name}: {n_swapped} synthetic-swapped sector rows, {n_normal} untouched (real/normal) rows")
-    print("DT samples (dt_samples_6sites.csv) and HO events (ho_events_6sites.csv) are unchanged -- still 100% real.")
+    cells = inject_swaps(pd.read_csv(DATA_DIR / "cells.csv", dtype={"site_id": str}))
+    cells.to_csv(DATA_DIR / "cells_synthetic.csv", index=False)
+    groups = cells.groupby("group_id").agg(ground_truth=("ground_truth", "first"), swap_type=("swap_type", "first"))
+    print(f"[synthetic] groups: {len(groups)} | eligible: {int((groups['ground_truth'] != 'NOT_ELIGIBLE').sum())}")
+    print(groups["ground_truth"].value_counts().to_string())
+    print(groups.loc[groups["ground_truth"] == "SWAPPED", "swap_type"].value_counts().to_string())
+    print(f"Whole antenna endpoints exchanged; every eligible carrier also has azimuth errors of up to "
+          f"+-{AZIMUTH_JITTER_DEG:.0f} deg. Measurements are unchanged -- still 100% real.")
 
 
 if __name__ == "__main__":

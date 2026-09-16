@@ -22,6 +22,7 @@ from ..lte_prediction_offset.services import (
     _haversine_m as _offset_haversine_m,
     _prepare_site_rows as _offset_prepare_site_rows,
     _site_record as _offset_site_record,
+    _cell_edge_radius_m as _offset_cell_edge_radius_m,
 )
 from ..lte_prediction_offset.phase27_calibration import add_features as _offset_add_features
 from ..lte_prediction_offset.phase27_physical import score_candidates as _offset_score_candidates
@@ -1321,7 +1322,29 @@ def _build_change_mask(site_df):
             continue
         before = pd.to_numeric(site_df[orig_col], errors="coerce").fillna(-999999.0)
         after = pd.to_numeric(site_df[col], errors="coerce").fillna(-999999.0)
-        changed_mask = changed_mask | (~np.isclose(before, after, equal_nan=True))
+        # rtol=0 deliberately. np.isclose defaults to rtol=1e-05, which scales
+        # the tolerance with the magnitude of the value - and lat/lon are large
+        # numbers. At Taiwan's latitude that made the tolerance 0.00025 deg of
+        # latitude (~28 m) and 0.0012 deg of longitude (~123 m), so a real site
+        # relocation of 10-20 m compared EQUAL and the whole optimisation run
+        # was rejected as "no effective change". Absolute tolerance only: 1e-7
+        # deg is ~1 cm, far below any edit a user can make, and the same
+        # threshold is safe for degrees, metres, dBm and MHz alike.
+        changed_mask = changed_mask | (
+            ~np.isclose(before, after, rtol=0.0, atol=1e-7, equal_nan=True)
+        )
+
+    # The row itself records that a user saved an optimisation. That record is
+    # authoritative - re-deriving "did anything change?" from float comparison
+    # can only lose information, and did. An edit that stores the same numbers
+    # is still an edit the user made, and must not cancel their run.
+    for flag_col, truthy in (("is_updated", {"1", "true", "yes"}), ("optimization_applied", {"1", "true", "yes"})):
+        if flag_col in site_df.columns:
+            flag = site_df[flag_col].astype(str).str.strip().str.lower()
+            changed_mask = changed_mask | flag.isin(truthy)
+    if "status" in site_df.columns:
+        status = site_df["status"].astype(str).str.strip().str.lower()
+        changed_mask = changed_mask | status.eq("updated")
     return changed_mask
 
 
@@ -1486,8 +1509,27 @@ def _compute_affected_cells(
     site_work["_scope_technology"] = _technology_series(site_work)
     changed_mask = _build_change_mask(site_work)
     changed_rows = site_work.loc[changed_mask].copy()
+    if changed_rows.empty and "optimization_applied" in site_work.columns:
+        # An optimisation row was overlaid onto these sites but no field-level
+        # difference was detected. The overlay is proof the user saved something
+        # for these cells, so recompute them rather than aborting: cancelling a
+        # run because a comparison found the values equal throws away work the
+        # user explicitly asked for, and is unrecoverable from the UI.
+        applied = site_work["optimization_applied"].fillna(False).astype(bool)
+        if applied.any():
+            changed_rows = site_work.loc[applied].copy()
+            print(
+                f"[LTE_OPT][CHANGE_DETECT] field_diff_rows=0 "
+                f"falling_back_to_overlaid_rows={len(changed_rows)} "
+                f"reason=optimization_applied_but_values_identical",
+                flush=True,
+            )
     if changed_rows.empty:
-        raise ValueError("No effective optimized site change detected")
+        raise ValueError(
+            "No optimized site rows resolved for this scenario. The scenario has no rows that "
+            "match the project's current sites - check site_prediction_optimized for this "
+            "project/scenario and that its cell identity matches site_prediction."
+        )
 
     changed_cell_ids = sorted(changed_rows[identity_col].astype(str).unique().tolist())
     changed_technologies = sorted(changed_rows["_scope_technology"].astype(str).unique().tolist())
@@ -1805,7 +1847,35 @@ def _baseline_points_for_cells(baseline_df: pd.DataFrame, cell_ids) -> pd.DataFr
 
 
 def _generated_points_for_cell(site_rows: pd.DataFrame, cid: str, params: dict) -> pd.DataFrame:
-    pts = generate_grid(site_rows, params.get("radius", 500), params.get("grid_resolution", 10))
+    radius_m = float(params.get("radius", 500))
+    if str(params.get("prediction_scope", "radius")).lower() == "hcell":
+        edge_dbm = float(params.get("cell_edge_rsrp_dbm", -110.0))
+        # Use the same link-budget inversion as the baseline H-Cell path.  A
+        # manual optimisation may change power/height/tilt, so its footprint
+        # must be regenerated from the modified cell, not reused from a stale
+        # fixed-radius circle.
+        solved = []
+        # The optimized-table schema does not always carry production's
+        # technology_key/deployed-frequency fields. Normalize it first so n78
+        # gets the 5G link budget rather than falling back to the 4G default.
+        link_budget_rows = _offset_ready_site_df(
+            site_rows, str(params.get("region", "india")).lower()
+        )
+        for _, row in link_budget_rows.iterrows():
+            try:
+                value = _offset_cell_edge_radius_m(row, edge_dbm)
+            except (KeyError, TypeError, ValueError, OverflowError):
+                value = None
+            if value is not None and np.isfinite(value) and value > 0.0:
+                solved.append(float(value))
+        if solved:
+            radius_m = max(float(params.get("radius", 100)), max(solved))
+        print(
+            f"[LTE_OPT][HCELL_RADIUS] cell={cid} edge_dbm={edge_dbm:.1f} "
+            f"solved_radius_m={radius_m:.1f} source=modified_link_budget",
+            flush=True,
+        )
+    pts = generate_grid(site_rows, radius_m, params.get("grid_resolution", 10))
     if pts.empty:
         return pts
     pts = pts.copy()
@@ -1839,19 +1909,33 @@ def _location_change_summary(site_rows: pd.DataFrame) -> tuple[bool, float, floa
     return moved_m > 1.0, moved_m, old_lat, old_lon, new_lat, new_lon
 
 
-def _local_project_dem_candidate(project_id, region) -> str | None:
-    if int(project_id or 0) != 210 and str(region).lower() != "taiwan":
+def _local_project_dem_candidate(project_id, region, site_df=None) -> str | None:
+    """Resolve this project's terrain DEM, exactly as the baseline pipeline does.
+
+    This used to be a hardcoded lookup for project 210 under ML_ROOT/tests. That
+    directory only exists in a developer checkout - once the backend is frozen
+    ML_ROOT points inside _internal and the path is gone - so in production it
+    returned None, score_candidates was called with allow_auto_dem=False, and
+    the manual optimisation ran with terrain entirely disabled
+    ("PHASE26_DEM enabled=False ... dem_disabled") while the baseline it is
+    compared against had terrain applied. Delegating to the shared resolver
+    keeps both sides on the same DEM.
+    """
+    from ..lte_prediction_offset.services import resolve_project_dem
+
+    try:
+        path, _band = resolve_project_dem(
+            project_id=int(project_id or 0),
+            region=str(region).lower(),
+            site_df=site_df if site_df is not None else pd.DataFrame(),
+        )
+        return str(path)
+    except Exception as exc:
+        print(f"[LTE_OPT][PHASE26_CONTEXT] dem_unresolved reason={exc}", flush=True)
         return None
-    mapdata_root = ML_ROOT / "tests" / "new-project" / "data" / "mapdata"
-    if not mapdata_root.exists():
-        return None
-    for path in sorted(mapdata_root.rglob("height_5m.grd")):
-        if path.is_file():
-            return str(path)
-    return None
 
 
-def _manual_physical_context(params: dict) -> tuple[pd.DataFrame, str | None, dict]:
+def _manual_physical_context(params: dict, site_df: pd.DataFrame | None = None) -> tuple[pd.DataFrame, str | None, dict]:
     building_df = params.get("building_df")
     if not isinstance(building_df, pd.DataFrame):
         building_df = pd.DataFrame()
@@ -1876,6 +1960,7 @@ def _manual_physical_context(params: dict) -> tuple[pd.DataFrame, str | None, di
         dem_raster_path = _local_project_dem_candidate(
             params.get("project_id"),
             str(params.get("region", "india")).lower(),
+            site_df=site_df,
         )
     if dem_raster_path:
         print(f"[LTE_OPT][PHASE26_CONTEXT] dem_raster_path={dem_raster_path}", flush=True)
@@ -2234,7 +2319,9 @@ def run_prediction_only_offset_manual(opt_sites, k1k2_map, params):
             f"site_scope_cells={len(site_scope_cells)}"
         )
 
-    physical_building_df, physical_dem_path, physical_clutter_by_grid = _manual_physical_context(params)
+    physical_building_df, physical_dem_path, physical_clutter_by_grid = _manual_physical_context(
+        params, site_df=scoped_work_df
+    )
     # Per-job Phase 26 cache (see _phase36_surface_for_points). Callers that
     # evaluate many candidates against the same cells (tilt coordinate search,
     # manual/recommendation optimisation) pass a dict in params and pay the
@@ -2259,7 +2346,13 @@ def run_prediction_only_offset_manual(opt_sites, k1k2_map, params):
         residual_points = _baseline_points_for_cells(baseline_df, local_cell_ids)
         location_changed, moved_m, old_lat, old_lon, new_lat, new_lon = _location_change_summary(site_rows)
         target_point_source = "baseline_prediction_points"
-        if params.get("strict_prediction_points", False):
+        hcell_scope = str(params.get("prediction_scope", "radius")).lower() == "hcell"
+        if hcell_scope:
+            # Do not reuse baseline points: those represent the pre-change
+            # footprint and cannot expand/shrink after an optimisation.
+            target_points = _generated_points_for_cell(site_rows, cid, params)
+            target_point_source = "generated_hcell_link_budget"
+        elif params.get("strict_prediction_points", False):
             target_points = _baseline_points_for_cells(baseline_df, [cid])
             if target_points.empty:
                 print(f"[LTE_OPT][OFFSET_MANUAL] cell={cid} skipped_reason=no_baseline_points", flush=True)

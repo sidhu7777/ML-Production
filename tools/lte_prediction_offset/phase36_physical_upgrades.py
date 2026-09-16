@@ -41,7 +41,11 @@ _DEFAULT_BORESIGHT_DBI = {
 # LTE resource blocks by channel bandwidth (MHz).  NR n78 100 MHz / SCS 30 kHz = 273.
 _RB_BY_BW_MHZ = {1.4: 6, 3: 15, 5: 25, 10: 50, 15: 75, 20: 100, 100: 273}
 _DEFAULT_N_RB = {"4G": 50, "5G": 273}
-ANTENNA_DELTA_CLIP_DB = (-15.0, 12.0)
+# The production RF core already contains the generic 3GPP gain. To apply the
+# PAP absolutely, add the exact PAP-minus-generic difference with no artificial
+# bound; this is algebraically identical to replacing generic gain by PAP gain.
+ANTENNA_DELTA_CLIP_DB = None
+ANTENNA_PATTERN_SUBSTITUTION_CLIP_DB = None
 
 
 def n_rb_for(technology: str, bandwidth_mhz: float | None) -> int:
@@ -76,31 +80,46 @@ def apply_reference_and_water(
     pattern_lookup=None,
 ) -> pd.DataFrame:
     """Return `frame` with `phase36_physical_rsrp` = physical + per-RE + 5G anchor
-    + real-antenna gain delta, and the Water O2I term removed (terrain kept).
+    + real-antenna gain delta.
 
     `pattern_lookup` defaults to the Phase 36 v2 vendor patterns (CCVVPX308 4G /
     K800109221 5G); generic 3GPP only where a pattern file is missing."""
     out = frame.copy()
     tech = out["technology"].astype(str)
     bw = _bandwidth_series(out)
-    # 4G: the formulaic RSRP-per-RE term.  5G: the raw already carries the n78
-    # 2600->3300 offset; its SS-RSRP level is closed by the data anchor instead
-    # of a second formulaic term (a -35 dB per-RE term would just be undone by
-    # the anchor and leave a nonsense physical).
-    per_re = np.where(
-        tech.to_numpy() == "4G",
-        np.array([per_re_offset_db("4G", b) for b in bw], dtype=float),
-        0.0,
+    # Total carrier power -> per-resource-element level, for BOTH technologies.
+    # RSRP and SS-RSRP are both defined per RE, so the conversion is not optional
+    # for 5G. It was previously skipped on the grounds that `g5_level_anchor_db`
+    # would close the 5G level instead, but that anchor is passed as 0.0 by the
+    # production caller, so nothing closed it and 5G physical carried raw total
+    # carrier power - roughly 35 dB hot at n78's 273 RB.
+    per_re = np.array(
+        [per_re_offset_db(t, b) for t, b in zip(tech.to_numpy(), bw)], dtype=float
     )
     anchor = np.where(tech.to_numpy() == "5G", float(g5_level_anchor_db), 0.0)
 
-    # Water: undo the dominant-building / O2I loss (a negative number in
-    # building_obstruction_loss_db); keep terrain_diffraction_loss_db as-is.
-    water = out.get("clutter_class", pd.Series("", index=out.index)).astype(str).str.lower().eq("water").to_numpy()
-    o2i = pd.to_numeric(out.get("building_obstruction_loss_db", 0.0), errors="coerce").fillna(0.0).to_numpy()
-    water_addback = np.where(water, -o2i, 0.0)   # remove the O2I loss for water rows
+    # Phase 48 keeps the physical obstruction score as-is. Water is handled by
+    # calibration/clutter grouping, not by a second post-physical addback.
+    water_addback = np.zeros(len(out), dtype=float)
 
     antenna = antenna_gain_delta_details(out, pattern_lookup=pattern_lookup or default_pattern_lookup)
+
+    # Emit evidence of the pattern source actually used for this calculation.
+    # This distinguishes an applied vendor PAP from the intentional generic
+    # 3GPP fallback without changing any RF value.
+    pattern_log = pd.DataFrame({
+        "technology": tech.to_numpy(),
+        "source": antenna["phase36_antenna_source"].astype(str).to_numpy(),
+        "file": antenna["phase36_pap_file"].astype(str).to_numpy(),
+    })
+    for (technology, source), group in pattern_log.groupby(["technology", "source"], dropna=False):
+        files = sorted({value for value in group["file"] if value})
+        detail = f" files={files}" if files else ""
+        print(
+            f"[LTE_OFFSET][PHASE36_ANTENNA_PATTERN] technology={technology} "
+            f"source={source} rows={len(group)}{detail}",
+            flush=True,
+        )
 
     out["phase36_per_re_db"] = per_re
     out["phase36_5g_anchor_db"] = anchor
@@ -120,7 +139,13 @@ def apply_reference_and_water(
 # --------------------------------------------------------------------------- antenna
 def _generic_3gpp_gain(az_off_deg: np.ndarray, elev_diff_deg: np.ndarray,
                        max_gain: float = 18.0, h_bw: float = 65.0, v_bw: float = 6.0,
-                       a_max: float = 30.0, sla_v: float = 30.0) -> np.ndarray:
+                       a_max: float = 30.0, sla_v: float = 20.0) -> np.ndarray:
+    """Must stay identical to Sector_wise_prediction_code_copy's
+    compute_3gpp_antenna_gain_vectorized. `raw_cost231_rsrp` already contains
+    that generic pattern, and the Phase 36 delta subtracts this one to replace
+    it with the measured PAP pattern. Any difference between the two - sla_v
+    was 30 here against 20 there - leaves a residue of the generic pattern in
+    the result instead of cancelling it."""
     az_off = np.abs(np.asarray(az_off_deg, dtype=float))
     a_h = -np.minimum(12.0 * (az_off / h_bw) ** 2, a_max)
     a_v = -np.minimum(12.0 * (np.asarray(elev_diff_deg, dtype=float) / v_bw) ** 2, sla_v)
@@ -182,11 +207,12 @@ def antenna_gain_delta_details(
     pap_file = np.full(n, "", dtype=object)
     source = np.full(n, "generic_3gpp", dtype=object)
 
-    keys = pd.DataFrame({"m": model, "t": tech, "et": et_round})
-    for (m, t, et), grp in keys.groupby(["m", "t", "et"], sort=False):
+    freq_key = np.round(freq, 1)
+    keys = pd.DataFrame({"m": model, "t": tech, "et": et_round, "f": freq_key})
+    for (m, t, et, f), grp in keys.groupby(["m", "t", "et", "f"], sort=False):
         sel = grp.index.to_numpy()
-        median_freq = float(np.median(freq[sel]))
-        pat = pattern_lookup(m, median_freq, int(et), t)
+        lookup_freq = float(f)
+        pat = pattern_lookup(m, lookup_freq, int(et), t)
         if pat is None:
             continue
         hs, h, vs, v, g0 = pat
@@ -198,12 +224,12 @@ def antenna_gain_delta_details(
         real[sel] = g0 + h_gain + v_gain
         source[sel] = "pap"
         resolved_tech = "5G" if (str(t) == "5G" or str(m).upper().startswith("K800")) else "4G"
-        default_path, _ = _default_pap_path(resolved_tech, median_freq, int(et))
+        default_path, _ = _default_pap_path(resolved_tech, lookup_freq, int(et))
         pap_model[sel] = str(m).strip() or ("K800109221" if resolved_tech == "5G" else "CCVVPX308")
         pap_file[sel] = str(default_path) if default_path is not None and default_path.is_file() else ""
 
     real_filled = np.where(np.isfinite(real), real, generic)
-    delta = np.clip(real_filled - generic, *ANTENNA_DELTA_CLIP_DB)
+    delta = real_filled - generic
     return pd.DataFrame(
         {
             "phase36_antenna_delta_db": delta,
@@ -266,18 +292,69 @@ def _load_pap(path_str: str):
     return _parse_pap(Path(path_str))
 
 
-def _default_pap_path(technology: str, freq_mhz: float, etilt_deg: int) -> tuple[Path | None, float]:
-    """Resolve the Phase 36 v2 default pattern file + boresight gain for a cell."""
+def _pattern_family(technology: str, freq_mhz: float) -> tuple[Path, str, tuple]:
+    """(directory, filename template with {et}, boresight key) for a cell.
+
+    Selection is by the cell's DEPLOYED frequency, never by the COST-231
+    anchor: the anchor is a propagation-model construct and says nothing about
+    which physical antenna is installed."""
     if str(technology) == "5G":
-        et = int(min(12, max(2, etilt_deg)))
-        return (PATTERN_DIR / "K800109221" / f"3300 - 3590 MHz, eTilt {et}, Y1P45 - Port1.pap",
-                _DEFAULT_BORESIGHT_DBI[("5G", "n78")])
-    et = int(min(10, max(0, etilt_deg)))
+        return (PATTERN_DIR / "K800109221",
+                "3300 - 3590 MHz, eTilt {et}, Y1P45 - Port1.pap", ("5G", "n78"))
     if round(float(freq_mhz), 1) <= 1000.0:
-        return (PATTERN_DIR / "CCVVPX308" / f"698 - 806 MHz, T {et}, eAz 0, eBw 0, Port 1 +45.pap",
-                _DEFAULT_BORESIGHT_DBI[("4G", "low")])
-    return (PATTERN_DIR / "CCVVPX308" / f"1710 - 1880 MHz, T {et}, eAz 0, eBw 0, Port 5 +45.pap",
-            _DEFAULT_BORESIGHT_DBI[("4G", "high")])
+        return (PATTERN_DIR / "CCVVPX308",
+                "698 - 806 MHz, T {et}, eAz 0, eBw 0, Port 1 +45.pap", ("4G", "low"))
+    return (PATTERN_DIR / "CCVVPX308",
+            "1710 - 1880 MHz, T {et}, eAz 0, eBw 0, Port 5 +45.pap", ("4G", "high"))
+
+
+@lru_cache(maxsize=64)
+def available_tilts(technology: str, freq_mhz: float) -> tuple[int, ...]:
+    """Electrical tilts this antenna actually ships, discovered from the files.
+
+    Returned instead of a hardcoded range so adding or removing a .pap file
+    changes the supported set with no code edit."""
+    directory, template, _ = _pattern_family(technology, freq_mhz)
+    if not directory.is_dir():
+        return ()
+    prefix, suffix = template.split("{et}")
+    found = []
+    for path in directory.glob("*.pap"):
+        name = path.name
+        if name.startswith(prefix) and name.endswith(suffix):
+            middle = name[len(prefix):len(name) - len(suffix)]
+            if middle.strip().isdigit():
+                found.append(int(middle.strip()))
+    return tuple(sorted(set(found)))
+
+
+_TILT_SNAP_LOGGED: set = set()
+
+
+def _default_pap_path(technology: str, freq_mhz: float, etilt_deg: int) -> tuple[Path | None, float]:
+    """Resolve the pattern file + boresight gain, snapping to the NEAREST tilt
+    the antenna actually offers and saying so.
+
+    The previous silent clamp (min/max into a hardcoded range) is what hid the
+    tenths-of-a-degree tilt unit error: every unconverted tilt of 20..90 landed
+    on T 10 and the run still reported success."""
+    directory, template, key = _pattern_family(technology, freq_mhz)
+    boresight = _DEFAULT_BORESIGHT_DBI[key]
+    offered = available_tilts(technology, freq_mhz)
+    if not offered:
+        return None, boresight
+    requested = int(round(float(etilt_deg)))
+    et = min(offered, key=lambda t: (abs(t - requested), t))
+    if et != requested:
+        token = (key, requested, et)
+        if token not in _TILT_SNAP_LOGGED:
+            _TILT_SNAP_LOGGED.add(token)
+            print(
+                f"[LTE_OFFSET][PHASE36_TILT_SNAP] {key[0]}/{key[1]} requested_etilt={requested} deg "
+                f"-> using nearest available {et} deg (offered={list(offered)})",
+                flush=True,
+            )
+    return directory / template.format(et=et), boresight
 
 
 def make_pattern_lookup(client_patterns: dict | None = None):

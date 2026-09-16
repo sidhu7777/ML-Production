@@ -1,31 +1,22 @@
 """
-Sector-Swap Detection — test-only validation dashboard (Streamlit).
+Sector Swap Check -- test-case dashboard (Streamlit). Reads data/*.csv only; no database.
 
-Purpose: visually validate detect_sector_swap.py's output against the data
-already fetched by fetch_data.py / make_synthetic_swap.py -- NOT a new data
-path. Everything here reads the local CSV snapshots in tests/swap_sector/data/
-(no DB connection, no production writes), the same "local snapshot" pattern
-tests/Pci_optimization/pci_map_dashboard.py already uses for offline
-iteration. Sector-wedge geometry and the PCI color palette are reused
-directly from that dashboard so a sector reads the same visual way here as
-it does in the live app / PCI-optimization dashboard.
-
-Four things this version makes explicit (v1 buried or omitted all four):
-  1. Full per-sector identity (cell_id, sector, band, EARFCN) -- not just a
-     site-level label -- with the ".0" float-formatting bug on site ids fixed.
-  2. A legend for what the map wedges mean (solid=configured, dashed=observed).
-  3. The actual evidence behind a verdict: DT sample counts + RSRP/RSRQ/SINR
-     per PCI, a polar chart of which PCI dominates each bearing bin, and the
-     real HO transition events plotted on the map -- not just the final
-     summarized wedges.
-  4. An explicit CONFIGURED vs PREDICTED comparison table per sector, with a
-     clear match/mismatch column, instead of one line of red text.
+Active model: antenna-pattern swap detector (pattern_detector.py + antenna_profile.py). For every
+carrier (site + operator + technology + EARFCN) the expected 36 x 10-degree antenna gains of each
+configured antenna endpoint (azimuth + pattern) are compared, at the same drive-test locations, with
+which sector the phone measured stronger -- for every way of assigning endpoints to PCIs. PCI numbers
+never change. Every result shows the antenna pattern it rests on: EXACT, ASSUMED (technology rule) or
+APPROXIMATE (generic 3GPP) -- the last two can never give a Confirmed swap.
+  Demo            controlled synthetic sites (3 normal, a pair swap, a rotation)
+  Whole project   one operator + technology at a time, never mixed
 
 Run from the ML/ directory:
     venv\\Scripts\\python.exe -m streamlit run tests/swap_sector/swap_sector_dashboard.py
 """
 from __future__ import annotations
 
+import json
+import math
 import sys
 from pathlib import Path
 
@@ -37,259 +28,434 @@ import folium
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
+from plotly.subplots import make_subplots
 from streamlit_folium import st_folium
 
-from tests.Pci_optimization.pci_map_dashboard import build_sector_triangle, pci_color
 from tests.swap_sector.detect_sector_swap import (
     BIN_SIZE_DEG,
-    MIN_BIN_SAMPLES,
-    dt_observed_azimuth,
-    fuse_observations,
-    ho_observed_azimuth,
+    DATA_DIR,
+    angle_diff_deg,
+    direction_profile,
+    reference_provenance,
     run as run_detection,
+    scorecard,
+    strongest_per_spot,
 )
+from tests.swap_sector.evidence import Settings
 
-DATA_DIR = Path(__file__).resolve().parent / "data"
-WEDGE_RADIUS_M = 300.0
-BEAMWIDTH_DEG = 40.0
-
-VERDICT_BADGE = {
-    "NORMAL": ("✅", "green"),
-    "PROBABLE_SWAP": ("⚠️", "orange"),
-    "CONFIRMED_SWAP": ("🚨", "red"),
-    "INSUFFICIENT_DATA": ("❔", "gray"),
+RESULT_LABELS = {
+    "CONFIRMED_SWAP": "🚨 Confirmed swap (rule-based)",
+    "PROBABLE_SWAP": "⚠️ Probable swap",
+    "AZIMUTH_MISMATCH": "🧭 Direction / RF anomaly",
+    "AMBIGUOUS": "🔀 Ambiguous",
+    "NORMAL": "✅ Normal",
+    "NOT_ENOUGH_DATA": "❔ Insufficient data",
+    "NOT_TESTABLE": "➖ Not testable",
 }
+QUALITY_LABELS = {
+    "EXACT": "Exact antenna pattern",
+    "ASSUMED": "Assumed antenna model",
+    "APPROXIMATE": "Generic 3GPP pattern (approximate)",
+    "": "—",
+}
+MATCH_LABELS = {"ID": "eNodeB ID", "PCI": "PCI fallback"}
+OUTCOME_LABELS = {
+    "FOUND": "✅ Swap found", "WRONG_SECTORS": "⚠️ Wrong sectors", "MISSED": "❌ Swap missed",
+    "FALSE_ALARM": "❌ False alarm", "CORRECT": "✅ Correct", "UNDECIDED": "❔ Undecided",
+}
+# Distinct colours per sector inside one carrier (PCI-modulo palettes collide, e.g. PCI 51 / 151).
+SECTOR_COLORS = ["#e6194b", "#3cb44b", "#4363d8", "#f58231", "#911eb4", "#42d4f4", "#f032e6", "#9a6324"]
+NO_WINNER_COLOR = "#9ca3af"
+WEDGE_RADIUS_M = 250.0
+WEDGE_WIDTH_DEG = 60
+RING_INNER_M = 290.0
+RING_OUTER_M = 340.0
+MAP_HEIGHT = 400
+MAX_MAP_POINTS = 3000
+VIEW_FILES = {
+    "demo": ["cells_demo.csv", "measurements_demo.csv", "demo_metadata.json"],
+    "project": ["cells.csv", "measurements.csv", "skipped.csv"],
+}
+HOW_IT_WORKS = """
+**How it works**
+1. **Expected (no drive-test RF):** every configured antenna endpoint's pattern is rotated to its configured azimuth and
+   averaged into 36 slices of 10°. The carrier frequency comes from the drive-test EARFCN. Pattern source:
+   **Exact** (real antenna model + in-band file) › **Assumed** (technology rule + in-band file) › **Approximate**
+   (generic 3GPP). Another band's antenna file is never used.
+2. **Observed (drive test):** at each spot, which sector the phone measured stronger (two sectors ≥ 3 dB apart, or the
+   serving sector against sectors it did not even report). Comparing at the same spot cancels distance and propagation.
+3. **Compare:** for every way of assigning the antenna endpoints to the PCIs, count how many dB the expected gains in that
+   spot's slice put the weaker sector ahead (beyond 3 dB). PCI numbers never change.
+4. **Decide:** the configured mapping fits → **Normal**. A mapping exchanging ≥ 2 sectors fits clearly and stably better →
+   **Probable swap** (**Confirmed** only with exact patterns and handover support). One sector off with no exchange →
+   **Direction / RF anomaly**. Unstable answer → **Ambiguous**. Thin data → **Insufficient data**.
+"""
 
 
-def clean_site_id(value) -> str:
-    """358.0 -> '358', 1.82 -> '1.82' -- CSV round-trips read numeric-looking
-    site ids as float64, which is a display artifact, not a real identity
-    change; strip a trailing .0 only, keep genuine decimals like site 1.82."""
-    s = str(value)
-    return s[:-2] if s.endswith(".0") else s
+def file_stamp(names: list[str]) -> tuple:
+    paths = [DATA_DIR / name for name in names + ["handovers.csv", "raw_fetch_info.json"]]
+    paths += [DATA_DIR.parent / name for name in ("antenna_profile.py", "pattern_detector.py", "evidence.py",
+                                                  "detect_sector_swap.py", "reference_provenance.json")]
+    return tuple(p.stat().st_mtime_ns if p.exists() else 0 for p in paths)
+
+
+@st.cache_data(show_spinner="Running the antenna-pattern detector...")
+def load_results(config_name: str, operator: str, technology: str, stamp: tuple, max_violation_db: float) -> pd.DataFrame:
+    return run_detection(config_name, operator, technology, Settings(method="pattern", max_violation_db=max_violation_db))
 
 
 @st.cache_data
-def load_data(config_name: str):
-    config_file = "site_config.csv" if config_name == "real" else "synthetic_swap_site_config.csv"
-    site_df = pd.read_csv(DATA_DIR / config_file)
-    site_df["site_id_display"] = site_df["site_id_inferred"].apply(clean_site_id)
-    dt_df = pd.read_csv(DATA_DIR / "dt_samples_6sites.csv")
-    dt_df["site_id_display"] = dt_df["site_id_inferred"].apply(clean_site_id)
-    # dt_observed_azimuth() matches on "site_id_inferred" -- point it at the
-    # cleaned id directly so callers can pass the same display string used
-    # everywhere else on this page (no float-vs-string mismatch).
-    dt_df["site_id_inferred"] = dt_df["site_id_display"]
-    ho_df = pd.read_csv(DATA_DIR / "ho_events_6sites.csv")
-    return site_df, dt_df, ho_df
+def load_csv(name: str, stamp: tuple) -> pd.DataFrame:
+    dtype = None if name.startswith("measurements") else {"site_id": str}
+    return pd.read_csv(DATA_DIR / name, dtype=dtype, low_memory=False)
 
 
-@st.cache_data
-def load_results(config_name: str) -> pd.DataFrame:
-    df = run_detection(config_name)
-    df["site_id_display"] = df["site_id"].apply(clean_site_id)
-    return df
+def json_frame(text) -> pd.DataFrame:
+    if not isinstance(text, str) or not text.strip():
+        return pd.DataFrame()
+    try:
+        return pd.DataFrame(json.loads(text))
+    except ValueError:
+        return pd.DataFrame()
 
 
-def badge(verdict: str) -> str:
-    icon, color = VERDICT_BADGE.get(verdict.split(" ")[0], ("❔", "gray"))
-    return f":{color}[{icon} {verdict}]"
+def number_text(value, unit: str = "", digits: int = 1) -> str:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return "–"
+    return "–" if not math.isfinite(number) else f"{number:.{digits}f}{unit}"
 
 
-def pci_stats_table(dt_df: pd.DataFrame, ho_df: pd.DataFrame, site_id_display: str, sector_pcis: set) -> pd.DataFrame:
-    site_dt = dt_df[(dt_df["site_id_display"] == site_id_display) & (dt_df["pci"].isin(sector_pcis))]
-    rows = []
-    for pci in sorted(sector_pcis):
-        sub = site_dt[site_dt["pci"] == pci]
-        n_ho = 0
-        if not ho_df.empty:
-            n_ho = int(
-                ((ho_df["from_pci"] == pci) & (ho_df["from_site_id_inferred"].astype(str).apply(clean_site_id) == site_id_display)).sum()
-                + ((ho_df["to_pci"] == pci) & (ho_df["to_site_id_inferred"].astype(str).apply(clean_site_id) == site_id_display)).sum()
-            )
-        rows.append({
-            "PCI": pci,
-            "DT samples": len(sub),
-            "avg RSRP": round(sub["rsrp"].mean(), 1) if len(sub) else None,
-            "avg RSRQ": round(sub["rsrq"].mean(), 1) if len(sub) else None,
-            "avg SINR": round(sub["sinr"].mean(), 1) if len(sub) else None,
-            "HO events touching this PCI": n_ho,
-        })
-    return pd.DataFrame(rows)
+def project_label() -> str:
+    info = DATA_DIR / "raw_fetch_info.json"
+    return str(json.loads(info.read_text()).get("project_id", "")) if info.exists() else ""
 
 
-def bearing_rose_chart(dt_df: pd.DataFrame, site_id_display: str, sector_pcis: set):
-    """Polar bar chart: for every BIN_SIZE_DEG bearing bin, how many DT
-    samples of each of the site's own PCIs fall in it. This IS the raw
-    evidence dt_observed_azimuth() summarizes into one azimuth per PCI --
-    shown directly so the summarized number can be checked against the
-    actual distribution it came from."""
-    site_dt = dt_df[(dt_df["site_id_display"] == site_id_display) & (dt_df["pci"].isin(sector_pcis))]
-    fig = go.Figure()
-    if site_dt.empty:
-        return fig
-    for pci in sorted(sector_pcis):
-        sub = site_dt[site_dt["pci"] == pci]
-        counts = sub.groupby("angle_bin_10deg").size()
-        bins = list(range(0, 360, BIN_SIZE_DEG))
-        r = [int(counts.get(b, 0)) for b in bins]
-        fig.add_trace(go.Barpolar(
-            r=r, theta=[b + BIN_SIZE_DEG / 2 for b in bins], width=[BIN_SIZE_DEG] * len(bins),
-            name=f"PCI {int(pci)}", marker_color=pci_color(pci), opacity=0.75,
-        ))
-    fig.update_layout(
-        polar=dict(angularaxis=dict(direction="clockwise", rotation=90, tickmode="array", tickvals=list(range(0, 360, 30)))),
-        showlegend=True, height=420, margin=dict(l=10, r=10, t=30, b=10),
-        title=f"DT sample count per {BIN_SIZE_DEG}° bearing bin (min {MIN_BIN_SAMPLES} samples/bin to count as evidence)",
-    )
+def demo_scope() -> tuple[str, str] | None:
+    path = DATA_DIR / "cells_demo.csv"
+    if not path.exists():
+        return None
+    demo = pd.read_csv(path, usecols=["operator", "technology"])
+    return str(demo["operator"].iloc[0]), str(demo["technology"].iloc[0])
+
+
+def offset_point(lat: float, lon: float, distance_m: float, bearing: float) -> tuple[float, float]:
+    ang = distance_m / 6371000.0
+    brg, phi1, lam1 = math.radians(bearing), math.radians(lat), math.radians(lon)
+    phi2 = math.asin(math.sin(phi1) * math.cos(ang) + math.cos(phi1) * math.sin(ang) * math.cos(brg))
+    lam2 = lam1 + math.atan2(math.sin(brg) * math.sin(ang) * math.cos(phi1), math.cos(ang) - math.sin(phi1) * math.sin(phi2))
+    return math.degrees(phi2), math.degrees(lam2)
+
+
+def wedge(lat: float, lon: float, azimuth: float) -> list[tuple[float, float]]:
+    half = WEDGE_WIDTH_DEG // 2
+    arc = [offset_point(lat, lon, WEDGE_RADIUS_M, azimuth + step) for step in range(-half, half + 1, 5)]
+    return [(lat, lon)] + arc
+
+
+def ring_slice(lat: float, lon: float, start_deg: float) -> list[tuple[float, float]]:
+    angles = [start_deg, start_deg + BIN_SIZE_DEG / 2, start_deg + BIN_SIZE_DEG]
+    outer = [offset_point(lat, lon, RING_OUTER_M, a) for a in angles]
+    inner = [offset_point(lat, lon, RING_INNER_M, a) for a in reversed(angles)]
+    return outer + inner
+
+
+def carrier_label(row) -> str:
+    frequency = number_text(row.get("frequency_mhz", float("nan")), " MHz", 0)
+    return f"{row.get('band', '')} / EARFCN {row.get('earfcn', '')}" + ("" if frequency == "–" else f" / {frequency}")
+
+
+def injected_change(group_cells: pd.DataFrame) -> str:
+    moved = group_cells[angle_diff_deg(group_cells["azimuth"], group_cells["true_azimuth"]) >= 1]
+    if moved.empty:
+        return "Left as is"
+    return "Antenna endpoints crossed on purpose: " + " ↔ ".join(f"PCI {int(p)}" for p in moved["pci"])
+
+
+def select_row(table: pd.DataFrame, key: str) -> int:
+    event = st.dataframe(table, hide_index=True, use_container_width=True, on_select="rerun", selection_mode="single-row", key=key)
+    rows = event["selection"]["rows"]
+    if not rows:
+        st.caption("Click a row to open it. Showing the first row.")
+    return rows[0] if rows else 0
+
+
+def base_map(group_cells: pd.DataFrame) -> tuple[folium.Map, float, float]:
+    site_lat, site_lon = float(group_cells["site_lat"].iloc[0]), float(group_cells["site_lon"].iloc[0])
+    return folium.Map(location=[site_lat, site_lon], zoom_start=16, tiles="CartoDB positron"), site_lat, site_lon
+
+
+def add_site_marker(fmap: folium.Map, lat: float, lon: float, site_id: str) -> None:
+    folium.CircleMarker([lat, lon], radius=6, color="#111827", fill=True, fill_color="#111827", tooltip=f"Site {site_id}").add_to(fmap)
+
+
+def build_configured_map(group_cells: pd.DataFrame, colors: dict, site_id: str) -> folium.Map:
+    fmap, lat, lon = base_map(group_cells)
+    for pci, azimuth in zip(group_cells["pci"], group_cells["azimuth"]):
+        folium.Polygon(wedge(lat, lon, float(azimuth)), color=colors[pci], weight=2, fill=True, fill_opacity=0.3,
+                       tooltip=f"PCI {int(pci)} · configured {azimuth:.0f}°").add_to(fmap)
+    add_site_marker(fmap, lat, lon, site_id)
+    return fmap
+
+
+def build_drive_test_map(group_cells: pd.DataFrame, colors: dict, strongest: pd.DataFrame, profile: pd.DataFrame, site_id: str) -> folium.Map:
+    fmap, lat, lon = base_map(group_cells)
+    points = strongest.sample(MAX_MAP_POINTS, random_state=0) if len(strongest) > MAX_MAP_POINTS else strongest
+    for p in points.itertuples():
+        folium.CircleMarker([p.lat, p.lon], radius=3, weight=0, fill=True, fill_color=colors[p.pci], fill_opacity=0.85,
+                            tooltip=f"Strongest: PCI {p.pci} ({p.rsrp:.0f} dBm)").add_to(fmap)
+    for b in profile.itertuples():
+        if b.spots == 0:
+            continue
+        has_winner = not pd.isna(b.dominant_pci)
+        label = f"PCI {int(b.dominant_pci)} strongest at {b.share:.0%}" if has_winner else "no clear winner"
+        folium.Polygon(ring_slice(lat, lon, b.bin_deg), color="white", weight=1, fill=True,
+                       fill_color=colors[int(b.dominant_pci)] if has_winner else NO_WINNER_COLOR,
+                       fill_opacity=0.9 if has_winner else 0.35,
+                       tooltip=f"{b.bin_deg}–{b.bin_deg + BIN_SIZE_DEG}°: {b.spots} spots, {label}").add_to(fmap)
+    add_site_marker(fmap, lat, lon, site_id)
+    return fmap
+
+
+def profile_figure(row: pd.Series, pcis: list[int], colors: dict) -> go.Figure | None:
+    details = json_frame(row.get("profile_details", ""))
+    if details.empty:
+        return None
+    fig = make_subplots(rows=1, cols=len(pcis), subplot_titles=[f"PCI {p}" for p in pcis], shared_yaxes=True)
+    for k, pci in enumerate(pcis, start=1):
+        d = details[details["pci"] == pci].sort_values("bin_deg")
+        angle = d["bin_deg"] + BIN_SIZE_DEG / 2
+        observed = pd.to_numeric(d["observed_db"], errors="coerce")
+        shift = (observed - d["expected_gain_db"]).median() if observed.notna().any() else 0.0
+        fig.add_trace(go.Scatter(x=angle, y=d["expected_gain_db"], name="Configured antenna (expected gain)",
+                                 line={"color": "#6b7280", "dash": "dash"}, showlegend=k == 1, legendgroup="configured"), row=1, col=k)
+        if "best_gain_db" in d and not d["best_gain_db"].equals(d["expected_gain_db"]):
+            fig.add_trace(go.Scatter(x=angle, y=d["best_gain_db"], name="Best-fit antenna (expected gain)",
+                                     line={"color": "#111827"}, showlegend=k == 1, legendgroup="best"), row=1, col=k)
+        fig.add_trace(go.Scatter(x=angle, y=observed - shift, name="Drive test (distance-corrected, shifted)", mode="markers",
+                                 marker={"color": colors[pci], "size": 6}, showlegend=k == 1, legendgroup="observed"), row=1, col=k)
+    fig.update_layout(height=320, margin={"l": 10, "r": 10, "t": 40, "b": 10}, legend={"orientation": "h", "y": -0.25})
+    fig.update_xaxes(range=[0, 360], dtick=90, title_text="Direction from site (°)")
+    fig.update_yaxes(title_text="Relative dB", row=1, col=1)
     return fig
 
 
-def main() -> None:
-    st.set_page_config(page_title="Sector Swap Detection — Validation", layout="wide")
-    st.title("Sector Swap Detection — Validation Dashboard (test case)")
-    st.caption(
-        "Reads only the local snapshots in tests/swap_sector/data/ -- no DB hit, no production writes."
-    )
+def pattern_text(pattern: pd.Series | None) -> str:
+    if pattern is None:
+        return "–"
+    text = f"{QUALITY_LABELS.get(pattern['pattern_quality'], pattern['pattern_quality'])} · {pattern['antenna_model']}"
+    file_tilt = number_text(pattern.get("file_e_tilt"), "°", 0)
+    if file_tilt != "–":
+        text += f" · file tilt {file_tilt} (site {number_text(pattern.get('requested_e_tilt'), '°', 0)})"
+    return text
 
-    config_name = st.sidebar.radio(
-        "Config source",
-        options=["real", "synthetic"],
-        format_func=lambda x: "Real (unmodified)" if x == "real" else "Synthetic swap (injected, ground truth known)",
-    )
-    site_df, dt_df, ho_df = load_data(config_name)
-    results_df = load_results(config_name)
 
-    st.subheader("All sites — detection summary")
-    display_df = results_df.copy()
-    display_df["site_id"] = display_df["site_id_display"]
-    display_df["verdict"] = display_df["verdict"].apply(badge)
-    st.dataframe(
-        display_df[["site_id", "n_sectors", "verdict", "confidence_score", "evidence_completeness", "ground_truth_has_swap"]],
-        use_container_width=True, hide_index=True,
-    )
+def render_detail(row: pd.Series, cells: pd.DataFrame, measurements: pd.DataFrame, view: str) -> None:
+    show_truth = view == "demo"
+    st.divider()
+    st.subheader(f"Site {row['site_id']} · {row['operator']} {row['technology']} · {carrier_label(row)}")
+    st.markdown(f"**{RESULT_LABELS.get(row['verdict'], row['verdict'])}** — {row['reason']}")
+    quality = row.get("pattern_quality", "")
+    quality = "" if pd.isna(quality) else str(quality)
+    note = row.get("pattern_note", "")
+    st.markdown(f"Antenna pattern: **{QUALITY_LABELS.get(quality, quality)}**" + (f" — {note}" if isinstance(note, str) and note else ""))
+    if quality in ("ASSUMED", "APPROXIMATE"):
+        st.caption("Without the real antenna model and its pattern file, this carrier can be a Probable swap at most, never Confirmed.")
 
-    site_ids = sorted(site_df["site_id_display"].unique())
-    selected_site = st.sidebar.selectbox("Site", site_ids)
+    group_cells = cells[cells["group_id"] == row["group_id"]].sort_values("pci").reset_index(drop=True)
+    if show_truth:
+        st.info(f"Demo setup: {injected_change(group_cells)}.  Detector: {OUTCOME_LABELS.get(row.get('outcome', ''), row.get('outcome', ''))}")
+    metrics = st.columns(4)
+    support = row.get("support")
+    for col, label, value in zip(metrics, ["Violation, configured mapping", "Violation, best mapping", "Improvement", "Same answer when resampled"],
+                                 [number_text(row.get("original_violation_db"), " dB"), number_text(row.get("best_violation_db"), " dB"),
+                                  number_text(row.get("violation_improvement_db"), " dB"),
+                                  "–" if number_text(support) == "–" else f"{float(support):.0%}"]):
+        col.metric(label, value)
+    st.caption("Violation = on average, how many dB the expected antenna gains put the wrong sector ahead of the one the phone measured "
+               "stronger at the same spot (beyond a 3 dB tolerance). 0 dB = every comparison agrees. PCI values are unchanged.")
 
-    site_rows = site_df[site_df["site_id_display"] == selected_site].reset_index(drop=True)
-    site_result_rows = results_df[results_df["site_id_display"] == selected_site]
-    site_result = site_result_rows.iloc[0] if not site_result_rows.empty else None
-    sector_pcis = set(site_rows["site_pci"].tolist())
+    pcis = group_cells["pci"].astype(int).tolist()
+    colors = {pci: SECTOR_COLORS[k % len(SECTOR_COLORS)] for k, pci in enumerate(pcis)}
+    figure = profile_figure(row, pcis, colors)
+    if figure is not None:
+        st.plotly_chart(figure, use_container_width=True, key=f"{view}_{row['group_id']}_profile")
+        st.caption("Diagnostic view per PCI: dashed = expected gain of the antenna it is configured on; solid = the best-fit antenna "
+                   "(only drawn when different); dots = drive-test RSRP per 10° slice, distance-corrected and shifted by one constant.")
 
-    site_lat = site_rows["site_lat"].mean()
-    site_lon = site_rows["site_lon"].mean()
-    dt_obs = dt_observed_azimuth(dt_df, selected_site, sector_pcis)
-    ho_obs = ho_observed_azimuth(ho_df, selected_site, site_lat, site_lon)
-    fused_obs = fuse_observations(dt_obs, ho_obs)
+    group_meas = measurements[(measurements["group_id"] == row["group_id"]) & measurements["pci"].isin(pcis)]
+    profile = direction_profile(group_meas, pcis, require_comparison=True)
+    strongest = strongest_per_spot(group_meas)
+    left, right = st.columns(2)
+    with left:
+        st.markdown("**Configured directions (site table)**")
+        st_folium(build_configured_map(group_cells, colors, row["site_id"]), width=None, height=MAP_HEIGHT,
+                  returned_objects=[], key=f"{view}_{row['group_id']}_configured")
+    with right:
+        st.markdown("**Drive test**")
+        st_folium(build_drive_test_map(group_cells, colors, strongest, profile, row["site_id"]), width=None, height=MAP_HEIGHT,
+                  returned_objects=[], key=f"{view}_{row['group_id']}_drive_test")
+    st.caption(f"Right map: dot = strongest measured PCI · ring = {BIN_SIZE_DEG}° slices coloured by the PCI that is strongest at most "
+               f"shared locations (grey = no clear winner).")
 
-    st.markdown("---")
-    st.subheader(f"Site {selected_site} — full sector identity")
-    identity_cols = ["site_cell_id_representative", "sector", "band", "site_earfcn", "network", "site_pci", "site_azimuth_deg"]
-    identity_cols = [c for c in identity_cols if c in site_rows.columns]
-    st.dataframe(
-        site_rows[identity_cols].rename(columns={
-            "site_cell_id_representative": "cell_id", "site_earfcn": "earfcn",
-            "network": "operator", "site_pci": "configured_pci", "site_azimuth_deg": "configured_azimuth",
-        }),
-        hide_index=True, use_container_width=True,
-    )
+    fits, patterns = json_frame(row.get("sector_fit_details", "")), json_frame(row.get("pattern_details", ""))
+    sector_rows = []
+    for k, pci in enumerate(pcis):
+        fit = fits[fits["pci"] == pci].iloc[0] if not fits.empty and (fits["pci"] == pci).any() else None
+        pattern = patterns[patterns["pci"] == pci].iloc[0] if not patterns.empty and (patterns["pci"] == pci).any() else None
+        configured = float(group_cells.at[k, "azimuth"])
+        best = float(fit["best_endpoint_azimuth"]) if fit is not None else configured
+        entry = {
+            "PCI": pci,
+            "Configured": f"{configured:.0f}°",
+            "Antenna pattern": pattern_text(pattern),
+            "Violation on configured antenna": number_text(fit["violation_configured_db"], " dB") if fit is not None else "–",
+            "Best-fit antenna": f"{best:.0f}°" + (" 🔁" if angle_diff_deg(best, configured) >= 1 else ""),
+            "Violation on best-fit antenna": number_text(fit["violation_best_db"], " dB") if fit is not None else "–",
+            "Comparisons": int(fit["comparisons"]) if fit is not None else 0,
+            "Measured slices": int(fit["measured_bins"]) if fit is not None else 0,
+        }
+        if show_truth:
+            entry["True antenna"] = f"{group_cells.at[k, 'true_azimuth']:.0f}°"
+        sector_rows.append(entry)
+    sector_df = pd.DataFrame(sector_rows)
+    styled = sector_df.style.apply(lambda col: [f"background-color: {colors[p]}; color: white" for p in col], subset=["PCI"])
+    st.dataframe(styled, hide_index=True, use_container_width=True)
 
-    # ---- 4. Explicit CONFIGURED vs PREDICTED comparison (the main answer) ----
-    st.subheader("Configured vs Predicted — the actual comparison")
-    if site_result is not None and site_result["best_perm"] is not None:
-        import ast
-        identity_perm = site_result["identity_perm"]
-        best_perm = site_result["best_perm"]
-        if isinstance(identity_perm, str):
-            identity_perm = ast.literal_eval(identity_perm)
-        if isinstance(best_perm, str):
-            best_perm = ast.literal_eval(best_perm)
-        comp_rows = []
-        for (_, sector), predicted_pci in zip(site_rows.iterrows(), best_perm):
-            configured_pci = sector["site_pci"]
-            configured_az = sector["site_azimuth_deg"]
-            obs_of_configured = fused_obs.get(configured_pci)
-            obs_of_predicted = fused_obs.get(predicted_pci)
-            comp_rows.append({
-                "cell_id": sector["site_cell_id_representative"],
-                "configured_azimuth": configured_az,
-                "configured_PCI": configured_pci,
-                "predicted_PCI (best-fit)": predicted_pci,
-                "match?": "✅ same" if configured_pci == predicted_pci else "❌ DIFFERENT",
-                "observed_azimuth_of_configured_PCI": round(obs_of_configured[0], 1) if obs_of_configured else None,
-                "observed_azimuth_of_predicted_PCI": round(obs_of_predicted[0], 1) if obs_of_predicted else None,
-                "confidence_of_predicted_PCI": round(obs_of_predicted[1], 2) if obs_of_predicted else None,
-            })
-        comp_df = pd.DataFrame(comp_rows)
-        st.dataframe(comp_df, hide_index=True, use_container_width=True)
-        st.markdown(
-            f"**Verdict: {badge(str(site_result['verdict']))}**  |  "
-            f"Confidence score: **{site_result['confidence_score']}**  |  "
-            f"Evidence completeness: **{site_result['evidence_completeness']}**  |  "
-            f"Total angular error — configured mapping: **{site_result['identity_avg_error_deg']}°**, "
-            f"best-fit mapping: **{site_result['best_avg_error_deg']}°**"
-        )
-        if config_name == "synthetic" and bool(site_result["ground_truth_has_swap"]):
-            st.info("Ground truth: this site DOES have an injected synthetic swap (for validation).")
+    with st.expander("Coverage, handover and pattern evidence"):
+        keys = ["comparison_locations", "comparisons", "serving_comparisons", "coverage_fraction", "locations",
+                "original_profile_error_db", "best_profile_error_db", "ho_points", "ho_original_loss_db", "ho_best_loss_db",
+                "confidence_score", "confidence_basis", "match_level", "provenance"]
+        st.dataframe(pd.DataFrame({"Evidence": keys, "Value": [str(row.get(k, "")) for k in keys]}), hide_index=True)
+        if not patterns.empty:
+            st.dataframe(patterns, hide_index=True, use_container_width=True)
+        st.caption("Serving comparisons = the serving sector against group sectors the phone did not report. Handover points are matched "
+                   "serving-cell transitions (proxies, not protocol-confirmed handovers). Profile errors are diagnostics only.")
+
+
+def render_demo(operator: str, technology: str, stamp: tuple) -> None:
+    results = load_results("demo", operator, technology, stamp, st.session_state.max_violation)
+    cells = load_csv("cells_demo.csv", stamp)
+    measurements = load_csv("measurements_demo.csv", stamp)
+    st.caption(f"All demo sites are {operator} {technology}. Each operator + technology is checked on its own, never mixed.")
+    st.info(json.loads((DATA_DIR / "demo_metadata.json").read_text())["description"])
+    st.markdown(HOW_IT_WORKS)
+    view = results.assign(_swap=results["ground_truth"].eq("SWAPPED")).sort_values(["_swap", "site_id"], ascending=[False, True]).reset_index(drop=True)
+    setups = {gid: injected_change(g) for gid, g in cells.groupby("group_id")}
+    table = pd.DataFrame({
+        "Site": view["site_id"],
+        "Carrier": view.apply(carrier_label, axis=1),
+        "Antenna pattern": view["pattern_quality"].fillna("").map(QUALITY_LABELS),
+        "Demo setup": view["group_id"].map(setups),
+        "Result": view["verdict"].map(RESULT_LABELS),
+        "Detector right?": view["outcome"].map(OUTCOME_LABELS),
+    })
+    render_detail(view.iloc[select_row(table, "demo_table")], cells, measurements, "demo")
+
+
+def render_reliability(operator: str, technology: str) -> None:
+    names = ["cells.csv", "measurements.csv", "cells_synthetic.csv"]
+    if not (DATA_DIR / "cells_synthetic.csv").exists():
+        return
+    with st.expander(f"How reliable is this for {operator} {technology}? (synthetic test)"):
+        results = load_results("synthetic", operator, technology, file_stamp(names), st.session_state.max_violation)
+        full = scorecard(results).iloc[0]
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Swaps found", f"{full['found']} of {full['injected']}")
+        c2.metric("Found, but wrong sectors", int(full["wrong_sectors"]))
+        c3.metric("False alarms", f"{full['false_alarms']} of {full['untouched']}")
+        rows = []
+        for quality, subset in results.groupby(results["pattern_quality"].fillna("")):
+            card = scorecard(subset).iloc[0]
+            rows.append({"Antenna pattern": QUALITY_LABELS.get(quality, quality), "Swaps found": f"{card.found} of {card.injected}",
+                         "Wrong sectors": int(card.wrong_sectors), "False alarms": f"{card.false_alarms} of {card.untouched}"})
+        st.dataframe(pd.DataFrame(rows), hide_index=True)
+        st.caption("Whole antenna endpoints were exchanged in the configuration of half the eligible carriers; every test carrier's "
+                   "azimuths were also moved by up to 15°. Drive-test data is real. Controls are not field-verified healthy sites, and "
+                   "recovering crossed configurations does not prove field accuracy.")
+
+
+def render_project(stamp: tuple) -> None:
+    cells_all = load_csv("cells.csv", stamp)
+    scopes = list(cells_all.groupby(["operator", "technology"])["group_id"].nunique().sort_values(ascending=False).index)
+    operator, technology = st.selectbox("Operator · Technology (each is checked on its own)", scopes, format_func=lambda s: f"{s[0]} · {s[1]}")
+    results = load_results("real", operator, technology, stamp, st.session_state.max_violation)
+    cells = cells_all[(cells_all["operator"] == operator) & (cells_all["technology"] == technology)]
+    measurements = load_csv("measurements.csv", stamp)
+    skipped = load_csv("skipped.csv", stamp)
+
+    st.markdown(HOW_IT_WORKS)
+    counts = results["verdict"].value_counts()
+    for col, (key, label) in zip(st.columns(len(RESULT_LABELS)), RESULT_LABELS.items()):
+        col.metric(label, int(counts.get(key, 0)))
+    quality_counts = results["pattern_quality"].fillna("").value_counts()
+    st.caption("Carriers by antenna pattern: " + " · ".join(f"{QUALITY_LABELS.get(q, q)}: {n}" for q, n in quality_counts.items() if q)
+               + f" · no pattern (not testable earlier): {int(quality_counts.get('', 0))}")
+    render_reliability(operator, technology)
+
+    chosen = st.multiselect("Result", list(RESULT_LABELS), default=[k for k in RESULT_LABELS if k != "NOT_TESTABLE"], format_func=RESULT_LABELS.get)
+    view = results[results["verdict"].isin(chosen)]
+    view = view.assign(_rank=view["verdict"].map({k: i for i, k in enumerate(RESULT_LABELS)})).sort_values(["_rank", "site_id"]).reset_index(drop=True)
+    if view.empty:
+        st.info("No carriers match this filter.")
     else:
-        st.warning("Not enough sectors at this site to run a permutation comparison (config incomplete).")
+        table = pd.DataFrame({
+            "Site": view["site_id"],
+            "Carrier": view.apply(carrier_label, axis=1),
+            "Antenna pattern": view["pattern_quality"].fillna("").map(QUALITY_LABELS),
+            "Matched by": view["match_level"].map(MATCH_LABELS),
+            "Sectors": view["n_sectors"],
+            "Result": view["verdict"].map(RESULT_LABELS),
+            "Why": view["reason"],
+        })
+        render_detail(view.iloc[select_row(table, f"project_table_{operator}_{technology}")], cells, measurements, "project")
 
-    # ---- 3. Underlying evidence: RSRP/RSRQ/SINR + HO count per PCI ----
-    st.subheader("Evidence behind the prediction — per-PCI stats")
-    st.dataframe(pci_stats_table(dt_df, ho_df, selected_site, sector_pcis), hide_index=True, use_container_width=True)
+    operator_skipped = skipped[skipped["operator"] == operator]
+    with st.expander(f"{operator} site-table sectors that could not be checked ({len(operator_skipped)})"):
+        st.dataframe(operator_skipped["reason_type"].value_counts().rename_axis("Reason").reset_index(name="Sectors"), hide_index=True)
+        st.dataframe(operator_skipped, hide_index=True, use_container_width=True)
 
-    col_map, col_rose = st.columns([3, 2])
 
-    with col_rose:
-        st.plotly_chart(bearing_rose_chart(dt_df, selected_site, sector_pcis), use_container_width=True)
-
-    with col_map:
-        st.markdown(
-            "**Map legend:** solid wedge = configured azimuth (colored by configured PCI) · "
-            "dashed wedge = observed azimuth for that same PCI (from DT+HO evidence) · "
-            "★ markers = real handover events touching this site, colored by the PCI on that side of the transition."
-        )
-        fmap = folium.Map(location=[site_lat, site_lon], zoom_start=17, tiles="CartoDB positron")
-        folium.CircleMarker(
-            location=[site_lat, site_lon], radius=6, color="#1d4ed8", fill=True, fill_color="#1d4ed8",
-            tooltip=f"Site {selected_site}",
-        ).add_to(fmap)
-
-        for _, sector in site_rows.iterrows():
-            pci = sector["site_pci"]
-            color = pci_color(pci)
-            configured_triangle = build_sector_triangle(site_lat, site_lon, sector["site_azimuth_deg"], BEAMWIDTH_DEG, WEDGE_RADIUS_M)
-            folium.Polygon(
-                locations=configured_triangle, color=color, weight=2, fill=True, fill_color=color, fill_opacity=0.35,
-                tooltip=f"CONFIGURED: {sector['site_cell_id_representative']} — PCI {pci} @ {sector['site_azimuth_deg']:.0f}°",
-            ).add_to(fmap)
-            if pci in fused_obs:
-                obs_az, confidence, n = fused_obs[pci]
-                observed_triangle = build_sector_triangle(site_lat, site_lon, obs_az, BEAMWIDTH_DEG, WEDGE_RADIUS_M * 1.15)
-                folium.Polygon(
-                    locations=observed_triangle, color=color, weight=3, dash_array="8,6", fill=False,
-                    tooltip=f"OBSERVED: PCI {pci} @ {obs_az:.0f}° (confidence {confidence:.2f}, n={n})",
-                ).add_to(fmap)
-
-        # Real HO transition events touching this site
-        if not ho_df.empty:
-            from_here = ho_df[ho_df["from_site_id_inferred"].astype(str).apply(clean_site_id) == selected_site]
-            to_here = ho_df[ho_df["to_site_id_inferred"].astype(str).apply(clean_site_id) == selected_site]
-            for _, ev in from_here.iterrows():
-                folium.RegularPolygonMarker(
-                    location=[ev["event_lat"], ev["event_lon"]], number_of_sides=5, radius=6,
-                    color=pci_color(ev["from_pci"]), fill=True, fill_color=pci_color(ev["from_pci"]),
-                    tooltip=f"HO from this site: PCI {ev['from_pci']} -> {ev['to_pci']}",
-                ).add_to(fmap)
-            for _, ev in to_here.iterrows():
-                folium.RegularPolygonMarker(
-                    location=[ev["event_lat"], ev["event_lon"]], number_of_sides=5, radius=6,
-                    color=pci_color(ev["to_pci"]), fill=True, fill_color="white",
-                    tooltip=f"HO into this site: PCI {ev['from_pci']} -> {ev['to_pci']}",
-                ).add_to(fmap)
-
-        st_folium(fmap, width=None, height=560, key=f"map_{config_name}_{selected_site}")
+def main() -> None:
+    st.set_page_config(page_title="Sector Swap Check", layout="wide")
+    st.title("Sector Swap Check")
+    st.sidebar.select_slider("Max mean violation (dB)", options=[2.0, 3.0, 4.0], value=3.0, key="max_violation")
+    st.sidebar.caption("Sensitivity control. 3 dB (one tolerance step) is the starting value; no field-calibrated optimum exists yet.")
+    st.caption(f"Project {project_label()} · Reference: {reference_provenance()['status']} · Local CSV snapshot · Antenna-pattern model")
+    st.warning("Testing dashboard. Probable and rule-confirmed swaps need field verification. The demo sites are synthetic, "
+               "not a field accuracy benchmark.")
+    skipped_path = DATA_DIR / "skipped.csv"
+    if skipped_path.exists():
+        skipped_all = pd.read_csv(skipped_path)
+        nr = skipped_all[skipped_all["technology"].eq("NR")]
+        with st.expander(f"Data quality / not testable — {len(skipped_all)} excluded sector records; {len(nr)} NR records"):
+            st.dataframe(skipped_all.groupby(["operator", "technology", "reason_type"], dropna=False).size().reset_index(name="Sector records"), hide_index=True)
+            st.dataframe(skipped_all, hide_index=True)
+    validation_path = DATA_DIR / "validation_summary.csv"
+    if validation_path.exists():
+        validation = pd.read_csv(validation_path)
+        with st.expander("Validation: antenna-pattern model vs earlier methods (synthetic, exploratory)"):
+            columns = [c for c in ("configuration", "partition", "injected", "found", "wrong_sectors", "untouched", "false_alarms",
+                                   "max_violation_db", "comparison_tolerance_db", "min_support") if c in validation.columns]
+            st.dataframe(validation[columns], hide_index=True)
+            quality_path = DATA_DIR / "validation_by_pattern_quality.csv"
+            if quality_path.exists():
+                st.dataframe(pd.read_csv(quality_path), hide_index=True)
+            st.caption("Sensitivity results, not threshold calibration. One project; no real field-labelled swaps.")
+    demo = demo_scope()
+    demo_label = f"Demo — {demo[0]} {demo[1]} sites (learn the concept)" if demo else "Demo"
+    view = st.radio("View", ["demo", "project"], horizontal=True,
+                    format_func=lambda v: demo_label if v == "demo" else f"Whole project {project_label()}")
+    missing = [name for name in VIEW_FILES[view] if not (DATA_DIR / name).exists()]
+    if missing:
+        st.error(f"Missing {', '.join(missing)}. Run build_dataset, make_synthetic_swap and make_demo first (see README.md).")
+        st.stop()
+    stamp = file_stamp(VIEW_FILES[view])
+    if view == "demo":
+        render_demo(demo[0], demo[1], stamp)
+    else:
+        render_project(stamp)
 
 
 if __name__ == "__main__":

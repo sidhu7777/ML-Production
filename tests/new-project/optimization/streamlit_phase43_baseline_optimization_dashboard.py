@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import json
 from pathlib import Path
@@ -18,12 +18,13 @@ from matplotlib.patches import Rectangle
 
 ML_ROOT = Path(__file__).resolve().parents[3]
 OUTPUT_ROOT = ML_ROOT / "tests" / "output"
+PHASE39_DIR = ML_ROOT / "tests" / "new-project" / "data" / "project_210_taiwan" / "cost231_phase39_equal_power_diagnostic"
 
 RUNS = {
     "Project 210 Taiwan": {
-        "production": OUTPUT_ROOT / "baseline_210_profile_20260907_165242",
+        "production": OUTPUT_ROOT / "baseline_210_profile_20260908_115936",
         "phase43": OUTPUT_ROOT / "baseline_210_profile_20260907_174241",
-        "phase43_v2": OUTPUT_ROOT / "baseline_210_profile_20260907_183149",
+        "phase43_v2": OUTPUT_ROOT / "baseline_210_profile_20260908_120413",
     },
     "Project 193 India": {
         "production": OUTPUT_ROOT / "baseline_193_profile_20260907_170610",
@@ -34,7 +35,7 @@ RUNS = {
 }
 
 RSRP_BINS = [
-    (-140, -115, "#991b1b", "-140 to -115"),
+    (-147, -115, "#991b1b", "-147 to -115"),
     (-115, -105, "#d97706", "-115 to -105"),
     (-105, -95, "#fef08a", "-105 to -95"),
     (-95, -85, "#22c55e", "-95 to -85"),
@@ -80,6 +81,123 @@ def load_predictions(path: str) -> pd.DataFrame:
         frame["center_lon"] = frame["lon"]
     return frame
 
+
+@st.cache_data(show_spinner=False)
+def load_dt_scored(path: str) -> pd.DataFrame:
+    run = Path(path)
+    scored_path = run / "dt_calibrated_predictions.parquet"
+    if not scored_path.exists():
+        scored_path = run / "dt_scored_predictions.parquet"
+    drive_path = run / "drive_test_rows.parquet"
+    if not scored_path.exists():
+        return pd.DataFrame()
+    scored = pd.read_parquet(scored_path)
+    if "technology" not in scored.columns and "Technology" in scored.columns:
+        scored["technology"] = scored["Technology"]
+    if drive_path.exists():
+        drive = pd.read_parquet(drive_path)
+        measured_cols = [col for col in ["rsrp_measured", "RSRP", "rsrp", "lte_rsrp", "reference_signal_power"] if col in drive.columns]
+        if measured_cols and len(drive) == len(scored):
+            scored["rsrp_measured"] = pd.to_numeric(drive[measured_cols[0]], errors="coerce").to_numpy()
+    return scored
+
+
+def environment_mask(frame: pd.DataFrame, indoor: bool) -> pd.Series:
+    branch = frame.get("obstruction_branch", pd.Series("", index=frame.index)).astype(str).str.lower()
+    clutter = frame.get("clutter_class", pd.Series("", index=frame.index)).astype(str).str.lower()
+    mask = branch.eq("indoor") | clutter.eq("indoor")
+    return mask if indoor else ~mask
+
+
+
+
+
+
+@st.cache_data(show_spinner=False)
+def load_phase39_serving_reference(tech: str) -> pd.DataFrame:
+    path = PHASE39_DIR / f"phase39_serving_grid_{tech.lower()}_project210.parquet"
+    if not path.exists():
+        return pd.DataFrame()
+    return pd.read_parquet(path)
+
+
+@st.cache_data(show_spinner=False)
+def load_phase39_validation_reference(tech: str) -> pd.DataFrame:
+    path = PHASE39_DIR / "phase39_validation_dt_project210.parquet"
+    if not path.exists():
+        return pd.DataFrame()
+    frame = pd.read_parquet(path)
+    out = frame[frame["technology"].astype(str).eq(tech)].copy()
+    out = out[out.get("obstruction_branch", pd.Series("", index=out.index)).astype(str).ne("indoor")].copy()
+    for excluded_col in ["p36_backlobe", "p38_excluded"]:
+        if excluded_col in out.columns:
+            out = out[~out[excluded_col].astype(bool)].copy()
+    return out
+
+
+def phase39_reference_cdf_figure(tech: str, aggregation: str) -> go.Figure:
+    agg_suffix = "mean" if aggregation.startswith("Frontend") else "best"
+    agg_label = "frontend mean" if agg_suffix == "mean" else "serving cell"
+    final_col = f"phase39_final_{agg_suffix}_rsrp"
+    serv = load_phase39_serving_reference(tech)
+    val = load_phase39_validation_reference(tech)
+    fig = go.Figure()
+    if not val.empty:
+        fig.add_trace(cdf_trace(val["rsrp_measured"], "1 - DT measured (outdoor)", "#e5e7eb"))
+        fig.add_trace(cdf_trace(val["phase39_final_rsrp"], "2 - Phase 39 calibrated predicted at DT", "#3b82f6"))
+    if not serv.empty and final_col in serv.columns:
+        fig.add_trace(cdf_trace(serv.loc[serv["serving_environment"].eq("outdoor"), final_col], f"3 - Phase 39 calibrated outdoor polygon ({agg_label})", "#22c55e"))
+        fig.add_trace(cdf_trace(serv.loc[serv["serving_environment"].eq("indoor"), final_col], f"4 - Phase 39 calibrated indoor polygon ({agg_label})", "#f59e0b"))
+    fig.update_layout(
+        title=f"{tech} canonical Phase 39 production CDF reference ({agg_label})",
+        height=470,
+        xaxis_title="RSRP (dBm)",
+        yaxis_title="Cumulative %",
+        yaxis_range=[0, 100],
+        xaxis_range=[-140, -45],
+        legend=dict(orientation="h", yanchor="bottom", y=-0.35),
+        paper_bgcolor="#0e1117",
+        plot_bgcolor="#0e1117",
+        font=dict(color="#f8fafc"),
+    )
+    fig.update_xaxes(gridcolor="#374151", zerolinecolor="#6b7280")
+    fig.update_yaxes(gridcolor="#374151", zerolinecolor="#6b7280")
+    return fig
+
+
+def serving_grid_for_phase39_cdf(frame: pd.DataFrame) -> pd.DataFrame:
+    """Mirror Phase 39 CDF polygon source: one serving row per technology/grid."""
+    if frame.empty or "grid_id" not in frame.columns:
+        return pd.DataFrame()
+    work = frame.copy()
+    if "technology" not in work.columns and "Technology" in work.columns:
+        work["technology"] = work["Technology"]
+    value_col = "final_rsrp" if "final_rsrp" in work.columns else "pred_rsrp"
+    sort_col = "final_rsrp_unclipped" if "final_rsrp_unclipped" in work.columns else value_col
+    work["_phase43_cdf_sort"] = pd.to_numeric(work[sort_col], errors="coerce")
+    best = work.sort_values("_phase43_cdf_sort").groupby(["technology", "grid_id"], dropna=False).tail(1).copy()
+    best["phase43_cdf_rsrp"] = pd.to_numeric(best[value_col], errors="coerce")
+    branch = best.get("obstruction_branch", pd.Series("", index=best.index)).astype(str)
+    best["serving_environment"] = np.where(branch.eq("indoor"), "indoor", "outdoor")
+    return best.reset_index(drop=True)
+
+
+def validation_dt_for_phase39_cdf(frame: pd.DataFrame) -> pd.DataFrame:
+    """Mirror Phase 39 DT CDF intent: held-out outdoor DT rows only."""
+    if frame.empty:
+        return pd.DataFrame()
+    out = frame.copy()
+    if "technology" not in out.columns and "Technology" in out.columns:
+        out["technology"] = out["Technology"]
+    if "split" in out.columns:
+        out = out[out["split"].astype(str).str.lower().eq("validation")].copy()
+    elif "phase25_split" in out.columns:
+        out = out[out["phase25_split"].astype(str).str.lower().eq("validation")].copy()
+    out = out[out.get("obstruction_branch", pd.Series("", index=out.index)).astype(str).ne("indoor")].copy()
+    for excluded_col in ["p36_backlobe", "p38_excluded"]:
+        if excluded_col in out.columns:
+            out = out[~out[excluded_col].astype(bool)].copy()
+    return out
 
 def color_for(value: float, bins: list[tuple[float, float, str, str]]) -> str:
     if not np.isfinite(value):
@@ -166,7 +284,8 @@ def map_frame(frame: pd.DataFrame, metric: str, title: str, view_mode: str) -> N
             f"<b>Cell:</b> {getattr(row, 'strict_cell_key', '')}<br>"
             f"<b>Operator:</b> {getattr(row, 'operator', '')}<br>"
             f"<b>Technology:</b> {getattr(row, 'technology', '')}<br>"
-            f"<b>{metric}:</b> {value:.2f}"
+            f"<b>{metric}:</b> {value:.2f}<br>"
+            f"<b>Samples:</b> {getattr(row, 'samples', '')}"
         )
         if needed_bounds.issubset(df.columns) and all(np.isfinite([row.min_lat, row.max_lat, row.min_lon, row.max_lon])):
             folium.Rectangle(
@@ -205,15 +324,78 @@ def load_timings(path: str) -> list[dict]:
     return json.loads(timings_path.read_text(encoding="utf-8")) if timings_path.exists() else []
 
 
+
+def grid_display_frame(frame: pd.DataFrame, metric: str, mode: str) -> pd.DataFrame:
+    if frame.empty:
+        return frame.copy()
+    lat_col = "center_lat" if "center_lat" in frame.columns else "lat"
+    lon_col = "center_lon" if "center_lon" in frame.columns else "lon"
+    min_lat_col = "min_lat" if "min_lat" in frame.columns else "grid_min_lat"
+    max_lat_col = "max_lat" if "max_lat" in frame.columns else "grid_max_lat"
+    min_lon_col = "min_lon" if "min_lon" in frame.columns else "grid_min_lon"
+    max_lon_col = "max_lon" if "max_lon" in frame.columns else "grid_max_lon"
+    work = frame.dropna(subset=[metric, lat_col, lon_col]).copy()
+    if work.empty:
+        return work
+    if mode == "Frontend API avg by lat/lon/site":
+        work["lat_6dp"] = pd.to_numeric(work[lat_col], errors="coerce").round(6)
+        work["lon_6dp"] = pd.to_numeric(work[lon_col], errors="coerce").round(6)
+        site_col = "site" if "site" in work.columns else "strict_cell_key"
+        work["frontend_site_id"] = work.get(site_col, pd.Series("", index=work.index)).astype(str)
+        agg = {
+            metric: (metric, "mean"),
+            "center_lat": ("lat_6dp", "first"),
+            "center_lon": ("lon_6dp", "first"),
+            "samples": (metric, "size"),
+        }
+        if "grid_id" in work.columns:
+            agg["grid_id"] = ("grid_id", "first")
+        else:
+            work["grid_id"] = work["lat_6dp"].astype(str) + ":" + work["lon_6dp"].astype(str)
+            agg["grid_id"] = ("grid_id", "first")
+        for col in [min_lat_col, max_lat_col, min_lon_col, max_lon_col]:
+            if col in work.columns:
+                agg[col] = (col, "first")
+        for col in ["operator", "technology", "strict_cell_key", "site", "sector", "band", "clutter_class", "obstruction_branch"]:
+            if col in work.columns:
+                agg[col] = (col, "first")
+        out = work.groupby(["lat_6dp", "lon_6dp", "frontend_site_id"], as_index=False).agg(**agg)
+    else:
+        if "grid_id" not in work.columns:
+            return work.copy()
+        idx = work.groupby("grid_id")[metric].idxmax()
+        out = work.loc[idx].copy()
+        out["samples"] = work.groupby("grid_id")[metric].size().reindex(out["grid_id"]).to_numpy()
+    rename = {}
+    if lat_col in out.columns:
+        rename[lat_col] = "center_lat"
+    if lon_col in out.columns:
+        rename[lon_col] = "center_lon"
+    if min_lat_col in out.columns:
+        rename[min_lat_col] = "min_lat"
+    if max_lat_col in out.columns:
+        rename[max_lat_col] = "max_lat"
+    if min_lon_col in out.columns:
+        rename[min_lon_col] = "min_lon"
+    if max_lon_col in out.columns:
+        rename[max_lon_col] = "max_lon"
+    out = out.rename(columns=rename)
+    return out.reset_index(drop=True)
+
 def render() -> None:
     st.title("Phase 43 Baseline Optimization")
+    st.info(
+        "Phase 43 is a speed optimization check. Production and optimized maps/CDF should overlap exactly. "
+        "These plots use the captured diagnostic prediction parquet, not the live frontend DB/API layer unless that export is added."
+    )
 
     with st.sidebar:
         project = st.selectbox("Project", list(RUNS), index=0)
         available_runs = [key for key in ["phase43", "phase43_v2", "phase43_v3"] if key in RUNS[project]]
         optimized_run = st.selectbox("Optimized run", available_runs, index=len(available_runs) - 1)
         metric = st.selectbox("Metric", ["pred_rsrp", "pred_rsrq", "pred_sinr"], index=0)
-        view_mode = st.radio("Map view", ["Static", "Interactive"], index=0)
+        display_mode = st.radio("Aggregation", ["Serving cell (best server)", "Frontend (mean of candidates)", "Both"], index=0)
+        view_mode = st.radio("Map view", ["Interactive", "Static"], index=0)
 
     prod_dir = RUNS[project]["production"]
     phase43_dir = RUNS[project][optimized_run]
@@ -233,38 +415,135 @@ def render() -> None:
     tech = st.sidebar.radio("Technology", techs, index=0, horizontal=False)
     operator = st.sidebar.selectbox("Operator", operators, index=0)
 
-    prod_f = filtered(prod, tech, operator)
-    opt_f = filtered(opt, tech, operator)
+    prod_raw_f = filtered(prod, tech, operator)
+    opt_raw_f = filtered(opt, tech, operator)
+    display_modes = ["Serving cell (best server)", "Frontend (mean of candidates)"] if display_mode == "Both" else [display_mode]
+
+    def mode_to_grid_name(mode: str) -> str:
+        return "Frontend API avg by lat/lon/site" if mode.startswith("Frontend") else "Best server / MAX per grid"
 
     cols = st.columns(5)
     cols[0].metric("Production wall", f"{prod_summary.get('wall_s', 0.0):.1f}s")
     cols[1].metric(f"{optimized_run} wall", f"{opt_summary.get('wall_s', 0.0):.1f}s")
     cols[2].metric("Production scorer", f"{scorer_seconds(prod_timings):.1f}s")
     cols[3].metric(f"{optimized_run} scorer", f"{scorer_seconds(opt_timings):.1f}s")
-    cols[4].metric("Rows", f"{len(opt):,}")
+    cols[4].metric("Raw rows", f"{len(opt_raw_f):,}")
+    st.caption("Phase 43 compares production-before vs optimized-after. Serving cell is best-server by grid_id. Frontend mode mirrors GetLtePredictionLocationStats: avg by rounded lat/lon/site with sampleCount.")
+    st.caption(f"Production source: {prod_dir.name}; optimized source: {phase43_dir.name}")
 
-    if len(prod_f) and len(opt_f):
-        aligned = prod_f.sort_values(["technology", "operator", "grid_id", "strict_cell_key"]).reset_index(drop=True)
-        aligned_opt = opt_f.sort_values(["technology", "operator", "grid_id", "strict_cell_key"]).reset_index(drop=True)
-        if len(aligned) == len(aligned_opt):
-            diff = (pd.to_numeric(aligned[metric], errors="coerce") - pd.to_numeric(aligned_opt[metric], errors="coerce")).abs()
-            st.metric(f"Max abs diff for {metric}", f"{float(diff.max()):.6f}")
+    for selected_mode in display_modes:
+        grid_mode = mode_to_grid_name(selected_mode)
+        prod_f = grid_display_frame(prod_raw_f, metric, grid_mode)
+        opt_f = grid_display_frame(opt_raw_f, metric, grid_mode)
+        st.divider()
+        st.header(selected_mode)
+        st.metric("Display grid rows", f"{len(opt_f):,}", delta=f"raw {len(opt_raw_f):,}")
 
-    st.subheader("CDF")
-    fig = go.Figure()
-    fig.add_trace(cdf_trace(prod_f[metric], "Production", "#ef4444"))
-    fig.add_trace(cdf_trace(opt_f[metric], optimized_run, "#22c55e"))
-    fig.update_layout(height=420, xaxis_title=metric, yaxis_title="Cumulative %", yaxis_range=[0, 100])
-    st.plotly_chart(fig, use_container_width=True)
+        aligned = pd.DataFrame()
+        aligned_opt = pd.DataFrame()
+        if len(prod_f) and len(opt_f):
+            aligned = prod_f.sort_values(["grid_id"]).reset_index(drop=True)
+            aligned_opt = opt_f.sort_values(["grid_id"]).reset_index(drop=True)
+            if len(aligned) == len(aligned_opt) and aligned["grid_id"].astype(str).equals(aligned_opt["grid_id"].astype(str)):
+                diff_rows = []
+                for diff_metric in ["pred_rsrp", "pred_rsrq", "pred_sinr", "building_obstruction_loss_db", "terrain_diffraction_loss_db", "physical_rsrp_unclipped"]:
+                    if diff_metric in aligned.columns and diff_metric in aligned_opt.columns:
+                        diff = (pd.to_numeric(aligned[diff_metric], errors="coerce") - pd.to_numeric(aligned_opt[diff_metric], errors="coerce")).abs()
+                        diff_rows.append({"field": diff_metric, "max_abs_diff": float(diff.max()), "changed_rows": int((diff > 1e-9).sum())})
+                label_rows = []
+                for label_col in ["obstruction_branch", "clutter_class"]:
+                    if label_col in aligned.columns and label_col in aligned_opt.columns:
+                        label_rows.append({"field": label_col, "mismatch_rows": int((aligned[label_col].astype(str) != aligned_opt[label_col].astype(str)).sum())})
+                st.subheader("Production vs optimized equality check")
+                st.caption("For Phase 43, these values should be zero. Zero means latency improved without changing RF/model output.")
+                if diff_rows:
+                    st.dataframe(pd.DataFrame(diff_rows), use_container_width=True, hide_index=True)
+                if label_rows:
+                    st.dataframe(pd.DataFrame(label_rows), use_container_width=True, hide_index=True)
+                selected_diff = (pd.to_numeric(aligned[metric], errors="coerce") - pd.to_numeric(aligned_opt[metric], errors="coerce")).abs()
+                st.metric(f"Selected metric max abs diff: {metric}", f"{float(selected_diff.max()):.6f}")
+                if float(selected_diff.max()) == 0.0:
+                    st.success("Production and optimized values are exactly identical for this aggregation and filter.")
+            else:
+                st.error(f"Cannot align rows for exact comparison: production={len(aligned):,}, optimized={len(aligned_opt):,}")
 
-    st.subheader("Maps")
-    map_cols = st.columns(2)
-    with map_cols[0]:
-        st.caption("Production baseline")
-        map_frame(prod_f, metric, f"{project} production {metric}", view_mode)
-    with map_cols[1]:
-        st.caption(f"{optimized_run} optimized baseline")
-        map_frame(opt_f, metric, f"{project} {optimized_run} {metric}", view_mode)
+        st.subheader("Phase 37/39-style RSRP CDF guardrail")
+        prod_dt = load_dt_scored(str(prod_dir))
+        opt_dt = load_dt_scored(str(phase43_dir))
+        prod_dt_f = filtered(validation_dt_for_phase39_cdf(prod_dt), tech, operator) if not prod_dt.empty else pd.DataFrame()
+        opt_dt_f = filtered(validation_dt_for_phase39_cdf(opt_dt), tech, operator) if not opt_dt.empty else pd.DataFrame()
+        prod_serving_cdf = filtered(serving_grid_for_phase39_cdf(prod_raw_f), tech, operator)
+        opt_serving_cdf = filtered(serving_grid_for_phase39_cdf(opt_raw_f), tech, operator)
+
+        def four_curve_guard(title: str, serving_frame: pd.DataFrame, dt_frame: pd.DataFrame, predicted_label: str) -> go.Figure:
+            fig = go.Figure()
+            if not dt_frame.empty and "rsrp_measured" in dt_frame.columns:
+                fig.add_trace(cdf_trace(dt_frame["rsrp_measured"], "1 - DT measured (outdoor)", "#e5e7eb"))
+                pred_col = "final_rsrp" if "final_rsrp" in dt_frame.columns else ("pred_rsrp" if "pred_rsrp" in dt_frame.columns else None)
+                if pred_col:
+                    fig.add_trace(cdf_trace(dt_frame[pred_col], f"2 - {predicted_label} calibrated predicted at DT", "#3b82f6"))
+            if "phase43_cdf_rsrp" in serving_frame.columns:
+                fig.add_trace(cdf_trace(serving_frame.loc[serving_frame["serving_environment"].eq("outdoor"), "phase43_cdf_rsrp"], f"3 - {predicted_label} calibrated outdoor polygon (serving cell)", "#22c55e"))
+                fig.add_trace(cdf_trace(serving_frame.loc[serving_frame["serving_environment"].eq("indoor"), "phase43_cdf_rsrp"], f"4 - {predicted_label} calibrated indoor polygon (serving cell)", "#f59e0b"))
+            fig.update_layout(
+                title=title,
+                height=470,
+                xaxis_title="RSRP (dBm)",
+                yaxis_title="Cumulative %",
+                yaxis_range=[0, 100],
+                xaxis_range=[-140, -45],
+                legend=dict(orientation="h", yanchor="bottom", y=-0.35),
+                paper_bgcolor="#0e1117",
+                plot_bgcolor="#0e1117",
+                font=dict(color="#f8fafc"),
+            )
+            fig.update_xaxes(gridcolor="#374151", zerolinecolor="#6b7280")
+            fig.update_yaxes(gridcolor="#374151", zerolinecolor="#6b7280")
+            return fig
+
+        guard_cols = st.columns(2)
+        with guard_cols[0]:
+            st.plotly_chart(
+                four_curve_guard(
+                    f"Production baseline CDF guardrail - {selected_mode}",
+                    prod_serving_cdf,
+                    prod_dt_f,
+                    "Production baseline",
+                ),
+                use_container_width=True,
+            )
+        with guard_cols[1]:
+            st.plotly_chart(
+                four_curve_guard(
+                    f"{optimized_run} CDF guardrail - {selected_mode}",
+                    opt_serving_cdf,
+                    opt_dt_f,
+                    optimized_run,
+                ),
+                use_container_width=True,
+            )
+        if prod_dt_f.empty or opt_dt_f.empty or "rsrp_measured" not in prod_dt_f.columns or "rsrp_measured" not in opt_dt_f.columns:
+            st.warning("DT measured/predicted-at-DT curves need drive_test_rows.parquet plus dt_calibrated_predictions.parquet. Older runs may only show outdoor/indoor polygon curves until rerun with the updated harness.")
+        st.caption("This is the valid Phase43 optimization guardrail: production baseline run and optimized run are drawn from the same pipeline, same DT selection, same serving-grid aggregation. DT counts must match; if they do not, the comparison is invalid.")
+        if project == "Project 210 Taiwan" and tech in ["4G", "5G"]:
+            with st.expander("Canonical Phase39 equal-power reference only ? not used as the Phase43 comparison baseline"):
+                st.plotly_chart(phase39_reference_cdf_figure(tech, selected_mode), use_container_width=True)
+
+        st.subheader("CDF: production before vs optimized after")
+        fig = go.Figure()
+        fig.add_trace(cdf_trace(prod_f[metric], "Production", "#ef4444"))
+        fig.add_trace(cdf_trace(opt_f[metric], optimized_run, "#22c55e"))
+        fig.update_layout(height=420, xaxis_title=metric, yaxis_title="Cumulative %", yaxis_range=[0, 100])
+        st.plotly_chart(fig, use_container_width=True)
+
+        st.subheader("Maps: production before vs optimized after")
+        map_cols = st.columns(2)
+        with map_cols[0]:
+            st.caption("Production baseline / before")
+            map_frame(prod_f, metric, f"{project} production {metric} - {selected_mode}", view_mode)
+        with map_cols[1]:
+            st.caption(f"{optimized_run} optimized baseline / after")
+            map_frame(opt_f, metric, f"{project} {optimized_run} {metric} - {selected_mode}", view_mode)
 
     st.subheader("Operator / Technology Counts")
     count_cols = st.columns(2)
@@ -289,6 +568,8 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+
 
 
 

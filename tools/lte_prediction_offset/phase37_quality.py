@@ -35,8 +35,18 @@ def _mw(dbm):
 
 
 def _carrier_key(frame: pd.DataFrame) -> pd.Series:
-    freq = pd.to_numeric(frame.get("original_frequency_mhz", frame.get("serving_frequency_mhz", frame.get("frequency_mhz"))),
-                         errors="coerce").round(1)
+    # A frame that carries none of the three frequency columns makes every
+    # .get() return None, and pd.to_numeric(None) is a numpy scalar, not a
+    # Series -- .astype("string") then fails on it with "data type 'string' not
+    # understood", which reads as a dtype fault rather than the missing column
+    # it actually is. Force a Series so the key degrades to "<tech>|<NA>"
+    # instead of raising.
+    freq = frame.get("original_frequency_mhz",
+                     frame.get("serving_frequency_mhz",
+                               frame.get("frequency_mhz")))
+    if freq is None:
+        freq = pd.Series(np.nan, index=frame.index, dtype=float)
+    freq = pd.to_numeric(pd.Series(freq, index=frame.index), errors="coerce").round(1)
     return frame["technology"].astype(str) + "|" + freq.astype("string")
 
 
@@ -53,14 +63,21 @@ def _attach_carrier_key(frame: pd.DataFrame, cell_carrier_map) -> pd.Series:
     frames scoring the SAME cell can otherwise compute two different keys for
     it and silently fail to join.
     """
-    fallback = _carrier_key(frame)
     if cell_carrier_map is None or getattr(cell_carrier_map, "empty", True) or "strict_cell_key" not in frame.columns:
-        return fallback
+        return _carrier_key(frame)
     mapped = frame[["strict_cell_key"]].merge(
         cell_carrier_map[["strict_cell_key", "carrier_key"]], on="strict_cell_key", how="left"
     )
     mapped.index = frame.index
-    return mapped["carrier_key"].where(mapped["carrier_key"].notna(), fallback)
+    key = mapped["carrier_key"]
+    # The fallback is only consulted for cells the map does not cover, so it is
+    # computed lazily. Evaluating it up front made a frame that carries no
+    # frequency column fail even when the map resolved every one of its rows -
+    # which is the normal production path, since the map exists precisely
+    # because those columns do not survive every join.
+    if key.notna().all():
+        return key
+    return key.where(key.notna(), _carrier_key(frame))
 
 
 def _point_quality(signal_dbm, interference_mw):

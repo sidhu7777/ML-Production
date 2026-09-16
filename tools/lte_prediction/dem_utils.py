@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Optional
 
 import geopandas as gpd
+import numpy as np
 import pandas as pd
 import requests
 from dotenv import load_dotenv
@@ -175,6 +176,42 @@ def _validate_dem_coverage(dem_path: Path, min_lat: float, min_lon: float, max_l
         if not math.isfinite(centroid_value):
             return False, "centroid_nodata"
 
+        # Covering the bbox is not enough to be usable: _DemSampler still has to
+        # pick an elevation band, and it rejects any band whose percentiles look
+        # like imagery or bathymetry rather than terrain. An unclipped mosaic of
+        # a coastal project is mostly ocean and fails that test even though it
+        # covers the project perfectly.
+        #
+        # This deliberately mirrors _DemSampler's test EXACTLY, whole raster and
+        # all, rather than checking only the project window. "Valid cache" has
+        # to mean "the sampler can actually open this". Judging it on a window
+        # the sampler does not use would pass a file the sampler then rejects,
+        # the cache would never be invalidated, and terrain would stay disabled
+        # on every future run.
+        #
+        # A file that declares its elevation band is one we generated, and the
+        # sampler trusts that declaration, so there is nothing to sniff. Caches
+        # written before the tag existed carry no tag and still get checked -
+        # which is what evicts the old unclipped, ocean-heavy mosaics.
+        if src.tags().get("DEM_ELEVATION_BAND"):
+            return True, "ok"
+        for band in range(1, src.count + 1):
+            try:
+                values = src.read(band, masked=True).compressed().astype(float)
+            except Exception:
+                continue
+            values = values[np.isfinite(values)]
+            if not len(values):
+                continue
+            if len(values) > 100_000:
+                values = values[:: max(1, len(values) // 100_000)]
+            p1, p50, p99 = np.percentile(values, [1, 50, 99])
+            if (-500.0 <= p1 <= 9000.0 and -500.0 <= p50 <= 9000.0
+                    and p99 <= 9000.0 and p99 - p1 >= 1.0):
+                break
+        else:
+            return False, "no_plausible_elevation_band"
+
     return True, "ok"
 
 
@@ -198,7 +235,25 @@ def _build_dem(project_id: int, region: str, site_df: Optional[pd.DataFrame], ou
 
         datasets = [rasterio.open(path) for path in tile_paths]
         try:
-            mosaic, transform = merge(datasets)
+            # Clip the mosaic to the project window. Unclipped, a 1x2 degree
+            # SRTM pair is kept whole - 3601x7201 samples of which the project
+            # uses a sliver - and for a coastal project most of it is ocean.
+            # That breaks the elevation-band check in _DemSampler, which reads
+            # percentiles over the WHOLE raster and rejects any band whose 1st
+            # percentile is below -500 m: seafloor values down to -2899 m made
+            # a perfectly good DEM read as "no plausible elevation band", and
+            # terrain was silently disabled. The margin keeps tx->rx profiles
+            # that graze the edge of the site extent inside the raster.
+            margin_deg = 0.02
+            mosaic, transform = merge(
+                datasets,
+                bounds=(
+                    min_lon - margin_deg,
+                    min_lat - margin_deg,
+                    max_lon + margin_deg,
+                    max_lat + margin_deg,
+                ),
+            )
             meta = datasets[0].meta.copy()
             meta.update(
                 {
@@ -210,6 +265,20 @@ def _build_dem(project_id: int, region: str, site_df: Optional[pd.DataFrame], ou
             )
             with rasterio.open(output_path, "w", **meta) as dst:
                 dst.write(mosaic)
+                # Record provenance. We built this file ourselves from a known
+                # source, so the reader must not have to guess which band holds
+                # elevation. The statistical band-sniffing in _DemSampler exists
+                # for project-supplied rasters of unknown layout (a .grd can
+                # carry RGB display bands); applying it to our own download is
+                # what made a valid DEM read as "no plausible elevation band".
+                # Amazon elevation-tiles-prod is SRTM land PLUS ETOPO1 ocean, so
+                # a coastal project legitimately contains seafloor below -500 m
+                # and would keep failing that heuristic no matter how tightly
+                # the mosaic is clipped.
+                dst.update_tags(
+                    DEM_SOURCE="amazon_elevation_tiles_prod_skadi",
+                    DEM_ELEVATION_BAND="1",
+                )
         finally:
             for ds in datasets:
                 ds.close()

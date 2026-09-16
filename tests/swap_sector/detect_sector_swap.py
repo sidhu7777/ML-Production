@@ -1,31 +1,47 @@
 """
-Sector-swap detector -- TEST CASE ONLY. Reads the files already produced by
-fetch_data.py / make_synthetic_swap.py in tests/swap_sector/data/, does not
-touch the database or write anything back to production tables.
+Sector-swap detector -- TEST CASE ONLY. Reads data/cells*.csv + data/measurements*.csv (built by
+build_dataset.py / make_synthetic_swap.py / make_demo.py); never touches the database.
 
-Algorithm (per site), per the spec agreed in this test case:
+Active model: method="pattern" (pattern_detector.py + antenna_profile.py). The expected 36 x 10-degree
+antenna-gain profile of every configured antenna endpoint (azimuth + EXACT / ASSUMED / APPROXIMATE
+pattern) is compared with each PCI's drive-test profile, for every way of assigning endpoints to PCIs.
+Verdicts: NORMAL, PROBABLE_SWAP, CONFIRMED_SWAP (rule-based, EXACT patterns only), AZIMUTH_MISMATCH
+(direction / RF anomaly), AMBIGUOUS, NOT_ENOUGH_DATA, NOT_TESTABLE. No field calibration is claimed.
 
-  DT samples  -> quality-filtered directional PCI profile -> DT observed azimuth per PCI
-  HO events   -> quality-filtered directional PCI profile -> HO observed azimuth per PCI
-  DT + HO fusion (HO only weighted up when it has enough evidence on its own;
-    sparse HO never overrides strong DT) -> final observed azimuth per PCI
-  compare final observed azimuth against each sector's CONFIGURED azimuth
-  test every PCI<->sector permutation for the site (not per-sector deltas),
-    weighting each sector's error term by that PCI's evidence confidence
-    (an implausibility penalty: a permutation that fights strong evidence
-    costs more than one that fights weak evidence)
-  confidence = evidence completeness x margin between best and 2nd-best permutation
-  verdict = NORMAL / PROBABLE_SWAP / CONFIRMED_SWAP / INSUFFICIENT_DATA
+Kept for comparison only (validate.py): method="combined" / "direction" / "ranking" (evidence.py) and
+method="legacy" (analyse_group_legacy below). Legacy baseline:
+Per carrier group (site + operator + technology + EARFCN) it compares the PREDICTED direction of
+each sector (site_prediction azimuth) with the REAL coverage direction measured in the drive test:
 
-Run from the ML/ directory:
-    venv\\Scripts\\python.exe -m tests.swap_sector.detect_sector_swap --config real
+  1. Drive-test spots around the site are split by bearing into 36 bins of BIN_SIZE_DEG (10 deg).
+  2. At each spot, the strongest of the group's PCIs is taken (serving + neighbour RSRP).
+  3. A bin is won by a PCI when the bin has >= MIN_BIN_SPOTS spots and that PCI is the strongest
+     at >= MIN_BIN_DOMINANCE of them.
+  4. Real direction of a PCI = circular mean of the centres of the bins it wins, weighted by its
+     strongest-spot count. A PCI needs >= MIN_PCI_BINS won bins to get a real direction.
+  5. A predicted direction is right when the real direction is within +-DIRECTION_LIMIT_DEG.
+  6. Every way of re-assigning the predicted directions across the PCIs is tried:
+       NORMAL            the prediction as it is fits every sector that has a real direction
+       SWAP_SUSPECTED    the prediction does not fit, but crossing the directions of sectors does
+       AZIMUTH_MISMATCH  neither the prediction nor any crossing fits -- a direction is simply wrong
+       NOT_ENOUGH_DATA   too few sectors with a real direction, or more than one answer fits
+       NOT_TESTABLE      only one sector on the carrier, or sectors point the same way
+
+PCI numbers are never changed (that would be PCI optimization). A swap means the coverage
+directions of sectors are crossed -- e.g. feeder cables on the wrong antennas, or azimuths swapped
+in the site table.
+
+Run from the ML/ directory (production checks one operator + technology at a time):
+    venv\\Scripts\\python.exe -m tests.swap_sector.detect_sector_swap --config real --operator Airtel --technology LTE
     venv\\Scripts\\python.exe -m tests.swap_sector.detect_sector_swap --config synthetic
+    venv\\Scripts\\python.exe -m tests.swap_sector.detect_sector_swap --config demo
 """
 from __future__ import annotations
 
 import argparse
 import itertools
-import math
+import json
+from datetime import datetime, timezone
 from pathlib import Path
 
 import numpy as np
@@ -34,269 +50,356 @@ import pandas as pd
 DATA_DIR = Path(__file__).resolve().parent / "data"
 
 BIN_SIZE_DEG = 10
-MIN_BIN_SAMPLES = 15          # a DT angle-bin needs this many total samples to count at all
-MIN_BIN_DOMINANCE = 0.40      # top PCI (among the site's own sectors) must hold >=40% share -- meaningful
-                               # plurality for up to 3 overlapping sectors, not an unreachable 50%+ majority
-MIN_HO_EVENTS_FOR_PCI = 3     # a PCI needs at least this many HO-derived bearings to get an HO azimuth
-MIN_EVIDENCE_COMPLETENESS = 0.66  # below this fraction of sectors with usable evidence -> INSUFFICIENT_DATA
-CONFIRMED_CONFIDENCE = 0.70
-PROBABLE_CONFIDENCE = 0.40
+MIN_BIN_SPOTS = 3
+MIN_BIN_DOMINANCE = 0.5
+MIN_PCI_BINS = 2
+DIRECTION_LIMIT_DEG = 30.0
+MIN_SECTOR_SHARE_WITH_DIRECTION = 2 / 3
+MIN_SWAP_ANGLE_DEG = 30.0       # re-assignments moving no sector this much are the same answer
+MAX_FULL_PERMUTATION_SECTORS = 4
+SWAP_VERDICTS = {"SWAP_SUSPECTED", "PROBABLE_SWAP", "CONFIRMED_SWAP"}
 
 
-def circular_weighted_mean_deg(angles_deg: np.ndarray, weights: np.ndarray) -> float:
-    rad = np.radians(angles_deg)
-    x = np.sum(weights * np.cos(rad))
-    y = np.sum(weights * np.sin(rad))
-    if x == 0 and y == 0:
-        return float("nan")
-    return (math.degrees(math.atan2(y, x)) + 360.0) % 360.0
+def angle_diff_deg(a, b) -> np.ndarray:
+    return np.abs((np.asarray(a, dtype=float) - np.asarray(b, dtype=float) + 180.0) % 360.0 - 180.0)
 
 
-def circular_diff_deg(a: float, b: float) -> float:
-    d = abs(a - b) % 360.0
-    return min(d, 360.0 - d)
+def same_answer(azimuths_a, azimuths_b) -> bool:
+    return bool(angle_diff_deg(azimuths_a, azimuths_b).max() < MIN_SWAP_ANGLE_DEG)
 
 
-def dt_observed_azimuth(dt_df: pd.DataFrame, site_id: str, sector_pcis: set) -> dict:
-    """Per PCI: (azimuth_deg, confidence 0-1, n_samples) from quality-filtered DT bins only."""
-    site_dt = dt_df[dt_df["site_id_inferred"].astype(str) == str(site_id)]
-    if site_dt.empty:
-        return {}
+def circular_mean_deg(angles_deg, weights) -> float:
+    rad = np.radians(np.asarray(angles_deg, dtype=float))
+    w = np.asarray(weights, dtype=float)
+    return float((np.degrees(np.arctan2((w * np.sin(rad)).sum(), (w * np.cos(rad)).sum())) + 360.0) % 360.0)
 
-    # Dominance is decided among this site's OWN configured PCIs only, not
-    # against every PCI observed within the radius -- the radius also
-    # catches nearby unrelated sites' traffic, which would otherwise dilute
-    # "dominance" against signals that have nothing to do with this site's
-    # own 3 sectors. A bin "belongs" to whichever of the site's own PCIs
-    # has the most samples in it (plurality, not a fixed >=50% share --
-    # with 3 overlapping sectors no single one reliably clears 50% even in
-    # a bin it genuinely dominates), as long as the bin has enough total
-    # own-PCI samples to be trustworthy at all.
-    own_pci_dt = site_dt[site_dt["pci"].isin(sector_pcis)]
-    if own_pci_dt.empty:
-        return {}
-    per_bin_pci_counts = own_pci_dt.groupby(["angle_bin_10deg", "pci"]).size()
-    bin_totals = own_pci_dt.groupby("angle_bin_10deg").size()
 
-    bin_winner: dict[float, tuple] = {}
-    for (angle_bin, pci), count in per_bin_pci_counts.items():
-        if bin_totals.get(angle_bin, 0) < MIN_BIN_SAMPLES:
+def format_values(values) -> str:
+    return ";".join(f"{float(v):.1f}" for v in values)
+
+
+def parse_values(text) -> list[float]:
+    return [float(v) for v in str(text).split(";") if v != ""]
+
+
+def candidate_assignments(azimuths: np.ndarray) -> list[tuple[int, ...]]:
+    """perm[i] = index of the predicted direction given to sector i. Identity (the prediction) first."""
+    n = len(azimuths)
+    identity = tuple(range(n))
+    if n <= MAX_FULL_PERMUTATION_SECTORS:
+        options = list(itertools.permutations(range(n)))
+    else:
+        options = []
+        for i, j in itertools.combinations(range(n), 2):
+            swapped = list(identity)
+            swapped[i], swapped[j] = j, i
+            options.append(tuple(swapped))
+    seen = {tuple(np.round(azimuths, 1))}
+    result = [identity]
+    for perm in options:
+        moved = azimuths[list(perm)]
+        signature = tuple(np.round(moved, 1))
+        if signature in seen or same_answer(azimuths, moved):
             continue
-        share = count / bin_totals[angle_bin]
-        if share < MIN_BIN_DOMINANCE:
-            continue
-        current = bin_winner.get(angle_bin)
-        if current is None or count > current[1]:
-            bin_winner[angle_bin] = (pci, count)
-
-    per_pci_bins: dict = {}
-    for angle_bin, (pci, count) in bin_winner.items():
-        per_pci_bins.setdefault(pci, {"bins": [], "weights": []})
-        per_pci_bins[pci]["bins"].append(angle_bin + BIN_SIZE_DEG / 2.0)
-        per_pci_bins[pci]["weights"].append(count)
-
-    result: dict[float, tuple[float, float, int]] = {}
-    for pci, data in per_pci_bins.items():
-        weights = np.array(data["weights"], dtype=float)
-        az = circular_weighted_mean_deg(np.array(data["bins"], dtype=float), weights)
-        n_samples = int(weights.sum())
-        confidence = min(1.0, n_samples / 200.0)  # saturates at 200 dominant-bin samples
-        result[pci] = (az, confidence, n_samples)
+        seen.add(signature)
+        result.append(perm)
     return result
 
 
-def ho_observed_azimuth(ho_df: pd.DataFrame, site_id: str, site_lat: float, site_lon: float) -> dict:
-    """Per PCI: (azimuth_deg, confidence 0-1, n_events) from HO transition locations
-    where this site was the FROM side (serving that PCI right before the transition)
-    or the TO side (serving that PCI right after)."""
-    if ho_df.empty:
-        return {}
+def strongest_per_spot(group_meas: pd.DataFrame) -> pd.DataFrame:
+    if group_meas.empty:
+        return group_meas
+    return group_meas.loc[group_meas.groupby("location_id")["rsrp"].idxmax()]
 
-    def bearing(lat, lon):
-        phi1, phi2 = math.radians(site_lat), math.radians(lat)
-        dlon = math.radians(lon - site_lon)
-        y = math.sin(dlon) * math.cos(phi2)
-        x = math.cos(phi1) * math.sin(phi2) - math.sin(phi1) * math.cos(phi2) * math.cos(dlon)
-        return (math.degrees(math.atan2(y, x)) + 360.0) % 360.0
 
-    points: dict[float, list] = {}
-    from_mask = ho_df["from_site_id_inferred"].astype(str) == str(site_id)
-    to_mask = ho_df["to_site_id_inferred"].astype(str) == str(site_id)
+def direction_profile(group_meas: pd.DataFrame, pcis: list[int], require_comparison=False) -> pd.DataFrame:
+    """One row per 10-degree bin: spots in the bin, the PCI that wins it (NaN if none), its share."""
+    bins = list(range(0, 360, BIN_SIZE_DEG))
+    group_meas = group_meas[group_meas["pci"].isin(pcis)]
+    if require_comparison and not group_meas.empty:
+        group_meas = group_meas[group_meas.groupby("location_id").pci.transform("nunique") >= 2]
+        # Exact RSRP ties are not wins for whichever PCI happens to appear first.
+        peaks = group_meas.groupby("location_id").rsrp.transform("max")
+        tied = group_meas[group_meas.rsrp.eq(peaks)].groupby("location_id").size()
+        group_meas = group_meas[~group_meas.location_id.isin(tied[tied > 1].index)]
+    strongest = strongest_per_spot(group_meas)
+    if strongest.empty:
+        counts = pd.DataFrame(0, index=bins, columns=pcis)
+    else:
+        bin_of_spot = (strongest["bearing_deg"] // BIN_SIZE_DEG * BIN_SIZE_DEG).astype(int) % 360
+        counts = pd.crosstab(bin_of_spot, strongest["pci"]).reindex(index=bins, columns=pcis, fill_value=0)
+    spots = counts.sum(axis=1)
+    top_spots = counts.max(axis=1)
+    share = (top_spots / spots.where(spots > 0)).fillna(0.0)
+    won = (spots >= MIN_BIN_SPOTS) & (share >= MIN_BIN_DOMINANCE)
+    if require_comparison:
+        won &= counts.eq(top_spots, axis=0).sum(axis=1).eq(1)
+    return pd.DataFrame({
+        "bin_deg": bins,
+        "spots": spots.to_numpy(),
+        "dominant_pci": counts.idxmax(axis=1).where(won).to_numpy(),
+        "dominant_spots": top_spots.where(won, 0).to_numpy(),
+        "share": share.round(2).to_numpy(),
+    })
 
-    for _, row in ho_df[from_mask].iterrows():
-        pci = row["from_pci"]
-        b = bearing(row["event_lat"], row["event_lon"])
-        points.setdefault(pci, []).append(b)
-    for _, row in ho_df[to_mask].iterrows():
-        pci = row["to_pci"]
-        b = bearing(row["event_lat"], row["event_lon"])
-        points.setdefault(pci, []).append(b)
 
+def real_directions(profile: pd.DataFrame, pcis: list[int]) -> dict[int, float]:
     result = {}
-    for pci, bearings in points.items():
-        if len(bearings) < MIN_HO_EVENTS_FOR_PCI:
-            continue
-        arr = np.array(bearings, dtype=float)
-        az = circular_weighted_mean_deg(arr, np.ones_like(arr))
-        confidence = min(1.0, len(bearings) / 15.0)  # saturates at 15 HO points
-        result[pci] = (az, confidence, len(bearings))
+    for pci in pcis:
+        won = profile[profile["dominant_pci"] == pci]
+        if len(won) >= MIN_PCI_BINS:
+            result[pci] = circular_mean_deg(won["bin_deg"] + BIN_SIZE_DEG / 2, won["dominant_spots"])
     return result
 
 
-def fuse_observations(dt_obs: dict, ho_obs: dict) -> dict:
-    """HO only outweighs DT for a given PCI when HO itself has enough evidence
-    (per feedback: sparse HO must never override strong DT); otherwise DT-only."""
-    fused = {}
-    all_pcis = set(dt_obs) | set(ho_obs)
-    for pci in all_pcis:
-        dt = dt_obs.get(pci)
-        ho = ho_obs.get(pci)
-        if ho and dt:
-            w_ho, w_dt = 0.6 * ho[1], 0.4 * dt[1]
-            total_w = w_ho + w_dt
-            az = circular_weighted_mean_deg(np.array([ho[0], dt[0]]), np.array([w_ho, w_dt]))
-            confidence = max(ho[1], dt[1])
-            n = ho[2] + dt[2]
-        elif ho:
-            az, confidence, n = ho
-        elif dt:
-            az, confidence, n = dt
-        else:
+def crossing_text(pcis: list[int], azimuths: np.ndarray, perm: tuple[int, ...], real: dict[int, float]) -> str:
+    parts = []
+    for k, pci in enumerate(pcis):
+        if angle_diff_deg(azimuths[k], azimuths[perm[k]]) < 1:
             continue
-        fused[pci] = (az, confidence, n)
-    return fused
+        seen = f"really covers {real[pci]:.0f}°" if pci in real else "has no clear real direction"
+        parts.append(f"PCI {pci} {seen} (predicted {azimuths[k]:.0f}°)")
+    return "Coverage directions crossed: " + "; ".join(parts)
 
 
-def permutation_test(sectors: list, fused_obs: dict) -> dict:
-    """sectors: list of dicts {cell_id, azimuth, configured_pci}.
-    Tries every bijection of the site's configured PCIs onto its sector
-    azimuth slots; error term per sector is weighted by that PCI's evidence
-    confidence (implausibility penalty: contradicting strong evidence costs
-    more than contradicting weak/absent evidence)."""
-    pcis = [s["configured_pci"] for s in sectors]
-    azimuths = [s["azimuth"] for s in sectors]
-    identity = tuple(pcis)
-
-    results = []
-    for perm in set(itertools.permutations(pcis)):
-        total_error, total_weight, covered = 0.0, 0.0, 0
-        for az, pci in zip(azimuths, perm):
-            if pci not in fused_obs:
-                continue
-            obs_az, confidence, _n = fused_obs[pci]
-            err = circular_diff_deg(az, obs_az)
-            weight = max(confidence, 0.05)
-            total_error += err * weight
-            total_weight += weight
-            covered += 1
-        avg_error = (total_error / total_weight) if total_weight > 0 else float("inf")
-        results.append({"perm": perm, "avg_error": avg_error, "covered": covered})
-
-    results.sort(key=lambda r: r["avg_error"])
-    best = results[0]
-    second = results[1] if len(results) > 1 else None
-    identity_result = next(r for r in results if r["perm"] == identity)
-
-    evidence_completeness = sum(1 for pci in pcis if pci in fused_obs) / len(pcis)
-    if second and best["avg_error"] < float("inf") and second["avg_error"] < float("inf"):
-        denom = max(second["avg_error"], 1e-6)
-        margin = max(0.0, (second["avg_error"] - best["avg_error"]) / denom)
-    else:
-        margin = 0.0
-    confidence_score = round(evidence_completeness * margin, 3)
-
-    if evidence_completeness < MIN_EVIDENCE_COMPLETENESS:
-        verdict = "INSUFFICIENT_DATA"
-    elif best["perm"] == identity:
-        verdict = "NORMAL"
-    elif confidence_score >= CONFIRMED_CONFIDENCE:
-        verdict = "CONFIRMED_SWAP"
-    elif confidence_score >= PROBABLE_CONFIDENCE:
-        verdict = "PROBABLE_SWAP"
-    else:
-        verdict = "INSUFFICIENT_DATA"
-
-    return {
-        "identity_perm": identity,
-        "best_perm": best["perm"],
-        "best_avg_error_deg": round(best["avg_error"], 2) if best["avg_error"] != float("inf") else None,
-        "identity_avg_error_deg": round(identity_result["avg_error"], 2) if identity_result["avg_error"] != float("inf") else None,
-        "evidence_completeness": round(evidence_completeness, 2),
-        "confidence_score": confidence_score,
-        "verdict": verdict,
+def analyse_group_legacy(group_cells: pd.DataFrame, group_meas: pd.DataFrame) -> dict:
+    group_cells = group_cells.sort_values("pci")
+    first = group_cells.iloc[0]
+    pcis = group_cells["pci"].astype(int).tolist()
+    azimuths = group_cells["azimuth"].astype(float).to_numpy()
+    result = {
+        "group_id": first["group_id"], "operator": first["operator"], "site_id": str(first["site_id"]),
+        "technology": first["technology"], "band": first["band"], "earfcn": int(first["earfcn"]),
+        "match_level": first["match_level"], "n_sectors": len(pcis),
+        "pcis": ";".join(str(p) for p in pcis),
+        "predicted_azimuths": format_values(azimuths), "real_directions": "", "bins_won": "",
+        "sectors_with_direction": 0, "locations": 0, "largest_gap_deg": np.nan,
+        "best_azimuths": format_values(azimuths), "changed_pcis": "",
     }
 
+    def finish(verdict: str, reason: str) -> dict:
+        result.update(verdict=verdict, reason=reason)
+        return result
 
-def run(config_name: str) -> pd.DataFrame:
-    config_file = "site_config.csv" if config_name == "real" else "synthetic_swap_site_config.csv"
-    site_df = pd.read_csv(DATA_DIR / config_file)
-    dt_df = pd.read_csv(DATA_DIR / "dt_samples_6sites.csv")
-    ho_df = pd.read_csv(DATA_DIR / "ho_events_6sites.csv")
+    if len(pcis) < 2:
+        return finish("NOT_TESTABLE", "Only one sector on this carrier")
+    candidates = candidate_assignments(azimuths)
+    if len(candidates) == 1:
+        return finish("NOT_TESTABLE", f"All sectors point within {MIN_SWAP_ANGLE_DEG:.0f}° of each other")
 
+    profile = direction_profile(group_meas, pcis)
+    real = real_directions(profile, pcis)
+    result.update(
+        locations=int(profile["spots"].sum()),
+        sectors_with_direction=len(real),
+        real_directions=format_values([real.get(p, np.nan) for p in pcis]),
+        bins_won=";".join(str(int((profile["dominant_pci"] == p).sum())) for p in pcis),
+    )
+    if len(real) < max(2, MIN_SECTOR_SHARE_WITH_DIRECTION * len(pcis)):
+        return finish("NOT_ENOUGH_DATA", f"Only {len(real)} of {len(pcis)} sectors have a clear real direction in the drive test")
+
+    measured = [k for k, pci in enumerate(pcis) if pci in real]
+    real_az = np.array([real[pcis[k]] for k in measured])
+    assigned = [azimuths[list(perm)] for perm in candidates]
+    gaps = [angle_diff_deg(real_az, a[measured]) for a in assigned]
+    largest = np.array([g.max() for g in gaps])
+    average = np.array([g.mean() for g in gaps])
+    fits = largest <= DIRECTION_LIMIT_DEG
+    result["largest_gap_deg"] = round(float(largest[0]), 1)
+
+    if fits[0]:
+        better = [i for i in range(1, len(candidates)) if fits[i] and average[i] < average[0]]
+        if better:
+            return finish("NOT_ENOUGH_DATA", "Both the prediction and a crossing of directions fit the drive test")
+        return finish("NORMAL", f"Real directions match the prediction within ±{DIRECTION_LIMIT_DEG:.0f}° (largest gap {largest[0]:.0f}°)")
+
+    fitting = [i for i in range(1, len(candidates)) if fits[i]]
+    if not fitting:
+        worst = measured[int(np.argmax(gaps[0]))]
+        return finish(
+            "AZIMUTH_MISMATCH",
+            f"Direction wrong and no crossing explains it: PCI {pcis[worst]} really covers {real[pcis[worst]]:.0f}°, "
+            f"predicted {azimuths[worst]:.0f}° ({largest[0]:.0f}° off)",
+        )
+    best = min(fitting, key=lambda i: average[i])
+    if any(not same_answer(assigned[i], assigned[best]) for i in fitting):
+        return finish("NOT_ENOUGH_DATA", "More than one crossing of directions fits the drive test")
+    result.update(
+        best_azimuths=format_values(assigned[best]),
+        changed_pcis=";".join(str(pcis[k]) for k in range(len(pcis)) if candidates[best][k] != k),
+    )
+    return finish("SWAP_SUSPECTED", crossing_text(pcis, azimuths, candidates[best], real))
+
+
+def detect(cells: pd.DataFrame, measurements: pd.DataFrame, handovers=None, settings=None) -> pd.DataFrame:
+    from tests.swap_sector import pattern_detector
+    from tests.swap_sector.evidence import analyse, Settings
+    settings = settings or Settings(method="pattern")
+    meas_by_group = dict(tuple(measurements.groupby("group_id")))
+    empty = measurements.iloc[0:0]
+    if handovers is None and (DATA_DIR / "handovers.csv").exists():
+        handovers = pd.read_csv(DATA_DIR / "handovers.csv")
+    ho_by_group = dict(tuple(handovers.groupby("group_id"))) if handovers is not None and not handovers.empty else {}
     rows = []
-    for site_id, group in site_df.groupby("site_id_inferred"):
-        site_id = str(site_id)
-        group = group.reset_index(drop=True)
-        sectors = [
-            {
-                "cell_id": r["site_cell_id_representative"],
-                "azimuth": float(r["site_azimuth_deg"]),
-                "configured_pci": float(r["site_pci"]),
-                "ground_truth_swapped": bool(r.get("ground_truth_swapped", False)),
-            }
-            for _, r in group.iterrows()
-        ]
-        sector_pcis = {s["configured_pci"] for s in sectors}
-        site_lat, site_lon = group["site_lat"].mean(), group["site_lon"].mean()
+    for group_id, group_cells in cells.groupby("group_id"):
+        group_meas, group_ho = meas_by_group.get(group_id, empty), ho_by_group.get(group_id)
+        if settings.method == "legacy":
+            rows.append(analyse_group_legacy(group_cells, group_meas))
+        elif settings.method == "pattern":
+            rows.append(pattern_detector.analyse(group_cells, group_meas, group_ho, settings))
+        else:
+            rows.append(analyse(group_cells, group_meas, group_ho, settings))
+    return pd.DataFrame(rows)
 
-        if len(sectors) < 2:
-            rows.append({
-                "site_id": site_id, "n_sectors": len(sectors),
-                "verdict": "INSUFFICIENT_DATA (config incomplete, <2 sectors)",
-                "confidence_score": None, "best_perm": None, "identity_perm": None,
-                "swapped_sectors_predicted": None,
-                "ground_truth_has_swap": any(s["ground_truth_swapped"] for s in sectors),
-            })
-            continue
 
-        dt_obs = dt_observed_azimuth(dt_df, site_id, sector_pcis)
-        ho_obs = ho_observed_azimuth(ho_df, site_id, site_lat, site_lon)
-        fused = fuse_observations(dt_obs, ho_obs)
+def outcome(row: pd.Series) -> str:
+    if row["ground_truth"] == "SWAPPED":
+        if row["verdict"] in SWAP_VERDICTS:
+            correct = same_answer(parse_values(row["best_azimuths"]), parse_values(row["true_azimuths"]))
+            return "FOUND" if correct else "WRONG_SECTORS"
+        return "MISSED" if row["verdict"] == "NORMAL" else "UNDECIDED"
+    if row["ground_truth"] == "CONTROL":
+        if row["verdict"] in SWAP_VERDICTS:
+            return "FALSE_ALARM"
+        return "CORRECT" if row["verdict"] == "NORMAL" else "UNDECIDED"
+    return ""
 
-        result = permutation_test(sectors, fused)
 
-        predicted_swaps = []
-        if result["best_perm"] != result["identity_perm"]:
-            for cell, configured, predicted in zip([s["cell_id"] for s in sectors], result["identity_perm"], result["best_perm"]):
-                if configured != predicted:
-                    predicted_swaps.append(f"{cell}: configured_PCI={configured}->best_fit_PCI={predicted}")
+def add_ground_truth(results: pd.DataFrame, synthetic_cells: pd.DataFrame, real_results: pd.DataFrame) -> pd.DataFrame:
+    truth = synthetic_cells.sort_values("pci").groupby("group_id").agg(
+        ground_truth=("ground_truth", "first"),
+        swap_type=("swap_type", "first"),
+        true_azimuths=("true_azimuth", format_values),
+    )
+    real = real_results[["group_id", "verdict"]].rename(columns={"verdict": "real_verdict"})
+    out = results.merge(truth, on="group_id", how="left").merge(real, on="group_id", how="left")
+    out["swap_type"] = out["swap_type"].fillna("")
+    out["outcome"] = out.apply(outcome, axis=1)
+    return out
 
+
+def scorecard(results: pd.DataFrame) -> pd.DataFrame:
+    """Synthetic test score. The second row only counts carriers whose REAL configuration was Normal, so
+    real configuration problems do not blur the measurement of the detector itself (selection-biased)."""
+    rows = []
+    for scope, subset in (
+        ("All eligible carriers", results),
+        ("Detector-selected Normal subset (selection-biased)", results[results["real_verdict"] == "NORMAL"]),
+    ):
+        swapped = subset[subset["ground_truth"] == "SWAPPED"]["outcome"]
+        control = subset[subset["ground_truth"] == "CONTROL"]["outcome"]
         rows.append({
-            "site_id": site_id,
-            "n_sectors": len(sectors),
-            "verdict": result["verdict"],
-            "confidence_score": result["confidence_score"],
-            "evidence_completeness": result["evidence_completeness"],
-            "identity_avg_error_deg": result["identity_avg_error_deg"],
-            "best_avg_error_deg": result["best_avg_error_deg"],
-            "identity_perm": result["identity_perm"],
-            "best_perm": result["best_perm"],
-            "swapped_sectors_predicted": "; ".join(predicted_swaps) if predicted_swaps else None,
-            "ground_truth_has_swap": any(s["ground_truth_swapped"] for s in sectors),
+            "scope": scope,
+            "injected": len(swapped),
+            "found": int((swapped == "FOUND").sum()),
+            "wrong_sectors": int((swapped == "WRONG_SECTORS").sum()),
+            "missed": int((swapped == "MISSED").sum()),
+            "undecided": int((swapped == "UNDECIDED").sum()),
+            "untouched": len(control),
+            "false_alarms": int((control == "FALSE_ALARM").sum()),
+            "correct_normal": int((control == "CORRECT").sum()),
+            "untouched_undecided": int((control == "UNDECIDED").sum()),
         })
+    return pd.DataFrame(rows)
 
-    out_df = pd.DataFrame(rows)
-    out_path = DATA_DIR / f"detection_results_{config_name}.csv"
-    out_df.to_csv(out_path, index=False)
-    return out_df
+
+TEST_CELL_FILES = {"synthetic": "cells_synthetic.csv", "demo": "cells_demo.csv"}
+
+
+def in_scope(cells: pd.DataFrame, operator: str | None, technology: str | None) -> pd.DataFrame:
+    """Production checks one operator + technology at a time, never mixed."""
+    if operator:
+        cells = cells[cells["operator"] == operator]
+    if technology:
+        cells = cells[cells["technology"] == technology]
+    return cells
+
+
+def reference_provenance():
+    info = json.loads((DATA_DIR / "raw_fetch_info.json").read_text())
+    references = json.loads((DATA_DIR.parent / "reference_provenance.json").read_text())
+    return references.get(str(info["project_id"]), {"status": "UNKNOWN", "basis": "Reference independence has not been established for this project"})
+
+
+def run(config_name: str, operator: str | None = None, technology: str | None = None, settings=None) -> pd.DataFrame:
+    """real = the project's site_prediction; synthetic / demo = test configurations with known ground truth.
+    Pass operator + technology to check one scope, the way production runs."""
+    real_cells = in_scope(pd.read_csv(DATA_DIR / "cells.csv", dtype={"site_id": str}), operator, technology)
+    if real_cells.empty and config_name != "demo":
+        raise ValueError(f"No carriers for operator={operator!r} technology={technology!r}")
+    measurements = pd.read_csv(DATA_DIR / "measurements.csv")
+    measurements = measurements[measurements["group_id"].isin(real_cells["group_id"])]
+    if config_name == "real":
+        results = detect(real_cells, measurements, settings=settings)
+    else:
+        test_cells = in_scope(pd.read_csv(DATA_DIR / TEST_CELL_FILES[config_name], dtype={"site_id": str}), operator, technology)
+        if test_cells.empty:
+            raise ValueError(f"No {config_name} carriers for operator={operator!r} technology={technology!r}")
+        if config_name == "demo":
+            measurements = pd.read_csv(DATA_DIR / "measurements_demo.csv")
+            real_cells = test_cells.assign(azimuth=test_cells["true_azimuth"])
+        real_results = detect(real_cells[real_cells["group_id"].isin(test_cells["group_id"])], measurements, settings=settings)
+        results = add_ground_truth(detect(test_cells, measurements, settings=settings), test_cells, real_results)
+    provenance = reference_provenance()
+    controlled = config_name == "demo" and json.loads((DATA_DIR / "demo_metadata.json").read_text()).get("source") == "controlled"
+    results["provenance"] = "CONTROLLED_SYNTHETIC" if controlled else provenance["status"]
+    if not controlled and provenance["status"] != "USER_CONFIRMED_INDEPENDENT":
+        results["verdict"] = "NOT_ENOUGH_DATA"
+        results["reason"] = provenance["basis"]
+        results["confidence_score"] = 0
+        if "outcome" in results:
+            results["outcome"] = results.apply(outcome, axis=1)
+    scope = "".join(f"_{value}" for value in (operator, technology) if value)
+    results.to_csv(DATA_DIR / f"results_{config_name}{scope}.csv", index=False)
+    return results
+
+
+def write_run_summary(results: pd.DataFrame, config_name: str, operator, technology, settings) -> Path:
+    info = json.loads((DATA_DIR / "raw_fetch_info.json").read_text())
+    summary = {
+        "generated_at_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "project_id": info.get("project_id"), "config": config_name, "method": settings.method,
+        "operator": operator or "all", "technology": technology or "all",
+        "verdict_counts": results["verdict"].value_counts().to_dict(),
+        "field_confirmed": False,
+    }
+    if "pattern_quality" in results:
+        summary["pattern_quality_counts"] = results["pattern_quality"].replace("", "none").value_counts().to_dict()
+        summary["verdicts_by_pattern_quality"] = {
+            quality or "none": group["verdict"].value_counts().to_dict() for quality, group in results.groupby("pattern_quality")
+        }
+    scope = "".join(f"_{value}" for value in (operator, technology) if value)
+    path = DATA_DIR / f"run_summary_{config_name}{scope}.json"
+    path.write_text(json.dumps(summary, indent=2))
+    return path
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--config", choices=["real", "synthetic"], required=True)
+    parser.add_argument("--config", choices=["real", "synthetic", "demo"], required=True)
+    parser.add_argument("--operator", help="e.g. Airtel, JIO, Vi -- production runs one operator + technology at a time")
+    parser.add_argument("--technology", help="LTE or NR")
+    parser.add_argument("--method", choices=["pattern", "combined", "direction", "ranking", "legacy"], default="pattern")
+    parser.add_argument("--max-violation-db", type=float, default=3.0, help="Pattern model: largest acceptable mean violation")
+    parser.add_argument("--tolerance-deg", type=float, default=30.0, help="Direction models only; not a field-calibrated threshold")
     args = parser.parse_args()
 
-    df = run(args.config)
-    pd.set_option("display.width", 200)
-    pd.set_option("display.max_colwidth", 60)
-    print(df.to_string(index=False))
+    from tests.swap_sector.evidence import Settings
+    try:
+        settings = Settings(method=args.method, tolerance_deg=args.tolerance_deg, max_violation_db=args.max_violation_db)
+    except ValueError as exc:
+        parser.error(str(exc))
+    df = run(args.config, args.operator, args.technology, settings)
+    pd.set_option("display.width", 250)
+    pd.set_option("display.max_colwidth", 140)
+    print(df["verdict"].value_counts().to_string())
+    if "pattern_quality" in df:
+        print(pd.crosstab(df["pattern_quality"].replace("", "none"), df["verdict"]).to_string())
+    shown = df if args.config == "demo" else df[df["verdict"].isin(["PROBABLE_SWAP", "CONFIRMED_SWAP", "AZIMUTH_MISMATCH", "AMBIGUOUS", "SWAP_SUSPECTED"])]
+    columns = ["site_id", "operator", "technology", "band", "earfcn", "n_sectors", "predicted_azimuths", "best_azimuths",
+               "pattern_quality", "original_violation_db", "best_violation_db", "support", "verdict", "reason"]
+    columns += ["ground_truth", "outcome"] if args.config == "demo" else []
+    print(shown[[c for c in columns if c in shown.columns]].to_string(index=False))
+    if args.config == "synthetic":
+        print(scorecard(df).to_string(index=False))
+    print(f"[summary] {write_run_summary(df, args.config, args.operator, args.technology, settings)}")
