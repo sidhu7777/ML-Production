@@ -21,7 +21,7 @@ from shapely.ops import transform as shapely_transform
 from tools.lte_prediction.geo_correction_pipeline import _choose_utm_crs, building_df_to_gdf
 
 PHASE27_CLUTTER_SOURCE = "Overture Maps + GHS-OBAT"
-PHASE27_CLASSIFIER_VERSION = "phase27-v2"
+PHASE27_CLASSIFIER_VERSION = "phase27-v3"
 OVERTURE_CONNECT_TIMEOUT_S = 20
 OVERTURE_REQUEST_TIMEOUT_S = 90
 GREEN_LC_SUBTYPES = {"forest", "shrub", "grass"}
@@ -190,7 +190,13 @@ def _impute_heights(buildings: gpd.GeoDataFrame, obat_csv_path: str | None) -> t
             for position, neighbours in zip(unresolved, tree.query_ball_point(pts[unresolved], radius)):
                 if neighbours:
                     work.at[position, "height_m"] = float(means[neighbours].mean())
-    work["height_m"] = pd.to_numeric(work["height_m"], errors="coerce").fillna(12.0).clip(3.0, 120.0)
+    # Whatever is still missing after direct height, GHS-OBAT, and neighbour
+    # imputation falls back to this project's own real known-height mean -
+    # never a fixed constant. A universal fallback (e.g. 12.0m always)
+    # silently pins every such building into the same height tier
+    # regardless of what the project actually looks like.
+    known_mean = float(work.loc[known, "height_m"].mean()) if known.any() else 12.0
+    work["height_m"] = pd.to_numeric(work["height_m"], errors="coerce").fillna(known_mean).clip(3.0, 120.0)
     return work, source
 
 
@@ -236,11 +242,28 @@ def _fetch_overture_context(grid: gpd.GeoDataFrame) -> dict[str, gpd.GeoDataFram
     return layers
 
 
+def _grid_resolution_m(grid: gpd.GeoDataFrame) -> float:
+    """Tile edge length in metres, read back from the tile polygons themselves.
+
+    Recorded on the dataset row so `resolution_m` describes the grid the tiles
+    were actually classified on. The cache key is the boundary hash, never this
+    value, so it is provenance only - but a 50 m dataset labelled 25 m makes the
+    table unreadable to anyone auditing which grid a cached run used.
+    """
+    if grid.empty:
+        return 0.0
+    bounds = grid.geometry.bounds
+    metres = (bounds["maxy"] - bounds["miny"]).to_numpy(float) * 111320.0
+    metres = metres[np.isfinite(metres) & (metres > 0)]
+    return round(float(np.median(metres)), 1) if metres.size else 0.0
+
+
 def _phase27_dataset(db_engine, project_id: int, grid: gpd.GeoDataFrame) -> int:
     layout = "|".join(sorted(
         f"{grid_id}:{geometry.wkb_hex}" for grid_id, geometry in zip(grid["grid_id"].astype(str), grid.geometry)
     ))
     boundary_hash = hashlib.sha256(layout.encode("utf-8")).hexdigest()
+    resolution_m = _grid_resolution_m(grid)
     def action():
       with db_engine.begin() as conn:
         existing = conn.execute(text("""
@@ -260,38 +283,54 @@ def _phase27_dataset(db_engine, project_id: int, grid: gpd.GeoDataFrame) -> int:
                 (project_id, dataset_type, source_name, source_version, boundary_hash,
                  resolution_m, metadata_json, is_active)
             VALUES (:project_id, 'phase27_clutter', :source_name, :source_version,
-                    :boundary_hash, 25.0,
+                    :boundary_hash, :resolution_m,
                     JSON_OBJECT('classifier', 'water->building-height->road->green->open'), 1)
         """), {"project_id": project_id, "source_name": PHASE27_CLUTTER_SOURCE,
-               "source_version": PHASE27_CLASSIFIER_VERSION, "boundary_hash": boundary_hash})
+               "source_version": PHASE27_CLASSIFIER_VERSION, "boundary_hash": boundary_hash,
+               "resolution_m": resolution_m})
         return int(result.lastrowid)
     return _with_db_retry(db_engine, action, "phase27_dataset")
 
 
 def _save_phase27_tiles(db_engine, project_id: int, dataset_id: int, grid: gpd.GeoDataFrame, values: pd.DataFrame) -> None:
     lookup = values.set_index("grid_id")
-    rows = [{
-        "project_id": project_id, "dataset_id": dataset_id, "grid_id": str(row.grid_id),
-        "geometry_wkt": row.geometry.wkt, "clutter_class": str(lookup.at[str(row.grid_id), "clutter_class"]),
-        "land_cover_class": str(lookup.at[str(row.grid_id), "land_cover_class"]),
-    } for row in grid.itertuples()]
-    statement = text("""
-        INSERT INTO tbl_project_clutter_tile
-          (project_id, geo_dataset_id, grid_id, geometry_wkt, clutter_class, land_cover_class, resolution_m, is_active)
-        VALUES (:project_id, :dataset_id, :grid_id, :geometry_wkt, :clutter_class, :land_cover_class, 25.0, 1)
-        ON DUPLICATE KEY UPDATE geometry_wkt=VALUES(geometry_wkt), clutter_class=VALUES(clutter_class),
-          land_cover_class=VALUES(land_cover_class), is_active=1
-    """)
+    rows = [(
+        project_id, dataset_id, str(row.grid_id), row.geometry.wkt,
+        str(lookup.at[str(row.grid_id), "clutter_class"]),
+        str(lookup.at[str(row.grid_id), "land_cover_class"]),
+    ) for row in grid.itertuples()]
+
+    # Manual multi-row INSERT (not SQLAlchemy's execute(statement, list_of_dicts)
+    # executemany path) - same reason as _save_overture_context_layers: pymysql's
+    # executemany batching does not reliably merge rows when a VALUES expression
+    # contains a function call like ST_GeomFromText(...). geometry_geom is a
+    # NOT NULL, spatially-indexed column built from the same WKT already stored
+    # (as portable text) in geometry_wkt.
+    def make_action(batch):
+        def action():
+            placeholders = ", ".join(
+                ["(%s, %s, %s, %s, %s, %s, 25.0, 1, ST_GeomFromText(%s, 4326, 'axis-order=long-lat'))"] * len(batch)
+            )
+            params = []
+            for proj_id, ds_id, grid_id, geometry_wkt, clutter_class, land_cover_class in batch:
+                params.extend([proj_id, ds_id, grid_id, geometry_wkt, clutter_class, land_cover_class, geometry_wkt])
+            with db_engine.begin() as conn:
+                conn.exec_driver_sql(
+                    "INSERT INTO tbl_project_clutter_tile "
+                    "(project_id, geo_dataset_id, grid_id, geometry_wkt, clutter_class, land_cover_class, "
+                    "resolution_m, is_active, geometry_geom) "
+                    f"VALUES {placeholders} "
+                    "ON DUPLICATE KEY UPDATE geometry_wkt=VALUES(geometry_wkt), clutter_class=VALUES(clutter_class), "
+                    "land_cover_class=VALUES(land_cover_class), is_active=1, geometry_geom=VALUES(geometry_geom)",
+                    tuple(params),
+                )
+        return action
+
     # Keep transactions short.  A project cache has thousands of grid tiles and
     # one long upsert transaction can be blocked by unrelated DB activity.
     for start in range(0, len(rows), 250):
         batch = rows[start:start + 250]
-
-        def action(batch=batch):
-            with db_engine.begin() as conn:
-                conn.execute(statement, batch)
-
-        _with_db_retry(db_engine, action, f"save_clutter_tiles_{start // 250 + 1}")
+        _with_db_retry(db_engine, make_action(batch), f"save_clutter_tiles_{start // 250 + 1}")
 
 
 def _save_building_profiles(db_engine, project_id: int, dataset_id: int, buildings: gpd.GeoDataFrame, method: str) -> None:
@@ -327,6 +366,131 @@ def _attach_resolved_heights(building_df: pd.DataFrame, buildings: gpd.GeoDataFr
     return out
 
 
+def _explode_polygons(layer: gpd.GeoDataFrame) -> list:
+    """Singlepart Polygon geometries only - tbl_savepolygon.region is
+    polygon-typed and MySQL rejects a MultiPolygon insert into it."""
+    if layer is None or layer.empty:
+        return []
+    out = []
+    for geom in layer.geometry:
+        if geom is None or geom.is_empty:
+            continue
+        if geom.geom_type == "Polygon":
+            out.append(geom)
+        elif geom.geom_type == "MultiPolygon":
+            out.extend(part for part in geom.geoms if not part.is_empty)
+    return out
+
+
+def _save_overture_context_layers(db_engine, project_id: int, dataset_id: int, context: dict) -> None:
+    """Persist the real Overture geometry this project's clutter was
+    actually computed from - roads/highway/railway/water/land_cover/
+    land_use - not just the derived clutter_class summary, so the
+    frontend can render these as real, independent layers (matching the
+    reference tool) instead of trying to reconstruct a road's shape from
+    a tile label. Reuses tbl_savepolygon, which is already generic and
+    source-tagged/dataset-versioned for exactly this - no new table.
+    Line features (road/highway/railway) go in the table's existing
+    generic `geometry` column; polygon features (water/land_cover/
+    land_use) go in `region`, the same column buildings already use.
+    Called only on a cache miss - once per dataset version, not per run.
+    """
+    segment = context.get("segment")
+    if segment is not None and not segment.empty:
+        subtype = segment.get("subtype", pd.Series(index=segment.index, dtype=str)).astype(str)
+        cls = segment.get("class", pd.Series(index=segment.index, dtype=str)).astype(str)
+        is_rail = subtype.eq("rail")
+        is_highway = ~is_rail & cls.isin({"trunk", "primary", "secondary"})
+        railway, highway, road = segment[is_rail], segment[is_highway], segment[~is_rail & ~is_highway]
+    else:
+        railway = highway = road = gpd.GeoDataFrame()
+
+    polygon_layers = [
+        ("overture_water", context.get("water")),
+        ("overture_land_cover", context.get("land_cover")),
+        ("overture_land_use", context.get("land_use")),
+    ]
+    line_layers = [
+        ("overture_road", road),
+        ("overture_highway", highway),
+        ("overture_railway", railway),
+    ]
+
+    # A manually-built, single multi-row INSERT (not SQLAlchemy's
+    # execute(statement, list_of_dicts) executemany path) - pymysql's
+    # executemany batching does not reliably merge rows when a VALUES
+    # expression contains a function call like ST_GeomFromText(...); it
+    # can scramble parameters across rows. Every other geometry insert in
+    # this codebase that survives real use (tools/buildings) already
+    # avoids this the same way.
+    def action():
+        with db_engine.begin() as conn:
+            for source_name, layer in polygon_layers:
+                geoms = _explode_polygons(layer)
+                for start in range(0, len(geoms), 250):
+                    batch = geoms[start:start + 250]
+                    if not batch:
+                        continue
+                    placeholders = ", ".join(
+                        ["(%s, %s, ST_GeomFromText(%s, 4326, 'axis-order=long-lat'), %s, %s)"] * len(batch)
+                    )
+                    params = []
+                    for g in batch:
+                        params.extend([project_id, source_name, g.wkt, dataset_id, source_name])
+                    conn.exec_driver_sql(
+                        f"INSERT INTO tbl_savepolygon (project_id, name, region, geo_dataset_id, source_name) "
+                        f"VALUES {placeholders}",
+                        tuple(params),
+                    )
+                print(f"[LTE_OFFSET][PHASE27_CONTEXT_SAVE] source_name={source_name} rows={len(geoms)}", flush=True)
+
+            for source_name, layer in line_layers:
+                if layer is None or layer.empty:
+                    print(f"[LTE_OFFSET][PHASE27_CONTEXT_SAVE] source_name={source_name} rows=0", flush=True)
+                    continue
+                geoms = [g for g in layer.geometry if g is not None and not g.is_empty]
+                saved = 0
+                for start in range(0, len(geoms), 250):
+                    rows = []
+                    for g in geoms[start:start + 250]:
+                        # tbl_savepolygon.region is polygon-typed and NOT
+                        # NULL - a line can't go there. A hairline buffer
+                        # satisfies the constraint without claiming false
+                        # precision; the real line geometry (what any real
+                        # consumer should actually render) is in `geometry`.
+                        region_poly = g.buffer(0.00001)
+                        if region_poly.geom_type == "MultiPolygon":
+                            # tbl_savepolygon.region is strictly POLYGON-typed
+                            # (not generic GEOMETRY) - a disjoint MultiLineString
+                            # (e.g. a road split across a tunnel/bridge gap)
+                            # buffers into a MultiPolygon, which MySQL rejects
+                            # for that column. It's only a NOT-NULL placeholder
+                            # here (the real shape is in `geometry`), so keep
+                            # just the largest part.
+                            region_poly = max(region_poly.geoms, key=lambda p: p.area)
+                        if region_poly.is_empty:
+                            continue
+                        rows.append((region_poly.wkt, g.wkt))
+                    if not rows:
+                        continue
+                    placeholders = ", ".join(
+                        ["(%s, %s, ST_GeomFromText(%s, 4326, 'axis-order=long-lat'), "
+                         "ST_GeomFromText(%s, 4326, 'axis-order=long-lat'), %s, %s)"] * len(rows)
+                    )
+                    params = []
+                    for region_wkt, geom_wkt in rows:
+                        params.extend([project_id, source_name, region_wkt, geom_wkt, dataset_id, source_name])
+                    conn.exec_driver_sql(
+                        f"INSERT INTO tbl_savepolygon (project_id, name, region, geometry, geo_dataset_id, source_name) "
+                        f"VALUES {placeholders}",
+                        tuple(params),
+                    )
+                    saved += len(rows)
+                print(f"[LTE_OFFSET][PHASE27_CONTEXT_SAVE] source_name={source_name} rows={saved}", flush=True)
+
+    _with_db_retry(db_engine, action, "save_overture_context_layers")
+
+
 def load_or_build_phase27_clutter(grid_df: pd.DataFrame, building_df: pd.DataFrame, project_id: int, db_engine, obat_csv_path: str | None) -> tuple[pd.DataFrame, pd.DataFrame, dict]:
     """Production implementation of Phase 27's vector clutter classifier."""
     if db_engine is None:
@@ -345,6 +509,7 @@ def load_or_build_phase27_clutter(grid_df: pd.DataFrame, building_df: pd.DataFra
         }
 
     context = _fetch_overture_context(grid)
+    _save_overture_context_layers(db_engine, int(project_id), dataset_id, context)
     building_count, building_ratio = _building_context(grid, buildings)
     water_ratio = _clip_area_ratio(grid, context["water"], "water")
     road_length = _road_length(grid, context["segment"])
@@ -361,14 +526,38 @@ def load_or_build_phase27_clutter(grid_df: pd.DataFrame, building_df: pd.DataFra
     project_mean = float(buildings["height_m"].mean()) if not buildings.empty else 12.0
     records = []
     for grid_id in grid["grid_id"].astype(str):
-        h = surrounding.get(grid_id)
-        h = project_mean if pd.isna(h) else float(h)
+        # Classify by real vector facts FIRST - water/building/road/green/
+        # rural - before touching height at all. Height is only resolved
+        # inside the two branches that actually need it (building, road),
+        # and each handles a missing sample differently: a building tile
+        # with no height sample still IS a building (project-mean is a
+        # defensible estimate); a road tile with no nearby building at all
+        # has no built context to tier by, so it stays Rural/Open instead
+        # of borrowing a height that has nothing to do with it.
         if water_ratio.get(grid_id, 0.0) >= 0.5:
             label, rule = "Water", "water_ratio>=0.5"
         elif building_count.get(grid_id, 0.0) > 0:
-            label, rule = ("Dense Urban" if h > 15.0 else "Urban" if h > 6.0 else "Suburban"), "building_height_tier"
+            h = surrounding.get(grid_id)
+            h = project_mean if pd.isna(h) else float(h)
+            br = building_ratio.get(grid_id, 0.0)
+            # Density-first: real building footprint coverage of the tile
+            # is a fact, independent of height data quality. A tile that is
+            # mostly built over is at least as dense as height alone would
+            # suggest, so density can promote a tier even when the height
+            # sample is thin or imputed.
+            if br >= 0.5 or h > 15.0:
+                label, rule = "Dense Urban", "building_density_or_height_tier"
+            elif br >= 0.15 or h > 6.0:
+                label, rule = "Urban", "building_density_or_height_tier"
+            else:
+                label, rule = "Suburban", "building_density_or_height_tier"
         elif road_length.get(grid_id, 0.0) > 0:
-            label, rule = ("Dense Urban" if h > 15.0 else "Urban" if h > 6.0 else "Suburban"), "road_surrounding_height_tier"
+            h = surrounding.get(grid_id)
+            if pd.isna(h):
+                label, rule = "Rural/Open", "road_no_building_context"
+            else:
+                h = float(h)
+                label, rule = ("Dense Urban" if h > 15.0 else "Urban" if h > 6.0 else "Suburban"), "road_surrounding_height_tier"
         elif green_ratio.get(grid_id, 0.0) >= 0.30:
             label, rule = "Vegetation", "green_ratio>=0.30"
         else:

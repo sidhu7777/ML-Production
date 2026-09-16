@@ -5,6 +5,11 @@ from flask import Blueprint, current_app, jsonify, request
 from .services import LTEPredictionOffsetService
 
 
+# Service edge for the H Cell scope: the RSRP a cell must still deliver for the
+# pixel to count as its coverage. Used only to solve each cell's own radius from
+# its link budget, so the caller does not have to supply a distance per cell.
+CELL_EDGE_RSRP_DBM = -110.0
+
 lte_prediction_offset_bp = Blueprint("lte_prediction_offset", __name__)
 svc = LTEPredictionOffsetService()
 
@@ -26,6 +31,33 @@ def _resolve_region(data):
     return "india"
 
 
+def _prediction_scope(data):
+    """('radius' | 'hcell', cell_edge_rsrp_dbm).
+
+    radius : the operator fixes one distance and every cell is evaluated over it.
+    hcell  : the model decides each cell's coverage itself, solving the distance
+             at which that cell's own RSRP falls to the service edge from its
+             link budget - tx power, real antenna gain, height, frequency. A
+             700 MHz macro and a 3.5 GHz cell therefore get different radii
+             with no per-cell input from the caller.
+
+    The edge level is a planning constant, not something the operator has to
+    supply per run, so it defaults to CELL_EDGE_RSRP_DBM. A caller may still
+    override it to model a different service definition.
+    """
+    raw = str(data.get("prediction_scope") or data.get("predictionScope") or "radius").strip().lower()
+    if raw.replace("_", "").replace("-", "").replace(" ", "") not in {"hcell", "cell", "cellh"}:
+        return "radius", None
+
+    edge = data.get("cell_edge_rsrp_dbm", data.get("cellEdgeRsrpDbm"))
+    if edge is None or str(edge).strip() == "":
+        return "hcell", CELL_EDGE_RSRP_DBM
+    edge = float(edge)
+    if not -160.0 <= edge <= -40.0:
+        raise ValueError(f"cell_edge_rsrp_dbm={edge} is outside the plausible RSRP range -160..-40 dBm")
+    return "hcell", edge
+
+
 @lte_prediction_offset_bp.route("/run", methods=["POST"])
 def run_prediction():
     try:
@@ -33,14 +65,23 @@ def run_prediction():
         app = current_app._get_current_object()
         cpu_count = multiprocessing.cpu_count()
 
+        scope, cell_edge_rsrp_dbm = _prediction_scope(data)
+
         cfg = {
             "project_id": int(data["project_id"]),
+            "prediction_scope": scope,
             "session_ids": data["session_ids"],
             "region": _resolve_region(data),
             "country_code": data.get("country_code") or data.get("countryCode"),
             "polygon_ids": data.get("polygon_ids") or data.get("polygonIds"),
             "operator": str(data.get("operator", "") or "").strip(),
+            # Radius scope: this value applies to every cell. H Cell scope: it
+            # becomes a lower bound on the solved per-cell radius.
             "radius_m": float(data.get("radius", data.get("radius_m", 500))),
+            # None keeps the flat radius; a value switches on the per-cell
+            # link-budget radius in _run_raw_surface.
+            "cell_edge_rsrp_dbm": cell_edge_rsrp_dbm,
+            "cell_edge_radius_cap_m": data.get("cell_edge_radius_cap_m") or data.get("cellEdgeRadiusCapM"),
             "grid_resolution": float(data.get("grid_resolution", 25)),
             "building": bool(data.get("building", True)),
             # An approved project DEM asset. The physical scorer chooses its

@@ -951,6 +951,8 @@ class LTEPredictionService_optimised:
 
             params = {
                 "radius": cfg.get("radius", 500),
+                "prediction_scope": cfg.get("prediction_scope", "radius"),
+                "cell_edge_rsrp_dbm": cfg.get("cell_edge_rsrp_dbm", -110.0),
                 "grid_resolution": cfg.get("grid_resolution", 10),
                 "n_workers": cfg.get("n_workers"),
                 "antenna_gain": 18,
@@ -981,10 +983,19 @@ class LTEPredictionService_optimised:
             )
             _df_summary("OPTIMIZED_RF_OUTPUT_DF", optimized_df)
 
-            self._update(job_id, "running", "Saving CSV")
+            self._update(job_id, "running", "Saving results")
 
-            # Save the CSV
-            file_path = self._save_csv(optimized_df, project_id, operator)
+            # The CSV is a debug artifact: its path is stored on the job record
+            # but nothing in the product reads it - the map loads results from
+            # lte_prediction_optimised_results. It must therefore never be able
+            # to fail the job. It previously did: a whole optimisation was
+            # computed, then discarded at this step because the file could not
+            # be written, and the database save below never ran.
+            try:
+                file_path = self._save_csv(optimized_df, project_id, operator)
+            except Exception as exc:
+                file_path = None
+                print(f"[LTE_OPT][CSV_SAVE] skipped reason={exc}", flush=True)
 
             db_df = self._format_for_db(
                 optimized_df,
@@ -1206,8 +1217,20 @@ class LTEPredictionService_optimised:
             print(" ERROR:", traceback.format_exc())
 
     def _save_csv(self, df, project_id, operator):
-        output_dir = "outputs"
-        os.makedirs(output_dir, exist_ok=True)
+        # "outputs" was relative, so it resolved against whatever working
+        # directory the backend happened to be started in. In the packaged app
+        # that is not a location the process can write to, and the failure lands
+        # here - after the whole optimisation has been computed - discarding the
+        # run at the final step. Write to the per-user data directory instead,
+        # falling back to the old relative path only if that cannot be created.
+        base = os.getenv("APPDATA") or os.getenv("XDG_DATA_HOME") or os.path.expanduser("~")
+        output_dir = os.path.join(base, "S-Tracer", "outputs")
+        try:
+            os.makedirs(output_dir, exist_ok=True)
+        except Exception as exc:
+            print(f"[LTE_OPT][CSV_DIR] falling back to relative path, reason={exc}", flush=True)
+            output_dir = "outputs"
+            os.makedirs(output_dir, exist_ok=True)
 
         timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
 
@@ -1224,7 +1247,21 @@ class LTEPredictionService_optimised:
     def _save_to_db(self, df, region="india"):
         bridge = get_bridge_client()
         if bridge:
-            safe_df = df.replace({pd.NA: None}).where(pd.notna(df), None)
+            # JSON cannot carry NaN or +/-Infinity, and requests encodes with
+            # allow_nan=False, so a single such value rejects the entire POST
+            # and the whole optimisation is lost at the final step.
+            #
+            # The previous line handled neither case. `pd.notna(inf)` is True,
+            # so infinities passed straight through; and writing None into a
+            # float64 column silently coerces back to NaN, so the NaN branch did
+            # nothing either. Casting to object first is what makes None stick.
+            #
+            # Infinities reach here from COST-231: log10(0) is -inf for any cell
+            # whose antenna height is 0, which then makes the path loss NaN.
+            # Those rows are stored as NULL rather than being allowed to abort
+            # the save - the underlying zero heights are a data problem.
+            safe_df = df.replace([np.inf, -np.inf], np.nan)
+            safe_df = safe_df.astype(object).where(pd.notna(safe_df), None)
             rows = []
             for row in safe_df.to_dict(orient="records"):
                 rows.append(

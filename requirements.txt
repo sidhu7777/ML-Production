@@ -139,6 +139,7 @@ openpyxl==3.1.5
 optuna>=3.6,<5
 orjson==3.11.3
 osmnx==2.0.6
+overturemaps
 overrides==7.7.0
 packaging==24.1
 pandas==2.2.3

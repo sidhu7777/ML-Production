@@ -1377,7 +1377,7 @@ class LTEPredictionService:
                 project_id=int(project_id),
                 job_id=str(baseline_job_id),
                 region=str(region).lower(),
-                chunk_size=int(os.getenv("PYTHON_BRIDGE_GEO_SAVE_CHUNK_SIZE", "50000")),
+                chunk_size=int(os.getenv("PYTHON_BRIDGE_GEO_SAVE_CHUNK_SIZE", "10000")),
                 replace_existing=True,
             )
             print("[LTE][GEO_DB_WRITE] source=python_bridge")

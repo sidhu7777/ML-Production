@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib.util
 import io
 import json
 import re
@@ -13,6 +14,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
+import plotly.express as px
 import streamlit as st
 import streamlit.components.v1 as components
 from matplotlib.markers import MarkerStyle
@@ -23,6 +25,7 @@ THIS_DIR = Path(__file__).resolve().parent
 PROJECT_DIR = THIS_DIR / "data" / "project_210_taiwan"
 IDENTITY_PATH = PROJECT_DIR / "baseline_fetch_scope" / "site_identity_strict_cells_project210.parquet"
 PHASE9_DIR = PROJECT_DIR / "cost231_phase9_gridanalytics_compatible"
+PHASE46_RUN = THIS_DIR.parent / "output" / "baseline_210_profile_20260908_142428"
 PHASE17_DIR = PROJECT_DIR / "cost231_phase17_geo_dt_comparison"
 PHASE19_DIR = PROJECT_DIR / "cost231_phase19_branch_calibrated_comparison"
 PHASE20_DIR = PROJECT_DIR / "cost231_phase20_5g_real_dt_match"
@@ -44,6 +47,7 @@ PHASE31_DIR = PROJECT_DIR / "cost231_phase31_phase28_real_antenna"
 PHASE37_DIR = PROJECT_DIR / "cost231_phase37_quality_readiness"
 STATIC_MAP_DISPLAY_WIDTH_PX = 430
 SITE_TECH_COLORS = {"4G": "#1d4ed8", "5G": "#7c3aed"}
+PHASE43_DASHBOARD = THIS_DIR / "optimization" / "streamlit_phase43_baseline_optimization_dashboard.py"
 
 RSRP_BINS = [
     (-140, -115, "#991b1b", "-140 to -115"),
@@ -2871,6 +2875,60 @@ def _render_phase40_quality(tech: str) -> None:
     st.dataframe(dt[[column for column in display_columns if column in dt.columns]], use_container_width=True, height=360, hide_index=True)
 
 
+@st.cache_data(show_spinner=False)
+def _load_phase46_rows() -> pd.DataFrame:
+    path = PHASE46_RUN / "baseline_predictions.parquet"
+    if not path.exists():
+        return pd.DataFrame()
+    out = pd.read_parquet(path)
+    if "technology" not in out and "Technology" in out:
+        out["technology"] = out["Technology"]
+    out["technology"] = out["technology"].astype(str)
+    out["strict_cell_key"] = out["strict_cell_key"].astype(str)
+    return out
+
+
+def _render_phase46_production_cell_audit() -> None:
+    st.header("Phase 46 - Production cell audit")
+    st.caption("All rows are from the complete read-only production offset run. This view does not recompute or write results.")
+    rows = _load_phase46_rows()
+    if rows.empty:
+        st.error(f"Phase 46 output not found: {PHASE46_RUN}")
+        return
+    tech = st.radio("Technology", ["4G", "5G"], horizontal=True, key="phase46_tech")
+    sub = rows[rows["technology"].eq(tech)].copy()
+    cells = sub[["strict_cell_key", "site", "sector", "band"]].drop_duplicates("strict_cell_key").sort_values(["site", "sector", "band", "strict_cell_key"])
+    labels = [f"{r.strict_cell_key} | site={r.site} sector={r.sector} band={r.band}" for r in cells.itertuples()]
+    if not labels:
+        st.warning("No cells available.")
+        return
+    selected = st.selectbox("Production cell (all cells)", labels, key="phase46_cell")
+    cell = sub[sub.strict_cell_key.eq(str(cells.iloc[labels.index(selected)].strict_cell_key))].copy()
+    st.write(f"Rows: {len(cell):,} | PAP rows: {int(cell.get('phase36_antenna_source', pd.Series(dtype=str)).astype(str).eq('pap').sum()):,}")
+    map_value = st.selectbox("Coverage map value", ["raw_cost231_rsrp", "phase36_physical_rsrp", "final_rsrp"], format_func=lambda c: {"raw_cost231_rsrp":"Raw COST-231", "phase36_physical_rsrp":"Physical / PAP", "final_rsrp":"Final calibrated"}[c], key="phase46_map_value")
+    map_rows = cell.dropna(subset=["lat", "lon"]).copy()
+    if not map_rows.empty and map_value in map_rows:
+        map_rows["map_value"] = pd.to_numeric(map_rows[map_value], errors="coerce")
+        map_rows = map_rows.dropna(subset=["map_value"])
+        # Use the dashboard's static renderer so the map remains visible when
+        # external map tiles are unavailable. It plots every selected-cell row.
+        static_rows = map_rows.rename(columns={"lat": "center_lat", "lon": "center_lon", "map_value": "phase46_static_value"})
+        _render_map(static_rows, "phase46_static_value", f"Phase 46 selected cell - {map_value}", "Static image")
+    else:
+        st.warning("No mappable rows for this value.")
+    values = [("Raw COST-231", "raw_cost231_rsrp", "#64748b"), ("Physical/PAP", "phase36_physical_rsrp", "#2563eb"), ("Final calibrated", "final_rsrp", "#16a34a")]
+    fig = go.Figure()
+    for label, col, color in values:
+        if col not in cell:
+            continue
+        x = np.sort(pd.to_numeric(cell[col], errors="coerce").dropna().to_numpy())
+        fig.add_trace(go.Scatter(x=x, y=np.arange(1, len(x)+1)*100/max(len(x), 1), name=f"{label} (n={len(x)})", line=dict(color=color)))
+    fig.update_layout(title=f"Phase 46 selected cell: {selected}", xaxis_title="RSRP (dBm)", yaxis_title="Cumulative %", yaxis_range=[0, 100], template="plotly_dark")
+    st.plotly_chart(fig, use_container_width=True)
+    cols = ["grid_id", "lat", "lon", "raw_cost231_rsrp", "phase36_physical_rsrp", "final_rsrp", "phase36_antenna_source", "phase36_pap_file", "phase36_antenna_delta_db", "azimuth_delta_deg", "obstruction_branch", "calibration_status"]
+    st.dataframe(cell[[c for c in cols if c in cell]].sort_values("grid_id"), use_container_width=True, height=400, hide_index=True)
+
+
 def _render_phase41_coverage_footprint(view_mode: str, tech: str) -> None:
     st.header("Phase 41 - Sector serving coverage")
     summary = load_phase41_summary()
@@ -3137,6 +3195,20 @@ def _render_phase42_coverage_footprint(view_mode: str, tech: str) -> None:
     )
 
 
+
+def _render_phase43_baseline_optimization() -> None:
+    if not PHASE43_DASHBOARD.exists():
+        st.error(f"Phase 43 dashboard file not found: {PHASE43_DASHBOARD}")
+        return
+    spec = importlib.util.spec_from_file_location("phase43_baseline_optimization_dashboard", PHASE43_DASHBOARD)
+    if spec is None or spec.loader is None:
+        st.error(f"Unable to load Phase 43 dashboard from {PHASE43_DASHBOARD}")
+        return
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    module.render()
+
+
 def render() -> None:
     st.title("Project 210 Taiwan - Phase Validation")
 
@@ -3163,31 +3235,43 @@ def render() -> None:
                 "Phase 40 fixed-power RSRQ / SINR",
                 "Phase 41 sector serving coverage",
                 "Phase 42 1500m direct-PAP sector coverage",
+                "Phase 43 baseline optimization",
+                "Phase 46 production cell audit",
                 "Phase 37 RSRQ / SINR readiness",
                 "All sections",
             ],
             index=0,
             key="phase_validation_view",
         )
-        view_mode = st.radio(
-            "Map view",
-            ["Interactive (folium)", "Static image"],
-            index=1,
-            key="phase20_21_22_view_mode",
-        )
-        tech = st.radio("Technology", ["4G", "5G"], index=1, horizontal=True, key="phase20_21_22_tech")
-        st.radio(
-            "Site sector overlay",
-            ["Selected technology", "Both 4G and 5G", "Off"],
-            index=0,
-            key="phase_site_overlay",
-        )
-        aggregation = st.radio(
-            "Phase 22/24/25 aggregation",
-            ["Serving cell (best server)", "Frontend (mean of candidates)"],
-            index=0,
-            key="phase22_aggregation",
-        )
+        if validation_view == "Phase 43 baseline optimization":
+            view_mode = "Static image"
+            tech = "4G"
+            aggregation = "Serving cell (best server)"
+            st.caption("Phase 43 has its own project, technology, operator, metric, and optimized-run filters below.")
+            st.caption("The old serving/frontend aggregation control is hidden here because Phase 43 compares saved production baseline output against optimized baseline output.")
+        elif validation_view == "Phase 46 production cell audit":
+            view_mode = "Static image"
+            st.caption("Phase 46 exposes every production cell and its raw, physical/PAP, and final calibrated rows.")
+        else:
+            view_mode = st.radio(
+                "Map view",
+                ["Interactive (folium)", "Static image"],
+                index=1,
+                key="phase20_21_22_view_mode",
+            )
+            tech = st.radio("Technology", ["4G", "5G"], index=1, horizontal=True, key="phase20_21_22_tech")
+            st.radio(
+                "Site sector overlay",
+                ["Selected technology", "Both 4G and 5G", "Off"],
+                index=0,
+                key="phase_site_overlay",
+            )
+            aggregation = st.radio(
+                "Phase 22/24/25 aggregation",
+                ["Serving cell (best server)", "Frontend (mean of candidates)"],
+                index=0,
+                key="phase22_aggregation",
+            )
         if validation_view == "Phase 27 dynamic on corrected obstruction":
             corrections = load_phase27_group_corrections()
             clutter = corrections[
@@ -3255,6 +3339,10 @@ def render() -> None:
         _render_phase41_coverage_footprint(view_mode, tech)
     elif validation_view == "Phase 42 1500m direct-PAP sector coverage":
         _render_phase42_coverage_footprint(view_mode, tech)
+    elif validation_view == "Phase 43 baseline optimization":
+        _render_phase43_baseline_optimization()
+    elif validation_view == "Phase 46 production cell audit":
+        _render_phase46_production_cell_audit()
     elif validation_view == "Phase 37 RSRQ / SINR readiness":
         _render_phase37_quality(tech)
     else:
@@ -3275,6 +3363,7 @@ def render() -> None:
         _render_phase40_quality(tech)
         _render_phase41_coverage_footprint(view_mode, tech)
         _render_phase42_coverage_footprint(view_mode, tech)
+        _render_phase43_baseline_optimization()
         _render_phase37_quality(tech)
 
 

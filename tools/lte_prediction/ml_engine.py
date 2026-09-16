@@ -36,14 +36,18 @@ from utils.python_bridge import PythonBridgeError, _filter_complete_site_predict
 
 load_dotenv()
 
+_DB_CONNECT_ARGS = {"connect_timeout": 10, "read_timeout": 30, "write_timeout": 30}
+
 engine = {
     "india": create_engine(
         os.getenv("DATABASE_URL"),
-        pool_size=10, max_overflow=20, pool_recycle=300, pool_pre_ping=True
+        pool_size=10, max_overflow=20, pool_recycle=300, pool_pre_ping=True,
+        connect_args=_DB_CONNECT_ARGS,
     ) if os.getenv("DATABASE_URL") else None,
     "taiwan": create_engine(
         os.getenv("DATABASE_URL_Taiwan"),
-        pool_size=10, max_overflow=20, pool_recycle=300, pool_pre_ping=True
+        pool_size=10, max_overflow=20, pool_recycle=300, pool_pre_ping=True,
+        connect_args=_DB_CONNECT_ARGS,
     ) if os.getenv("DATABASE_URL_Taiwan") else None
 }
 
@@ -735,11 +739,25 @@ def fetch_drive_data(
         primary_filtered_rows = len(df)
         source = "python_bridge"
     else:
+        # The site source legitimately returns no single operator when a
+        # project contains more than one operator.  In that case the database
+        # fallback must fetch all requested sessions.  Filtering against the
+        # string "None" made every fallback query empty and later caused the
+        # nearest-grid matcher to receive a zero-row DT dataframe.
+        operator_value = str(operator or "").strip()
+        operator_clause = ""
+        if operator_value:
+            escaped_operator = operator_value.replace("'", "''")
+            operator_clause = (
+                "\n        AND LOWER(COALESCE(m_alpha_long, m_alpha_short)) "
+                f"= LOWER('{escaped_operator}')"
+            )
+
         main_query = f"""
         SELECT lat, lon, rsrp, rsrq, sinr, cell_id, nodeb_id, pci, earfcn
         FROM tbl_network_log
         WHERE session_id IN ({session_str})
-        AND LOWER(COALESCE(m_alpha_long, m_alpha_short)) = LOWER('{operator}')
+        {operator_clause}
         AND LOWER(COALESCE(`primary`, '')) = 'yes'
         """
 
@@ -747,7 +765,7 @@ def fetch_drive_data(
         SELECT lat, lon, rsrp, rsrq, sinr, cell_id, nodeb_id, pci, earfcn
         FROM tbl_network_log_neighbour
         WHERE session_id IN ({session_str})
-        AND LOWER(COALESCE(m_alpha_long, m_alpha_short)) = LOWER('{operator}')
+        {operator_clause}
         AND LOWER(COALESCE(`primary`, '')) = 'yes'
         """
 
@@ -755,14 +773,14 @@ def fetch_drive_data(
         SELECT lat, lon, rsrp, rsrq, sinr, cell_id, nodeb_id, pci, earfcn
         FROM tbl_network_log
         WHERE session_id IN ({session_str})
-        AND LOWER(COALESCE(m_alpha_long, m_alpha_short)) = LOWER('{operator}')
+        {operator_clause}
         """
 
         raw_neighbour_query = f"""
         SELECT lat, lon, rsrp, rsrq, sinr, cell_id, nodeb_id, pci, earfcn
         FROM tbl_network_log_neighbour
         WHERE session_id IN ({session_str})
-        AND LOWER(COALESCE(m_alpha_long, m_alpha_short)) = LOWER('{operator}')
+        {operator_clause}
         """
 
         current_engine = _require_engine(current_engine, region, "fetching LTE drive data")
@@ -770,6 +788,31 @@ def fetch_drive_data(
         raw_neighbour_df = pd.read_sql(raw_neighbour_query, current_engine)
         main_df = pd.read_sql(main_query, current_engine)
         neighbour_df = pd.read_sql(neighbour_query, current_engine)
+
+        # Mirror the bridge behaviour: a requested operator can be a display
+        # label (for example "taiwan") rather than the carrier text stored in
+        # m_alpha_long/m_alpha_short. If that filter finds nothing, retry the
+        # same requested sessions without it instead of returning zero DT rows.
+        if operator_value and raw_main_df.empty and raw_neighbour_df.empty:
+            print(
+                "[LTE][DRIVE_FETCH_FALLBACK] source=database "
+                "reason=operator_filter_empty_using_all_session_rows"
+            )
+            raw_main_df = pd.read_sql(raw_main_query.replace(operator_clause, ""), current_engine)
+            raw_neighbour_df = pd.read_sql(raw_neighbour_query.replace(operator_clause, ""), current_engine)
+            main_df = pd.read_sql(main_query.replace(operator_clause, ""), current_engine)
+            neighbour_df = pd.read_sql(neighbour_query.replace(operator_clause, ""), current_engine)
+
+        # Some data sources do not mark a primary row. Preserve calibration by
+        # using the selected session rows rather than returning an empty frame.
+        if main_df.empty and neighbour_df.empty and (not raw_main_df.empty or not raw_neighbour_df.empty):
+            print(
+                "[LTE][DRIVE_FETCH_FALLBACK] source=database "
+                "reason=primary_only_empty_using_all_session_rows"
+            )
+            main_df = raw_main_df.copy()
+            neighbour_df = raw_neighbour_df.copy()
+
         raw_total_rows = len(raw_main_df) + len(raw_neighbour_df)
         primary_filtered_rows = len(main_df) + len(neighbour_df)
         df = _normalize_drive_dataframe(pd.concat([main_df, neighbour_df], ignore_index=True))
@@ -938,10 +981,13 @@ def fetch_building_data(project_id, region="india"):
             project_id,
             area,
             geometry,
+            height_m,
+            source_name,
             ST_AsText(region) AS region_wkt,
             ST_AsText(geometry) AS geometry_wkt
         FROM tbl_savepolygon
         WHERE project_id = {project_id}
+          AND (source_name IS NULL OR source_name IN ('overture_building', 'osm_building'))
         """
 
         current_engine = _require_engine(current_engine, region, "fetching LTE building data")

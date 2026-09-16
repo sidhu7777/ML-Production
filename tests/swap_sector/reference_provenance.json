@@ -1,0 +1,8 @@
+{
+  "193": {
+    "status": "USER_CONFIRMED_INDEPENDENT",
+    "basis": "User explicitly confirmed in supplied conversation that site_prediction contains real configured site values and is independent of site_ml and the DT-derived site-location model.",
+    "field_swap_labels_available": false,
+    "scope": "Project 193 only. Other projects need their own reference provenance."
+  }
+}

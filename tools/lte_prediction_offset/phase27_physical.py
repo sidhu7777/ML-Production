@@ -30,6 +30,14 @@ DEFAULT_BUILDING_HEIGHT_M = 12.0
 # A DEM sample must intrude materially into the first Fresnel zone before it
 # is eligible as a terrain obstacle. This rejects sub-cell elevation noise;
 # it is an input-quality gate before the P.526-style knife-edge calculation.
+# Whether to add an explicit per-building knife-edge diffraction loss to
+# OUTDOOR pixels on top of the empirical COST-231 Hata path loss. False because
+# Hata already carries urban building clutter in its fitted coefficients, so
+# adding the explicit term double-counts it. Set True only alongside a
+# propagation model that does not pre-include clutter (free space + P.526, or
+# P.1812), where the explicit term is the only building loss in the chain.
+OUTDOOR_BUILDING_DIFFRACTION_ON_EMPIRICAL_MODEL = False
+
 TERRAIN_FRESNEL_CLEARANCE_FRACTION = 0.60
 TERRAIN_ENDPOINT_BUFFER_M = 20.0
 
@@ -81,11 +89,43 @@ def _knife_edge_loss_db(height_m: float, d1_m: float, d2_m: float, freq_mhz: flo
 
 
 class _DemSampler:
-    def __init__(self, path: str | Path):
+    def __init__(self, path: str | Path, band: int | None = None):
         if rasterio is None:
             raise RuntimeError("rasterio is unavailable")
         self.src = rasterio.open(path)
         self.to_dem = Transformer.from_crs("EPSG:4326", self.src.crs, always_xy=True)
+        # An explicitly supplied band wins over everything below. This is the
+        # band recorded against the project in tbl_project_dem_asset: the owner
+        # of the raster knows which band holds elevation, and a survey .grd
+        # carries display bands beside it that the statistical test below cannot
+        # always tell apart. Guessing is the fallback, not the rule.
+        if band is not None and str(band).strip() != "":
+            try:
+                requested = int(band)
+            except (TypeError, ValueError):
+                requested = 0
+            if 1 <= requested <= self.src.count:
+                self.band = requested
+                return
+            raise ValueError(
+                f"Declared elevation band {band} is out of range for {Path(path).name} "
+                f"(raster has {self.src.count} band(s))"
+            )
+        # A DEM we generated ourselves declares which band holds elevation, so
+        # trust it instead of re-deriving it statistically. The sniffing below
+        # is for project-supplied rasters of unknown layout; run against our own
+        # download it rejects legitimate data, because Amazon's tiles carry
+        # ETOPO1 ocean alongside SRTM land and a coastal project's seafloor sits
+        # far below the -500 m plausibility floor.
+        declared_band = self.src.tags().get("DEM_ELEVATION_BAND")
+        if declared_band:
+            try:
+                band = int(declared_band)
+            except (TypeError, ValueError):
+                band = 0
+            if 1 <= band <= self.src.count:
+                self.band = band
+                return
         # A DEM can contain RGB/display bands. Prefer continuous floating or
         # signed/non-byte numeric bands, then choose the plausible elevation
         # surface with the widest range. This avoids treating 0/255 imagery as
@@ -217,8 +257,16 @@ def score_candidates(
     project_id: int,
     region: str,
     dem_raster_path: str | Path | None = None,
+    # Elevation band recorded for this project's DEM. Threaded through so the
+    # band the registry declared is the band actually sampled - re-opening the
+    # raster here without it would fall back to guessing.
+    dem_band: int | None = None,
     clutter_by_grid: dict | None = None,
-    allow_auto_dem: bool = True,
+    # Defaults to False so a caller that forgets the flag cannot silently swap
+    # the project's own survey grid for downloaded 30 m SRTM. Every production
+    # caller already passes False explicitly; this only closes the latent trap.
+    allow_auto_dem: bool = False,
+    progress_callback=None,
 ) -> pd.DataFrame:
     """Apply Phase-26 physical corrections to already-selected candidates."""
     out = candidates.copy()
@@ -246,8 +294,12 @@ def score_candidates(
             if not allow_auto_dem:
                 raise FileNotFoundError("No approved project terrain DEM resolved")
             dem_path = ensure_project_dem(int(project_id), str(region), site_df)
-        dem = _DemSampler(dem_path)
-        print(f"[LTE_OFFSET][PHASE26_DEM] enabled=True path={dem_path} selected_band={dem.band}", flush=True)
+        dem = _DemSampler(dem_path, band=dem_band)
+        print(
+            f"[LTE_OFFSET][PHASE26_DEM] enabled=True path={dem_path} "
+            f"selected_band={dem.band} band_source={'registry' if dem_band else 'sniffed'}",
+            flush=True,
+        )
     except Exception as exc:
         if explicit_dem is not None:
             raise RuntimeError(f"Configured terrain DEM is unusable: {exc}") from exc
@@ -261,7 +313,9 @@ def score_candidates(
     out["obstruction_branch"] = "clear"
     out["clutter_class"] = "Open"
     clutter_by_grid = clutter_by_grid or {}
-    for key, idx in out.groupby("strict_cell_key", dropna=False).groups.items():
+    cell_groups = out.groupby("strict_cell_key", dropna=False).groups
+    total_cells = len(cell_groups)
+    for completed_cells, (key, idx) in enumerate(cell_groups.items(), start=1):
         if key not in sites.index:
             continue
         site = sites.loc[key]
@@ -289,6 +343,8 @@ def score_candidates(
                 "building_obstruction_loss_db", "terrain_diffraction_loss_db", "terrain_fresnel_excess_m",
                 "terrain_peak_clearance_m", "terrain_decision", "obstruction_branch", "clutter_class"
             ]] = [building_loss, terrain, excess, peak, decision, branch, clutter]
+        if callable(progress_callback):
+            progress_callback(completed_cells, total_cells)
     if dem is not None:
         dem.close()
     terrain_counts = out["terrain_decision"].value_counts(dropna=False).to_dict()
@@ -298,5 +354,27 @@ def score_candidates(
         f"nonzero={int((out['terrain_diffraction_loss_db'] > 0).sum())} decisions={terrain_counts}",
         flush=True,
     )
-    out["physical_rsrp_unclipped"] = pd.to_numeric(out["raw_cost231_rsrp"], errors="coerce") + pd.to_numeric(out["building_obstruction_loss_db"], errors="coerce") - pd.to_numeric(out["terrain_diffraction_loss_db"], errors="coerce")
+    # COST-231 Hata is an empirical URBAN model: the measurements it was fitted
+    # to already contain building clutter statistically. Charging an explicit
+    # knife-edge building loss on top of it for an OUTDOOR pixel counts the same
+    # buildings twice, and it was doing so harder than the indoor branch
+    # (-21.5 dB median outdoor against -17.0 dB indoor), which inverted the
+    # indoor/outdoor ordering. The indoor O2I term is kept: penetrating a wall
+    # is a real extra loss that no outdoor-measured empirical model contains.
+    applied_building_loss = pd.to_numeric(out["building_obstruction_loss_db"], errors="coerce").fillna(0.0)
+    if not OUTDOOR_BUILDING_DIFFRACTION_ON_EMPIRICAL_MODEL:
+        outdoor = ~out["obstruction_branch"].astype(str).eq("indoor")
+        suppressed = int((outdoor & applied_building_loss.ne(0.0)).sum())
+        applied_building_loss = applied_building_loss.where(~outdoor, 0.0)
+        print(
+            f"[LTE_OFFSET][PHASE26_OUTDOOR_BUILDING] suppressed_on={suppressed} outdoor rows "
+            "(COST-231 Hata already contains urban clutter); indoor O2I retained",
+            flush=True,
+        )
+    out["building_obstruction_loss_applied_db"] = applied_building_loss
+    out["physical_rsrp_unclipped"] = (
+        pd.to_numeric(out["raw_cost231_rsrp"], errors="coerce")
+        + applied_building_loss
+        - pd.to_numeric(out["terrain_diffraction_loss_db"], errors="coerce")
+    )
     return out

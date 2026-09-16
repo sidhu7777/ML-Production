@@ -9,6 +9,11 @@ from __future__ import annotations
 import math
 
 import numpy as np
+
+# Below this the prediction is reported as no coverage rather than as a
+# very weak RSRP, and above the ceiling it is capped for display.
+NO_COVERAGE_DBM = -120.0
+RSRP_CEILING_DBM = -44.0
 import pandas as pd
 
 try:  # optional - only needed for the Phase 36 v2 local residual field
@@ -190,7 +195,8 @@ def apply_outdoor_v2(candidates: pd.DataFrame, layers: list[pd.DataFrame],
     out["local_residual_correction_db"] = np.where(indoor, 0.0, local)
     out["dynamic_residual_db"] = np.where(indoor, group_bias, full)
     out["final_rsrp_unclipped"] = pd.to_numeric(out[physical_col], errors="coerce") + out["dynamic_residual_db"]
-    out["final_rsrp"] = out["final_rsrp_unclipped"].where(out["final_rsrp_unclipped"] >= -140.0)
+    out["final_rsrp"] = out["final_rsrp_unclipped"].where(
+        out["final_rsrp_unclipped"] >= NO_COVERAGE_DBM).clip(upper=RSRP_CEILING_DBM)
     # Guard: a (technology, band) with NO tech_band calibration support is not
     # validated - the applied physical (which now carries the -28 dB per-RE term)
     # has no correction to anchor it. Emit NaN rather than an unvalidated value.
@@ -224,5 +230,6 @@ def apply_outdoor(candidates: pd.DataFrame, layers: list[pd.DataFrame], physical
     total = out[correction_cols].sum(axis=1) if correction_cols else pd.Series(0.0, index=out.index)
     out["dynamic_residual_db"] = total.where(~indoor, 0.0)
     out["final_rsrp_unclipped"] = pd.to_numeric(out[physical_col], errors="coerce") + out["dynamic_residual_db"]
-    out["final_rsrp"] = out["final_rsrp_unclipped"].where(out["final_rsrp_unclipped"] >= -140.0)
+    out["final_rsrp"] = out["final_rsrp_unclipped"].where(
+        out["final_rsrp_unclipped"] >= NO_COVERAGE_DBM).clip(upper=RSRP_CEILING_DBM)
     return out
