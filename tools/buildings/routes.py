@@ -86,16 +86,21 @@ def generate_buildings():
         except Exception as e:
              return jsonify({"Status": 0, "Message": f"Invalid WKT: {str(e)}"}), 400
 
-        # ✅ Pass region to the service
-        result = service.process_buildings(polygon, name, project_id, swap_output=was_swapped, region=region)
+        # ✅ Pass region to the service. Buildings + Phase-27 clutter
+        # classification both belong at project creation time, run
+        # concurrently, not two separate calls - see process_project_geo_setup.
+        buildings_result, clutter_result = service.process_project_geo_setup(
+            polygon, name, project_id, swap_output=was_swapped, region=region
+        )
 
-        if not result:
+        if not buildings_result:
             return jsonify({
                 "Status": 0,
                 "Message": "No buildings found in this area"
             })
 
-        geojson, extracted_count, saved_count = result
+        geojson, extracted_count, saved_count = buildings_result
+        _, clutter_summary = clutter_result
 
         return jsonify({
             "Status": 1,
@@ -105,6 +110,7 @@ def generate_buildings():
                 "extracted": extracted_count,
                 "saved_to_db": saved_count
             },
+            "Clutter": clutter_summary,
             "input_format_detected": "Lat/Lon" if was_swapped else "Lon/Lat"
         })
 

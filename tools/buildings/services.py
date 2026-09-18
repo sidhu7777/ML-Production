@@ -1,3 +1,4 @@
+import concurrent.futures
 import os
 import json
 import logging
@@ -9,7 +10,6 @@ import osmnx as ox
 import geopandas as gpd
 import pandas as pd
 import requests
-from shapely import ops
 import sqlalchemy as db
 from sqlalchemy.exc import OperationalError
 from flask import current_app
@@ -247,21 +247,35 @@ class BuildingService:
 
         if "height_m" not in buildings_exp.columns:
             buildings_exp["height_m"] = pd.NA
-        buildings_exp["height_m"] = buildings_exp["height_m"].where(buildings_exp["height_m"].notna(), None)
 
-        # --- SWAP BACK LOGIC (Lon/Lat -> Lat/Lon) ---
-        if swap_output:
-            print(f"🔄 Buildings: Swapping output back to Lat/Lon before saving...")
-            buildings_exp['geometry'] = buildings_exp['geometry'].apply(
-                lambda geom: ops.transform(lambda x, y: (y, x), geom)
-            )
-        # --------------------------------------------
+        # swap_output intentionally does nothing to the geometry here. It used
+        # to swap the already-correct lon/lat geometry back to lat/lon before
+        # saving, on the assumption the DB wanted the ORIGINAL input's axis
+        # order - but the INSERT below always declares
+        # ST_GeomFromText(..., 'axis-order=long-lat'), so the column always
+        # expects lon/lat regardless of how the input WKT was originally
+        # given. Real bug, confirmed against project 263: for a project whose
+        # input WKT needed swapping (swap_output=True), this used to swap the
+        # geometry to lat/lon and then insert it declaring long/lat order,
+        # producing an out-of-range latitude (MySQL error 3617) and silently
+        # failing every building save whose input happened to be lat/lon.
+        # swap_output is kept as a parameter only because callers still pass
+        # it for the response's input_format_detected field.
 
         # Convert geometry to WKT
         buildings_exp["wkt_4326"] = buildings_exp.geometry.to_wkt()
 
+        # NaN must become a real Python None here, not upstream on the
+        # Series - pandas silently coerces None back to NaN when a column
+        # is float64 dtype (confirmed: the previous .where(notna(), None)
+        # on the Series never actually worked because of this), so pymysql
+        # was handed a real float('nan') and rejected it outright
+        # ("nan can not be used with MySQL"). Checking with pd.isna() per
+        # row, right before the SQL parameter tuple is built, sidesteps
+        # the dtype coercion entirely.
         values_list = [
-            (area_name, row.wkt_4326, project_id, row.calc_area, row.height_m, source_name)
+            (area_name, row.wkt_4326, project_id, row.calc_area,
+             None if pd.isna(row.height_m) else float(row.height_m), source_name)
             for row in buildings_exp.itertuples()
         ]
 
@@ -305,10 +319,14 @@ class BuildingService:
     # -------------------------------------
     # MAIN EXTRACT + SAVE METHOD (UPDATED)
     # -------------------------------------
-    # Overture + GHS-OBAT are primary (real building polygons + real
-    # height); OSM is the fallback only, used when Overture genuinely
-    # cannot return coverage for this polygon. OSM buildings never get a
-    # fabricated height - height_m stays NULL for them, same as before.
+    # Overture is the primary building source (OSM is the fallback only,
+    # used when Overture genuinely cannot return coverage for this
+    # polygon). Height is deliberately NOT resolved here any more -
+    # GHS-OBAT/OSM height matching moved to baseline run time (the only
+    # place it's actually consumed - indoor penetration loss), so project
+    # creation only ever saves geometry, never blocks on a height match.
+    # height_m stays NULL for every building at this stage, real source or
+    # not; a later baseline run is what fills it in, in place, once.
     def process_buildings(self, polygon, name, project_id, swap_output=False, region="india"):
         """
         Extract buildings and save them to DB
@@ -324,16 +342,86 @@ class BuildingService:
         if buildings is None or buildings.empty:
             return None, 0, 0
 
-        if source_name == "overture_building":
-            buildings = _match_ghs_obat_heights(buildings, region)
-        else:
-            buildings["height_m"] = pd.NA
+        buildings["height_m"] = pd.NA
 
         # ✅ Pass region down to the save function
         saved_count = self.save_buildings_to_db(
             buildings, name, project_id, swap_output=swap_output, region=region, source_name=source_name
         )
 
-        geojson = json.loads(buildings.to_json())
+        # geometry + height_m only, not the raw Overture attribute columns -
+        # Overture's own fields (e.g. 'sources') can hold nested
+        # numpy/array values that plain json.dumps can't serialize
+        # (confirmed: this crashed AFTER a real, successful DB save,
+        # turning a completed save into a reported failure for no reason -
+        # the geojson response doesn't need those raw fields anyway).
+        geojson = json.loads(buildings[["geometry", "height_m"]].to_json())
 
         return geojson, count, saved_count
+
+    # -------------------------------------
+    # UNIFIED PROJECT-CREATION GEO SETUP
+    # -------------------------------------
+    # Buildings and clutter classification both pull from Overture and
+    # both belong at project creation - previously they were two separate,
+    # disconnected pipelines (this file, and tools/lte_prediction_offset's
+    # Phase-27 classifier, triggered separately at different times). This
+    # is the single entry point: one project creation step, buildings and
+    # clutter fetched CONCURRENTLY (not one after another - they're
+    # independent network calls, and clutter classification does not read
+    # building geometry or height at all any more, so there's no real
+    # dependency forcing them to run in sequence), and height is not
+    # touched at all - that's resolved later, once, at baseline time.
+    def process_project_geo_setup(self, polygon, name, project_id, swap_output=False, region="india"):
+        def _do_buildings():
+            return self.process_buildings(polygon, name, project_id, swap_output=swap_output, region=region)
+
+        def _do_clutter():
+            from tools.lte_prediction.geo_correction_pipeline import create_analysis_grid
+            from tools.lte_prediction_offset.geo_inputs import load_or_build_phase27_clutter
+
+            db_engine = get_regional_engine(region)
+            mask_gdf = gpd.GeoDataFrame({"geometry": [polygon]}, crs="EPSG:4326")
+            grid_gdf = create_analysis_grid(mask_gdf, cell_size_m=25.0)
+            bounds = grid_gdf.geometry.bounds
+            centroids = grid_gdf.geometry.centroid
+            grid_df = pd.DataFrame({
+                "grid_id": grid_gdf["grid_id"].astype(str),
+                "center_lat": centroids.y, "center_lon": centroids.x,
+                "min_lat": bounds["miny"], "max_lat": bounds["maxy"],
+                "min_lon": bounds["minx"], "max_lon": bounds["maxx"],
+            })
+            # Clutter classification never reads building geometry/height
+            # (see geo_inputs.py's classify loop) - building_df is no longer
+            # even part of this function's signature. Height resolution is
+            # entirely separate now (resolve_building_heights), called at
+            # baseline time, not here.
+            return load_or_build_phase27_clutter(grid_df, project_id, db_engine)
+
+        # Check both futures independently, not one after the other - a
+        # naive buildings_future.result() followed by clutter_future.result()
+        # means a real exception in buildings hides whatever actually
+        # happened to clutter (confirmed: this exact ordering once made a
+        # genuine clutter-side failure invisible, reported only as a
+        # buildings error, while the clutter thread's own partial work -
+        # a dataset row with zero tiles - was left stranded with no
+        # explanation). Both errors, if any, are surfaced together.
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+            buildings_future = pool.submit(_do_buildings)
+            clutter_future = pool.submit(_do_clutter)
+            buildings_result = buildings_error = None
+            clutter_result = clutter_error = None
+            try:
+                buildings_result = buildings_future.result()
+            except Exception as exc:
+                buildings_error = exc
+            try:
+                clutter_result = clutter_future.result()
+            except Exception as exc:
+                clutter_error = exc
+
+        if buildings_error or clutter_error:
+            raise RuntimeError(
+                f"process_project_geo_setup failed - buildings_error={buildings_error!r} clutter_error={clutter_error!r}"
+            )
+        return buildings_result, clutter_result

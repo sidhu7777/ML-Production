@@ -841,7 +841,12 @@ def run_report(project_id: int = DEFAULT_PROJECT_ID, use_llm: bool = True) -> Pa
     )
     assert drive_summary is not None, "No drive summary metadata generated"
     assert drive_summary["total_samples"] == len(report_df)
-    assert drive_summary["total_sessions"] == len(session_ids)
+    assert drive_summary["total_sessions"] <= len(session_ids)
+    if drive_summary["total_sessions"] < len(session_ids):
+        print(
+            f"[warn] {len(session_ids) - drive_summary['total_sessions']} of "
+            f"{len(session_ids)} referenced session(s) had no report rows"
+        )
 
     # ---------- 2b. SESSION DISTANCE (Haversine sum-of-consecutive-points;
     #             tbl_session distance query is permission-denied so

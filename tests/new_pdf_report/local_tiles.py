@@ -63,15 +63,27 @@ Four pieces:
 """
 import contextlib
 import http.server
+import io
 import os
+import re
 import socket
 import threading
 from pathlib import Path
 
 from PIL import Image, ImageStat
 
-_TILE_UPSTREAM = "https://a.basemaps.cartocdn.com"
+# CartoDB Voyager/Positron now serve "API KEY REQUIRED" watermark tiles (same
+# issue already fixed in tools/report_engine/map_generator.py and
+# tools/Ppt_report_Automation/ppt_map_generator.py), so this proxy's upstream
+# is Google's free, no-key XYZ endpoint instead. The "light_all" style (the
+# muted overlay new_report_map_gray_clipped uses to avoid Voyager's yellow
+# roads colliding with the legend's yellow KPI color) has no direct Google
+# equivalent, so it's produced by desaturating the same Google roadmap tile
+# server-side (_TILE_STYLES below) rather than switching upstream per style.
+_TILE_UPSTREAM = "https://mt1.google.com/vt/lyrs=m"
 _CACHE_DIR = Path(__file__).parent / "output" / "tile_cache"
+_TILE_PATH_RE = re.compile(r"^(?P<style>.+)/(?P<z>\d+)/(?P<x>\d+)/(?P<y>\d+)(?:@2x)?\.png$")
+_TILE_STYLES = {"rastertiles/voyager", "light_all"}
 
 _server_lock = threading.Lock()
 _server_state: dict = {}  # {"port": int, "httpd": ThreadingHTTPServer}
@@ -82,20 +94,38 @@ class _TileCacheHandler(http.server.BaseHTTPRequestHandler):
         pass  # silence per-tile access logging (would be one line per tile)
 
     def do_GET(self):
-        # rel includes the CartoDB style path, e.g.
-        # "rastertiles/voyager/12/1234/2345.png" or "light_all/12/.../2345@2x.png"
-        # -- kept generic (not hardcoded to one style) so BOTH the base
-        # Voyager tiles and the grid maps' gray Positron overlay
-        # (google_tiles.new_report_map_gray_clipped) share this same cache.
+        # rel keeps the SAME local path shape as before (e.g.
+        # "rastertiles/voyager/12/1234/2345.png" or "light_all/12/.../2345@2x.png")
+        # so folium/Leaflet's tile URL templates don't need to change --
+        # only what this proxy fetches upstream for a given z/x/y changes.
         rel = self.path.lstrip("/")
         local_path = _CACHE_DIR / rel
 
         if not local_path.exists():
             local_path.parent.mkdir(parents=True, exist_ok=True)
+            match = _TILE_PATH_RE.match(rel)
+            if not match or match.group("style") not in _TILE_STYLES:
+                self.send_response(404)
+                self.end_headers()
+                self.wfile.write(f"unknown tile path: {rel}".encode())
+                return
+            style, z, x, y = match.group("style"), match.group("z"), match.group("x"), match.group("y")
             try:
                 import urllib.request
-                with urllib.request.urlopen(f"{_TILE_UPSTREAM}/{rel}", timeout=15) as resp:
+                upstream_url = f"{_TILE_UPSTREAM}&x={x}&y={y}&z={z}"
+                with urllib.request.urlopen(upstream_url, timeout=15) as resp:
                     data = resp.read()
+                if style == "light_all":
+                    # Desaturate + lighten so it still reads as the same
+                    # muted "gray canvas" the clip overlay was built for,
+                    # since Google's tile endpoint has no separate light/gray
+                    # style of its own.
+                    with Image.open(io.BytesIO(data)) as im:
+                        gray = im.convert("L").convert("RGB")
+                        lightened = Image.blend(gray, Image.new("RGB", gray.size, (245, 245, 245)), 0.5)
+                        buf = io.BytesIO()
+                        lightened.save(buf, format="PNG")
+                        data = buf.getvalue()
                 # Write via a unique temp file + atomic rename so two
                 # concurrent misses for the same tile (a single map page can
                 # fire many parallel tile requests) can never interleave
@@ -167,8 +197,8 @@ def new_report_map_local():
     )
     folium.TileLayer(
         tiles=local_tile_url("rastertiles/voyager"),
-        attr="© CartoDB, © OpenStreetMap contributors",
-        name="CartoDB Voyager (local cache)",
+        attr="© Google",
+        name="Google Maps (local cache)",
         overlay=False,
         control=False,
         max_zoom=REPORT_MAP_MAX_ZOOM,

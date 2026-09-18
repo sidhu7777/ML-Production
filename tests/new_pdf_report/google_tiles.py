@@ -181,8 +181,8 @@ def new_report_map_gray_clipped(polygon_wkt: str):
     )
     folium.TileLayer(
         tiles=local_tile_url("rastertiles/voyager"),
-        attr="© CartoDB, © OpenStreetMap contributors",
-        name="CartoDB Voyager (local cache)",
+        attr="© Google",
+        name="Google Maps (local cache)",
         overlay=False,
         control=False,
         max_zoom=REPORT_MAP_MAX_ZOOM,

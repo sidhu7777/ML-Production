@@ -45,7 +45,7 @@ from tools.lte_prediction_offset import phase27_calibration as _calib
 from tools.lte_prediction_offset import phase36_physical_upgrades as _p36
 from tools.lte_prediction_offset import phase37_quality as _p37
 from tools.lte_prediction_offset import phase48_calibration as _p48cal
-from tools.lte_prediction_offset.geo_inputs import load_or_build_phase27_clutter
+from tools.lte_prediction_offset.geo_inputs import load_or_build_phase27_clutter, resolve_building_heights
 from utils.python_bridge import PythonBridgeError, get_bridge_client
 
 
@@ -1748,11 +1748,15 @@ class LTEPredictionOffsetService:
             surface = _run_raw_surface(site_df, grid_df, cfg, progress_callback=raw_progress)
             self._update(job_id, "running", "Classifying land and building context")
             with (_without_python_bridge() if force_direct_db else nullcontext()):
-                grid_clutter, resolved_building_df, clutter_summary = load_or_build_phase27_clutter(
-                    grid_df, building_df, cfg["project_id"], current_engine, cfg.get("ghs_obat_csv_path")
+                grid_clutter, clutter_summary = load_or_build_phase27_clutter(
+                    grid_df, cfg["project_id"], current_engine
+                )
+                resolved_building_df, height_source = resolve_building_heights(
+                    building_df, grid_df, cfg["project_id"], current_engine, region, cfg.get("ghs_obat_csv_path")
                 )
             clutter_by_grid = grid_clutter.set_index("grid_id")["clutter_class"].to_dict() if not grid_clutter.empty else {}
             print(f"[LTE_OFFSET][PHASE27_CLUTTER] {clutter_summary}", flush=True)
+            print(f"[LTE_OFFSET][BUILDING_HEIGHT] source={height_source}", flush=True)
             # A cell's own coverage must not depend on how strong its
             # neighbours are. The previous competitor-relative gate (keep only
             # within 20 dB of the strongest candidate at this pixel) deleted a
@@ -1987,6 +1991,7 @@ class LTEPredictionOffsetService:
                 "ensure_all_cells_backfill_rows": int(final_df.get("ensure_all_cells_backfill", pd.Series(False, index=final_df.index)).sum()),
                 "dynamic_layers": [str(layer["layer"].iloc[0]) for layer in layers if not layer.empty],
                 "phase27_clutter": clutter_summary,
+                "building_height_source": height_source,
                 "dt_replaced_pixels": 0,
                 "raw_directional_rows": int(len(final_df)),
                 "grid_pixels": int(final_df["grid_id"].nunique(dropna=False)),

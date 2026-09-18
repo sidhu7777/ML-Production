@@ -414,16 +414,24 @@ def _synthesize_missing_sections(metadata: Dict, missing_keys):
 
     for key in missing_keys:
         if key == "Introduction":
-            # Calculate number of days from start and end dates
-            start = drive.get("start_date")
-            end = drive.get("end_date")
-            num_days = drive.get("number_of_days", "N/A")
-            
-            out[key] = metadata.get("introduction") or (
-                f"This report presents a comprehensive RF drive test analysis conducted to evaluate network performance and quality. "
-                f"RF drive testing is a critical methodology for assessing real-world network coverage, signal strength, and service quality. "
-                f"The evaluation encompasses key performance indicators including signal measurements, quality metrics, and throughput analysis. "
-                f"This assessment provides valuable insights for network optimization and performance improvement."
+            # Same shape the LLM prompt asks for: 3-4 sentences, dynamic
+            # "in <city>, <country>" if available, purpose/importance of
+            # drive testing, map visualizations, actionable insights.
+            # No drive stats here (those belong to Drive Summary).
+            loc = metadata.get("location") or {}
+            city = loc.get("city")
+            country = loc.get("country")
+            location_phrase = ""
+            if city or country:
+                location_phrase = " in " + ", ".join(v for v in [city, country] if v)
+
+            out[key] = (
+                f"This report presents a comprehensive RF drive test analysis conducted{location_phrase} "
+                f"to evaluate network coverage, signal strength, and service quality. RF drive testing is a "
+                f"critical methodology for assessing real-world network performance and provider quality. "
+                f"The accompanying map visualizations highlight areas of strong and weak coverage across the "
+                f"tested route. These findings provide actionable insights to support network optimization "
+                f"and deployment planning."
             )
 
         elif key == "Area Summary":

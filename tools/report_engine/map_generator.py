@@ -18,8 +18,13 @@ REPORT_MAP_LEGEND_RIGHT_PADDING_PX = 420
 # margins) because zoomSnap=0 lets fit_bounds use fractional zoom, and the
 # viewport fits the DATA only — the polygon is drawn as an overlay but does NOT
 # expand the view.
+#
+# CartoDB Voyager/Positron now serve "API KEY REQUIRED" watermark tiles, so we
+# use Google's no-key XYZ tiles instead (same fix as Ppt_report_Automation).
 # -----------------------------------------------------
-REPORT_TILE = "CartoDB Voyager"
+DEFAULT_GOOGLE_MAPS_TILES = "https://mt1.google.com/vt/lyrs=m&x={x}&y={y}&z={z}"
+REPORT_TILE = os.getenv("REPORT_TILE", DEFAULT_GOOGLE_MAPS_TILES)
+REPORT_TILE_ATTR = os.getenv("REPORT_TILE_ATTR", "Google")
 REPORT_PAD_LEFT = 30
 REPORT_PAD_VERT = 30
 REPORT_PAD_RIGHT_BASE = 40
@@ -35,6 +40,26 @@ REPORT_RENDER_HEIGHT_HINT = int(os.getenv("REPORT_RENDER_HEIGHT", "900"))
 
 def new_report_map():
     """Folium map with fractional zoom (zoomSnap=0) so the data fills the frame."""
+    if REPORT_TILE and (REPORT_TILE.startswith("http://") or REPORT_TILE.startswith("https://")):
+        m = folium.Map(
+            tiles=None,
+            zoom_control=True,
+            control_scale=False,
+            prefer_canvas=True,
+            max_zoom=REPORT_MAP_MAX_ZOOM,
+            zoomSnap=0,       # continuous fractional zoom (no integer snapping)
+            zoomDelta=0.25,
+        )
+        folium.TileLayer(
+            tiles=REPORT_TILE,
+            attr=REPORT_TILE_ATTR,
+            name="Google Maps",
+            overlay=False,
+            control=False,
+            max_zoom=REPORT_MAP_MAX_ZOOM,
+        ).add_to(m)
+        return m
+
     return folium.Map(
         tiles=REPORT_TILE,
         zoom_control=True,
@@ -453,12 +478,20 @@ def generate_debug_map(df, polygon_wkt, output_path, sample_points=50):
 
     # Center map on GPS data
     m = folium.Map(
-        tiles="CartoDB positron",  # cleaner than OSM
+        tiles=None,
         zoom_control=True,
         control_scale=False,
         prefer_canvas=True,
         max_zoom=REPORT_MAP_MAX_ZOOM
     )
+    folium.TileLayer(
+        tiles=REPORT_TILE,
+        attr=REPORT_TILE_ATTR,
+        name="Google Maps",
+        overlay=False,
+        control=False,
+        max_zoom=REPORT_MAP_MAX_ZOOM,
+    ).add_to(m)
 
     add_fullscreen_css(m)
 

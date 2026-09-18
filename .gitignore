@@ -65,6 +65,13 @@ data/reports/
 tests/output/
 tests/output/project_*/
 
+# Open map clutter generated outputs
+tests/new-project/open_map_clutter/*.jpg
+tests/new-project/open_map_clutter/*.jpeg
+tests/new-project/open_map_clutter/*.png
+tests/new-project/open_map_clutter/*.csv
+tests/new-project/open_map_clutter/*.geojson
+
 # Trained model artifacts (checkpoints, plots, HTML reports)
 *.pkl
 *.joblib

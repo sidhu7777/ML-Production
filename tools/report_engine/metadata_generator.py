@@ -74,6 +74,14 @@ def reverse_geocode_area(lat, lon, sleep_sec=1.0):
             ["road", "neighbourhood", "suburb", "quarter", "city_district", "locality"]
             if addr.get(k)
         ]
+        if not labels:
+            # Fall back to coarser fields so rural/sparsely-mapped cells still
+            # resolve to a name instead of being dropped from Area Summary.
+            labels = [
+                addr.get(k) for k in
+                ["village", "town", "hamlet", "municipality", "county", "state_district", "city", "state"]
+                if addr.get(k)
+            ]
         return {
             "labels": labels,
             "class": loc.raw.get("class"),
@@ -135,6 +143,7 @@ def build_area_summary(filtered_df: pd.DataFrame, top_n: int = 6, sleep_sec: flo
     hotspots_list = []
     crowded_list = []
     covered_list = []
+    covered_by_name = {}
 
     for cell in selected_cells:
         geo = reverse_geocode_area(cell.center_lat, cell.center_lon, sleep_sec=sleep_sec)
@@ -143,19 +152,30 @@ def build_area_summary(filtered_df: pd.DataFrame, top_n: int = 6, sleep_sec: flo
 
         name = geo["labels"][0]
 
-        # Collect for paragraph summary
-        covered_list.append({
-            "name": name,
-            "type": f"{geo.get('class','')} {geo.get('type','')}".strip(),
-            "samples": int(cell.sample_count)
-        })
+        # Collect for paragraph summary; merge cells that resolve to the same
+        # name (e.g. several cells inside one sparsely-mapped district)
+        # instead of repeating it.
+        if name in covered_by_name:
+            covered_by_name[name]["samples"] += int(cell.sample_count)
+        else:
+            covered_by_name[name] = {
+                "name": name,
+                "type": f"{geo.get('class','')} {geo.get('type','')}".strip(),
+                "samples": int(cell.sample_count),
+            }
+            covered_list.append(covered_by_name[name])
 
-        # Only add top 3 hotspots (just names)
-        if len(hotspots_list) < 3:
+        # Only add top 3 distinct hotspots (just names)
+        if name not in hotspots_list and len(hotspots_list) < 3:
             hotspots_list.append(name)
 
-        # Only add top 3 crowded locations (just names)
-        if speed_median is not None and cell.avg_speed <= speed_median and len(crowded_list) < 3:
+        # Only add top 3 distinct crowded locations (just names)
+        if (
+            speed_median is not None
+            and cell.avg_speed <= speed_median
+            and name not in crowded_list
+            and len(crowded_list) < 3
+        ):
             crowded_list.append(name)
 
     # Build Major Areas Covered as a paragraph
