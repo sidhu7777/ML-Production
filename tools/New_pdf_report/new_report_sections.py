@@ -96,7 +96,7 @@ from tools.report_engine.metadata_generator import (
     reverse_geocode_area,
     haversine,
 )
-from tests.new_pdf_report.grid_rsrp_map_test import (
+from tools.New_pdf_report.grid_maps import (
     fit_bounds_including_polygon, aggregate_grid_cells, resolve_lattice,
 )
 from tools.report_engine.kpi_config import KPI_CONFIG
@@ -327,7 +327,7 @@ def generate_poor_region_map_fixed(
     from tools.report_engine.map_generator import (
         new_report_map, add_fullscreen_css, add_legend, draw_polygon_overlay,
     )
-    from tests.new_pdf_report.local_tiles import html_to_png_verified as html_to_png
+    from tools.New_pdf_report.local_tiles import html_to_png_verified as html_to_png
 
     if value_col not in filtered_df.columns:
         print(f" Missing column: {value_col}")
@@ -407,7 +407,7 @@ def generate_poor_region_grid_map(
     from tools.report_engine.map_generator import (
         new_report_map, add_fullscreen_css, add_legend, draw_polygon_overlay,
     )
-    from tests.new_pdf_report.local_tiles import html_to_png_verified as html_to_png
+    from tools.New_pdf_report.local_tiles import html_to_png_verified as html_to_png
 
     if value_col not in filtered_df.columns:
         print(f" Missing column: {value_col}")
@@ -2267,7 +2267,7 @@ def generate_tech_handover_map(
     from tools.report_engine.map_generator import (
         new_report_map, add_fullscreen_css, add_legend, draw_polygon_overlay,
     )
-    from tests.new_pdf_report.local_tiles import html_to_png_verified as html_to_png
+    from tools.New_pdf_report.local_tiles import html_to_png_verified as html_to_png
 
     valid_events = _inter_rat_events([
         e for e in tech_events if e.get("lat") is not None and e.get("lon") is not None
@@ -2357,7 +2357,7 @@ def generate_key_findings_map(
     from tools.report_engine.map_generator import (
         new_report_map, add_fullscreen_css, add_legend, draw_polygon_overlay,
     )
-    from tests.new_pdf_report.local_tiles import html_to_png_verified as html_to_png
+    from tools.New_pdf_report.local_tiles import html_to_png_verified as html_to_png
 
     required = {"nodeb_id", "lat", "lon"}
     if not required.issubset(report_df.columns):

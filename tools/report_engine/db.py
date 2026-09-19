@@ -191,6 +191,7 @@ def get_network_logs_for_sessions(
     end_date: str | None = None,
     region: str | None = None,
     country_code: str | None = None,
+    technologies: list[str] | None = None,
 ) -> pd.DataFrame:
     if not session_ids:
         return pd.DataFrame()
@@ -205,6 +206,7 @@ def get_network_logs_for_sessions(
             end_date=end_date,
             region=region,
             country_code=country_code,
+            technologies=technologies,
         )
         return _normalize_bridge_datetime_columns(df, ["timestamp"])
 
@@ -214,13 +216,32 @@ def get_network_logs_for_sessions(
         close_conn = True
 
     try:
-        query = text("""
+        # tbl_network_log (the serving/primary table) can itself contain rows whose own
+        # `network` string is self-tagged e.g. "4G (Neighbour)" while `primary` = 'Yes'
+        # (confirmed against real data: project 358 had 52 such rows, all primary='Yes').
+        # These are genuine neighbour-cell readings the device logged into the serving
+        # table, not primary-cell samples -- `primary` alone cannot distinguish them, so
+        # they're excluded here by inspecting `network` itself. Mirrors the same guard
+        # added to GetDriveTestRowsAsync's servingSql on the C# bridge side.
+        technology_clause = ""
+        query_params: dict = {"session_ids": session_ids}
+        bind_params = [bindparam("session_ids", expanding=True)]
+        clean_technologies = [t.strip() for t in (technologies or []) if t and t.strip()]
+        if clean_technologies:
+            technology_clause = "AND network IN :technologies"
+            query_params["technologies"] = clean_technologies
+            bind_params.append(bindparam("technologies", expanding=True))
+
+        query = text(f"""
             SELECT *
             FROM tbl_network_log
             WHERE session_id IN :session_ids
-        """).bindparams(bindparam("session_ids", expanding=True))
+              AND UPPER(COALESCE(network, '')) NOT LIKE '%NEIGHBOUR%'
+              AND UPPER(COALESCE(network, '')) NOT LIKE '%NEIGHBOR%'
+              {technology_clause}
+        """).bindparams(*bind_params)
 
-        df = pd.read_sql(query, conn, params={"session_ids": session_ids})
+        df = pd.read_sql(query, conn, params=query_params)
         df.attrs["report_data_source"] = "direct_db_raw"
         df.attrs["report_prefiltered"] = False
         _normalize_invalid_pci(df)

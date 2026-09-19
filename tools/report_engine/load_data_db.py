@@ -186,9 +186,16 @@ def load_project_data(
     project_id: int,
     region: str | None = None,
     country_code: str | None = None,
+    technologies: list[str] | None = None,
 ):
     """
     DB-based replacement for Excel loading.
+
+    `technologies`: optional exact `network` column values to keep (e.g.
+    "4G", "4G (LTE Anchor - NSA)", "5G NSA") -- None/empty means every
+    technology is kept, unchanged behavior for every existing caller.
+    Threaded straight through to GetDriveTestRows' new Technologies field
+    (bridge mode) / the direct-DB tbl_network_log query (fallback mode).
 
     Returns:
         raw_df       : DataFrame (all project session data)
@@ -217,6 +224,7 @@ def load_project_data(
         end_date=project.get("to_date"),
         region=region,
         country_code=country_code,
+        technologies=technologies,
     )
 
     valid_geo_rows = 0

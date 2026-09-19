@@ -1,0 +1,397 @@
+from flask import Blueprint, request, jsonify, current_app, send_file, Response, stream_with_context
+import os
+import threading
+import uuid
+import json
+import tempfile
+from queue import Queue, Empty
+
+from tools.New_pdf_report.main import main as generate_new_pdf_report
+from tools.report_engine.db import get_project_by_id
+from tools.report_engine.playwright_utils import check_chromium_rendering
+from extensions import db
+
+new_pdf_report_bp = Blueprint("new_pdf_report", __name__)
+REPORT_JOBS = {}
+REPORT_JOBS_LOCK = threading.Lock()
+REPORT_SUBSCRIBERS = {}
+REPORT_SUBSCRIBERS_LOCK = threading.Lock()
+
+
+def _safe_int(value):
+    try:
+        return int(value)
+    except Exception:
+        return None
+
+
+def _resolve_region(data: dict):
+    raw_region = str(data.get("region") or data.get("Region") or "").strip().lower()
+    if raw_region:
+        if raw_region in {"tw", "twn"}:
+            return "taiwan"
+        if raw_region in {"in", "ind"}:
+            return "india"
+        return raw_region
+
+    country_code = str(
+        data.get("country_code")
+        or data.get("countryCode")
+        or data.get("CountryCode")
+        or ""
+    ).strip().lower()
+    if country_code in {"tw", "twn", "taiwan"}:
+        return "taiwan"
+    if country_code in {"in", "ind", "india"}:
+        return "india"
+    return None
+
+
+def _resolve_country_code(data: dict, region: str | None):
+    raw = str(
+        data.get("country_code")
+        or data.get("countryCode")
+        or data.get("CountryCode")
+        or ""
+    ).strip().upper()
+    if raw:
+        if raw in {"TAIWAN", "TWN"}:
+            return "TW"
+        if raw in {"INDIA", "IND"}:
+            return "IN"
+        return raw
+    if region == "taiwan":
+        return "TW"
+    if region == "india":
+        return "IN"
+    return None
+
+
+def _reports_root() -> str:
+    root_path = getattr(current_app, "root_path", None)
+    if not root_path:
+        root_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+    return os.path.join(root_path, "data", "new_pdf_reports")
+
+
+def _report_dir(report_id: str) -> str:
+    return os.path.join(_reports_root(), report_id)
+
+
+def _report_status_path(report_id: str) -> str:
+    return os.path.join(_report_dir(report_id), "status.json")
+
+
+def _write_job_status(report_id: str, state: dict):
+    try:
+        report_dir = _report_dir(report_id)
+        os.makedirs(report_dir, exist_ok=True)
+        fd, tmp_path = tempfile.mkstemp(prefix="status.", suffix=".json", dir=report_dir)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(state, f, default=str)
+        os.replace(tmp_path, _report_status_path(report_id))
+    except Exception as exc:
+        current_app.logger.warning("[NewPdfReport] Failed to persist status for %s: %s", report_id, exc)
+
+
+def _read_job_status(report_id: str):
+    try:
+        path = _report_status_path(report_id)
+        if not os.path.exists(path):
+            return None
+        with open(path, "r", encoding="utf-8") as f:
+            state = json.load(f)
+        return dict(state) if isinstance(state, dict) else None
+    except Exception as exc:
+        current_app.logger.warning("[NewPdfReport] Failed to read status for %s: %s", report_id, exc)
+        return None
+
+
+def _set_job(report_id: str, **updates):
+    with REPORT_JOBS_LOCK:
+        state = REPORT_JOBS.get(report_id, {})
+        state.update(updates)
+        REPORT_JOBS[report_id] = state
+        persisted = dict(state)
+    _write_job_status(report_id, persisted)
+    return persisted
+
+
+def _get_job(report_id: str):
+    with REPORT_JOBS_LOCK:
+        state = REPORT_JOBS.get(report_id)
+        if state:
+            return dict(state)
+
+    persisted = _read_job_status(report_id)
+    if persisted:
+        with REPORT_JOBS_LOCK:
+            REPORT_JOBS[report_id] = dict(persisted)
+        return persisted
+
+    return None
+
+
+def _status_payload(report_id: str, job: dict):
+    payload = {
+        "status": job.get("status", "processing"),
+        "report_id": report_id,
+        "project_id": job.get("project_id"),
+        "user_id": job.get("user_id"),
+        "region": job.get("region"),
+        "country_code": job.get("country_code"),
+    }
+    if job.get("download_url"):
+        payload["download_url"] = job["download_url"]
+    if job.get("error"):
+        payload["error"] = job["error"]
+    if job.get("message"):
+        payload["message"] = job["message"]
+    return payload
+
+
+def _report_pdf_path(report_id: str) -> str:
+    return os.path.join(_report_dir(report_id), "report.pdf")
+
+
+def _subscribe(report_id: str):
+    q = Queue()
+    with REPORT_SUBSCRIBERS_LOCK:
+        REPORT_SUBSCRIBERS.setdefault(report_id, []).append(q)
+    return q
+
+
+def _unsubscribe(report_id: str, q: Queue):
+    with REPORT_SUBSCRIBERS_LOCK:
+        listeners = REPORT_SUBSCRIBERS.get(report_id, [])
+        if q in listeners:
+            listeners.remove(q)
+        if not listeners and report_id in REPORT_SUBSCRIBERS:
+            del REPORT_SUBSCRIBERS[report_id]
+
+
+def _publish_status_event(report_id: str):
+    job = _get_job(report_id)
+    if not job:
+        return
+    payload = _status_payload(report_id, job)
+    with REPORT_SUBSCRIBERS_LOCK:
+        listeners = list(REPORT_SUBSCRIBERS.get(report_id, []))
+    for q in listeners:
+        q.put(payload)
+
+
+def background_report_task(
+    app, project_id, user_id, report_id, region=None, country_code=None,
+    technologies=None, map_view_type=None,
+):
+    with app.app_context():
+        try:
+            _set_job(
+                report_id,
+                status="processing",
+                project_id=project_id,
+                user_id=user_id,
+                region=region,
+                country_code=country_code,
+                message="Report generation is running",
+            )
+            _publish_status_event(report_id)
+            current_app.logger.info(
+                f"[NewPdfReport] Starting generation: project_id={project_id}, user_id={user_id}, "
+                f"region={region}, country_code={country_code}, report_id={report_id}, "
+                f"technologies={technologies}, map_view_type={map_view_type}"
+            )
+            generate_new_pdf_report(
+                project_id=project_id,
+                user_id=user_id,
+                report_id=report_id,
+                db_engine=db.engine,
+                region=region,
+                country_code=country_code,
+                technologies=technologies,
+                map_view_type=map_view_type,
+            )
+            pdf_path = _report_pdf_path(report_id)
+            if not os.path.exists(pdf_path):
+                raise FileNotFoundError(f"Report PDF was not created: {pdf_path}")
+            download_url = f"/api/new-pdf-report/download/{report_id}"
+            _set_job(
+                report_id,
+                status="ready",
+                project_id=project_id,
+                user_id=user_id,
+                region=region,
+                country_code=country_code,
+                download_url=download_url,
+                message="Report generation completed",
+            )
+            _publish_status_event(report_id)
+            current_app.logger.info(
+                f"[NewPdfReport] Completed generation: report_id={report_id}"
+            )
+        except Exception as e:
+            _set_job(report_id, status="failed", error=str(e), message="Report generation failed")
+            _publish_status_event(report_id)
+            current_app.logger.exception(
+                f"[NewPdfReport] Failed generation: report_id={report_id}"
+            )
+
+
+@new_pdf_report_bp.route("/generate", methods=["POST"])
+def generate():
+    data = request.get_json() or {}
+
+    project_id = _safe_int(data.get("project_id") or data.get("Project_id"))
+    user_id = _safe_int(data.get("user_id") or data.get("User_id"))
+    region = _resolve_region(data)
+    country_code = _resolve_country_code(data, region)
+
+    # Optional: exact `network` values to keep (frontend enumerates the real
+    # distinct values present for this project and sends what the user
+    # checked) and "grid"/"raw" for how polygon-project maps are drawn.
+    # Both are None/empty-safe -- omitting them keeps every technology and
+    # the report's original always-grid-when-polygon behavior.
+    raw_technologies = data.get("technologies") or data.get("Technologies")
+    technologies = (
+        [str(t).strip() for t in raw_technologies if str(t).strip()]
+        if isinstance(raw_technologies, list) else None
+    )
+    map_view_type = str(data.get("map_view_type") or data.get("MapViewType") or "").strip().lower() or None
+
+    if not project_id:
+        return jsonify({"error": "project_id is required"}), 400
+    if not user_id:
+        return jsonify({"error": "user_id is required"}), 400
+
+    report_id = str(uuid.uuid4())
+    _set_job(
+        report_id,
+        status="processing",
+        project_id=project_id,
+        user_id=user_id,
+        region=region,
+        country_code=country_code,
+        download_url=None,
+        message="Report generation queued",
+    )
+    app = current_app._get_current_object()
+
+    thread = threading.Thread(
+        target=background_report_task,
+        args=(app, project_id, user_id, report_id, region, country_code, technologies, map_view_type),
+        daemon=True,
+    )
+    thread.start()
+
+    return jsonify({
+        "message": "Report generation started",
+        "status": "processing",
+        "project_id": project_id,
+        "user_id": user_id,
+        "region": region,
+        "country_code": country_code,
+        "report_id": report_id
+    }), 202
+
+
+@new_pdf_report_bp.route("/render-health", methods=["GET"])
+def render_health():
+    ok, detail = check_chromium_rendering()
+    status_code = 200 if ok else 503
+    return jsonify({
+        "status": "healthy" if ok else "unhealthy",
+        "chromium_rendering": ok,
+        "detail": detail,
+    }), status_code
+
+
+@new_pdf_report_bp.route("/status/<report_id>", methods=["GET"])
+def status(report_id):
+    job = _get_job(report_id)
+    if not job:
+        if os.path.exists(_report_pdf_path(report_id)):
+            return jsonify({
+                "status": "ready",
+                "report_id": report_id,
+                "download_url": f"/api/new-pdf-report/download/{report_id}",
+            }), 200
+
+        return jsonify({
+            "status": "not_found",
+            "report_id": report_id,
+        }), 404
+
+    payload = {
+        "status": job.get("status", "processing"),
+        "report_id": report_id,
+        "project_id": job.get("project_id"),
+        "user_id": job.get("user_id"),
+        "region": job.get("region"),
+        "country_code": job.get("country_code"),
+    }
+    if job.get("download_url"):
+        payload["download_url"] = job["download_url"]
+    if job.get("error"):
+        payload["error"] = job["error"]
+    if job.get("message"):
+        payload["message"] = job["message"]
+    return jsonify(payload), 200
+
+
+@new_pdf_report_bp.route("/events/<report_id>", methods=["GET"])
+def events(report_id):
+    job = _get_job(report_id)
+    if not job:
+        if os.path.exists(_report_pdf_path(report_id)):
+            return jsonify({
+                "status": "ready",
+                "report_id": report_id,
+                "download_url": f"/api/new-pdf-report/download/{report_id}",
+            }), 200
+
+        return jsonify({
+            "status": "not_found",
+            "report_id": report_id,
+        }), 404
+
+    terminal = {"ready", "failed"}
+
+    @stream_with_context
+    def event_stream():
+        initial = _get_job(report_id)
+        if initial and initial.get("status") in terminal:
+            payload = _status_payload(report_id, initial)
+            yield f"event: report_status\ndata: {json.dumps(payload)}\n\n"
+            return
+
+        q = _subscribe(report_id)
+        try:
+            while True:
+                try:
+                    payload = q.get(timeout=20)
+                    yield f"event: report_status\ndata: {json.dumps(payload)}\n\n"
+                    if payload.get("status") in terminal:
+                        break
+                except Empty:
+                    # Keep the connection alive for proxies/load balancers.
+                    yield ": keep-alive\n\n"
+        finally:
+            _unsubscribe(report_id, q)
+
+    return Response(event_stream(), mimetype="text/event-stream")
+
+
+@new_pdf_report_bp.route("/download/<report_id>", methods=["GET"])
+def download(report_id):
+    pdf_path = _report_pdf_path(report_id)
+
+    if os.path.exists(pdf_path):
+        return send_file(
+            pdf_path,
+            mimetype="application/pdf",
+            as_attachment=True,
+            download_name="drive_test_report_per_technology.pdf",
+        )
+
+    return jsonify({"error": "Report not found"}), 404

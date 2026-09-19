@@ -368,12 +368,14 @@ class PythonBridgeClient:
         end_date: str | None = None,
         region: str | None = None,
         country_code: str | None = None,
+        technologies: list[str] | None = None,
     ) -> pd.DataFrame:
         session_ids = [int(v) for v in session_ids if int(v) > 0]
         print(
             "[ReportLogs] requesting logs via PythonBridge "
             f"sessions={len(session_ids)} project_id={project_id} "
-            f"provider={provider!r} start_date={start_date} end_date={end_date} limit={limit}"
+            f"provider={provider!r} start_date={start_date} end_date={end_date} limit={limit} "
+            f"technologies={technologies!r}"
         )
 
         def _json_date(value: Any) -> Any:
@@ -391,6 +393,11 @@ class PythonBridgeClient:
             "EndDate": _json_date(end_date),
             "Limit": int(limit),
         }
+        # Optional exact `network` value filter (GetDriveTestRowsAsync's new
+        # Technologies field) -- None/empty means no filter, unchanged
+        # behavior for every existing caller that doesn't pass this.
+        if technologies:
+            body["Technologies"] = list(technologies)
         body.update(_bridge_region_body(region, country_code))
 
         df = self.post_rows("GetDriveTestRows", body, limit=limit)
