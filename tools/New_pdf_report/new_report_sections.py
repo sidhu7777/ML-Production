@@ -1455,7 +1455,10 @@ def _band_rsrq(avg_rsrq: float) -> str:
     return "Poor"
 
 
-def classify_quality(sinr: pd.Series, rsrq: pd.Series, unit_word: str = "samples") -> tuple[str, str]:
+def classify_quality(
+    sinr: pd.Series, rsrq: pd.Series, unit_word: str = "samples",
+    sinr_label: str = "SINR", rsrq_label: str | None = "RSRQ",
+) -> tuple[str, str]:
     """
     Quality status from Average SINR and Average RSRQ only (CQI/BLER are
     not part of this decision — see module notes above). Each metric is
@@ -1469,6 +1472,19 @@ def classify_quality(sinr: pd.Series, rsrq: pd.Series, unit_word: str = "samples
     `sinr`/`rsrq` are whatever the caller decided to classify over -- raw
     samples, or (per direction received) per-GRID-CELL medians via
     _kpi_stat_series, in which case pass unit_word="grid cells".
+
+    `sinr_label`/`rsrq_label` rename the remarks text only (e.g. "RxQual"
+    for a 2G subset -- see technology_metric_label), mirroring the
+    `pci_label` parameter already used by the PCI-table builders below --
+    the underlying sinr/rsrq columns and Good/Fair/Poor thresholds are
+    untouched regardless of technology.
+
+    `rsrq_label=None` means this technology has no RSRQ concept at all
+    (2G -- see technology_metric_label's docstring). In that case the
+    RSRQ clause is dropped entirely from the remarks and the status is
+    SINR-only, regardless of whether `rsrq` itself happens to be
+    populated -- this is a relabeling/applicability decision, not a
+    missing-data one.
     """
     if sinr.empty:
         return "N/A", "No SINR samples available."
@@ -1477,11 +1493,15 @@ def classify_quality(sinr: pd.Series, rsrq: pd.Series, unit_word: str = "samples
     sinr_band = _band_sinr(avg_sinr)
     pct_sinr_good = float((sinr > 20).mean() * 100)
 
+    if rsrq_label is None:
+        remarks = f"Average {sinr_label} {avg_sinr:.1f} dB ({pct_sinr_good:.0f}% of {unit_word} above 20 dB)."
+        return sinr_band, remarks
+
     if rsrq.empty:
         status = sinr_band
         remarks = (
-            f"Average SINR {avg_sinr:.1f} dB ({pct_sinr_good:.0f}% of {unit_word} above 20 dB). "
-            f"No RSRQ samples available."
+            f"Average {sinr_label} {avg_sinr:.1f} dB ({pct_sinr_good:.0f}% of {unit_word} above 20 dB). "
+            f"No {rsrq_label} samples available."
         )
         return status, remarks
 
@@ -1491,15 +1511,22 @@ def classify_quality(sinr: pd.Series, rsrq: pd.Series, unit_word: str = "samples
     status = max([sinr_band, rsrq_band], key=lambda b: _STATUS_RANK[b])
 
     remarks = (
-        f"Average SINR {avg_sinr:.1f} dB ({pct_sinr_good:.0f}% of {unit_word} above 20 dB); "
-        f"Average RSRQ {avg_rsrq:.1f} dB ({pct_rsrq_good:.0f}% of {unit_word} above -10 dB)."
+        f"Average {sinr_label} {avg_sinr:.1f} dB ({pct_sinr_good:.0f}% of {unit_word} above 20 dB); "
+        f"Average {rsrq_label} {avg_rsrq:.1f} dB ({pct_rsrq_good:.0f}% of {unit_word} above -10 dB)."
     )
     return status, remarks
 
 
-def classify_mobility(mobility_df: pd.DataFrame) -> tuple[str, str]:
+def classify_mobility(mobility_df: pd.DataFrame, pci_label: str = "PCI") -> tuple[str, str]:
     """
     PCI dominance for the Mobility row.
+
+    `pci_label` renames the remarks text only (e.g. "BCCH" for a 2G
+    subset, since GSM reuses the same `pci` DB column for its BCCH value)
+    -- mirrors the `pci_label` parameter already used by the PCI-table
+    builders (build_top_pci_table etc.) and by
+    classify_quality's sinr_label/rsrq_label. The underlying `pci` column
+    itself is untouched regardless of technology.
 
     Pass the corrected `report_df` (built through
     filter_primary_rows_including_nr + filter_known_band_rows — see notes
@@ -1530,7 +1557,10 @@ def classify_mobility(mobility_df: pd.DataFrame) -> tuple[str, str]:
     pci_ok = top_pci_share < DOMINANT_PCI_SHARE_THRESHOLD
 
     status = "Good" if pci_ok else "Fair"
-    remarks = f"{unique_pci} unique serving PCIs (PCI {top_pci} has {top_pci_share:.0f}% of the samples)."
+    remarks = (
+        f"{unique_pci} unique serving {pci_label}s "
+        f"({pci_label} {top_pci} has {top_pci_share:.0f}% of the samples)."
+    )
     return status, remarks
 
 
@@ -1562,6 +1592,71 @@ def _tech_slug(tech: str) -> str:
     """
     slug = re.sub(r"[^a-z0-9]+", "_", str(tech).strip().lower()).strip("_")
     return slug or "unknown"
+
+
+# ------------------------------------------------------------------
+# Per-technology metric display labels -- ported EXACTLY from the
+# frontend's ground truth at
+# StraceExeFron/src/utils/technologyMetricLabels.js
+# (TECHNOLOGY_METRIC_LABELS / normalizeMetricTechnology). This is a
+# RELABELING problem, not a missing-data problem: the same rsrp/rsrq/
+# sinr/pci DB columns are read for every technology -- for a 2G row the
+# number stored in `pci` literally IS the BCCH value (GSM reuses that
+# field), `rsrp` literally IS RxLev, `sinr` literally IS RxQual. Nothing
+# here changes which column is read or how KPI thresholds are resolved
+# (resolve_kpi_ranges keeps being called with kpi_name="RSRP"/"RSRQ"/
+# "SINR" for every technology, since those are the only keys configured
+# in the DB) -- only the human-facing label text changes per technology.
+# ------------------------------------------------------------------
+
+GENERIC_METRIC_LABELS = {"rsrp": "RSRP", "rsrq": "RSRQ", "sinr": "SINR", "pci": "PCI"}
+
+TECHNOLOGY_METRIC_LABELS = {
+    "2G": {"rsrp": "RxLev", "rsrq": None, "sinr": "RxQual", "pci": "BCCH"},
+    "3G": {"rsrp": "RSCP", "rsrq": "Ec/No", "sinr": "EcNo-derived", "pci": "PCI"},
+    "4G": {"rsrp": "RSRP", "rsrq": "RSRQ", "sinr": "SINR", "pci": "PCI"},
+    "5G": {"rsrp": "nrRSRP", "rsrq": "nrRSRQ", "sinr": "nrSINR", "pci": "PCI"},
+}
+
+
+def normalize_metric_technology(value) -> str:
+    """
+    Bucket a raw `network` string into "2G"/"3G"/"4G"/"5G"/"Unknown" by
+    substring match, mirroring technologyMetricLabels.js's
+    normalizeMetricTechnology() exactly (same order of checks, so e.g.
+    "5G NSA" -> "5G" and "4G (LTE Anchor - NSA)" -> "4G").
+    """
+    raw = str(value or "").strip().upper()
+    if not raw:
+        return "Unknown"
+    if "5G" in raw or "NR" in raw:
+        return "5G"
+    if "4G" in raw or "LTE" in raw:
+        return "4G"
+    if "3G" in raw or "UMTS" in raw or "WCDMA" in raw:
+        return "3G"
+    if "2G" in raw or "GSM" in raw or "GERAN" in raw or raw == "EDGE" or raw == "GPRS":
+        return "2G"
+    return "Unknown"
+
+
+def technology_metric_label(tech, metric: str) -> str | None:
+    """
+    Display label for `metric` ("rsrp"/"rsrq"/"sinr"/"pci") given a raw
+    `network` value, mirroring getTechnologyMetricLabels() in
+    technologyMetricLabels.js. Falls back to the generic label
+    (RSRP/RSRQ/SINR/PCI) for an unrecognized/"Unknown" bucket.
+
+    Returns None specifically for 2G's "rsrq" -- 2G has no RSRQ concept
+    at all (frontend: `rsrq: ""`), so callers must treat None as "skip
+    this metric for this technology entirely", not "blank/wrong value".
+    Every other metric/technology combination always returns a string.
+    """
+    bucket = normalize_metric_technology(tech)
+    overrides = TECHNOLOGY_METRIC_LABELS.get(bucket, {})
+    if metric in overrides:
+        return overrides[metric]
+    return GENERIC_METRIC_LABELS.get(metric)
 
 
 def classify_quality_by_technology(report_df: pd.DataFrame, grid_lattice: pd.DataFrame | None = None) -> list[dict]:
@@ -1599,11 +1694,15 @@ def classify_quality_by_technology(report_df: pd.DataFrame, grid_lattice: pd.Dat
     this function. Only the technologies that survive that filter (here:
     "4G" and "4G (LTE Anchor - NSA)") can appear below.
     """
-    def _classify(sub: pd.DataFrame) -> tuple[str, str]:
+    def _classify(sub: pd.DataFrame, tech=None) -> tuple[str, str]:
         sinr, sinr_unit = _kpi_stat_series(sub, "sinr", grid_lattice)
         rsrq, rsrq_unit = _kpi_stat_series(sub, "rsrq", grid_lattice)
         unit_word = sinr_unit if sinr_unit == rsrq_unit else "samples"
-        return classify_quality(sinr, rsrq, unit_word=unit_word)
+        sinr_label = technology_metric_label(tech, "sinr") if tech is not None else "SINR"
+        rsrq_label = technology_metric_label(tech, "rsrq") if tech is not None else "RSRQ"
+        return classify_quality(
+            sinr, rsrq, unit_word=unit_word, sinr_label=sinr_label, rsrq_label=rsrq_label,
+        )
 
     tech_list = _technology_groups(report_df)
     if not tech_list:
@@ -1614,7 +1713,52 @@ def classify_quality_by_technology(report_df: pd.DataFrame, grid_lattice: pd.Dat
     network_col = report_df["network"].fillna("").astype(str).str.strip()
     for tech in tech_list:
         sub = report_df.loc[network_col == tech]
-        status, remarks = _classify(sub)
+        status, remarks = _classify(sub, tech=tech)
+        results.append({
+            "technology": tech,
+            "status": status,
+            "remarks": remarks,
+        })
+    return results
+
+
+def classify_mobility_by_technology(
+    report_df: pd.DataFrame, mobility_df: pd.DataFrame | None = None,
+) -> list[dict]:
+    """
+    Mobility (PCI dominance) classified PER TECHNOLOGY, mirroring
+    classify_quality_by_technology's shape exactly -- one {"technology",
+    "status", "remarks"} entry per technology present, driven off the same
+    _technology_groups(report_df) list Radio Quality and Section 5's
+    per-technology PCI tables already use, per direction received: a
+    single blended "Mobility" row mixes PCI/BCCH populations across RATs
+    that aren't comparable (a 2G BCCH and a 4G PCI are different channel
+    identities entirely), same reasoning as why Radio Quality is never
+    blended across technologies.
+
+    `mobility_df` is filtered by the SAME per-technology `network` values
+    as `report_df` (see classify_mobility's docstring for why the
+    all-cells population is used for this metric rather than report_df
+    itself) -- falls back to report_df if not supplied. The 2G row's
+    remarks use "BCCH" instead of "PCI" via technology_metric_label(tech,
+    "pci"), same as Section 5's PCI tables.
+
+    Falls back to a single ungrouped entry (pci_label="PCI") if `network`
+    is absent, matching classify_quality_by_technology's own fallback.
+    """
+    base_df = mobility_df if mobility_df is not None else report_df
+
+    tech_list = _technology_groups(report_df)
+    if not tech_list or "network" not in base_df.columns:
+        status, remarks = classify_mobility(base_df)
+        return [{"technology": None, "status": status, "remarks": remarks}]
+
+    results = []
+    base_network_col = base_df["network"].fillna("").astype(str).str.strip()
+    for tech in tech_list:
+        sub = base_df.loc[base_network_col == tech]
+        pci_label = technology_metric_label(tech, "pci")
+        status, remarks = classify_mobility(sub, pci_label=pci_label)
         results.append({
             "technology": tech,
             "status": status,
@@ -2449,8 +2593,9 @@ def derive_executive_summary(
     """
     Build the Executive Summary content (report_VI.pdf, section 3).
     Rule-based (no LLM); Coverage/Quality/Mobility statuses use the exact
-    thresholds documented above, not ad-hoc cutoffs. Radio Quality is
-    broken out per technology (see classify_quality_by_technology) —
+    thresholds documented above, not ad-hoc cutoffs. Radio Quality and
+    Mobility are each broken out per technology (see
+    classify_quality_by_technology / classify_mobility_by_technology) —
     Coverage is not.
 
     `mobility_df` MUST be the all-cells, polygon-filtered population (same
@@ -2471,9 +2616,7 @@ def derive_executive_summary(
 
     coverage_status, coverage_remarks = classify_coverage(rsrp, unit_word=rsrp_unit)
     quality_entries = classify_quality_by_technology(report_df, grid_lattice=grid_lattice)
-    mobility_status, mobility_remarks = classify_mobility(
-        mobility_df if mobility_df is not None else report_df
-    )
+    mobility_entries = classify_mobility_by_technology(report_df, mobility_df=mobility_df)
 
     # --- Handover ---
     if handover_count is None:
@@ -2490,7 +2633,9 @@ def derive_executive_summary(
     for entry in quality_entries:
         label = f"Radio Quality - {entry['technology']}" if entry["technology"] else "Radio Quality"
         kpi_rows.append((label, entry["status"], entry["remarks"]))
-    kpi_rows.append(("Mobility", mobility_status, mobility_remarks))
+    for entry in mobility_entries:
+        label = f"Mobility - {entry['technology']}" if entry["technology"] else "Mobility"
+        kpi_rows.append((label, entry["status"], entry["remarks"]))
     kpi_rows.append(("Handover", handover_status, handover_remarks))
 
     observations = []
@@ -2506,18 +2651,23 @@ def derive_executive_summary(
             f"Radio quality ({tech_label}) classified as {entry['status']}."
             + (" Requires optimization." if entry["status"] not in ("Good", "N/A") else "")
         )
-    if mobility_status != "Good":
-        observations.append(
-            "PCI dominance or serving-cell instability detected; review PCI planning."
-        )
+    for entry in mobility_entries:
+        if entry["status"] != "Good":
+            tech_label = entry["technology"] or "overall"
+            pci_word = technology_metric_label(entry["technology"], "pci") if entry["technology"] else "PCI"
+            observations.append(
+                f"{pci_word} dominance or serving-cell instability detected ({tech_label}); "
+                f"review {pci_word} planning."
+            )
 
     quality_statuses = [e["status"] for e in quality_entries]
+    mobility_statuses = [e["status"] for e in mobility_entries]
     overall = (
         "The network demonstrated satisfactory RF performance. Coverage and "
         "mobility KPIs were generally within acceptable limits. Capacity "
         "optimization and interference mitigation are recommended in "
         "selected locations."
-        if all(s in ("Good", "N/A") for s in [coverage_status, mobility_status, *quality_statuses])
+        if all(s in ("Good", "N/A") for s in [coverage_status, *mobility_statuses, *quality_statuses])
         else (
             "The network showed mixed RF performance with some KPI groups "
             "below the Good threshold. Targeted optimization is recommended "
@@ -2547,6 +2697,7 @@ def derive_executive_summary(
         # the two sections can then never disagree with each other.
         "coverage": {"status": coverage_status, "remarks": coverage_remarks},
         "quality_entries": quality_entries,
+        "mobility_entries": mobility_entries,
     }
 
 
@@ -2597,9 +2748,23 @@ def build_drive_summary_text(drive_summary: dict) -> str:
 # averaged together). All content here is rule-based/templated — no LLM.
 # ------------------------------------------------------------------
 
-def build_rsrp_metric_table(rsrp: pd.Series, unit_word: str = "samples") -> pd.DataFrame:
+def build_rsrp_metric_table(rsrp: pd.Series, unit_word: str = "samples", metric_label: str = "RSRP") -> pd.DataFrame:
     """
-    4.2 RSRP Analysis metric table (Average / Best / Worst / % > -95 dBm).
+    4.2 RSRP/RSCP/RxLev Analysis metric block for ONE technology's already
+    -resolved series (or the whole blended frame's series when called
+    ungrouped) -- same single-technology-per-call shape as
+    build_serving_cell_metric_table (5.1)/build_rsrp_metric_table's own
+    caller now loops this once per technology present, per direction
+    received (the project owner explicitly overrode the earlier "RSRP
+    stays blended" decision for this table specifically, for full
+    consistency with every other Section 4/5 table, which is already
+    per-technology). `metric_label` renames every row to that
+    technology's own metric name (RxLev for 2G, RSCP for 3G, RSRP
+    otherwise) via technology_metric_label(tech, "rsrp") -- the -95 dBm
+    numeric threshold/column itself is untouched regardless of
+    technology, matching build_serving_cell_metric_table's `pci_label`-only
+    relabeling treatment.
+
     `rsrp` is whatever the caller resolved via _kpi_stat_series -- raw
     samples, or per-GRID-CELL medians when the project has a polygon, in
     which case "Best"/"Worst" become the best/worst CELL median rather
@@ -2608,10 +2773,13 @@ def build_rsrp_metric_table(rsrp: pd.Series, unit_word: str = "samples") -> pd.D
     correctly).
     """
     if rsrp.empty:
-        return pd.DataFrame({"Metric": ["Average RSRP"], "Value": ["No data available"]})
+        return pd.DataFrame({"Metric": [f"Average {metric_label}"], "Value": ["No data available"]})
     pct_above_95 = float((rsrp > -95).mean() * 100)
     return pd.DataFrame({
-        "Metric": ["Average RSRP", "Best RSRP", "Worst RSRP", f"{unit_word.title()} > -95 dBm"],
+        "Metric": [
+            f"Average {metric_label}", f"Best {metric_label}", f"Worst {metric_label}",
+            f"{unit_word.title()} > -95 dBm",
+        ],
         "Value": [
             f"{rsrp.mean():.1f} dBm",
             f"{rsrp.max():.1f} dBm",
@@ -2644,9 +2812,21 @@ def _build_per_technology_metric_table(report_df, column, unit, band_fn, metric_
     Average/Worst/Status, per direction received -- so "Worst RSRQ"/"Worst
     SINR" is the worst CELL median, not a single outlier sample, matching
     every other grid-based figure in this report.
+
+    Each row's actual metric name is resolved per-technology via
+    technology_metric_label(tech, column) -- e.g. "Ec/No" for 3G's RSRQ
+    row, "RxQual" for 2G's SINR row -- instead of reusing the single fixed
+    `metric_label` ("RSRQ"/"SINR") for every row regardless of technology,
+    same per-row relabeling pattern build_coverage_kpi_summary_table (4.5)
+    already uses. Since the label differs per row, the resolved name is
+    carried in its own "Metric" column rather than baked into a
+    metric-specific column header (which would be wrong for every row but
+    one). A technology for which technology_metric_label returns None
+    (e.g. 2G for the RSRQ table -- 2G has no RSRQ concept at all) is
+    skipped entirely, not just relabeled.
     """
     tech_list = _technology_groups(report_df)
-    columns = ["Technology", f"Average {metric_label}", f"Worst {metric_label}", "Status"]
+    columns = ["Technology", "Metric", "Average Value", "Worst Value", "Status"]
 
     if not tech_list:
         series, _unit_word = _kpi_stat_series(report_df, column, grid_lattice)
@@ -2654,19 +2834,22 @@ def _build_per_technology_metric_table(report_df, column, unit, band_fn, metric_
             return pd.DataFrame(columns=columns)
         avg = float(series.mean())
         return pd.DataFrame(
-            [["Overall", f"{avg:.1f} {unit}", f"{series.min():.1f} {unit}", band_fn(avg)]],
+            [["Overall", metric_label, f"{avg:.1f} {unit}", f"{series.min():.1f} {unit}", band_fn(avg)]],
             columns=columns,
         )
 
     rows = []
     network_col = report_df["network"].fillna("").astype(str).str.strip()
     for tech in tech_list:
+        label = technology_metric_label(tech, column)
+        if label is None:
+            continue  # e.g. 2G has no RSRQ concept -- skip the row entirely.
         sub = report_df.loc[network_col == tech]
         series, _unit_word = _kpi_stat_series(sub, column, grid_lattice)
         if series.empty:
             continue
         avg = float(series.mean())
-        rows.append([tech, f"{avg:.1f} {unit}", f"{series.min():.1f} {unit}", band_fn(avg)])
+        rows.append([tech, label, f"{avg:.1f} {unit}", f"{series.min():.1f} {unit}", band_fn(avg)])
     return pd.DataFrame(rows, columns=columns)
 
 
@@ -2743,33 +2926,43 @@ def build_coverage_kpi_summary_table(
         avg_rsrp_tech = float(rsrp_sub.mean())
         pct_within_tech = float((rsrp_sub > rsrp_threshold).mean() * 100)
         tech_status, _ = classify_coverage(rsrp_sub)
+        rsrp_label = technology_metric_label(tech, "rsrp") if tech != "Overall" else "RSRP"
         rows.append((
-            f"RSRP - {tech}", f"> {rsrp_threshold:g} dBm", f"{avg_rsrp_tech:.1f} dBm",
+            f"{rsrp_label} - {tech}", f"> {rsrp_threshold:g} dBm", f"{avg_rsrp_tech:.1f} dBm",
             "PASS" if tech_status in acceptable_statuses else "FAIL",
             f"{pct_within_tech:.0f}%", f"{100 - pct_within_tech:.0f}%",
         ))
 
-    # ---- RSRQ / SINR (per technology, never blended) ----
+    # ---- RSRQ (per technology, never blended) -- 2G is skipped entirely,
+    # not just relabeled: technology_metric_label(tech, "rsrq") returns
+    # None for 2G because 2G has no RSRQ concept at all (see that
+    # function's docstring), so a "RSRQ - 2G" row would be factually
+    # wrong, not merely mislabeled. ----
     for tech, sub in _tech_subsets():
+        rsrq_label = technology_metric_label(tech, "rsrq") if tech != "Overall" else "RSRQ"
+        if rsrq_label is None:
+            continue
         rsrq, _unit = _kpi_stat_series(sub, "rsrq", grid_lattice)
         if rsrq.empty:
             continue
         avg_rsrq = float(rsrq.mean())
         pct_within = float((rsrq > rsrq_threshold).mean() * 100)
         rows.append((
-            f"RSRQ - {tech}", f"> {rsrq_threshold:g} dB", f"{avg_rsrq:.1f} dB",
+            f"{rsrq_label} - {tech}", f"> {rsrq_threshold:g} dB", f"{avg_rsrq:.1f} dB",
             "PASS" if _band_rsrq(avg_rsrq) in acceptable_statuses else "FAIL",
             f"{pct_within:.0f}%", f"{100 - pct_within:.0f}%",
         ))
 
+    # ---- SINR (per technology, never blended) ----
     for tech, sub in _tech_subsets():
         sinr, _unit = _kpi_stat_series(sub, "sinr", grid_lattice)
         if sinr.empty:
             continue
         avg_sinr = float(sinr.mean())
         pct_within = float((sinr > sinr_threshold).mean() * 100)
+        sinr_label = technology_metric_label(tech, "sinr") if tech != "Overall" else "SINR"
         rows.append((
-            f"SINR - {tech}", f"> {sinr_threshold:g} dB", f"{avg_sinr:.1f} dB",
+            f"{sinr_label} - {tech}", f"> {sinr_threshold:g} dB", f"{avg_sinr:.1f} dB",
             "PASS" if _band_sinr(avg_sinr) in acceptable_statuses else "FAIL",
             f"{pct_within:.0f}%", f"{100 - pct_within:.0f}%",
         ))
@@ -2843,17 +3036,29 @@ def build_pci_distribution_stats(report_df: pd.DataFrame) -> dict:
     }
 
 
-def build_serving_cell_metric_table(report_df: pd.DataFrame) -> pd.DataFrame:
+def build_serving_cell_metric_table(report_df: pd.DataFrame, pci_label: str = "PCI") -> pd.DataFrame:
+    """
+    5.1 Serving Cell Distribution metric block for ONE technology's subset
+    of `report_df` (or the whole frame when called ungrouped). `pci_label`
+    renames every row ("BCCH" for a 2G subset, since GSM reuses the same
+    `pci` DB column for its BCCH value) -- same relabeling-only treatment
+    as build_top_pci_table's `pci_label` param. Callers are expected to
+    filter `report_df` to a single technology and call this once per
+    technology (see add_mobility_kpi_analysis) rather than passing the
+    whole blended frame, since a "10 unique serving PCIs" figure spanning
+    technologies whose channel-identity concepts differ (BCCH vs PCI) is
+    not a meaningful combined statistic.
+    """
     stats = build_pci_distribution_stats(report_df)
     if stats["total_samples"] == 0:
-        return pd.DataFrame({"Metric": ["Serving Cell Data"], "Observed Value": ["No PCI data available"]})
+        return pd.DataFrame({"Metric": ["Serving Cell Data"], "Observed Value": [f"No {pci_label} data available"]})
     return pd.DataFrame({
         "Metric": [
-            "Samples with Serving PCI",
-            "Unique Serving PCIs",
-            "Dominant PCI",
-            "Dominant PCI Share",
-            "Top 30 PCI Share",
+            f"Samples with Serving {pci_label}",
+            f"Unique Serving {pci_label}s",
+            f"Dominant {pci_label}",
+            f"Dominant {pci_label} Share",
+            f"Top 30 {pci_label} Share",
         ],
         "Observed Value": [
             f"{stats['total_samples']:,}",
@@ -2865,7 +3070,7 @@ def build_serving_cell_metric_table(report_df: pd.DataFrame) -> pd.DataFrame:
     })
 
 
-def build_top_pci_table(report_df: pd.DataFrame, limit: int = 15) -> pd.DataFrame:
+def build_top_pci_table(report_df: pd.DataFrame, limit: int = 15, pci_label: str = "PCI") -> pd.DataFrame:
     """
     PCI | Sample Count | % Samples | Good/Poor RSRP %
 
@@ -2877,10 +3082,15 @@ def build_top_pci_table(report_df: pd.DataFrame, limit: int = 15) -> pd.DataFram
     Coverage KPI Summary "Acceptance" column, Poor RSRP map/text — see
     CDF_ACCEPTANCE_THRESHOLDS), per direction received: one threshold,
     not a different number in different sections.
+
+    `pci_label` renames the first column only (e.g. "BCCH" for a 2G
+    subset, since GSM reuses the same `pci` DB column for its BCCH value)
+    -- the RSRP threshold/column itself is untouched regardless of
+    technology.
     """
     stats = build_pci_distribution_stats(report_df)
     counts = stats["counts"]
-    columns = ["PCI", "Sample Count", "% Samples", "Good/Poor RSRP %"]
+    columns = [pci_label, "Sample Count", "% Samples", "Good/Poor RSRP %"]
     if counts.empty:
         return pd.DataFrame(columns=columns)
 
@@ -2907,7 +3117,9 @@ def build_top_pci_table(report_df: pd.DataFrame, limit: int = 15) -> pd.DataFram
     return pd.DataFrame(rows, columns=columns)
 
 
-def build_pci_spread_table(report_df: pd.DataFrame, limit: int = 15) -> tuple[pd.DataFrame, list[dict]]:
+def build_pci_spread_table(
+    report_df: pd.DataFrame, limit: int = 15, pci_label: str = "PCI",
+) -> tuple[pd.DataFrame, list[dict]]:
     """
     PCI | Sample Count | < 2 km | 2-5 km | > 5 km
 
@@ -2927,7 +3139,7 @@ def build_pci_spread_table(report_df: pd.DataFrame, limit: int = 15) -> tuple[pd
     """
     stats = build_pci_distribution_stats(report_df)
     counts = stats["counts"]
-    columns = ["PCI", "Sample Count", "< 2 km", "2-5 km", "> 5 km"]
+    columns = [pci_label, "Sample Count", "< 2 km", "2-5 km", "> 5 km"]
     if counts.empty or not {"lat", "lon"}.issubset(report_df.columns):
         return pd.DataFrame(columns=columns), []
 
@@ -2963,27 +3175,27 @@ def build_pci_spread_table(report_df: pd.DataFrame, limit: int = 15) -> tuple[pd
     return pd.DataFrame(rows, columns=columns), pci_stats
 
 
-def build_top_pci_analysis_table(report_df: pd.DataFrame, limit: int = 8) -> pd.DataFrame:
+def build_top_pci_analysis_table(report_df: pd.DataFrame, limit: int = 8, pci_label: str = "PCI") -> pd.DataFrame:
     stats = build_pci_distribution_stats(report_df)
     counts = stats["counts"]
     if counts.empty:
-        return pd.DataFrame(columns=["PCI", "Sample Count", "% Samples", "Observation"])
+        return pd.DataFrame(columns=[pci_label, "Sample Count", "% Samples", "Observation"])
 
     total = stats["total_samples"]
     rows = []
     for pci, count in counts.head(limit).items():
         share = float((count / total) * 100) if total else 0.0
         if share >= 20:
-            obs = "Dominant serving PCI"
+            obs = f"Dominant serving {pci_label}"
         elif share >= 5:
             obs = "Healthy overlap"
         else:
             obs = "Normal utilization"
         rows.append((int(pci), f"{int(count):,}", f"{share:.1f}%", obs))
-    return pd.DataFrame(rows, columns=["PCI", "Sample Count", "% Samples", "Observation"])
+    return pd.DataFrame(rows, columns=[pci_label, "Sample Count", "% Samples", "Observation"])
 
 
-def build_poor_pci_analysis_table(report_df: pd.DataFrame, metric_column: str):
+def build_poor_pci_analysis_table(report_df: pd.DataFrame, metric_column: str, pci_label: str = "PCI"):
     """
     Uses the SAME single acceptance threshold as every other "poor"
     RSRP/RSRQ reference in this report (-95 dBm / -10 dB — see
@@ -2992,6 +3204,10 @@ def build_poor_pci_analysis_table(report_df: pd.DataFrame, metric_column: str):
     listed PCI's OWN samples (not just its already-filtered poor subset)
     split by that same threshold — matching the 5.2 PCI Distribution
     table's Good/Poor RSRP % column.
+
+    `pci_label` renames only the identifying "PCI" column (e.g. "BCCH"
+    for a 2G subset) -- the RSRP/RSRQ threshold and its own "Avg
+    RSRP"/"Worst RSRP" columns are untouched regardless of technology.
     """
     from tools.report_engine.kpi_analysis import build_poor_pci_table
 
@@ -3023,17 +3239,19 @@ def build_poor_pci_analysis_table(report_df: pd.DataFrame, metric_column: str):
     total_poor_pci = df.attrs.get("total_poor_pci")
     df = df.copy()
     df["Good/Poor %"] = good_poor_col
+    if pci_label != "PCI":
+        df = df.rename(columns={"PCI": pci_label})
     if total_poor_pci is not None:
         df.attrs["total_poor_pci"] = total_poor_pci
     return df
 
 
-def _poor_pci_section_title(base_title: str, table_df: pd.DataFrame | None) -> str:
+def _poor_pci_section_title(base_title: str, table_df: pd.DataFrame | None, pci_label: str = "PCI") -> str:
     if table_df is None or table_df.empty:
         return base_title
     shown = len(table_df)
     total = int(table_df.attrs.get("total_poor_pci", shown))
-    suffix = f"Top {shown} of {total} PCIs" if total > shown else f"{shown} PCIs"
+    suffix = f"Top {shown} of {total} {pci_label}s" if total > shown else f"{shown} {pci_label}s"
     return f"{base_title} ({suffix})"
 
 
@@ -3047,7 +3265,7 @@ def build_neighbor_cell_table(neighbor_df: pd.DataFrame | None) -> pd.DataFrame:
                 "Assessment",
             ],
             "Observed Value": [
-                "tbl_network_log_neighbour",
+                "Dedicated neighbor-cell measurement log",
                 "0",
                 "0 unique neighbor PCIs",
                 "Not populated",
@@ -3085,7 +3303,7 @@ def build_neighbor_cell_table(neighbor_df: pd.DataFrame | None) -> pd.DataFrame:
             "Assessment",
         ],
         "Observed Value": [
-            "tbl_network_log_neighbour",
+            "Dedicated neighbor-cell measurement log",
             f"{len(neighbor_df):,}",
             f"{int(pci.nunique()) if not pci.empty else 0}",
             top_pci_text,
@@ -3224,9 +3442,8 @@ def build_throughput_observation_text(classification: dict, label: str) -> str:
     classified = classification["classified"]
     if classified == 0:
         return (
-            f"Observation: No samples carried a recognized LTE channel-bandwidth reference "
-            f"(tbl_network_log.bw), so {label} could not be classified against the "
-            f"bandwidth-specific throughput reference."
+            f"Observation: No samples carried a recognized LTE channel-bandwidth reference, "
+            f"so {label} could not be classified against the bandwidth-specific throughput reference."
         )
     good_pct = classification["good"] / classified * 100
     fair_pct = classification["fair"] / classified * 100
@@ -3763,6 +3980,7 @@ class NewFormatPDFReport(PDFReportGenerator):
 
     def _kpi_image_flowables_per_technology(
         self, report_df, map_prefix: str, cdf_filename: str, max_height=4 * inch,
+        metric_key: str | None = None,
     ):
         """
         Same as _kpi_image_flowables, but for KPIs classified PER
@@ -3773,6 +3991,15 @@ class NewFormatPDFReport(PDFReportGenerator):
         together. The CDF chart stays a single blended distribution
         (unchanged) since the per-technology breakdown already lives in
         the relevant KPI table.
+
+        `metric_key` -- one of "rsrp"/"rsrq"/"sinr" -- adds the
+        technology-appropriate metric name to each heading via
+        technology_metric_label() (e.g. "2G — RxLev" instead of just
+        "2G"), and SKIPS a technology entirely (no heading, no image) when
+        that lookup returns None (2G has no RSRQ concept at all). Left as
+        None for the DL/UL/MOS callers (Section 7), which keep the plain
+        "<tech name>" heading and never skip a technology -- those KPIs
+        aren't in TECHNOLOGY_METRIC_LABELS.
 
         Each technology's [label, image] pair is wrapped in its own
         KeepTogether — without this, ReportLab was free to strand the
@@ -3786,11 +4013,19 @@ class NewFormatPDFReport(PDFReportGenerator):
         maps_dir = os.path.join(self.images_dir, "kpi_maps")
         any_map = False
         for tech in tech_list:
+            if metric_key is not None:
+                metric_label = technology_metric_label(tech, metric_key)
+                if metric_label is None:
+                    # e.g. 2G under RSRQ -- not applicable, skip entirely.
+                    continue
+                heading_text = f"{tech} — {metric_label}"
+            else:
+                heading_text = tech
             map_path = os.path.join(maps_dir, f"{map_prefix}_{_tech_slug(tech)}.png")
             if not os.path.exists(map_path):
                 continue
             flowables.append(KeepTogether([
-                Paragraph(f"<b>{tech}</b>", self.styles["Body"]),
+                Paragraph(f"<b>{heading_text}</b>", self.styles["Body"]),
                 Spacer(1, 2),
                 self._sized_image(self._compress_png(map_path), 5.8 * inch, max_height),
             ]))
@@ -3807,6 +4042,43 @@ class NewFormatPDFReport(PDFReportGenerator):
         if os.path.exists(cdf_path):
             flowables.append(self._sized_image(cdf_path, TABLE_MAX_WIDTH, max_height))
             flowables.append(Spacer(1, 6))
+        return flowables
+
+    def _poor_region_image_flowables_per_technology(
+        self, report_df, map_prefix: str, metric_key: str, max_height=4.5 * inch,
+    ):
+        """
+        Per-technology counterpart of _kpi_image_flowables_per_technology
+        for the Poor RSRP / Poor RSRQ region maps (Section 4.2/4.3) --
+        same `{map_prefix}_{_tech_slug(tech)}.png` naming (generated by
+        main.py's _render_poor_region_maps_per_technology) and the same
+        skip-when-None behaviour via technology_metric_label(tech,
+        metric_key): 2G has no RSRQ concept at all, so no heading/image is
+        produced for it when `metric_key="rsrq"`.
+        """
+        flowables = []
+        tech_list = _technology_groups(report_df)
+        maps_dir = os.path.join(self.images_dir, "kpi_maps")
+        for tech in tech_list:
+            metric_label = technology_metric_label(tech, metric_key)
+            if metric_label is None:
+                continue  # e.g. 2G under RSRQ -- not applicable, skip entirely.
+            map_path = os.path.join(maps_dir, f"{map_prefix}_{_tech_slug(tech)}.png")
+            if not os.path.exists(map_path):
+                continue
+            flowables.append(KeepTogether([
+                Paragraph(f"<b>{tech} — {metric_label}</b>", self.styles["Body"]),
+                Spacer(1, 2),
+                self._sized_image(self._compress_png(map_path), 5.8 * inch, max_height),
+            ]))
+            flowables.append(Spacer(1, 6))
+        if not flowables:
+            # Fall back to a single combined map if no per-technology maps
+            # were generated (e.g. `network` column missing entirely).
+            map_path = os.path.join(maps_dir, f"{map_prefix}_all.png")
+            if os.path.exists(map_path):
+                flowables.append(self._sized_image(self._compress_png(map_path), 5.8 * inch, max_height))
+                flowables.append(Spacer(1, 6))
         return flowables
 
     def add_introduction(self, text):
@@ -3932,22 +4204,47 @@ class NewFormatPDFReport(PDFReportGenerator):
 
         # ---- 4.2 RSRP Analysis (Coverage) — numeric stats stay blended
         # (RSRP is dBm-comparable across RATs), but the map visualization
-        # is per-technology, same as RSRQ/SINR below ----
-        rsrp_flowables = [
-            Paragraph(
+        # is per-technology, same as RSRQ/SINR below. The HEADING/
+        # Definition/Acceptance Criteria text, however, is built
+        # dynamically from whichever technologies are actually present
+        # (_technology_groups + technology_metric_label(tech, "rsrp")) so
+        # a 2G/3G-inclusive project also surfaces RxLev/RSCP by name here
+        # instead of only ever saying "RSRP" -- a single-technology (4G
+        # only) project keeps the plain, unchanged "RSRP" wording. ----
+        rsrp_tech_list = _technology_groups(report_df)
+        rsrp_alt_labels = []
+        rsrp_alt_desc_parts = []
+        for _tech in rsrp_tech_list:
+            _label = technology_metric_label(_tech, "rsrp")
+            if _label and _label != "RSRP" and _label not in rsrp_alt_labels:
+                rsrp_alt_labels.append(_label)
+                rsrp_alt_desc_parts.append(f"{_label} for {_tech}")
+
+        if rsrp_alt_labels:
+            rsrp_metric_term = "RSRP / " + " / ".join(rsrp_alt_labels)
+            rsrp_heading = f"4.2 {rsrp_metric_term} Analysis (Coverage)"
+            rsrp_definition_text = (
                 "Definition: Reference Signal Received Power (RSRP) is the primary LTE "
-                "coverage KPI and indicates the received signal strength from the serving cell.",
-                self.styles["Body"],
-            ),
+                "coverage KPI and indicates the received signal strength from the serving "
+                f"cell, also referred to as {' / '.join(rsrp_alt_desc_parts)} in this drive."
+            )
+        else:
+            rsrp_metric_term = "RSRP"
+            rsrp_heading = "4.2 RSRP Analysis (Coverage)"
+            rsrp_definition_text = (
+                "Definition: Reference Signal Received Power (RSRP) is the primary LTE "
+                "coverage KPI and indicates the received signal strength from the serving cell."
+            )
+
+        rsrp_flowables = [
+            Paragraph(rsrp_definition_text, self.styles["Body"]),
             Spacer(1, 4),
             Paragraph("<b>Acceptance Criteria</b>", self.styles["Body"]),
             *self._bullet_flowables([
-                "Good: RSRP &gt; -95 dBm for more than 90% of samples",
-                "Fair: Average RSRP -95 to -105 dBm",
-                "Poor: Average RSRP &lt; -105 dBm, or coverage (% &gt; -95 dBm) &lt; 75%",
+                f"Good: {rsrp_metric_term} &gt; -95 dBm for more than 90% of samples",
+                f"Fair: Average {rsrp_metric_term} -95 to -105 dBm",
+                f"Poor: Average {rsrp_metric_term} &lt; -105 dBm, or coverage (% &gt; -95 dBm) &lt; 75%",
             ]),
-            Spacer(1, 4),
-            make_native_table(build_rsrp_metric_table(rsrp, unit_word=rsrp_unit)),
             Spacer(1, 4),
             Paragraph(
                 f"Observation: Coverage classified as <b>{coverage_status}</b>. "
@@ -3955,29 +4252,88 @@ class NewFormatPDFReport(PDFReportGenerator):
                 self.styles["Body"],
             ),
         ]
-        self.add_labeled_block("4.2 RSRP Analysis (Coverage)", rsrp_flowables)
+        self.add_labeled_block(rsrp_heading, rsrp_flowables)
+        # 4.2's own Metric|Value table -- one block PER TECHNOLOGY, same
+        # shape as 5.1's per-technology split (build_serving_cell_metric_table),
+        # per direction received: the project owner overrode the earlier
+        # "RSRP stays blended" design so this table is no longer the one
+        # remaining blended table in Section 4/5. Appended as separate
+        # KeepTogether blocks outside add_labeled_block's own single
+        # KeepTogether (same reasoning as the map images below it) so
+        # several technologies' blocks can never trigger a
+        # "content too large for one page" layout failure.
+        rsrp_metric_blocks = []
+        if rsrp_tech_list:
+            rsrp_network_col = report_df["network"].fillna("").astype(str).str.strip()
+            for _tech in rsrp_tech_list:
+                _sub = report_df.loc[rsrp_network_col == _tech]
+                _rsrp_sub, _rsrp_sub_unit = _kpi_stat_series(_sub, "rsrp", grid_lattice)
+                if _rsrp_sub.empty:
+                    continue
+                _label = technology_metric_label(_tech, "rsrp") or "RSRP"
+                rsrp_metric_blocks.append(KeepTogether([
+                    Paragraph(f"<b>{_tech} — {_label}</b>", self.styles["Body"]),
+                    Spacer(1, 2),
+                    make_native_table(build_rsrp_metric_table(_rsrp_sub, unit_word=_rsrp_sub_unit, metric_label=_label)),
+                ]))
+                rsrp_metric_blocks.append(Spacer(1, 6))
+        if not rsrp_metric_blocks:
+            # No per-technology "network" data available -- fall back to
+            # the single blended block computed above, same fallback shape
+            # _build_per_technology_metric_table/build_coverage_kpi_summary_table
+            # use for an "Overall" row when no technology grouping exists.
+            rsrp_metric_blocks = [KeepTogether([
+                Paragraph("<b>Overall — RSRP</b>", self.styles["Body"]),
+                Spacer(1, 2),
+                make_native_table(build_rsrp_metric_table(rsrp, unit_word=rsrp_unit)),
+            ]), Spacer(1, 6)]
+        self.story.extend(rsrp_metric_blocks)
         # Map + CDF appended separately (not inside the KeepTogether block
         # above) so a full-page image can flow naturally instead of risking
         # a "content too large for one page" layout failure. Per-technology
         # maps (one per RAT present), matching RSRQ/SINR's treatment below.
         self.story.extend(
-            self._kpi_image_flowables_per_technology(report_df, "rsrp_map", "cdf_rsrp.png")
+            self._kpi_image_flowables_per_technology(report_df, "rsrp_map", "cdf_rsrp.png", metric_key="rsrp")
         )
-        self.story.extend(self._labeled_image_flowables(
-            f"Poor RSRP (< {CDF_ACCEPTANCE_THRESHOLDS['RSRP']:g} dBm)", "rsrp_poor_regions.png", subdir="kpi_maps",
-            max_width=5.8 * inch, max_height=4.5 * inch,
-            extra_text=build_poor_region_text(poor_rsrp_summary, "RSRP", "dBm"),
-        ))
+        # Poor RSRP maps -- one per technology (see
+        # _render_poor_region_maps_per_technology in main.py), not a
+        # single map blending every technology's poor samples together.
+        # The narrative text above the maps stays a single blended
+        # observation (build_poor_region_summary is not split per
+        # technology), matching this table's own RSRP (Blended) treatment.
+        self.story.append(KeepTogether([
+            Paragraph(
+                f"<b>Poor {rsrp_metric_term} (&lt; {CDF_ACCEPTANCE_THRESHOLDS['RSRP']:g} dBm)</b>",
+                self.styles["Body"],
+            ),
+            Spacer(1, 2),
+            Paragraph(build_poor_region_text(poor_rsrp_summary, "RSRP", "dBm"), self.styles["Body"]),
+        ]))
+        self.story.append(Spacer(1, 4))
+        self.story.extend(
+            self._poor_region_image_flowables_per_technology(report_df, "rsrp_poor_regions", metric_key="rsrp")
+        )
 
         # ---- 4.3 RSRQ Analysis — per technology, never blended ----
+        # Dynamic Poor-RSRQ heading term, same pattern as 4.2's RSRP
+        # heading above (_technology_groups + technology_metric_label):
+        # technology_metric_label(tech, "rsrq") returns None for 2G (no
+        # RSRQ concept at all), so 2G is never added to rsrq_alt_labels
+        # and the heading correctly never mentions it for RSRQ.
+        rsrq_alt_labels = []
+        for _tech in _technology_groups(report_df):
+            _label = technology_metric_label(_tech, "rsrq")
+            if _label and _label != "RSRQ" and _label not in rsrq_alt_labels:
+                rsrq_alt_labels.append(_label)
+        rsrq_metric_term = "RSRQ / " + " / ".join(rsrq_alt_labels) if rsrq_alt_labels else "RSRQ"
+
         rsrq_table = build_rsrq_technology_table(report_df, grid_lattice=grid_lattice)
         rsrq_worst_status = _worst_status(rsrq_table["Status"]) if not rsrq_table.empty else "N/A"
         rsrq_flowables = [
             Paragraph(
                 "Definition: Reference Signal Received Quality (RSRQ) indicates the quality "
                 "of the received reference signal and reflects both signal strength and cell "
-                "loading. RSRQ is classified PER TECHNOLOGY, not blended, since its "
-                "characteristic range differs by RAT.",
+                "loading.",
                 self.styles["Body"],
             ),
             Spacer(1, 4),
@@ -3996,27 +4352,44 @@ class NewFormatPDFReport(PDFReportGenerator):
             f"Observation: worst-case RSRQ classification across technologies is "
             f"<b>{rsrq_worst_status}</b>.", self.styles["Body"]
         ))
-        self.add_labeled_block("4.3 RSRQ Analysis", rsrq_flowables)
+        self.add_labeled_block(f"4.3 {rsrq_metric_term} Analysis", rsrq_flowables)
         # Per-technology maps (one per RAT present), not a single map
         # blending every technology together — RSRQ's characteristic range
         # differs by RAT, same reason its table is split per technology.
         self.story.extend(
-            self._kpi_image_flowables_per_technology(report_df, "rsrq_map", "cdf_rsrq.png")
+            self._kpi_image_flowables_per_technology(report_df, "rsrq_map", "cdf_rsrq.png", metric_key="rsrq")
         )
-        self.story.extend(self._labeled_image_flowables(
-            f"Poor RSRQ (< {CDF_ACCEPTANCE_THRESHOLDS['RSRQ']:g} dB)", "rsrq_poor_regions.png", subdir="kpi_maps",
-            max_width=5.8 * inch, max_height=4.5 * inch,
-            extra_text=build_poor_region_text(poor_rsrq_summary, "RSRQ", "dB"),
-        ))
+        # Poor RSRQ maps -- one per technology, 2G skipped entirely (no
+        # RSRQ concept), same treatment as _kpi_image_flowables_per_technology
+        # for the main RSRQ maps above.
+        self.story.append(KeepTogether([
+            Paragraph(
+                f"<b>Poor {rsrq_metric_term} (&lt; {CDF_ACCEPTANCE_THRESHOLDS['RSRQ']:g} dB)</b>",
+                self.styles["Body"],
+            ),
+            Spacer(1, 2),
+            Paragraph(build_poor_region_text(poor_rsrq_summary, "RSRQ", "dB"), self.styles["Body"]),
+        ]))
+        self.story.append(Spacer(1, 4))
+        self.story.extend(
+            self._poor_region_image_flowables_per_technology(report_df, "rsrq_poor_regions", metric_key="rsrq")
+        )
 
         # ---- 4.4 SINR Analysis — per technology, never blended ----
+        # Dynamic heading term, same pattern as 4.2/4.3 above.
+        sinr_alt_labels = []
+        for _tech in _technology_groups(report_df):
+            _label = technology_metric_label(_tech, "sinr")
+            if _label and _label != "SINR" and _label not in sinr_alt_labels:
+                sinr_alt_labels.append(_label)
+        sinr_metric_term = "SINR / " + " / ".join(sinr_alt_labels) if sinr_alt_labels else "SINR"
+
         sinr_table = build_sinr_technology_table(report_df, grid_lattice=grid_lattice)
         sinr_worst_status = _worst_status(sinr_table["Status"]) if not sinr_table.empty else "N/A"
         sinr_flowables = [
             Paragraph(
                 "Definition: Signal-to-Interference-plus-Noise Ratio (SINR) represents radio "
-                "link quality and interference conditions. SINR is classified PER TECHNOLOGY, "
-                "not blended, since its characteristic range differs by RAT.",
+                "link quality and interference conditions.",
                 self.styles["Body"],
             ),
             Spacer(1, 4),
@@ -4035,10 +4408,10 @@ class NewFormatPDFReport(PDFReportGenerator):
             f"Observation: worst-case SINR classification across technologies is "
             f"<b>{sinr_worst_status}</b>.", self.styles["Body"]
         ))
-        self.add_labeled_block("4.4 SINR Analysis", sinr_flowables)
+        self.add_labeled_block(f"4.4 {sinr_metric_term} Analysis", sinr_flowables)
         # Per-technology maps, same reasoning as 4.3 RSRQ above.
         self.story.extend(
-            self._kpi_image_flowables_per_technology(report_df, "sinr_map", "cdf_sinr.png")
+            self._kpi_image_flowables_per_technology(report_df, "sinr_map", "cdf_sinr.png", metric_key="sinr")
         )
 
         # ---- 4.5 Coverage KPI Summary — report_VI.pdf's own
@@ -4092,13 +4465,7 @@ class NewFormatPDFReport(PDFReportGenerator):
         ))
         self.story.append(Spacer(1, 8))
 
-        stats = build_pci_distribution_stats(report_df)
         mobility_status, mobility_remarks = classify_mobility(report_df)
-        top_pci_df = build_top_pci_table(report_df, limit=15)
-        top_pci_analysis_df = build_top_pci_analysis_table(report_df, limit=8)
-        poor_rsrp_df = build_poor_pci_analysis_table(report_df, "rsrp")
-        poor_rsrq_df = build_poor_pci_analysis_table(report_df, "rsrq")
-        pci_spread_df, pci_spread_stats = build_pci_spread_table(report_df, limit=15)
         neighbor_table_df = build_neighbor_cell_table(neighbor_df)
         # Used below in the Mobility Summary's overall_text logic even
         # though the standalone Neighbor Cell Analysis section (formerly
@@ -4108,45 +4475,98 @@ class NewFormatPDFReport(PDFReportGenerator):
         )
         summary_df = build_mobility_kpi_summary_table(report_df, neighbor_df=neighbor_df)
 
-        serving_flowables = [
+        # ---- 5.1-5.6: PCI/BCCH family, one sub-block PER TECHNOLOGY under
+        # each numbered heading -- same shape as 4.2-4.4's per-technology
+        # maps under one heading. "PCI" is relabeled to the technology's
+        # own channel-identity name (BCCH for 2G, PCI otherwise) via
+        # technology_metric_label(tech, "pci"); the underlying `pci` DB
+        # column itself is read unchanged for every technology (for 2G it
+        # literally holds the BCCH value already -- GSM reuses that
+        # field). Only pci_map.png / pci_distribution.png / cdf_pci.png
+        # stay single blended images (generated outside this module, not
+        # splittable here). Defined here (before 5.1) so 5.1's own
+        # Serving Cell Distribution table -- previously blended across
+        # every technology -- can use the same per-technology split.
+        tech_list = _technology_groups(report_df)
+        network_col = (
+            report_df["network"].fillna("").astype(str).str.strip()
+            if "network" in report_df.columns else None
+        )
+        pci_techs = tech_list if (tech_list and network_col is not None) else [None]
+
+        def _tech_df(tech):
+            return report_df if tech is None else report_df.loc[network_col == tech]
+
+        def _tech_pci_label(tech):
+            return technology_metric_label(tech, "pci") if tech is not None else "PCI"
+
+        def _tech_heading(tech, label):
+            name = tech if tech is not None else "All Technologies"
+            return f"{name} — {label}"
+
+        # 5.1 Serving Cell Distribution -- one sub-block PER TECHNOLOGY
+        # (mirroring 5.2-5.6's shape below), not a single table blending
+        # every technology's PCI/BCCH values into one "N unique serving
+        # PCIs" figure. A 2G BCCH value and a 4G/5G real PCI value are not
+        # the same channel-identity concept, so counting them together
+        # was factually meaningless, not just mislabeled.
+        self.add_labeled_block("5.1 Serving Cell Distribution", [
             Paragraph(
                 "Objective: verify that the UE remains connected to the expected serving cells "
                 "across the planned route.",
                 self.styles["Body"],
             ),
-            Spacer(1, 4),
-            make_native_table(build_serving_cell_metric_table(report_df)),
-            Spacer(1, 4),
-            Paragraph(f"Observation: {mobility_remarks}", self.styles["Body"]),
-        ]
-        self.add_labeled_block("5.1 Serving Cell Distribution", serving_flowables)
+        ])
+        serving_blocks = []
+        for tech in pci_techs:
+            df_tech = _tech_df(tech)
+            label = _tech_pci_label(tech)
+            _tech_mobility_status, tech_remarks = classify_mobility(df_tech, pci_label=label)
+            block = [Paragraph(f"<b>{_tech_heading(tech, label)}</b>", self.styles["Body"]), Spacer(1, 2)]
+            block.append(make_native_table(build_serving_cell_metric_table(df_tech, pci_label=label)))
+            block.append(Spacer(1, 4))
+            block.append(Paragraph(f"Observation: {tech_remarks}", self.styles["Body"]))
+            serving_blocks.append(KeepTogether(block))
+            serving_blocks.append(Spacer(1, 6))
+        self.story.extend(serving_blocks)
 
         pci_map_path = os.path.join(self.images_dir, "kpi_maps", "pci_map.png")
         if os.path.exists(pci_map_path):
             self.story.append(self._sized_image(self._compress_png(pci_map_path), 5.8 * inch, 4.5 * inch))
             self.story.append(Spacer(1, 6))
 
-        pci_flowables = [
+        # 5.2 PCI Distribution
+        self.add_labeled_block("5.2 PCI Distribution", [
             Paragraph(
-                "Objective: review how the serving PCI population is distributed along the drive "
-                "route and identify whether mobility is concentrated on a small number of cells.",
+                "Objective: review how the serving PCI (BCCH for 2G) population is distributed "
+                "along the drive route, per technology, and identify whether mobility is "
+                "concentrated on a small number of cells.",
                 self.styles["Body"],
             ),
-            Spacer(1, 4),
-        ]
-        if not top_pci_df.empty:
-            pci_flowables.append(make_native_table(top_pci_df))
-            pci_flowables.append(Spacer(1, 4))
-        if stats["total_samples"]:
-            pci_flowables.append(Paragraph(
-                f"Observation: {stats['unique_pci']} unique serving PCIs were observed. "
-                f"The dominant PCI was {stats['dominant_pci']} with {stats['dominant_share']:.1f}% "
-                f"of samples. PCI allocation was generally balanced across the drive route.",
-                self.styles["Body"],
-            ))
-        else:
-            pci_flowables.append(Paragraph("Observation: PCI distribution data is not available.", self.styles["Body"]))
-        self.add_labeled_block("5.2 PCI Distribution", pci_flowables)
+        ])
+        dist_blocks = []
+        for tech in pci_techs:
+            df_tech = _tech_df(tech)
+            label = _tech_pci_label(tech)
+            tech_stats = build_pci_distribution_stats(df_tech)
+            tech_top_pci_df = build_top_pci_table(df_tech, limit=15, pci_label=label)
+            block = [Paragraph(f"<b>{_tech_heading(tech, label)}</b>", self.styles["Body"]), Spacer(1, 2)]
+            if not tech_top_pci_df.empty:
+                block.append(make_native_table(tech_top_pci_df))
+                block.append(Spacer(1, 4))
+            if tech_stats["total_samples"]:
+                block.append(Paragraph(
+                    f"Observation: {tech_stats['unique_pci']} unique serving {label}s were observed. "
+                    f"The dominant {label} was {tech_stats['dominant_pci']} with "
+                    f"{tech_stats['dominant_share']:.1f}% of samples. {label} allocation was "
+                    f"generally balanced across the drive route.",
+                    self.styles["Body"],
+                ))
+            else:
+                block.append(Paragraph(f"Observation: {label} distribution data is not available.", self.styles["Body"]))
+            dist_blocks.append(KeepTogether(block))
+            dist_blocks.append(Spacer(1, 6))
+        self.story.extend(dist_blocks)
 
         for subdir, filename, compress in [
             ("kpi_analysis", "pci_distribution.png", False),
@@ -4158,90 +4578,143 @@ class NewFormatPDFReport(PDFReportGenerator):
                 self.story.append(self._sized_image(img_path, TABLE_MAX_WIDTH, 4.5 * inch))
                 self.story.append(Spacer(1, 6))
 
-        top_pci_flowables = []
-        if not top_pci_analysis_df.empty:
-            top_pci_flowables.append(make_native_table(top_pci_analysis_df))
-        else:
-            top_pci_flowables.append(Paragraph("No top PCI entries are available.", self.styles["Body"]))
-        self.add_labeled_block("5.3 Top PCI Analysis", top_pci_flowables)
-
-        poor_rsrp_flowables = []
-        if poor_rsrp_df is not None and not poor_rsrp_df.empty:
-            poor_rsrp_flowables.append(make_native_table(poor_rsrp_df))
-            poor_rsrp_flowables.append(Spacer(1, 4))
-            worst_rsrp_pci = poor_rsrp_df.iloc[0]
-            total_poor_rsrp_pci = int(poor_rsrp_df.attrs.get("total_poor_pci", len(poor_rsrp_df)))
-            poor_rsrp_flowables.append(Paragraph(
-                f"Observation: {total_poor_rsrp_pci} PCI{'s' if total_poor_rsrp_pci != 1 else ''} "
-                f"recorded poor RSRP samples. PCI {worst_rsrp_pci['PCI']} had the most, with "
-                f"{worst_rsrp_pci['Poor Samples']} poor samples (average {worst_rsrp_pci['Avg RSRP']} dBm, "
-                f"worst {worst_rsrp_pci['Worst RSRP']} dBm) on band(s) {worst_rsrp_pci['Bands']}.",
-                self.styles["Body"],
-            ))
-        else:
-            poor_rsrp_flowables.append(Paragraph("No poor PCI entries were observed for the configured RSRP threshold.", self.styles["Body"]))
-        self.add_labeled_block(
-            _poor_pci_section_title("5.4 Poor PCI Analysis (RSRP)", poor_rsrp_df),
-            poor_rsrp_flowables,
-        )
-
-        poor_rsrq_flowables = []
-        if poor_rsrq_df is not None and not poor_rsrq_df.empty:
-            poor_rsrq_flowables.append(make_native_table(poor_rsrq_df))
-            poor_rsrq_flowables.append(Spacer(1, 4))
-            worst_rsrq_pci = poor_rsrq_df.iloc[0]
-            total_poor_rsrq_pci = int(poor_rsrq_df.attrs.get("total_poor_pci", len(poor_rsrq_df)))
-            poor_rsrq_flowables.append(Paragraph(
-                f"Observation: {total_poor_rsrq_pci} PCI{'s' if total_poor_rsrq_pci != 1 else ''} "
-                f"recorded poor RSRQ samples. PCI {worst_rsrq_pci['PCI']} had the most, with "
-                f"{worst_rsrq_pci['Poor Samples']} poor samples (average {worst_rsrq_pci['Avg RSRQ']} dB, "
-                f"worst {worst_rsrq_pci['Worst RSRQ']} dB) on band(s) {worst_rsrq_pci['Bands']}.",
-                self.styles["Body"],
-            ))
-        else:
-            poor_rsrq_flowables.append(Paragraph("No poor PCI entries were observed for the configured RSRQ threshold.", self.styles["Body"]))
-        self.add_labeled_block(
-            _poor_pci_section_title("5.5 Poor PCI Analysis (RSRQ)", poor_rsrq_df),
-            poor_rsrq_flowables,
-        )
-
-        spread_flowables = [
+        # 5.3 Top PCI Analysis
+        self.add_labeled_block("5.3 Top PCI Analysis", [
             Paragraph(
-                "Objective: for each top serving PCI, measure how far its own samples are "
-                "scattered from that PCI's own average position — a cell whose samples spread "
-                "many kilometers from its own center suggests overshoot or interference rather "
-                "than a tight, well-contained serving footprint.",
+                "Per-technology breakdown of the top serving PCI (BCCH for 2G) values by "
+                "sample share.",
                 self.styles["Body"],
             ),
-            Spacer(1, 4),
-        ]
-        if not pci_spread_df.empty:
-            spread_flowables.append(make_native_table(pci_spread_df))
-            spread_flowables.append(Spacer(1, 4))
-            overshoot_candidates = [s for s in pci_spread_stats if s["pct_beyond_5km"] > 0]
-            if overshoot_candidates:
-                worst = max(overshoot_candidates, key=lambda s: s["pct_beyond_5km"])
-                other_count = len(overshoot_candidates) - 1
-                other_note = (
-                    f" {other_count} other PCI{'s' if other_count != 1 else ''} in this table also "
-                    f"had samples beyond 5 km from their own center."
-                    if other_count else ""
-                )
-                spread_flowables.append(Paragraph(
-                    f"Observation: PCI {worst['pci']} showed the widest spread, with "
-                    f"{worst['pct_beyond_5km']:.1f}% of its {worst['count']:,} samples more than "
-                    f"5 km from its own center — a candidate for overshoot review.{other_note}",
+        ])
+        top_blocks = []
+        for tech in pci_techs:
+            df_tech = _tech_df(tech)
+            label = _tech_pci_label(tech)
+            tech_top_analysis_df = build_top_pci_analysis_table(df_tech, limit=8, pci_label=label)
+            block = [Paragraph(f"<b>{_tech_heading(tech, label)}</b>", self.styles["Body"]), Spacer(1, 2)]
+            if not tech_top_analysis_df.empty:
+                block.append(make_native_table(tech_top_analysis_df))
+            else:
+                block.append(Paragraph(f"No top {label} entries are available.", self.styles["Body"]))
+            top_blocks.append(KeepTogether(block))
+            top_blocks.append(Spacer(1, 6))
+        self.story.extend(top_blocks)
+
+        # 5.4 Poor PCI Analysis (RSRP) -- threshold/column stay "rsrp"
+        # for every technology (only the PCI/BCCH label changes).
+        self.add_labeled_block("5.4 Poor PCI Analysis (RSRP)", [
+            Paragraph(
+                "Per-technology breakdown of the PCIs (BCCHs for 2G) with the most poor-RSRP "
+                "samples.",
+                self.styles["Body"],
+            ),
+        ])
+        poor_rsrp_blocks = []
+        for tech in pci_techs:
+            df_tech = _tech_df(tech)
+            label = _tech_pci_label(tech)
+            tech_poor_rsrp_df = build_poor_pci_analysis_table(df_tech, "rsrp", pci_label=label)
+            heading = _poor_pci_section_title(_tech_heading(tech, label), tech_poor_rsrp_df, pci_label=label)
+            block = [Paragraph(f"<b>{heading}</b>", self.styles["Body"]), Spacer(1, 2)]
+            if tech_poor_rsrp_df is not None and not tech_poor_rsrp_df.empty:
+                block.append(make_native_table(tech_poor_rsrp_df))
+                block.append(Spacer(1, 4))
+                worst_rsrp_row = tech_poor_rsrp_df.iloc[0]
+                total_poor_rsrp = int(tech_poor_rsrp_df.attrs.get("total_poor_pci", len(tech_poor_rsrp_df)))
+                block.append(Paragraph(
+                    f"Observation: {total_poor_rsrp} {label}{'s' if total_poor_rsrp != 1 else ''} "
+                    f"recorded poor RSRP samples. {label} {worst_rsrp_row[label]} had the most, with "
+                    f"{worst_rsrp_row['Poor Samples']} poor samples (average {worst_rsrp_row['Avg RSRP']} dBm, "
+                    f"worst {worst_rsrp_row['Worst RSRP']} dBm) on band(s) {worst_rsrp_row['Bands']}.",
                     self.styles["Body"],
                 ))
             else:
-                spread_flowables.append(Paragraph(
-                    "Observation: every listed PCI's samples stayed within 5 km of its own center, "
-                    "consistent with well-contained serving footprints across this drive.",
+                block.append(Paragraph(f"No poor {label} entries were observed for the configured RSRP threshold.", self.styles["Body"]))
+            poor_rsrp_blocks.append(KeepTogether(block))
+            poor_rsrp_blocks.append(Spacer(1, 6))
+        self.story.extend(poor_rsrp_blocks)
+
+        # 5.5 Poor PCI Analysis (RSRQ) -- 2G is skipped entirely (no RSRQ
+        # concept at all, matching the frontend and 4.3's RSRQ maps).
+        self.add_labeled_block("5.5 Poor PCI Analysis (RSRQ)", [
+            Paragraph(
+                "Per-technology breakdown of the PCIs with the most poor-RSRQ samples. Not "
+                "applicable to 2G, which has no RSRQ concept.",
+                self.styles["Body"],
+            ),
+        ])
+        poor_rsrq_blocks = []
+        for tech in pci_techs:
+            if tech is not None and technology_metric_label(tech, "rsrq") is None:
+                continue  # 2G -- not applicable, skip entirely.
+            df_tech = _tech_df(tech)
+            label = _tech_pci_label(tech)
+            tech_poor_rsrq_df = build_poor_pci_analysis_table(df_tech, "rsrq", pci_label=label)
+            heading = _poor_pci_section_title(_tech_heading(tech, label), tech_poor_rsrq_df, pci_label=label)
+            block = [Paragraph(f"<b>{heading}</b>", self.styles["Body"]), Spacer(1, 2)]
+            if tech_poor_rsrq_df is not None and not tech_poor_rsrq_df.empty:
+                block.append(make_native_table(tech_poor_rsrq_df))
+                block.append(Spacer(1, 4))
+                worst_rsrq_row = tech_poor_rsrq_df.iloc[0]
+                total_poor_rsrq = int(tech_poor_rsrq_df.attrs.get("total_poor_pci", len(tech_poor_rsrq_df)))
+                block.append(Paragraph(
+                    f"Observation: {total_poor_rsrq} {label}{'s' if total_poor_rsrq != 1 else ''} "
+                    f"recorded poor RSRQ samples. {label} {worst_rsrq_row[label]} had the most, with "
+                    f"{worst_rsrq_row['Poor Samples']} poor samples (average {worst_rsrq_row['Avg RSRQ']} dB, "
+                    f"worst {worst_rsrq_row['Worst RSRQ']} dB) on band(s) {worst_rsrq_row['Bands']}.",
                     self.styles["Body"],
                 ))
-        else:
-            spread_flowables.append(Paragraph("PCI coverage spread data is not available.", self.styles["Body"]))
-        self.add_labeled_block("5.6 Top PCI Coverage Spread", spread_flowables)
+            else:
+                block.append(Paragraph(f"No poor {label} entries were observed for the configured RSRQ threshold.", self.styles["Body"]))
+            poor_rsrq_blocks.append(KeepTogether(block))
+            poor_rsrq_blocks.append(Spacer(1, 6))
+        self.story.extend(poor_rsrq_blocks)
+
+        # 5.6 Top PCI Coverage Spread
+        self.add_labeled_block("5.6 Top PCI Coverage Spread", [
+            Paragraph(
+                "Objective: for each top serving PCI (BCCH for 2G), measure how far its own "
+                "samples are scattered from that cell's own average position — a cell whose "
+                "samples spread many kilometers from its own center suggests overshoot or "
+                "interference rather than a tight, well-contained serving footprint.",
+                self.styles["Body"],
+            ),
+        ])
+        spread_blocks = []
+        for tech in pci_techs:
+            df_tech = _tech_df(tech)
+            label = _tech_pci_label(tech)
+            tech_spread_df, tech_spread_stats = build_pci_spread_table(df_tech, limit=15, pci_label=label)
+            block = [Paragraph(f"<b>{_tech_heading(tech, label)}</b>", self.styles["Body"]), Spacer(1, 2)]
+            if not tech_spread_df.empty:
+                block.append(make_native_table(tech_spread_df))
+                block.append(Spacer(1, 4))
+                overshoot_candidates = [s for s in tech_spread_stats if s["pct_beyond_5km"] > 0]
+                if overshoot_candidates:
+                    worst = max(overshoot_candidates, key=lambda s: s["pct_beyond_5km"])
+                    other_count = len(overshoot_candidates) - 1
+                    other_note = (
+                        f" {other_count} other {label}{'s' if other_count != 1 else ''} in this table also "
+                        f"had samples beyond 5 km from their own center."
+                        if other_count else ""
+                    )
+                    block.append(Paragraph(
+                        f"Observation: {label} {worst['pci']} showed the widest spread, with "
+                        f"{worst['pct_beyond_5km']:.1f}% of its {worst['count']:,} samples more than "
+                        f"5 km from its own center — a candidate for overshoot review.{other_note}",
+                        self.styles["Body"],
+                    ))
+                else:
+                    block.append(Paragraph(
+                        f"Observation: every listed {label}'s samples stayed within 5 km of its own "
+                        "center, consistent with well-contained serving footprints across this drive.",
+                        self.styles["Body"],
+                    ))
+            else:
+                block.append(Paragraph(f"{label} coverage spread data is not available.", self.styles["Body"]))
+            spread_blocks.append(KeepTogether(block))
+            spread_blocks.append(Spacer(1, 6))
+        self.story.extend(spread_blocks)
 
         summary_flowables = [make_native_table(summary_df), Spacer(1, 4)]
         if mobility_status == "Good" and neighbor_status == "Available":
@@ -4476,10 +4949,8 @@ class NewFormatPDFReport(PDFReportGenerator):
         dl_class_df = build_lte_throughput_classification_table(dl_classification)
         dl_flowables = [
             Paragraph(
-                "Definition: Downlink (DL) throughput is the achievable download data rate, "
-                "classified relative to the theoretical peak throughput for the sample's own "
-                "LTE channel bandwidth (tbl_network_log.bw) — not a single fixed Mbps figure, "
-                "since the achievable peak itself scales with bandwidth.",
+                "Definition: Downlink (DL) throughput is the achievable download data rate "
+                "delivered to the device.",
                 self.styles["Body"],
             ),
             Spacer(1, 4),
@@ -4509,9 +4980,8 @@ class NewFormatPDFReport(PDFReportGenerator):
         ul_class_df = build_lte_throughput_classification_table(ul_classification)
         ul_flowables = [
             Paragraph(
-                "Definition: Uplink (UL) throughput is the achievable upload data rate, "
-                "classified relative to the theoretical peak throughput for the sample's own "
-                "LTE channel bandwidth (tbl_network_log.bw), same rule as DL throughput above.",
+                "Definition: Uplink (UL) throughput is the achievable upload data rate "
+                "sent from the device.",
                 self.styles["Body"],
             ),
             Spacer(1, 4),

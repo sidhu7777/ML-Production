@@ -474,9 +474,18 @@ class PDFReportGenerator:
         self.story.append(Spacer(1, 2*inch))
         self.story.append(Paragraph("Drive Test Report", self.styles["CustomTitle"]))
 
-        loc = metadata.get("location", {})
+        loc = metadata.get("location", {}) or {}
+        # loc.get('city', '') only defaults when the KEY is missing -- if
+        # city is present but None (geocoding found a country but no named
+        # place), .get() returns None itself and the f-string used to print
+        # the literal word "None". Guard explicitly, and only join with a
+        # comma when both parts are actually present, so a city-less result
+        # renders as just "Country" instead of " , Country".
+        city = (loc.get("city") or "").strip()
+        country = (loc.get("country") or "").strip()
+        location_text = ", ".join(part for part in (city, country) if part)
         self.story.append(Paragraph(
-            f"{loc.get('city','')} , {loc.get('country','')}",
+            location_text,
             self.styles["Body"]
         ))
 

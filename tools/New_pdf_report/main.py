@@ -301,7 +301,9 @@ def _render_kpi_map_per_technology(
     from tools.report_engine.threshold_resolver import resolve_kpi_ranges
     from tools.report_engine.map_generator import generate_kpi_map, has_valid_numeric_data
     from tools.New_pdf_report.local_tiles import html_to_png_verified as html_to_png
-    from tools.New_pdf_report.new_report_sections import _technology_groups, _tech_slug
+    from tools.New_pdf_report.new_report_sections import (
+        _technology_groups, _tech_slug, technology_metric_label,
+    )
     from tools.New_pdf_report.grid_maps import aggregate_grid_cells, generate_kpi_grid_map
 
     if col not in report_df.columns:
@@ -325,7 +327,25 @@ def _render_kpi_map_per_technology(
     )
     techs = tech_list if (tech_list and network_col is not None) else [None]
 
+    # Per-technology display label for the map's own legend/tooltip text
+    # ONLY (e.g. "RxLev" for a 2G RSRP map, "nrSINR" for a 5G SINR map) --
+    # gated to RSRP/RSRQ/SINR specifically so the DL/UL/MOS calls into this
+    # same function (Section 7) are completely unaffected, since those
+    # KPIs aren't in TECHNOLOGY_METRIC_LABELS. This NEVER changes
+    # `kpi_name` itself (still passed to resolve_kpi_ranges below exactly
+    # as before) or `col`/`kpi_column` (the actual dataframe column read) --
+    # only the human-facing label text.
+    is_signal_kpi = col in ("rsrp", "rsrq", "sinr")
+
     for tech in techs:
+        display_label = technology_metric_label(tech, col) if is_signal_kpi else kpi_name
+        if display_label is None:
+            # e.g. 2G RSRQ -- the frontend has no RSRQ concept for 2G at
+            # all (TECHNOLOGY_METRIC_LABELS["2G"]["rsrq"] is None), so skip
+            # this technology's map entirely rather than render an empty
+            # or mislabeled one.
+            print(f"[map] skipped {kpi_name} map for {tech or 'ALL'}: not applicable for this technology")
+            continue
         df_tech = report_df if tech is None else report_df.loc[network_col == tech]
         df_kpi = df_tech[df_tech[col].notna() & df_tech["lat"].notna() & df_tech["lon"].notna()]
         tech_label = tech or "ALL"
@@ -355,19 +375,114 @@ def _render_kpi_map_per_technology(
                     generate_kpi_grid_map(
                         cells, ranges, str(html_path), polygon_wkt=polygon_wkt,
                         grid_size_meters=grid_size_meters, bounds_df=report_df,
-                        metric_label=kpi_name.lower(), unit=unit, total_cells=drive_route_total_cells,
+                        metric_label=display_label.lower(), unit=unit, total_cells=drive_route_total_cells,
                     )
                 html_to_png(str(html_path), str(png_path), width=1200, height=900, device_scale_factor=1)
                 print(f"[map] generated {png_path.name} ({tech_label}, GRID: {populated}/{total} cells)")
             else:
+                # generate_kpi_map (tools/report_engine/map_generator.py,
+                # not modified) ties its legend title directly to
+                # `kpi_column` -- there's no separate label parameter for
+                # the raw-point path. To get a technology-correct legend
+                # (e.g. "rxlev" instead of "rsrp" for 2G) without touching
+                # report_engine, alias the KPI column under the display
+                # label's own name in a local copy and point kpi_column at
+                # that alias instead -- the underlying data/threshold
+                # classification is untouched, only which column name the
+                # map reads its legend title from.
+                map_kpi_column = col
+                map_df = df_kpi
+                if display_label.lower() != col:
+                    map_df = df_kpi.copy()
+                    map_df[display_label.lower()] = map_df[col]
+                    map_kpi_column = display_label.lower()
                 generate_kpi_map(
-                    df=df_kpi, kpi_column=col, color_func=color_func,
+                    df=map_df, kpi_column=map_kpi_column, color_func=color_func,
                     ranges=ranges, output_html=str(html_path), polygon_wkt=polygon_wkt,
                 )
                 html_to_png(str(html_path), str(png_path), width=1200, height=900, device_scale_factor=1)
                 print(f"[map] generated {png_path.name} ({tech_label}, raw points)")
         except Exception as exc:
             print(f"[map] WARNING: failed to generate {kpi_name} map for {tech_label}: {exc}")
+
+
+def _render_poor_region_maps_per_technology(
+    report_df, polygon_wkt, grid_lattice, grid_size_meters,
+    value_col: str, threshold: float, map_prefix: str,
+    html_dir: Path, maps_dir: Path,
+) -> None:
+    """
+    Per-technology counterpart of the single blended poor-region map
+    (RSRP/RSRQ below the acceptance threshold), mirroring
+    _render_kpi_map_per_technology's polygon/no-polygon branch and its
+    per-technology skip logic: a technology is skipped entirely (no file
+    generated) when technology_metric_label(tech, value_col) is None --
+    e.g. 2G has no RSRQ concept at all, so no `rsrq_poor_regions_2g.png`
+    is produced.
+
+    Filenames follow `{map_prefix}_{_tech_slug(tech)}.png` (e.g.
+    "rsrp_poor_regions_4g.png"), matching the naming convention
+    `_render_kpi_map_per_technology` already uses for the main RSRP/RSRQ/
+    SINR maps, so new_report_sections.py's rendering side can look them
+    up the same way.
+    """
+    from tools.New_pdf_report.new_report_sections import (
+        generate_poor_region_map_fixed, generate_poor_region_grid_map,
+        _technology_groups, _tech_slug, technology_metric_label,
+    )
+
+    if value_col not in report_df.columns:
+        return
+
+    use_grid_poor = bool(polygon_wkt) and grid_lattice is not None and not grid_lattice.empty
+
+    tech_list = _technology_groups(report_df)
+    network_col = (
+        report_df["network"].fillna("").astype(str).str.strip()
+        if "network" in report_df.columns else None
+    )
+    techs = tech_list if (tech_list and network_col is not None) else [None]
+
+    for tech in techs:
+        display_label = technology_metric_label(tech, value_col)
+        if display_label is None:
+            # e.g. 2G under RSRQ -- not applicable, skip entirely.
+            print(f"[map] skipped {map_prefix} map for {tech or 'ALL'}: not applicable for this technology")
+            continue
+        tech_label = tech or "ALL"
+        slug = _tech_slug(tech) if tech else "all"
+        png_path = maps_dir / f"{map_prefix}_{slug}.png"
+        html_path = html_dir / f"{map_prefix}_{slug}.html"
+        if _asset_exists(png_path):
+            print(f"[map] reused existing {png_path.name} ({tech_label})")
+            continue
+        df_tech = report_df if tech is None else report_df.loc[network_col == tech]
+        title = f"{display_label} < {threshold:g}"
+        try:
+            if use_grid_poor:
+                from tools.New_pdf_report.google_tiles import use_gray_basemap
+
+                with use_gray_basemap(polygon_wkt):
+                    ok = generate_poor_region_grid_map(
+                        df_tech, value_col, threshold, str(png_path), str(html_path),
+                        title, grid_lattice=grid_lattice, grid_size_meters=grid_size_meters,
+                        polygon_wkt=polygon_wkt,
+                    )
+                print(
+                    f"[map] poor-region grid map {map_prefix} ({tech_label}): "
+                    f"{'generated' if ok else 'SKIPPED (no cell median below threshold)'}"
+                )
+            else:
+                ok = generate_poor_region_map_fixed(
+                    df_tech, value_col, threshold, str(png_path), str(html_path),
+                    title, polygon_wkt=polygon_wkt,
+                )
+                print(
+                    f"[map] poor-region map {map_prefix} ({tech_label}): "
+                    f"{'generated' if ok else 'SKIPPED (no poor samples)'}"
+                )
+        except Exception as exc:
+            print(f"[map] WARNING: failed to generate {map_prefix} map for {tech_label}: {exc}")
 
 
 def _render_coverage_kpi_images(
@@ -384,12 +499,14 @@ def _render_coverage_kpi_images(
     generate_all_cdf_plots_from_df (adds the red acceptance-threshold
     crosshair; tools/report_engine is not modified).
 
-    RSRP/RSRQ/SINR maps are each generated ONE PER TECHNOLOGY present in
-    `network` -- RSRP's own numeric classification in the 4.2 table stays
-    blended across technologies (dBm is directly comparable across RATs),
-    but each map plots per-point actual values, so a per-technology split
-    is still useful there too. The CDF charts stay a single blended
-    distribution per KPI.
+    RSRP/RSRQ/SINR maps, and the RSRP/RSRQ poor-region maps below the
+    acceptance threshold, are each generated ONE PER TECHNOLOGY present in
+    `network` (see _render_kpi_map_per_technology /
+    _render_poor_region_maps_per_technology) -- RSRP's own numeric
+    classification in the 4.2 table stays blended across technologies
+    (dBm is directly comparable across RATs), but each map plots per-
+    point actual values, so a per-technology split is still useful there
+    too. The CDF charts stay a single blended distribution per KPI.
     """
     from tools.New_pdf_report.new_report_sections import generate_categorical_kpi_map_polygon_aware
     from tools.New_pdf_report.local_tiles import html_to_png_verified as html_to_png
@@ -416,55 +533,23 @@ def _render_coverage_kpi_images(
         except Exception as exc:
             print(f"[map] WARNING: failed to generate band map/pie: {exc}")
 
-    # ---- Poor-region maps (RSRP / RSRQ below acceptance threshold) ----
+    # ---- Poor-region maps (RSRP / RSRQ below acceptance threshold) --
+    # one per technology, mirroring the main RSRP/RSRQ/SINR maps below
+    # (_render_kpi_map_per_technology), not a single map blending every
+    # technology's poor samples together. ----
     if "rsrp" in report_df.columns:
-        from tools.New_pdf_report.new_report_sections import (
-            generate_poor_region_map_fixed, generate_poor_region_grid_map, CDF_ACCEPTANCE_THRESHOLDS,
-        )
+        from tools.New_pdf_report.new_report_sections import CDF_ACCEPTANCE_THRESHOLDS
 
-        use_grid_poor = bool(polygon_wkt) and grid_lattice is not None and not grid_lattice.empty
         rsrp_threshold = CDF_ACCEPTANCE_THRESHOLDS["RSRP"]
         rsrq_threshold = CDF_ACCEPTANCE_THRESHOLDS["RSRQ"]
-        poor_rsrp_png = maps_dir / "rsrp_poor_regions.png"
-        poor_rsrq_png = maps_dir / "rsrq_poor_regions.png"
-        if _asset_exists(poor_rsrp_png) and _asset_exists(poor_rsrq_png):
-            print("[map] reused existing poor-region maps")
-        else:
-            try:
-                if use_grid_poor:
-                    from tools.New_pdf_report.google_tiles import use_gray_basemap
-
-                    with use_gray_basemap(polygon_wkt):
-                        rsrp_ok = generate_poor_region_grid_map(
-                            report_df, "rsrp", rsrp_threshold,
-                            str(poor_rsrp_png), str(html_dir / "rsrp_poor_regions.html"),
-                            f"RSRP < {rsrp_threshold:g}", grid_lattice=grid_lattice,
-                            grid_size_meters=grid_size_meters, polygon_wkt=polygon_wkt,
-                        )
-                        rsrq_ok = generate_poor_region_grid_map(
-                            report_df, "rsrq", rsrq_threshold,
-                            str(poor_rsrq_png), str(html_dir / "rsrq_poor_regions.html"),
-                            f"RSRQ < {rsrq_threshold:g}", grid_lattice=grid_lattice,
-                            grid_size_meters=grid_size_meters, polygon_wkt=polygon_wkt,
-                        )
-                    print(
-                        f"[map] poor-region grid maps: rsrp={'generated' if rsrp_ok else 'SKIPPED (no cell median below threshold)'}, "
-                        f"rsrq={'generated' if rsrq_ok else 'SKIPPED (no cell median below threshold)'}"
-                    )
-                else:
-                    generate_poor_region_map_fixed(
-                        report_df, "rsrp", rsrp_threshold,
-                        str(poor_rsrp_png), str(html_dir / "rsrp_poor_regions.html"),
-                        f"RSRP < {rsrp_threshold:g}", polygon_wkt=polygon_wkt,
-                    )
-                    generate_poor_region_map_fixed(
-                        report_df, "rsrq", rsrq_threshold,
-                        str(poor_rsrq_png), str(html_dir / "rsrq_poor_regions.html"),
-                        f"RSRQ < {rsrq_threshold:g}", polygon_wkt=polygon_wkt,
-                    )
-                    print("[map] generated rsrp_poor_regions.png + rsrq_poor_regions.png (raw points, legend fixed)")
-            except Exception as exc:
-                print(f"[map] WARNING: failed to generate poor-region maps: {exc}")
+        _render_poor_region_maps_per_technology(
+            report_df, polygon_wkt, grid_lattice, grid_size_meters,
+            "rsrp", rsrp_threshold, "rsrp_poor_regions", html_dir, maps_dir,
+        )
+        _render_poor_region_maps_per_technology(
+            report_df, polygon_wkt, grid_lattice, grid_size_meters,
+            "rsrq", rsrq_threshold, "rsrq_poor_regions", html_dir, maps_dir,
+        )
 
     # ---- RSRP / RSRQ / SINR maps -- one per technology, never blended ----
     per_tech_kpi_specs = [
@@ -937,6 +1022,13 @@ def main(
     exec_summary = derive_executive_summary(
         report_df, handover_count, mobility_df=report_df, grid_lattice=grid_lattice,
     )
+    # Minimum floor: Coverage + Handover (1 row each), plus at least one
+    # Radio Quality row and at least one Mobility row -- both are now
+    # broken out per technology (see classify_quality_by_technology /
+    # classify_mobility_by_technology), so a multi-RAT project produces
+    # more than one Radio Quality row and more than one Mobility row, but
+    # >= 4 is still the correct floor for a normal single-technology
+    # project (1 Coverage + 1 Radio Quality + 1 Mobility + 1 Handover).
     if len(exec_summary["kpi_rows"]) < 4:
         raise ValueError("Executive summary produced fewer than the expected KPI rows")
     if not exec_summary["observations"]:
@@ -956,10 +1048,15 @@ def main(
                 "Session distances (km, Haversine consecutive-points)": distances_km,
                 "Total distance (km)": total_distance_km,
                 "Band Summary": band_summary,
-                "Mobility KPI Remarks": next(
-                    (remarks for label, _status, remarks in exec_summary["kpi_rows"] if label == "Mobility"),
-                    "",
-                ),
+                # Mobility is now broken out per technology (one
+                # "Mobility - <tech>" kpi_rows entry per RAT, or a single
+                # unlabeled "Mobility" row when `network` is absent) --
+                # collect every such row instead of assuming exactly one.
+                "Mobility KPI Remarks": {
+                    label: remarks
+                    for label, _status, remarks in exec_summary["kpi_rows"]
+                    if label == "Mobility" or label.startswith("Mobility - ")
+                },
                 "Neighbor Rows (tbl_network_log_neighbour)": int(len(neighbor_df)),
             },
             indent=2, default=str, ensure_ascii=False,

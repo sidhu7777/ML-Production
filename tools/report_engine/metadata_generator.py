@@ -93,14 +93,24 @@ def reverse_geocode_area(lat, lon, sleep_sec=1.0):
 
 
 def reverse_geocode_location(lat, lon, sleep_sec=1.0):
-    """Return coarse location info (city/country) for report metadata."""
+    """Return coarse location info (city/country) for report metadata.
+
+    Falls back through progressively coarser address components (town ->
+    village -> county/state_district -> state) when Nominatim has no city
+    for this point -- rural/sparsely-mapped areas otherwise came back with
+    city=None (not missing, just None), which the cover page then printed
+    literally as the string "None" instead of falling back to anything.
+    """
     try:
         loc = geolocator.reverse((lat, lon), zoom=10, language="en")
         time.sleep(sleep_sec)
         if not loc:
             return None
         addr = loc.raw.get("address", {})
-        city = addr.get("city") or addr.get("town") or addr.get("village")
+        city = (
+            addr.get("city") or addr.get("town") or addr.get("village")
+            or addr.get("county") or addr.get("state_district") or addr.get("state")
+        )
         country = addr.get("country")
         if not (city or country):
             return None
