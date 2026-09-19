@@ -53,10 +53,9 @@ GREEN_LU_CLASS = {"park", "garden", "grass", "recreation_ground", "village_green
 # roads/highway/railway for the reference layers (not the classification).
 HIGHWAY_CLASSES = {"trunk", "primary", "secondary"}
 
-# Same key already hardcoded in Research/open_map.py (that file already
-# has it in plaintext) - override with an env var if you'd rather not
-# reuse it.
-GOOGLE_MAPS_API_KEY = os.environ.get("GOOGLE_MAPS_API_KEY", "AIzaSyA2lyMMqfIhfeViN2ZENVD_nZKmw5wVRn0")
+GOOGLE_MAPS_API_KEY = os.environ.get("GOOGLE_MAPS_API_KEY")
+if not GOOGLE_MAPS_API_KEY:
+    raise RuntimeError("GOOGLE_MAPS_API_KEY is not set in ML/.env")
 
 IMG_WIDTH = 640
 IMG_HEIGHT = 640
